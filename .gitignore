@@ -9,3 +9,8 @@
 
 #Object files
 *.o
+
+# Rust OS build artifacts
+/build/
+/kernel/target/
+/third_party/limine/

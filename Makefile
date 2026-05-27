@@ -1,4 +1,4 @@
-SHELL     := /bin/bash
+SHELL     := /bin/bash      # required: 'build' recipe uses the 'source' builtin
 KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
@@ -15,7 +15,7 @@ build:
 limine:
 	@if [ ! -d $(LIMINE) ]; then \
 		git clone https://github.com/limine-bootloader/limine.git \
-			--branch=v11.x-binary --depth=1 $(LIMINE); \
+			--branch=v11.4.1-binary --depth=1 $(LIMINE); \
 	fi
 	$(MAKE) -C $(LIMINE)
 
@@ -39,7 +39,9 @@ run: iso
 
 run-test: iso
 	@echo "--- serial (timeout 30s) ---"
-	-timeout 30 qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512
+	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+		| tee build/serial.log; \
+	grep -q "$(HELLO)" build/serial.log && echo TEST_PASS || { echo TEST_FAIL; exit 1; }
 
 clean:
 	rm -rf build kernel/target

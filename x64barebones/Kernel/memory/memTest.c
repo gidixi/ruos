@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <frameAllocator.h>
 #include <paging.h>
+#include <heap.h>
 
 #define COM1 0x3F8
 
@@ -81,12 +82,35 @@ static void testPaging(void) {
 	freeFrame(phys);
 }
 
+static void testHeap(void) {
+	uint64_t before = heapFreeBytes();
+	ASSERT(before > 0, "heap.init.free");
+
+	void * a = kmalloc(100);
+	ASSERT(a != 0, "heap.kmalloc.nonzero");
+	void * b = kmalloc(100);
+	ASSERT(b != 0 && b != a, "heap.kmalloc.distinct");
+
+	*(volatile uint64_t *) a = 0x1234;
+	ASSERT(*(volatile uint64_t *) a == 0x1234, "heap.write");
+
+	kfree(a);
+	kfree(b);
+	ASSERT(heapFreeBytes() == before, "heap.free.restores");
+
+	void * big = kmalloc(0x100000);   /* 1 MiB */
+	ASSERT(big != 0, "heap.kmalloc.large");
+	kfree(big);
+	ASSERT(heapFreeBytes() == before, "heap.free.large");
+}
+
 void memTest(void) {
 	failCount = 0;
 	serialInit();
 	serialPrint("=== memTest start ===\n");
 	testFrameAllocator();
 	testPaging();
+	testHeap();
 	serialPrint(failCount == 0 ? "=== memTest: ALL PASS ===\n"
 	                           : "=== memTest: FAILURES ===\n");
 }

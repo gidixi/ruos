@@ -11,6 +11,10 @@
 #include <RTL8139.h>
 
 #include <systemCalls.h>
+#include <sysIO.h>
+#include <memTest.h>
+
+#define MEM_TEST_ON_BOOT 1   /* set to 0 for release builds */
 
 extern uint8_t text;
 extern uint8_t rodata;
@@ -89,12 +93,21 @@ void * initializeKernelBinary()
 
 
 int main()
-{	
+{
+#if MEM_TEST_ON_BOOT
+	/* Run the memory self-tests before the network stack is brought up.
+	** initRTL() polls the RTL8139 reset bit at a hardcoded I/O port whose
+	** PCI BAR is left unassigned under headless QEMU, so it spins forever;
+	** running memTest first keeps the harness observable and lets it exit
+	** via isa-debug-exit before that path is reached. */
+	memTest();
+	sysOutByte(0xF4, 0x00);   /* isa-debug-exit: stop QEMU after tests */
+#endif
 
 	initializeInterruptions();
 	activeRTLdma();
 	initRTL();
-	
+
 	ncClear();
 	((EntryPoint)sampleCodeModuleAddress)();
 	return 0;

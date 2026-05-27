@@ -21,6 +21,6 @@ void * memoryManagement(int memoryCode, void * ptr, unsigned int nbytes){
 	return (void *) systemCall(SYS_CALL_MEMORY, memoryCode, ptr, nbytes);
 }
 
-void memTest(){
+void memTest(void){
 	systemCall(SYS_CALL_MEMTEST, 0, 0, 0);
 }

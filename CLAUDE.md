@@ -22,6 +22,23 @@ Codice sorgente in `x64barebones/` (Bootloader Pure64, Kernel C, Userland).
 
 Ogni sotto-progetto ha il suo ciclo spec → piano → implementazione.
 
+## Ambiente di build (WSL Ubuntu)
+
+Il build è Linux-only (gcc ELF64, ld, nasm, qemu). Su questa macchina il toolchain
+vive nella distro **WSL Ubuntu** (root). Il repo è visibile da WSL a
+`/mnt/e/MinimalOS/BasicOperatingSystem`.
+
+- **Tutti** i comandi `make`/`qemu` vanno eseguiti via WSL, es.:
+  ```bash
+  wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem/x64barebones && make all'
+  ```
+- **Prima volta:** il `make all` top-level NON builda il Toolchain. Costruire una
+  volta il ModulePacker: `cd Toolchain && make all` (produce `mp.bin`). Poi
+  `make all` dalla root di `x64barebones`.
+- Output immagine: `Image/x64BareBonesImage.qcow2`.
+- Test headless con seriale catturato a terminale (vedi `runtest.sh`):
+  `qemu-system-x86_64 ... -serial stdio -display none -device isa-debug-exit,iobase=0xf4,iosize=0x04`.
+
 ## Regole di lavoro (OBBLIGATORIE)
 
 ### Changelog — una entry per ogni modifica

@@ -23,11 +23,14 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
-    assert!(BASE_REVISION.is_supported());
-
+    // Serial first: any failure below must be observable on the wire.
     let mut serial = serial::Serial::new();
     serial.init();
     let _ = serial.write_str("MinimalOS-rs: hello serial\n");
+
+    if !BASE_REVISION.is_supported() {
+        let _ = serial.write_str("MinimalOS-rs: unsupported Limine base revision\n");
+    }
 
     hcf();
 }

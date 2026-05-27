@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #define ENTRY_ADDR_MASK 0x000FFFFFFFFFF000ULL
+#define PAGE_PS 0x80   /* bit 7: 2 MiB/1 GiB large page when set on a PDPT/PD entry */
 
 #define PML4_IDX(v) (((v) >> 39) & 0x1FF)
 #define PDPT_IDX(v) (((v) >> 30) & 0x1FF)
@@ -19,7 +20,11 @@ uint64_t * currentPML4(void) {
 	return (uint64_t *)(cr3 & ENTRY_ADDR_MASK);
 }
 
-/* Returns the next-level table pointer; allocates+zeroes it when create != 0. */
+/* Returns the next-level table pointer; allocates+zeroes it when create != 0.
+ * LIMITATION: assumes the walked path uses only 4 KiB pages. If an entry has the
+ * PS bit set (a 2 MiB/1 GiB large page, as Pure64 uses for the low identity map),
+ * this returns 0 rather than misreading the large-page frame as a table pointer.
+ * So do NOT map over the Pure64 low identity map; use fresh virtual ranges. */
 static uint64_t * getOrCreate(uint64_t * table, uint64_t idx, int create) {
 	if (!(table[idx] & PAGE_PRESENT)) {
 		if (!create) return 0;
@@ -27,8 +32,12 @@ static uint64_t * getOrCreate(uint64_t * table, uint64_t idx, int create) {
 		if (!frame) return 0;
 		uint64_t * t = (uint64_t *) frame;
 		for (int i = 0; i < 512; i++) t[i] = 0;
+		/* Intermediate tables are created permissive (RW|USER); effective
+		 * permission is the AND across levels, gated by the final PTE. */
 		table[idx] = frame | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+		return (uint64_t *)(table[idx] & ENTRY_ADDR_MASK);
 	}
+	if (table[idx] & PAGE_PS) return 0;   /* large-page leaf: not a table pointer */
 	return (uint64_t *)(table[idx] & ENTRY_ADDR_MASK);
 }
 
@@ -65,6 +74,9 @@ uint64_t * createAddressSpace(void) {
 	if (!frame) return 0;
 	uint64_t * newPml4 = (uint64_t *) frame;
 	uint64_t * cur = currentPML4();
+	/* TODO: copies all 512 PML4 entries (user + higher half). Fine while there is
+	 * a single shared address space; real process isolation should share only the
+	 * kernel/higher-half entries. */
 	for (int i = 0; i < 512; i++) newPml4[i] = cur[i];   /* share kernel mappings */
 	return newPml4;
 }

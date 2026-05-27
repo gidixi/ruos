@@ -12,6 +12,7 @@ void processComand(char * buffer){
 		printf("  2048game : Juego 2048\n");
 		printf("  chat: enter to chat\n");
 		printf("  clear:  clear screen\n");
+		printf("  memtest : esegue i test del gestore memoria (output seriale)\n");
 	}
 	else if(startsWith("echo ",buffer)){
 		puts(buffer+5);
@@ -27,6 +28,10 @@ void processComand(char * buffer){
 	}else if(startsWith("chat",buffer)){
 		clearScreen();
 		myChat();
+	}
+	else if(!strcmp("memtest",buffer)){
+		memTest();
+		puts("  memtest eseguito (output su seriale)");
 	}
 	else{
 		puts("  Command not found - help for instructions");

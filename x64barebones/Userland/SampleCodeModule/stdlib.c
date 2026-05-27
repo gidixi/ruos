@@ -2,7 +2,7 @@
 #include <systemCalls.h>
 
 void *malloc(size_t size){
-	return memoryManagement(MEMORY_ASIGN_CODE, size);
+	return memoryManagement(MEMORY_ASIGN_CODE, 0, size);
 }
 
 void *realloc(void *ptr, size_t size){
@@ -25,7 +25,7 @@ void *calloc(size_t nitems, size_t size){
 }
 
 void free(void *ptr){
-	memoryManagement(MEMORY_FREE_CODE,NULL);
+	memoryManagement(MEMORY_FREE_CODE, ptr, 0);
 }
 
 int abs(int x){

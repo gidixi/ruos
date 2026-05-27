@@ -22,6 +22,7 @@ int write(int fildes, void *buf, unsigned int nbytes);
 
 void clearScreen();
 
-void *memoryManagement(int memoryCode, unsigned int nbytes);
+void * memoryManagement(int memoryCode, void * ptr, unsigned int nbytes);
+void   memTest();
 
 #endif

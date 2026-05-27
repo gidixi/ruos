@@ -17,7 +17,7 @@
 #include <paging.h>
 #include <heap.h>
 
-#define MEM_TEST_ON_BOOT 1   /* set to 0 for release builds */
+#define MEM_TEST_ON_BOOT 0   /* set to 0 for release builds */
 
 extern uint8_t text;
 extern uint8_t rodata;

@@ -14,6 +14,9 @@ void *calloc(size_t nitems, size_t size);
 
 void free(void *ptr);
 
+void * memoryManagement(int memoryCode, void * ptr, unsigned int nbytes);
+void   memTest();
+
 int abs(int x);
 
 #endif

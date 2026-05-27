@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 #define PAGE_SIZE        0x1000ULL
-#define MAX_PHYS_BYTES   (4ULL * 1024 * 1024 * 1024)   /* 4 GiB, matches identity map */
+#define MAX_PHYS_BYTES   (4ULL * 1024 * 1024 * 1024)   /* 4 GiB managed cap; Pure64 identity-maps 64 GiB, this is a conservative window */
 #define MAX_FRAMES       (MAX_PHYS_BYTES / PAGE_SIZE)   /* 1048576 */
 #define BITMAP_BYTES     (MAX_FRAMES / 8)               /* 131072 */
 

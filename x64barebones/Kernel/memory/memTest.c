@@ -2,6 +2,7 @@
 #include <sysIO.h>
 #include <stdint.h>
 #include <frameAllocator.h>
+#include <paging.h>
 
 #define COM1 0x3F8
 
@@ -55,11 +56,37 @@ static void testFrameAllocator(void) {
 	freeFrame(c + 0x3000);
 }
 
+static void testPaging(void) {
+	uint64_t * space = createAddressSpace();
+	ASSERT(space != 0, "paging.createAddrSpace");
+
+	uint64_t phys = allocFrame();
+	ASSERT(phys != 0, "paging.frame");
+
+	/* 256 GiB: inside PML4[0] but well beyond Pure64's identity-mapped 4 GiB,
+	   so no 2 MiB page covers it. */
+	uint64_t virt = 0x4000000000ULL;
+	uint64_t * cur = currentPML4();
+
+	int r = mapPage(cur, virt, phys, PAGE_RW);
+	ASSERT(r == 0, "paging.map.ok");
+
+	volatile uint64_t * p = (volatile uint64_t *) virt;
+	*p = 0xCAFEBABEULL;
+	ASSERT(*p == 0xCAFEBABEULL, "paging.map.rw");
+	/* phys is < 4 GiB so it is identity-mapped: same physical memory. */
+	ASSERT(*(volatile uint64_t *) phys == 0xCAFEBABEULL, "paging.map.backing");
+
+	unmapPage(cur, virt);
+	freeFrame(phys);
+}
+
 void memTest(void) {
 	failCount = 0;
 	serialInit();
 	serialPrint("=== memTest start ===\n");
 	testFrameAllocator();
+	testPaging();
 	serialPrint(failCount == 0 ? "=== memTest: ALL PASS ===\n"
 	                           : "=== memTest: FAILURES ===\n");
 }

@@ -14,6 +14,7 @@
 #include <sysIO.h>
 #include <memTest.h>
 #include <frameAllocator.h>
+#include <paging.h>
 
 #define MEM_TEST_ON_BOOT 1   /* set to 0 for release builds */
 
@@ -96,6 +97,7 @@ void * initializeKernelBinary()
 int main()
 {
 	initFrameAllocator();
+	initPaging();
 #if MEM_TEST_ON_BOOT
 	/* Run the memory self-tests before the network stack is brought up.
 	** initRTL() polls the RTL8139 reset bit at a hardcoded I/O port whose

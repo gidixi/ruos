@@ -1,6 +1,7 @@
 #include <memTest.h>
 #include <sysIO.h>
 #include <stdint.h>
+#include <frameAllocator.h>
 
 #define COM1 0x3F8
 
@@ -31,11 +32,34 @@ static void serialPrint(const char * s) {
 		else { serialPrint(": FAIL\n"); failCount++; }\
 	} while (0)
 
+static void testFrameAllocator(void) {
+	uint64_t a = allocFrame();
+	ASSERT(a != 0, "frame.alloc.nonzero");
+	ASSERT((a % 0x1000) == 0, "frame.alloc.aligned");
+	ASSERT(a >= 0x1800000, "frame.alloc.above-reserved");
+
+	uint64_t b = allocFrame();
+	ASSERT(b != a, "frame.alloc.distinct");
+
+	uint64_t before = freeFrameCount();
+	freeFrame(a);
+	freeFrame(b);
+	ASSERT(freeFrameCount() == before + 2, "frame.free.count");
+
+	uint64_t c = allocFrames(4);
+	ASSERT(c != 0, "frame.allocFrames.nonzero");
+	ASSERT((c % 0x1000) == 0, "frame.allocFrames.aligned");
+	freeFrame(c);
+	freeFrame(c + 0x1000);
+	freeFrame(c + 0x2000);
+	freeFrame(c + 0x3000);
+}
+
 void memTest(void) {
 	failCount = 0;
 	serialInit();
 	serialPrint("=== memTest start ===\n");
-	/* component tests added in later tasks */
+	testFrameAllocator();
 	serialPrint(failCount == 0 ? "=== memTest: ALL PASS ===\n"
 	                           : "=== memTest: FAILURES ===\n");
 }

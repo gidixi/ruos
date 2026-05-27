@@ -7,6 +7,11 @@
 #define MAX_ORDER   23              /* 2^23 = 8 MiB  = whole heap      */
 #define HEADER_SIZE 8               /* stores the block order          */
 
+/* The single root block is 2^MAX_ORDER; it must equal HEAP_SIZE. */
+#if ((1 << MAX_ORDER) != HEAP_SIZE)
+#error "HEAP_SIZE must equal (1 << MAX_ORDER)"
+#endif
+
 typedef struct FreeBlock {
 	struct FreeBlock * next;
 } FreeBlock;
@@ -62,13 +67,22 @@ void * kmalloc(uint64_t size) {
 		listPush(o, buddy);
 	}
 	*(uint64_t *) block = (uint64_t) order;    /* header */
+	/* Returned pointers are 8-byte aligned (block is order-aligned, +HEADER_SIZE).
+	 * Raise HEADER_SIZE to 16 if SSE-aligned allocations are ever needed. */
 	return (void *)((uint64_t) block + HEADER_SIZE);
 }
 
 void kfree(void * ptr) {
 	if (!ptr) return;
 	void * block = (void *)((uint64_t) ptr - HEADER_SIZE);
+
+	/* Reject pointers outside the heap region (foreign / corrupt). */
+	if ((uint64_t) block < HEAP_BASE ||
+	    (uint64_t) block >= HEAP_BASE + HEAP_SIZE) return;
+
 	int order = (int) *(uint64_t *) block;
+	/* Reject an implausible header order (double-free / corruption). */
+	if (order < MIN_ORDER || order > MAX_ORDER) return;
 
 	while (order < MAX_ORDER) {
 		uint64_t off = (uint64_t) block - HEAP_BASE;

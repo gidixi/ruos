@@ -2,44 +2,67 @@
 
 ## Progetto
 
-OS hobby x86-64. **Direzione corrente: riscrittura in Rust `no_std` con bootloader
-Limine.** North star a lungo termine: far girare **Podman/container** (implica, col
-tempo, user mode, syscall, VFS + fs reale, compat Linux).
+OS hobby x86-64 in Rust `no_std` con bootloader **Limine**. **North star (pivot
+2026-05-28): eseguire app `.wasm` (WASI), avere GUI (rlvgl) e accesso remoto via
+SSH.** Tutto userspace = moduli WebAssembly; il runtime WASM è il sandbox.
+
+### Cosa NON faremo (drop espliciti dal pivot)
+
+- **Niente Linux ABI / ELF userland.** App = `.wasm` compilate `wasm32-wasi`,
+  non binari ELF Linux. Niente Podman, niente compat libc Linux.
+- **Niente user-mode CPU ring 3** (no SYSCALL/SYSRET MSR, no GDT ring 3 attivo).
+  Sandbox = WASM, non page tables + privilegi CPU. Tutto gira in ring 0 con
+  isolamento garantito dal runtime.
+- **Niente preemptive thread scheduler.** Concurrency = **async cooperative**
+  (executor no_std, timer IRQ → wake), single-CPU. SMP dopo, se serve.
 
 ### Stato
 
 - **Codice attivo**: kernel Rust `no_std` in `kernel/` + Makefile root + `limine.conf`.
-  Bota da Limine in QEMU, heap funzionante (talc + Limine memmap/HHDM). Vedi
-  roadmap sotto.
+  Boot Limine → seriale → heap → smoke alloc → GDT/TSS → IDT → ACPI → LAPIC/IOAPIC
+  → timer 100 Hz → tastiera PS/2 → halt. Verificato in QEMU, VirtualBox, ISO USB.
 - **Legacy C (rimosso)** — il vecchio kernel C su Pure64 + gestore memoria
   (E820/bitmap/buddy/paging) viveva in `x64barebones/`. Rimosso dal working tree;
   resta come **riferimento storico in git history** fino al commit `c1d2a81`
   (plan/spec a `docs/superpowers/plans/2026-05-27-memory-manager.md` e
   `docs/superpowers/specs/2026-05-27-memory-manager-design.md`).
 
-### Roadmap Rust (dettaglio completo: `docs/superpowers/roadmap-rust-os.md`)
+### Roadmap (dettaglio completo: `docs/superpowers/roadmap-rust-os.md`)
 
-1. **Toolchain Rust nightly + target.** Target `x86_64-unknown-none` (ufficiale dal
-   1.62, niente target custom). `build-std=core,alloc,compiler_builtins` in
-   `.cargo/config.toml`. ✅ FATTO.
-2. **Build: cargo + Makefile orchestratore.** Cargo compila il kernel Rust; Makefile
-   assembla gli `.asm` rimasti, linka con linker script, genera ISO con `xorriso`
-   per Limine, lancia QEMU. ✅ FATTO.
-3. **Hello world Rust** `no_std`/`no_main`, output seriale `0x3F8`, panic handler
-   che halta. ✅ FATTO.
-4. **Allocator + heap.** `talc` come `#[global_allocator]`, heap 4 MiB da Limine
-   memory map + HHDM, `alloc` (Vec/Box/String/BTreeMap) abilitato. ✅ FATTO.
-5. **IDT, GDT, interrupt** col crate `x86_64`. Eccezioni base (DE/UD/GP/PF, DF su IST),
-   remap PIC (o APIC), handler tastiera PS/2 + timer PIT (portati ~1:1 dal C).
-6. **Frame allocator fisico + paging Rust.** Memory map da Limine; bitmap allocator;
-   API map/unmap con `x86_64::structures::paging` (PhysAddr/VirtAddr tipati, PTE bitflag).
-7. **Tasking** thread-style (per goal Podman). TCB (regs/stack kernel+user/page-table
-   root), context switch in asm (`global_asm!`/`.s`), scheduler round-robin
-   `VecDeque<Arc<Task>>`. Cooperative → poi preemptive (timer IRQ → reschedule).
-8. **User mode + syscall.** GDT ring 3, TSS con RSP0, MSR `IA32_LSTAR/STAR/FMASK`
-   (syscall/sysret), tabella syscall in Rust. Userland binari custom, libc dopo.
-9. **VFS + fs reale.** Trait `FileSystem`/`Inode`/`File`. tmpfs → FAT (`fatfs` no_std)
-   → block layer + driver disco (virtio-blk via `virtio-drivers` in QEMU, poi AHCI).
+**Fondamenta (5 step, tutti fatti):**
+
+1. **Toolchain Rust nightly + target** `x86_64-unknown-none` + `build-std`. ✅ FATTO.
+2. **Build cargo + Makefile orchestratore + Limine ISO via xorriso.** ✅ FATTO.
+3. **Hello world `no_std`/`no_main` + seriale COM1 + panic halt.** ✅ FATTO.
+4. **Heap + global allocator (`talc`)** su Limine memmap+HHDM, 4 MiB,
+   `alloc` (Vec/Box/String/BTreeMap) abilitato. ✅ FATTO.
+5. **IDT/GDT + APIC + timer 100 Hz + tastiera PS/2 IRQ1.** ✅ FATTO.
+
+**Base mancante per WASM userland (in ordine di dipendenza):**
+
+6. **Frame allocator fisico + paging API completata.** Bitmap da E820,
+   `map/unmap_page` generico, gestione reserve regions (heap, kernel, MMIO).
+   NO per-process page tables, NO ring 3.
+7. **VFS minimale + tmpfs in-RAM.** Trait `FileSystem`/`Inode`/`File`, popolato
+   a init (es. `/init.wasm`, `/dev/console`). FAT/AHCI dopo, se servirà.
+8. **Framebuffer console.** Limine `FramebufferRequest` + font bitmap +
+   scrolling + cursor. Trait `Console` (impl seriale + framebuffer).
+9. **Async executor `no_std`** (es. `embassy-executor`). Wake source = timer IRQ
+   tick. Sostituisce lo scheduler preemptive droppato.
+10. **WASM runtime + WASI Preview 1.** `wasmi` (Rust puro, no_std) preferito,
+    altrimenti WAMR via FFI. Host functions: `args_get`, `environ_get`,
+    `clock_time_get`, `random_get`, `fd_read/write/seek`, `path_*`, `proc_exit`.
+11. **Shell locale.** Line editing (←/→/⌫), PATH lookup via VFS, exec `.wasm` via
+    runtime, builtin minimali (`cd`, `pwd`, `ls`, `exit`).
+12. **PTY.** Pseudo-terminal master/slave, line discipline. La shell gira sopra
+    PTY (locale o SSH).
+13. **Mouse PS/2 + rlvgl + host functions custom.** Driver mouse PS/2 (IRQ12),
+    crate `rlvgl`, host fn `ruos_draw_*`/`ruos_input_event` per app WASM grafiche.
+14. **Networking.** Driver `virtio-net` (QEMU/VBox prima), stack TCP `smoltcp`,
+    **CSPRNG seedato da RDRAND** (critico per crypto SSH).
+15. **SSH server.** `sunset` (no_std/no_alloc, naturale) o `russh` (async+alloc).
+    Pubkey hardcoded inizialmente. Exec non-interattivo prima, sessione
+    interattiva su PTY dopo.
 
 Ogni step ha il suo ciclo spec → piano → implementazione.
 

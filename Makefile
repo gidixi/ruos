@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: ticks=
+HELLO     := ruos: async tick=2
 
 .PHONY: all build limine iso run run-test clean
 

@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := MinimalOS-rs: hello serial
+HELLO     := MinimalOS-rs: alloc box=0xCAFEBABE vec=[0, 1, 2, 3, 4]
 
 .PHONY: all build limine iso run run-test clean
 
@@ -41,7 +41,7 @@ run-test: iso
 	@echo "--- serial (timeout 30s) ---"
 	@timeout 30 qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		| tee build/serial.log; \
-	grep -q "$(HELLO)" build/serial.log && echo TEST_PASS || { echo TEST_FAIL; exit 1; }
+	grep -qF "$(HELLO)" build/serial.log && echo TEST_PASS || { echo TEST_FAIL; exit 1; }
 
 clean:
 	rm -rf build kernel/target

@@ -6,18 +6,20 @@ user mode, syscall, VFS + filesystem reale, e (a lungo termine) compatibilità L
 
 ## Cambio di direzione
 
-Il kernel C su Pure64 in `x64barebones/` (incluso il gestore memoria completo già
-implementato) diventa **materiale di riferimento**: si riusa la conoscenza (parsing
-E820, bitmap frame allocator, buddy heap, paging 4 KiB, COM1 0x3F8), non il codice.
-Il nuovo OS è scritto in **Rust `no_std`**, bootato da **Limine**.
+Il vecchio kernel C su Pure64 (`x64barebones/`, gestore memoria completo, RTL8139,
+shell) è stato **rimosso dal working tree**: vive solo come riferimento storico
+in git history fino al commit `c1d2a81` (plan/spec a `docs/superpowers/...`).
+Si riusa la conoscenza (parsing E820, bitmap frame allocator, buddy heap, paging
+4 KiB, COM1 0x3F8), non il codice. Il nuovo OS è scritto in **Rust `no_std`**,
+bootato da **Limine**.
 
 - Bootloader: Pure64 → **Limine** (fornisce memory map e framebuffer pronti).
-- Toolchain cross-gcc (`x64barebones/Toolchain/`): **eliminata**.
+- Toolchain cross-gcc (ex `x64barebones/Toolchain/`): rimossa.
 - Linguaggio: C → **Rust nightly**.
 
 ## Step 1 — Toolchain Rust nightly + target
 
-- Elimina la cartella `Toolchain/` (cross-gcc): non serve più.
+- Cartella `Toolchain/` cross-gcc rimossa (non serve più).
 - Installa Rust nightly + componenti necessari (`rust-src` per build-std,
   `llvm-tools-preview`).
 - **Target:** usa `x86_64-unknown-none` (target ufficiale dal Rust 1.62 — niente più

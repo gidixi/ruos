@@ -1,16 +1,11 @@
-#Binary Files
-*.bin
-*.sys
-
-#The images
-*.img
-*.qcow2
-*.vmdk
-
-#Object files
-*.o
-
 # Rust OS build artifacts
 /build/
 /kernel/target/
 /third_party/limine/
+
+# Editor / IDE
+.vscode/
+
+# OS / misc
+.DS_Store
+Thumbs.db

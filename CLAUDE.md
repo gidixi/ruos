@@ -8,27 +8,27 @@ tempo, user mode, syscall, VFS + fs reale, compat Linux).
 
 ### Stato
 
-- **Legacy C (riferimento)** in `x64barebones/` — kernel C su Pure64 + un gestore
-  memoria completo (frame allocator bitmap da E820, paging 4 KiB, heap buddy,
-  syscall). NON è la base del nuovo OS: serve come **riferimento di conoscenza**
-  (logica E820/bitmap/buddy/paging) mentre si riscrive in Rust. Plan/spec del C:
-  `docs/superpowers/plans/2026-05-27-memory-manager.md`.
-- **Nuovo OS Rust** — vedi roadmap sotto. Sostituisce gradualmente il kernel C;
-  bootloader Pure64 → **Limine**; cartella `Toolchain/` (cross-gcc) → **eliminata**.
+- **Codice attivo**: kernel Rust `no_std` in `kernel/` + Makefile root + `limine.conf`.
+  Bota da Limine in QEMU, heap funzionante (talc + Limine memmap/HHDM). Vedi
+  roadmap sotto.
+- **Legacy C (rimosso)** — il vecchio kernel C su Pure64 + gestore memoria
+  (E820/bitmap/buddy/paging) viveva in `x64barebones/`. Rimosso dal working tree;
+  resta come **riferimento storico in git history** fino al commit `c1d2a81`
+  (plan/spec a `docs/superpowers/plans/2026-05-27-memory-manager.md` e
+  `docs/superpowers/specs/2026-05-27-memory-manager-design.md`).
 
 ### Roadmap Rust (dettaglio completo: `docs/superpowers/roadmap-rust-os.md`)
 
 1. **Toolchain Rust nightly + target.** Target `x86_64-unknown-none` (ufficiale dal
    1.62, niente target custom). `build-std=core,alloc,compiler_builtins` in
-   `.cargo/config.toml`. Elimina `Toolchain/`.
+   `.cargo/config.toml`. ✅ FATTO.
 2. **Build: cargo + Makefile orchestratore.** Cargo compila il kernel Rust; Makefile
    assembla gli `.asm` rimasti, linka con linker script, genera ISO con `xorriso`
-   per Limine, lancia QEMU. (Non spostare tutto in `build.rs` finché il build non gira.)
-3. **Hello world Rust** al posto del kernel C. `#![no_std] #![no_main]`, entry
-   `kernel_main`, output su **seriale `0x3F8`** (debug facile), panic handler che halta.
-   Commit "ora sono in Rust".
-4. **Allocator + heap.** `linked_list_allocator` o `talc` come `#[global_allocator]`;
-   mappa un range virtuale come heap kernel → abilita `alloc` (Vec/Box/String/BTreeMap).
+   per Limine, lancia QEMU. ✅ FATTO.
+3. **Hello world Rust** `no_std`/`no_main`, output seriale `0x3F8`, panic handler
+   che halta. ✅ FATTO.
+4. **Allocator + heap.** `talc` come `#[global_allocator]`, heap 4 MiB da Limine
+   memory map + HHDM, `alloc` (Vec/Box/String/BTreeMap) abilitato. ✅ FATTO.
 5. **IDT, GDT, interrupt** col crate `x86_64`. Eccezioni base (DE/UD/GP/PF, DF su IST),
    remap PIC (o APIC), handler tastiera PS/2 + timer PIT (portati ~1:1 dal C).
 6. **Frame allocator fisico + paging Rust.** Memory map da Limine; bitmap allocator;
@@ -51,13 +51,14 @@ Comandi build/run vanno eseguiti via WSL, es.:
 wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <cmd>'
 ```
 
-- **Nuovo OS Rust (target):** rustup nightly + componenti `rust-src`, `llvm-tools`;
-  `cargo build` con `build-std`; ISO Limine via `xorriso`; run con `qemu-system-x86_64`.
-  Da installare allo Step 1 (vedi roadmap doc).
-- **Legacy C (solo per il riferimento):** gcc ELF64 + nasm + qemu già installati in WSL;
-  build con `cd x64barebones && cd Toolchain && make all` (una volta) poi `make all`;
-  test seriale headless via `x64barebones/runtest.sh`. Questo toolchain resta solo
-  finché serve consultare/eseguire il C; `Toolchain/` verrà eliminata allo Step 1.
+- **Toolchain installato in WSL:** rustup nightly (`nightly-2026-05-26`) +
+  componenti `rust-src` e `llvm-tools-preview`; `xorriso`, `qemu-system-x86_64`,
+  `gcc`/`make` (per buildare il tool host `limine`).
+- **Build:** `make iso` dalla root del repo (clona Limine v11.4.1-binary la prima
+  volta in `third_party/limine/`, builda il kernel Rust, assembla ISO).
+- **Test:** `make run-test` → boot headless con seriale a stdio, asserisce la
+  stringa di successo (vedi `Makefile` variabile `HELLO`).
+- **Run interattivo:** `make run` (QEMU con display).
 
 ## Regole di lavoro (OBBLIGATORIE)
 

@@ -50,6 +50,11 @@ pub struct Frames {
 
 impl Frames {
     fn new(total: u64) -> Self {
+        // Tail bits past `total` in the last chunk stay set ("phantom used").
+        // `allocate_frame`'s `frame >= self.total` guard guarantees we never
+        // hand them out. Counter accounting stays honest by initializing
+        // `used = total` (NOT `chunks * 64`); any future refactor must keep
+        // these two invariants in lockstep.
         let chunks = ((total + 63) / 64) as usize;
         Frames { bitmap: vec![u64::MAX; chunks], total, used: total }
     }
@@ -105,7 +110,7 @@ impl FrameDeallocator<Size4KiB> for Frames {
     }
 }
 
-pub static FRAMES: spin::Mutex<Option<Frames>> = spin::Mutex::new(None);
+pub(crate) static FRAMES: spin::Mutex<Option<Frames>> = spin::Mutex::new(None);
 
 pub fn init() -> Result<FrameCounts, FrameInitError> {
     let memmap = crate::MEMMAP_REQUEST
@@ -142,6 +147,10 @@ pub fn init() -> Result<FrameCounts, FrameInitError> {
     }
 
     // Heap frames are owned by talc — do not hand them back out.
+    // Round first DOWN and last UP: any frame touched by the heap, even
+    // partially, must be marked used. (This is the opposite rounding from
+    // the USABLE walk above, which rounds inward to count only fully-usable
+    // frames.)
     if let Some(info) = crate::memory::heap::heap_region() {
         let first = info.phys_base / PAGE_SIZE;
         let last  = (info.phys_base + info.size as u64 + PAGE_SIZE - 1) / PAGE_SIZE;

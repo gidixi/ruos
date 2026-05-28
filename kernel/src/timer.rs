@@ -9,8 +9,10 @@ use crate::{apic::lapic, idt, kprintln};
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    // fetch_add returns the *previous* value, so add 1 to get "now".
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     crate::console::fb::tick_cursor();
+    crate::executor::delay::timer_tick(now);
     lapic::eoi();
 }
 

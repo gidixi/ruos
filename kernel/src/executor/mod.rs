@@ -9,6 +9,8 @@
 //! the window between checking the wake flag and halting is
 //! interrupt-free, eliminating the missed-wake race.
 
+pub mod delay;
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +48,7 @@ pub fn run() -> ! {
     };
 
     let spawner = exec.spawner();
-    spawner.spawn(bootstrap_task()).unwrap();
+    spawner.spawn(tick_task()).unwrap();
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised
@@ -73,14 +75,15 @@ pub fn run() -> ! {
     }
 }
 
-/// Minimal task that proves the executor links and runs. Prints the
-/// expected boot sentinel, then parks forever so the executor never
-/// runs out of tasks. Later tasks (Task 2, Task 3) replace this with
-/// real work.
 #[embassy_executor::task]
-async fn bootstrap_task() {
+async fn tick_task() {
     kprintln!("ruos: executor up");
-    core::future::pending::<()>().await;
+    let mut n: u32 = 0;
+    loop {
+        delay::Delay::ticks(100).await; // 1s @ 100 Hz
+        kprintln!("ruos: async tick={}", n);
+        n = n.wrapping_add(1);
+    }
 }
 
 /// Embassy's "we have work, please poll" callback. Called from

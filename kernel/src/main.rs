@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod serial;
+mod memory;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;

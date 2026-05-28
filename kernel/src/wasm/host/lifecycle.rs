@@ -51,13 +51,82 @@ pub fn proc_exit(
     Err(Error::i32_exit(code))
 }
 
+/// Minimal poll_oneoff: only handles clock subscriptions (sleep).
+///
+/// The real work happens in `Fiber::dispatch(SuspendReason::Sleep)`.
+/// This host fn parses the first subscription, validates it is a clock,
+/// computes the delta-tick count, then traps with `SuspendReason::Sleep`
+/// so that the fiber can yield to the async executor.
+pub fn poll_oneoff(
+    caller: Caller<'_, RuntimeState>,
+    in_ptr: i32,
+    out_ptr: i32,
+    nsubs: i32,
+    nevents_ptr: i32,
+) -> Result<i32, Error> {
+    use crate::wasm::suspend::SuspendReason;
+
+    if nsubs < 1 {
+        return Ok(28); // EINVAL
+    }
+    let mem = wasm_memory(&caller)?;
+
+    // WASI `__wasi_subscription_t` is 48 bytes:
+    //   offset 0..8:   userdata (u64)
+    //   offset 8:      tag / type (u8): 0 = CLOCK, 1 = FD_READ, 2 = FD_WRITE
+    //   (padding/alignment varies — Wasm uses packed layout)
+    // For wasm32, the clock variant layout is:
+    //   offset 0..8:   userdata (u64)
+    //   offset 8..10:  type (u16, 0 = CLOCK)
+    //   offset 16..24: clock_id (u32)
+    //   offset 24..32: timeout (u64, ns)
+    //   offset 32..40: precision (u64)
+    //   offset 40..42: flags (u16, 0 = relative, 1 = ABSTIME)
+    let mut sub = [0u8; 48];
+    mem.read(&caller, in_ptr as usize, &mut sub)
+        .map_err(|_| Error::i32_exit(-1))?;
+
+    // Check type byte at offset 8 (u16 LE).
+    let sub_type = u16::from_le_bytes([sub[8], sub[9]]);
+    if sub_type != 0 {
+        // Not a clock subscription — not implemented in T1.
+        return Ok(28); // EINVAL
+    }
+
+    let timeout_ns = u64::from_le_bytes([
+        sub[24], sub[25], sub[26], sub[27], sub[28], sub[29], sub[30], sub[31],
+    ]);
+    let flags = u16::from_le_bytes([sub[40], sub[41]]);
+    let abstime = flags & 0x1 != 0;
+
+    // Timer runs at 100 Hz → 1 tick = 10_000_000 ns.
+    let tick_ns: u64 = 10_000_000;
+    let now_ticks = crate::timer::ticks();
+    let target_ticks = if abstime {
+        let abs_ticks = timeout_ns / tick_ns;
+        if abs_ticks <= now_ticks { now_ticks } else { abs_ticks }
+    } else {
+        now_ticks.saturating_add((timeout_ns + tick_ns - 1) / tick_ns)
+    };
+    let delta = target_ticks.saturating_sub(now_ticks);
+
+    // Suspend: Fiber::dispatch will await Delay::ticks(delta) then
+    // write one clock event and write nevents=1.
+    Err(Error::host(SuspendReason::Sleep {
+        ticks: delta,
+        events_ptr: out_ptr as u32,
+        nevents_ptr: nevents_ptr as u32,
+    }))
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("wasi_snapshot_preview1", "args_sizes_get", args_sizes_get)?
         .func_wrap("wasi_snapshot_preview1", "args_get", args_get)?
         .func_wrap("wasi_snapshot_preview1", "environ_sizes_get", environ_sizes_get)?
         .func_wrap("wasi_snapshot_preview1", "environ_get", environ_get)?
-        .func_wrap("wasi_snapshot_preview1", "proc_exit", proc_exit)?;
+        .func_wrap("wasi_snapshot_preview1", "proc_exit", proc_exit)?
+        .func_wrap("wasi_snapshot_preview1", "poll_oneoff", poll_oneoff)?;
     Ok(())
 }
 

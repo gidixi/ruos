@@ -2,6 +2,8 @@
 
 pub mod host;
 pub mod state;
+pub mod suspend;
+pub mod fiber;
 
 use alloc::vec::Vec;
 use wasmi::{Engine, Linker, Module, Store};
@@ -105,19 +107,23 @@ pub async fn run_at(path: &str) {
             return;
         }
     };
-    let mut rt = match Runtime::new(&bytes) {
-        Ok(r) => r,
+
+    kprintln!("ruos: wasm: about to instantiate {}", path);
+    let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
+        Ok(f) => f,
         Err(e) => {
             kprintln!("ruos: wasm: instantiate {} failed: {}", path, e);
             return;
         }
     };
+    kprintln!("ruos: wasm: instantiated {}", path);
 
-    // Inject pre-opened socket FD 4 for server and client.
+    // Inject pre-opened socket FD 4 for server and client (kept from Step 10
+    // for backwards compatibility; Task 3 migrates these to SuspendReason).
     match path {
         "/server.wasm" => {
             if let Some(idx) = *SERVER_SOCK_IDX.lock() {
-                let fds = &mut rt.store.data_mut().fds;
+                let fds = &mut fb.store.data_mut().fds;
                 if fds.len() <= 4 {
                     fds.resize_with(5, || None);
                 }
@@ -126,7 +132,7 @@ pub async fn run_at(path: &str) {
         }
         "/client.wasm" => {
             if let Some(idx) = *CLIENT_SOCK_IDX.lock() {
-                let fds = &mut rt.store.data_mut().fds;
+                let fds = &mut fb.store.data_mut().fds;
                 if fds.len() <= 4 {
                     fds.resize_with(5, || None);
                 }
@@ -136,9 +142,7 @@ pub async fn run_at(path: &str) {
         _ => {}
     }
 
-    let code = rt.run();
-    // Trim leading '/' so the message reads "ruos: init.wasm exited cleanly"
-    // which matches the Makefile HELLO sentinel exactly.
+    let code = fb.run().await;
     let short = path.trim_start_matches('/');
     if code == 0 {
         kprintln!("ruos: {} exited cleanly", short);

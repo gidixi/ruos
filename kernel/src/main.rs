@@ -227,7 +227,12 @@ unsafe extern "C" fn kmain() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // Disable interrupts first to avoid deadlock on CONSOLE lock.
+    x86_64::instructions::interrupts::disable();
+    // Try to print panic info (best-effort; may not work if CONSOLE is locked).
+    use core::fmt::Write as _;
+    let _ = writeln!(crate::console::CONSOLE.lock(), "KERNEL PANIC: {}", info);
     hcf();
 }
 

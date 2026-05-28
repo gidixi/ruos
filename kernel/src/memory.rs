@@ -1,23 +1,20 @@
-//! Kernel heap: global allocator (talc) and `init_heap()` (added in Task 2).
+//! Kernel heap: global allocator (talc) and `init_heap()`.
 //!
 //! Backing memory comes from a region described by Limine's memory map,
-//! accessed virtually via Limine's HHDM offset.
+//! accessed virtually via Limine's HHDM offset. The actual `MemmapRequest` /
+//! `HhdmRequest` statics live in `main.rs` so they sit next to the other Limine
+//! `.requests` items and inside the existing markers; this module reads them via
+//! the `crate::` path.
 
-use talc::{ErrOnOom, Talc, Talck};
+use core::fmt;
+use limine::memmap::MEMMAP_USABLE;
+use talc::{ErrOnOom, Span, Talc, Talck};
 
 /// Heap size in bytes: 4 MiB.
 pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();
-
-use core::fmt;
-use limine::memmap::MEMMAP_USABLE;
-use talc::Span;
-
-/// The actual `MemmapRequest` / `HhdmRequest` statics live in `main.rs` so they
-/// sit next to the other Limine `.requests` items and inside the existing markers.
-/// This module reads them via the `crate::` path.
 
 #[derive(Debug, Copy, Clone)]
 pub struct HeapInfo {
@@ -37,10 +34,10 @@ pub enum HeapInitError {
 impl fmt::Display for HeapInitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HeapInitError::NoMemoryMap     => f.write_str("no memory map"),
-            HeapInitError::NoHhdm          => f.write_str("no hhdm"),
-            HeapInitError::NoUsableRegion  => f.write_str("no usable region"),
-            HeapInitError::ClaimFailed     => f.write_str("claim"),
+            HeapInitError::NoMemoryMap    => f.write_str("no memory map"),
+            HeapInitError::NoHhdm         => f.write_str("no hhdm"),
+            HeapInitError::NoUsableRegion => f.write_str("no usable region"),
+            HeapInitError::ClaimFailed    => f.write_str("claim failed"),
         }
     }
 }
@@ -50,6 +47,9 @@ pub fn init_heap() -> Result<HeapInfo, HeapInitError> {
     let hhdm   = crate::HHDM_REQUEST.response().ok_or(HeapInitError::NoHhdm)?;
     let hhdm_offset = hhdm.offset;
 
+    // The MEMMAP_USABLE filter is load-bearing for memory safety: it excludes the
+    // kernel image, modules, bootloader-reclaimable regions, ACPI, MMIO, etc. Do
+    // not broaden this predicate without revisiting the SAFETY argument below.
     let entry = memmap.entries()
         .iter()
         .find(|e| e.type_ == MEMMAP_USABLE && (e.length as usize) >= HEAP_SIZE)
@@ -58,6 +58,13 @@ pub fn init_heap() -> Result<HeapInfo, HeapInitError> {
     let phys_base = entry.base;
     let virt_base = phys_base + hhdm_offset;
 
+    // SAFETY: `[virt_base, virt_base + HEAP_SIZE)` is the HHDM image of a Limine
+    // USABLE memmap entry of at least HEAP_SIZE bytes. Limine maps it read/write
+    // at `phys + hhdm_offset` for the lifetime of the kernel and guarantees it is
+    // disjoint from the kernel image, the bootloader, and any other reclaimable
+    // region. No other reference into this range exists at this point in boot, so
+    // the talc allocator has exclusive ownership. `ALLOCATOR` is `'static`, so
+    // the claimed span stays valid for as long as it is used.
     unsafe {
         ALLOCATOR
             .lock()

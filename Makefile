@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: init.wasm exited cleanly
+HELLO     := init.wasm: vfs smoke ok
 USER_WASM := user-bin/init.wasm
 
 .PHONY: all build limine iso run run-test clean user-wasm

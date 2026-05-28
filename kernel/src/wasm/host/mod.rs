@@ -1,5 +1,6 @@
 pub mod fd;
 pub mod lifecycle;
+pub mod path;
 
 use wasmi::{Error, Linker};
 use crate::wasm::state::RuntimeState;
@@ -7,5 +8,6 @@ use crate::wasm::state::RuntimeState;
 pub fn install(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     lifecycle::link(linker)?;
     fd::link(linker)?;
+    path::link(linker)?;
     Ok(())
 }

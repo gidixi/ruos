@@ -50,6 +50,10 @@ pub fn run() -> ! {
     let spawner = exec.spawner();
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(kbd_echo_task()).unwrap();
+    spawner.spawn(net_poll_task()).unwrap();
+    spawner.spawn(wasm_task("/init.wasm")).unwrap();
+    spawner.spawn(wasm_task("/server.wasm")).unwrap();
+    spawner.spawn(wasm_task("/client.wasm")).unwrap();
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised
@@ -74,6 +78,19 @@ pub fn run() -> ! {
             interrupts::enable_and_hlt();
         }
     }
+}
+
+#[embassy_executor::task]
+async fn net_poll_task() {
+    loop {
+        crate::net::poll();
+        delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
+    }
+}
+
+#[embassy_executor::task(pool_size = 3)]
+async fn wasm_task(path: &'static str) {
+    crate::wasm::run_at(path).await;
 }
 
 #[embassy_executor::task]

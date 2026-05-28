@@ -58,9 +58,16 @@ fn translate(irq: u8, overrides: &[IrqOverride]) -> (u32, bool, bool) {
 pub fn redirect(irq: u8, vector: u8, overrides: &[IrqOverride]) {
     let (gsi, active_low, level) = translate(irq, overrides);
     let idx = REG_IOREDTBL_BASE + gsi * 2;
+
+    // Write order matters: keep the entry masked while we update destination,
+    // then commit vector+flags+unmask atomically in the final low write.
+    // Mask first (idempotent if already masked from init()).
+    write(idx, 1 << 16);
+    // Destination APIC id 0, physical mode (high half).
+    write(idx + 1, 0);
+    // Atomically apply vector + polarity/trigger and clear the mask.
     let mut low = vector as u32;       // delivery mode 0 (fixed), phys dest, unmasked
     if active_low { low |= 1 << 13; }
     if level      { low |= 1 << 15; }
     write(idx, low);
-    write(idx + 1, 0);                  // destination APIC id 0
 }

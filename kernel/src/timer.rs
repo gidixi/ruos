@@ -19,9 +19,12 @@ pub fn init(hz: u32) -> Result<(), &'static str> {
     // Calibrate over 10 ms (100 PIT samples per second).
     let lapic_per_10ms = lapic::calibrate(10);
     if lapic_per_10ms == 0 { return Err("calibration"); }
-    let lapic_per_sec = lapic_per_10ms * 100;
-    let initial_count = lapic_per_sec / hz;
-    if initial_count == 0 { return Err("hz too high"); }
+    // u64 to avoid overflow on >4.29 GHz LAPIC buses.
+    let lapic_per_sec = (lapic_per_10ms as u64) * 100;
+    let initial_count_u64 = lapic_per_sec / hz as u64;
+    if initial_count_u64 == 0 { return Err("hz too high"); }
+    if initial_count_u64 > u32::MAX as u64 { return Err("hz too low"); }
+    let initial_count = initial_count_u64 as u32;
 
     kprintln!(
         "ruos: lapic calibrated {} ticks/sec, periodic count={}",

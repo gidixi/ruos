@@ -77,8 +77,23 @@ fn next_table_or_create<'a>(
             .checked_sub(hhdm_offset)
             .expect("pt page virt below HHDM offset");
         entry.set_addr(x86_64::PhysAddr::new(phys), parent_flags);
+    } else if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        // Present + PS bit = 1 GiB or 2 MiB leaf at this level — `entry.addr()`
+        // points at a data frame, NOT a next-level table. Treating it as a PT
+        // would corrupt mapped memory. Limine's HHDM commonly uses huge pages.
+        // For one-shot bring-up we refuse loudly rather than split the leaf;
+        // a long-term fix is to allocate a dedicated non-HHDM virtual range
+        // for MMIO so the walk never traverses an HHDM huge-page parent.
+        panic!(
+            "mmio map: huge-page leaf at level idx={} addr=0x{:X}; refusing to corrupt RAM",
+            index,
+            entry.addr().as_u64()
+        );
     }
-    // SAFETY: entry is present; addr() points at a valid PT physical frame.
+    // SAFETY: entry is present and NOT a huge-page leaf; addr() points at a
+    // valid 4 KiB PT physical frame, mapped into HHDM. The returned reference
+    // outlives `parent` because the heap-leaked PT is never freed; no aliasing
+    // because this module is the only writer.
     let phys = entry.addr().as_u64();
     unsafe { &mut *((phys + hhdm_offset) as *mut PageTable) }
 }

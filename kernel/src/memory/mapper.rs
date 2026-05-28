@@ -56,14 +56,12 @@ pub fn init(hhdm_offset: u64) {
     HHDM_OFFSET.call_once(|| hhdm_offset);
     let (cr3_frame, _) = Cr3::read();
     let pml4_virt = cr3_frame.start_address().as_u64() + hhdm_offset;
-    // SAFETY: invariant required for the `&'static mut PageTable` below to be
-    // sound: NO OTHER `&mut PageTable` may exist to the PML4 storage while
-    // `MAPPER` is alive. After Task 3 of the frames+mapper plan retires
-    // `apic/mmio.rs`, this Mapper is the unique writer of PML4 contents.
-    // Until then there is a transient second walker in `apic/mmio.rs`; it
-    // never holds its `&mut` across a `MAPPER.lock()` and the two never run
-    // concurrently (single CPU, no IF between init paths). The aliasing
-    // window closes when Task 3 lands.
+    // SAFETY: invariant for the `&'static mut PageTable` below: this Mapper
+    // is the sole `&mut` walker of PML4 storage in the entire kernel. Limine
+    // hands off after boot and writes nothing further; no other module
+    // fabricates a `&mut PageTable` from the HHDM image of PML4 (the prior
+    // ad-hoc walker in `apic/mmio.rs` is gone). All PML4 mutations flow
+    // through `MAPPER` and are serialized by its `spin::Mutex`.
     let pml4: &'static mut PageTable = unsafe { &mut *(pml4_virt as *mut PageTable) };
     let table = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm_offset)) };
     *MAPPER.lock() = Some(table);

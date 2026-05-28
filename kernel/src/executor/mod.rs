@@ -49,6 +49,7 @@ pub fn run() -> ! {
 
     let spawner = exec.spawner();
     spawner.spawn(tick_task()).unwrap();
+    spawner.spawn(kbd_echo_task()).unwrap();
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised
@@ -72,6 +73,14 @@ pub fn run() -> ! {
             // The x86_64 crate exposes this as a safe function.
             interrupts::enable_and_hlt();
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn kbd_echo_task() {
+    loop {
+        let b = crate::keyboard::queue::read_char().await;
+        kprintln!("ruos: kbd echo={:?}", b as char);
     }
 }
 

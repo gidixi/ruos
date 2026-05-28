@@ -1,0 +1,35 @@
+# Force LF line endings for all text files in the repo. Without this, a
+# Windows checkout (or `git config core.autocrlf=true`) silently rewrites
+# files to CRLF on stage, which inflates every diff to "all lines deleted
+# and re-added". With this, the index always stores LF and the working tree
+# stays consistent across platforms.
+
+* text=auto eol=lf
+
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.lock      text eol=lf
+*.md        text eol=lf
+*.ld        text eol=lf
+*.conf      text eol=lf
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.txt       text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+Makefile    text eol=lf
+
+# Binary blobs (never touched by line-ending normalization)
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.iso   binary
+*.bin   binary
+*.qcow2 binary
+*.vmdk  binary
+*.img   binary

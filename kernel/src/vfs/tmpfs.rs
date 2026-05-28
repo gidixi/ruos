@@ -121,7 +121,11 @@ impl FileSystem for Tmpfs {
     async fn unlink(&self, path: &[&str]) -> Result<(), VfsError> {
         let (parent, name) = self.parent_and_name(path)?;
         let mut p = parent.lock();
-        p.children.remove(name).ok_or(VfsError::NotFound)?;
+        let child = p.children.get(name).cloned().ok_or(VfsError::NotFound)?;
+        if matches!(child.lock().kind, TmpKind::Dir) {
+            return Err(VfsError::IsDirectory);
+        }
+        p.children.remove(name);
         Ok(())
     }
 }

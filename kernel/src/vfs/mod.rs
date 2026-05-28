@@ -95,6 +95,7 @@ pub async fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, VfsError> {
 }
 
 pub async fn write(fd: Fd, buf: &[u8]) -> Result<usize, VfsError> {
+    // Same FDS-lock-across-await caveat as `read` (see comment there).
     let mut t = FDS.lock();
     let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
         .as_mut().ok_or(VfsError::BadFd)?;
@@ -102,6 +103,7 @@ pub async fn write(fd: Fd, buf: &[u8]) -> Result<usize, VfsError> {
 }
 
 pub async fn seek(fd: Fd, off: i64, whence: Whence) -> Result<u64, VfsError> {
+    // Same FDS-lock-across-await caveat as `read` (see comment there).
     let mut t = FDS.lock();
     let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
         .as_mut().ok_or(VfsError::BadFd)?;

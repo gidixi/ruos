@@ -3,6 +3,11 @@ use crate::vfs::error::VfsError;
 pub type Fd = u32;
 
 bitflags::bitflags! {
+    /// Flag enforcement (READ/WRITE/TRUNCATE access checks, mode mismatches)
+    /// is deferred to Step 10 (WASI), where POSIX semantics matter for the
+    /// errno mapping. For Step 7 only `CREATE` is honored by `Tmpfs::open`;
+    /// the other bits are declared so callers and the WASI layer can pass
+    /// them through unchanged.
     #[derive(Debug, Copy, Clone)]
     pub struct OpenFlags: u32 {
         const READ     = 1 << 0;

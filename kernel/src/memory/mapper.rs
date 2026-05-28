@@ -25,6 +25,8 @@ pub enum MapError {
 pub enum UnmapError {
     NotInitialized,
     NotMapped,
+    ParentHugePage,
+    InvalidFrame,
 }
 
 impl fmt::Display for MapError {
@@ -43,17 +45,25 @@ impl fmt::Display for UnmapError {
         match self {
             UnmapError::NotInitialized => f.write_str("not initialized"),
             UnmapError::NotMapped      => f.write_str("not mapped"),
+            UnmapError::ParentHugePage => f.write_str("parent huge-page"),
+            UnmapError::InvalidFrame   => f.write_str("invalid frame"),
         }
     }
 }
 
 pub fn init(hhdm_offset: u64) {
+    if HHDM_OFFSET.get().is_some() { return; } // idempotent: avoid split-brain
     HHDM_OFFSET.call_once(|| hhdm_offset);
     let (cr3_frame, _) = Cr3::read();
     let pml4_virt = cr3_frame.start_address().as_u64() + hhdm_offset;
-    // SAFETY: `pml4_virt` is the HHDM image of the live PML4. We become the
-    // sole writer to `MAPPER` for the lifetime of the kernel; the underlying
-    // page tables are mutated only through the Mapper API.
+    // SAFETY: invariant required for the `&'static mut PageTable` below to be
+    // sound: NO OTHER `&mut PageTable` may exist to the PML4 storage while
+    // `MAPPER` is alive. After Task 3 of the frames+mapper plan retires
+    // `apic/mmio.rs`, this Mapper is the unique writer of PML4 contents.
+    // Until then there is a transient second walker in `apic/mmio.rs`; it
+    // never holds its `&mut` across a `MAPPER.lock()` and the two never run
+    // concurrently (single CPU, no IF between init paths). The aliasing
+    // window closes when Task 3 lands.
     let pml4: &'static mut PageTable = unsafe { &mut *(pml4_virt as *mut PageTable) };
     let table = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(hhdm_offset)) };
     *MAPPER.lock() = Some(table);
@@ -62,6 +72,9 @@ pub fn init(hhdm_offset: u64) {
 pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: PageTableFlags)
     -> Result<(), MapError>
 {
+    // LOCK ORDER: MAPPER then FRAMES, never the reverse. Any future caller
+    // that holds FRAMES and then enters map_page would deadlock; keep new
+    // call sites consistent with this order.
     let mut g_map = MAPPER.lock();
     let mapper = g_map.as_mut().ok_or(MapError::NotInitialized)?;
     let mut g_frames = crate::memory::frames::FRAMES.lock();
@@ -89,9 +102,12 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     let mut g_map = MAPPER.lock();
     let mapper = g_map.as_mut().ok_or(UnmapError::NotInitialized)?;
     let page: Page<Size4KiB> = Page::containing_address(virt);
+    // Exhaustive match: future x86_64-crate UnmapError variants break compile
+    // rather than getting silently folded into "not mapped".
     let (frame, flush) = mapper.unmap(page).map_err(|e| match e {
-        XUnmapError::PageNotMapped => UnmapError::NotMapped,
-        _ => UnmapError::NotMapped,
+        XUnmapError::PageNotMapped         => UnmapError::NotMapped,
+        XUnmapError::ParentEntryHugePage   => UnmapError::ParentHugePage,
+        XUnmapError::InvalidFrameAddress(_) => UnmapError::InvalidFrame,
     })?;
     flush.flush();
     Ok(frame)

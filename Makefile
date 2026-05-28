@@ -3,9 +3,10 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: mounted 1 boot modules
+HELLO     := ruos: init.wasm exited cleanly
+USER_WASM := user-bin/init.wasm
 
-.PHONY: all build limine iso run run-test clean
+.PHONY: all build limine iso run run-test clean user-wasm
 
 all: iso
 
@@ -19,7 +20,14 @@ limine:
 	fi
 	$(MAKE) -C $(LIMINE)
 
-iso: build limine
+$(USER_WASM): user/init/src/main.rs user/init/Cargo.toml user/Cargo.toml
+	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release
+	cp user/target/wasm32-wasip1/release/init.wasm user-bin/init.wasm
+
+.PHONY: user-wasm
+user-wasm: $(USER_WASM)
+
+iso: build limine $(USER_WASM)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel

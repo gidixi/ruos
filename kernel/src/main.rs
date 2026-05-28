@@ -18,6 +18,7 @@ mod keyboard;
 mod vfs;
 mod modules;
 mod console;
+mod wasm;
 mod executor;
 
 use core::panic::PanicInfo;

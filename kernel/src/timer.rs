@@ -10,6 +10,7 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::console::fb::tick_cursor();
     lapic::eoi();
 }
 

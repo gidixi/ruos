@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(impl_trait_in_assoc_type)]
 
 extern crate alloc;
 
@@ -16,6 +17,7 @@ mod timer;
 mod keyboard;
 mod vfs;
 mod console;
+mod executor;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -210,13 +212,7 @@ unsafe extern "C" fn kmain() -> ! {
     kprintln!("\x1b[31mERR\x1b[0m hello via ansi");
     kprintln!("ruos: ansi test ok");
 
-    // Wait for the timer to fire enough times.
-    while timer::ticks() < 10 {
-        core::hint::spin_loop();
-    }
-
-    kprintln!("ruos: ticks={}", timer::ticks());
-    hcf();
+    executor::run();
 }
 
 #[panic_handler]

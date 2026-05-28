@@ -13,6 +13,7 @@ acpi = "5"
 bitflags = "2"
 noto-sans-mono-bitmap = "0.3"
 vte = { version = "0.13", default-features = false, features = ["no_std"] }
+embassy-executor = { version = "0.6", default-features = false, features = ["nightly", "task-arena-size-4096"] }
 
 [profile.dev]
 panic = "abort"

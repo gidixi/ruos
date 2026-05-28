@@ -19,6 +19,7 @@ mod vfs;
 mod modules;
 mod console;
 mod wasm;
+mod net;
 mod executor;
 
 use core::panic::PanicInfo;
@@ -198,6 +199,7 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     modules::mount_all();
+    net::init();
 
     match console::fb_init::init() {
         Ok(mut fb) => {

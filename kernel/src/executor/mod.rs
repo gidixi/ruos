@@ -50,6 +50,7 @@ pub fn run() -> ! {
     let spawner = exec.spawner();
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(kbd_echo_task()).unwrap();
+    spawner.spawn(net_poll_task()).unwrap();
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
 
     loop {
@@ -74,6 +75,14 @@ pub fn run() -> ! {
             // The x86_64 crate exposes this as a safe function.
             interrupts::enable_and_hlt();
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_poll_task() {
+    loop {
+        crate::net::poll();
+        delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
     }
 }
 

@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := init.wasm: clock_rand ok
+HELLO     := ruos: net init ok addr=127.0.0.1/8
 USER_WASM := user-bin/init.wasm
 
 .PHONY: all build limine iso run run-test clean user-wasm

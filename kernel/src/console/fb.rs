@@ -4,7 +4,7 @@
 //! ANSI parsing, no cursor blink. Task 4 adds vte::Parser + cursor blink.
 
 use core::ptr::write_volatile;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use crate::console::ansi::{apply_sgr, Rgb};
 use crate::console::font::{glyph_height, glyph_width, raster_for};
 
@@ -37,10 +37,9 @@ unsafe impl Send for FramebufferConsole {}
 pub(crate) static FB_VIRT:       AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub(crate) static FB_PITCH:      AtomicU32     = AtomicU32::new(0);
 pub(crate) static FB_BPP:        AtomicU32     = AtomicU32::new(0);
-pub(crate) static FB_PIXEL_BGR:  AtomicBool    = AtomicBool::new(true);
 pub(crate) static CURSOR_POS:    AtomicU64     = AtomicU64::new(0);
-pub(crate) static CURSOR_SHOWN:  AtomicBool    = AtomicBool::new(false);
 pub(crate) static BLINK_COUNTER: AtomicU64     = AtomicU64::new(0);
+// 100 Hz LAPIC timer / 25 = ~4 Hz blink.
 pub(crate) const  BLINK_DIVIDER: u64           = 25;
 
 impl FramebufferConsole {
@@ -50,7 +49,6 @@ impl FramebufferConsole {
         FB_VIRT.store(info.addr, Ordering::Release);
         FB_PITCH.store(info.pitch, Ordering::Release);
         FB_BPP.store(info.bpp, Ordering::Release);
-        FB_PIXEL_BGR.store(matches!(info.pixel, PixelLayout::Bgr), Ordering::Release);
         let mut me = Self {
             info, cols, rows, cur_col: 0, cur_row: 0, fg, bg,
             parser: vte::Parser::new(),
@@ -238,18 +236,18 @@ impl vte::Perform for FramebufferConsole {
         match c {
             'A' => self.cur_row = self.cur_row.saturating_sub(p1.max(1) as u32),
             'B' => {
-                self.cur_row = (self.cur_row + p1.max(1) as u32).min(self.rows - 1);
+                self.cur_row = (self.cur_row + p1.max(1) as u32).min(self.rows.saturating_sub(1));
             }
             'C' => {
-                self.cur_col = (self.cur_col + p1.max(1) as u32).min(self.cols - 1);
+                self.cur_col = (self.cur_col + p1.max(1) as u32).min(self.cols.saturating_sub(1));
             }
             'D' => self.cur_col = self.cur_col.saturating_sub(p1.max(1) as u32),
             'H' => {
                 let mut it = params.iter();
                 let row = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
                 let col = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-                self.cur_row = (row.saturating_sub(1) as u32).min(self.rows - 1);
-                self.cur_col = (col.saturating_sub(1) as u32).min(self.cols - 1);
+                self.cur_row = (row.saturating_sub(1) as u32).min(self.rows.saturating_sub(1));
+                self.cur_col = (col.saturating_sub(1) as u32).min(self.cols.saturating_sub(1));
             }
             'J' => {
                 let arg = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
@@ -269,10 +267,9 @@ impl vte::Perform for FramebufferConsole {
                 }
             }
             'm' => {
-                let flat = params.iter()
-                    .flat_map(|p| p.iter().copied())
-                    .collect::<alloc::vec::Vec<u16>>();
-                let (fg, bg) = apply_sgr(flat.into_iter(), self.fg, self.bg);
+                // Avoid the Vec roundtrip: apply_sgr only needs an iterator.
+                let it = params.iter().flat_map(|p| p.iter().copied());
+                let (fg, bg) = apply_sgr(it, self.fg, self.bg);
                 self.fg = fg;
                 self.bg = bg;
             }
@@ -317,9 +314,4 @@ pub fn tick_cursor() {
             }
         }
     }
-    CURSOR_SHOWN.fetch_xor(true, Ordering::Relaxed);
 }
-
-// Suppress dead_code on currently-unread atomic for now.
-#[allow(dead_code)]
-fn _force_use() { let _ = FB_PIXEL_BGR.load(Ordering::Relaxed); let _ = CURSOR_SHOWN.load(Ordering::Relaxed); }

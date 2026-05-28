@@ -12,6 +12,7 @@ x86_64 = "0.15"
 acpi = "5"
 bitflags = "2"
 noto-sans-mono-bitmap = "0.3"
+vte = { version = "0.13", default-features = false, features = ["no_std"] }
 
 [profile.dev]
 panic = "abort"

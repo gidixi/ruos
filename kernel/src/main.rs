@@ -207,6 +207,9 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    kprintln!("\x1b[31mERR\x1b[0m hello via ansi");
+    kprintln!("ruos: ansi test ok");
+
     // Wait for the timer to fire enough times.
     while timer::ticks() < 10 {
         core::hint::spin_loop();

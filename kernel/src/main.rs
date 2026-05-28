@@ -9,10 +9,12 @@ mod kprint;
 mod memory;
 mod gdt;
 mod idt;
+mod pic;
+mod acpi_init;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{HhdmRequest, MemmapRequest};
+use limine::request::{HhdmRequest, MemmapRequest, RsdpRequest};
 use limine::{RequestsEndMarker, RequestsStartMarker};
 
 /// Tell Limine which base revision we support.
@@ -27,6 +29,10 @@ pub static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -72,6 +78,19 @@ unsafe extern "C" fn kmain() -> ! {
 
     // #BP smoke test: CPU traps are not maskable by IF, so `sti` is not required.
     core::arch::asm!("int3");
+
+    pic::disable();
+    let acpi_info = match acpi_init::parse() {
+        Ok(info) => info,
+        Err(e) => {
+            kprintln!("ruos: acpi fail: {}", e);
+            hcf();
+        }
+    };
+    kprintln!(
+        "ruos: acpi ok lapic=0x{:X} ioapic=0x{:X} overrides={}",
+        acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len()
+    );
 
     hcf();
 }

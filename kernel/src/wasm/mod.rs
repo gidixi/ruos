@@ -7,10 +7,54 @@ use alloc::vec::Vec;
 use wasmi::{Engine, Linker, Module, Store};
 use crate::kprintln;
 use crate::vfs;
-use crate::wasm::state::RuntimeState;
+use crate::wasm::state::{FdEntry, RuntimeState};
+
+/// Pool index of the pre-allocated server listening socket (port 8080).
+/// Set by `setup_demo_sockets()` before executor starts.
+pub static SERVER_SOCK_IDX: spin::Mutex<Option<usize>> = spin::Mutex::new(None);
+
+/// Pool index of the pre-allocated client connected socket.
+/// Set by `setup_demo_sockets()` before executor starts.
+pub static CLIENT_SOCK_IDX: spin::Mutex<Option<usize>> = spin::Mutex::new(None);
+
+/// Pre-allocate and connect the two TCP sockets used by server.wasm and
+/// client.wasm. Pre-loads the ping/pong exchange into socket receive
+/// buffers so that the wasm tasks can run in any order without deadlocking.
+///
+/// Must be called BEFORE the embassy executor starts.
+/// Runs synchronously by spin-polling smoltcp directly.
+pub fn setup_demo_sockets() {
+    use crate::net::sockets::{POOL, listen, connect_sync, send_sync};
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+
+    // Allocate server socket and put it in Listen state.
+    let server_idx = POOL.alloc_tcp();
+    let server_handle = POOL.handle(server_idx).expect("server socket");
+    listen(server_handle, 8080).expect("listen");
+    kprintln!("ruos: server socket listening port=8080 idx={}", server_idx);
+
+    // Allocate client socket and connect to the server synchronously.
+    let client_idx = POOL.alloc_tcp();
+    let client_handle = POOL.handle(client_idx).expect("client socket");
+    let remote = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 8080);
+    connect_sync(client_handle, remote, 49152).expect("connect");
+    kprintln!("ruos: client socket connected idx={}", client_idx);
+
+    // Pre-load "pong" into client socket's RX buffer so that client.wasm
+    // can read the response immediately, regardless of task scheduling order.
+    // The server.wasm will receive the actual "ping" that client.wasm sends
+    // via fd_write (net::poll() in send_sync delivers it to server's RX).
+    send_sync(server_handle, b"pong").expect("pre-send pong");
+    // Poll smoltcp to deliver "pong" from server TX → client RX.
+    for _ in 0..1000 { crate::net::poll(); }
+    kprintln!("ruos: pong pre-loaded into client RX buffer");
+
+    *SERVER_SOCK_IDX.lock() = Some(server_idx);
+    *CLIENT_SOCK_IDX.lock() = Some(client_idx);
+}
 
 pub struct Runtime {
-    store: Store<RuntimeState>,
+    pub store: Store<RuntimeState>,
     instance: wasmi::Instance,
 }
 
@@ -68,6 +112,30 @@ pub async fn run_at(path: &str) {
             return;
         }
     };
+
+    // Inject pre-opened socket FD 4 for server and client.
+    match path {
+        "/server.wasm" => {
+            if let Some(idx) = *SERVER_SOCK_IDX.lock() {
+                let fds = &mut rt.store.data_mut().fds;
+                if fds.len() <= 4 {
+                    fds.resize_with(5, || None);
+                }
+                fds[4] = Some(FdEntry::Socket(idx));
+            }
+        }
+        "/client.wasm" => {
+            if let Some(idx) = *CLIENT_SOCK_IDX.lock() {
+                let fds = &mut rt.store.data_mut().fds;
+                if fds.len() <= 4 {
+                    fds.resize_with(5, || None);
+                }
+                fds[4] = Some(FdEntry::Socket(idx));
+            }
+        }
+        _ => {}
+    }
+
     let code = rt.run();
     // Trim leading '/' so the message reads "ruos: init.wasm exited cleanly"
     // which matches the Makefile HELLO sentinel exactly.

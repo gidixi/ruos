@@ -3,8 +3,8 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: net init ok addr=127.0.0.1/8
-USER_WASM := user-bin/init.wasm
+HELLO     := client.wasm: rx='pong'
+USER_WASMS := user-bin/init.wasm user-bin/server.wasm user-bin/client.wasm
 
 .PHONY: all build limine iso run run-test clean user-wasm
 
@@ -20,19 +20,29 @@ limine:
 	fi
 	$(MAKE) -C $(LIMINE)
 
-$(USER_WASM): user/init/src/main.rs user/init/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release
+user-bin/init.wasm: user/init/src/main.rs user/init/Cargo.toml user/Cargo.toml
+	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p init
 	cp user/target/wasm32-wasip1/release/init.wasm user-bin/init.wasm
 
-.PHONY: user-wasm
-user-wasm: $(USER_WASM)
+user-bin/server.wasm: user/server/src/main.rs user/server/Cargo.toml user/Cargo.toml
+	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p server
+	cp user/target/wasm32-wasip1/release/server.wasm user-bin/server.wasm
 
-iso: build limine $(USER_WASM)
+user-bin/client.wasm: user/client/src/main.rs user/client/Cargo.toml user/Cargo.toml
+	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p client
+	cp user/target/wasm32-wasip1/release/client.wasm user-bin/client.wasm
+
+.PHONY: user-wasm
+user-wasm: $(USER_WASMS)
+
+iso: build limine $(USER_WASMS)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	cp user-bin/init.wasm $(ISO_ROOT)/
+	cp user-bin/server.wasm $(ISO_ROOT)/
+	cp user-bin/client.wasm $(ISO_ROOT)/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["init"]
+members = ["init", "server", "client"]
 
 [profile.release]
 opt-level = "s"

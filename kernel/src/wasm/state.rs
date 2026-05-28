@@ -19,6 +19,8 @@ pub enum FdEntry {
     StdoutConsole,
     /// VFS-backed file (populated in Task 3).
     Vfs(crate::vfs::Fd),
+    /// Kernel TCP socket (index into net::sockets::POOL).
+    Socket(usize),
 }
 
 impl RuntimeState {

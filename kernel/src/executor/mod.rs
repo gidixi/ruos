@@ -52,6 +52,8 @@ pub fn run() -> ! {
     spawner.spawn(kbd_echo_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
+    spawner.spawn(wasm_task("/server.wasm")).unwrap();
+    spawner.spawn(wasm_task("/client.wasm")).unwrap();
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised

@@ -200,11 +200,7 @@ unsafe extern "C" fn kmain() -> ! {
 
     modules::mount_all();
     net::init();
-
-    // Pre-establish TCP loopback sockets for server.wasm / client.wasm.
-    // This runs synchronously (spin-polls smoltcp) before the executor starts,
-    // so no cooperative scheduling issues.
-    wasm::setup_demo_sockets();
+    kprintln!("ruos: real ping-pong (no preload)");
 
     match console::fb_init::init() {
         Ok(mut fb) => {
@@ -227,7 +223,12 @@ unsafe extern "C" fn kmain() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // Disable interrupts first to avoid deadlock on CONSOLE lock.
+    x86_64::instructions::interrupts::disable();
+    // Try to print panic info (best-effort; may not work if CONSOLE is locked).
+    use core::fmt::Write as _;
+    let _ = writeln!(crate::console::CONSOLE.lock(), "KERNEL PANIC: {}", info);
     hcf();
 }
 

@@ -11,7 +11,7 @@ use limine::memmap::MEMMAP_USABLE;
 use talc::{ErrOnOom, Span, Talc, Talck};
 
 /// Heap size in bytes: 4 MiB.
-pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 16 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();

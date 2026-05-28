@@ -92,6 +92,10 @@ unsafe extern "C" fn kmain() -> ! {
         acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len()
     );
 
+    // `acpi_info` is consumed by Task 4 (LAPIC/IOAPIC bring-up) — kept on the
+    // stack until then.
+    let _ = &acpi_info;
+
     hcf();
 }
 

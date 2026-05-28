@@ -53,6 +53,7 @@ pub struct AcpiInfo {
 pub enum AcpiInitError {
     NoRsdp,
     NoHhdm,
+    RsdpBelowHhdm,
     Parse,
     NoLapic,
     NoIoapic,
@@ -61,11 +62,12 @@ pub enum AcpiInitError {
 impl core::fmt::Display for AcpiInitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AcpiInitError::NoRsdp   => f.write_str("no rsdp"),
-            AcpiInitError::NoHhdm   => f.write_str("no hhdm"),
-            AcpiInitError::Parse    => f.write_str("parse"),
-            AcpiInitError::NoLapic  => f.write_str("no lapic"),
-            AcpiInitError::NoIoapic => f.write_str("no ioapic"),
+            AcpiInitError::NoRsdp        => f.write_str("no rsdp"),
+            AcpiInitError::NoHhdm        => f.write_str("no hhdm"),
+            AcpiInitError::RsdpBelowHhdm => f.write_str("rsdp below hhdm"),
+            AcpiInitError::Parse         => f.write_str("parse"),
+            AcpiInitError::NoLapic       => f.write_str("no lapic"),
+            AcpiInitError::NoIoapic      => f.write_str("no ioapic"),
         }
     }
 }
@@ -83,7 +85,11 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
     // handler, which re-adds the HHDM offset. Subtract it here so the round
     // trip lands on the same RSDP bytes.
     let rsdp_virt = rsdp_resp.address as u64;
-    let rsdp_phys = rsdp_virt.saturating_sub(hhdm_offset) as usize;
+    // checked_sub turns a contract violation (Limine returning a non-HHDM addr)
+    // into a named error rather than silently zeroing the pointer.
+    let rsdp_phys = rsdp_virt
+        .checked_sub(hhdm_offset)
+        .ok_or(AcpiInitError::RsdpBelowHhdm)? as usize;
 
     // SAFETY: rsdp_phys derives from a virtual address Limine guarantees points
     // at a valid RSDP structure, mapped read/write via the HHDM.

@@ -21,22 +21,39 @@ pub trait File {
     async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError>;
 }
 
-// Concrete file types are introduced in Task 2 (tmpfs + devices).
-// FileImpl variants below will be filled in then; for Task 1 we declare an
-// empty placeholder so other modules can name the type. The variants are
-// constructed only by Task 2 code, so no real values flow through yet.
+use crate::vfs::tmpfs::TmpfsFile;
+use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile};
+
 pub enum FileImpl {
-    Placeholder,
+    Tmp(TmpfsFile),
+    Console(ConsoleFile),
+    Null(NullFile),
+    Zero(ZeroFile),
 }
 
 impl FileImpl {
-    pub async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, VfsError> {
-        Err(VfsError::Other)
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
+        match self {
+            FileImpl::Tmp(f)     => f.read(buf).await,
+            FileImpl::Console(f) => f.read(buf).await,
+            FileImpl::Null(f)    => f.read(buf).await,
+            FileImpl::Zero(f)    => f.read(buf).await,
+        }
     }
-    pub async fn write(&mut self, _buf: &[u8]) -> Result<usize, VfsError> {
-        Err(VfsError::Other)
+    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
+        match self {
+            FileImpl::Tmp(f)     => f.write(buf).await,
+            FileImpl::Console(f) => f.write(buf).await,
+            FileImpl::Null(f)    => f.write(buf).await,
+            FileImpl::Zero(f)    => f.write(buf).await,
+        }
     }
-    pub async fn seek(&mut self, _off: i64, _whence: Whence) -> Result<u64, VfsError> {
-        Err(VfsError::Other)
+    pub async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError> {
+        match self {
+            FileImpl::Tmp(f)     => f.seek(off, whence).await,
+            FileImpl::Console(f) => f.seek(off, whence).await,
+            FileImpl::Null(f)    => f.seek(off, whence).await,
+            FileImpl::Zero(f)    => f.seek(off, whence).await,
+        }
     }
 }

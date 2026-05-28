@@ -150,6 +150,14 @@ unsafe extern "C" fn kmain() -> ! {
 
     x86_64::instructions::interrupts::enable(); // sti
 
+    match vfs::init() {
+        Ok(n) => kprintln!("ruos: vfs init ok mounts={}", n),
+        Err(e) => {
+            kprintln!("ruos: vfs init fail: {}", e);
+            hcf();
+        }
+    }
+
     // Wait for the timer to fire enough times.
     while timer::ticks() < 10 {
         core::hint::spin_loop();

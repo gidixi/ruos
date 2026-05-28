@@ -107,6 +107,37 @@ unsafe extern "C" fn kmain() -> ! {
         frame_counts.total, frame_counts.used, frame_counts.free,
     );
 
+    memory::init_mapper(acpi_info.hhdm_offset);
+    kprintln!("ruos: paging up");
+
+    // Smoke test: map a fresh canonical lower-half VA, write/read, unmap.
+    {
+        use x86_64::structures::paging::PageTableFlags;
+        let test_virt = x86_64::VirtAddr::new(0x4000_0000_0000);
+        let frame = memory::allocate_frame().expect("smoke test: no frame");
+        let phys = frame.start_address();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        if let Err(e) = memory::map_page(test_virt, phys, flags) {
+            kprintln!("ruos: map test failed: {}", e);
+            hcf();
+        }
+        unsafe { test_virt.as_mut_ptr::<u64>().write_volatile(0xC0FFEEu64); }
+        let back = unsafe { test_virt.as_ptr::<u64>().read_volatile() };
+        if back != 0xC0FFEE {
+            kprintln!("ruos: map test mismatch: 0x{:X}", back);
+            hcf();
+        }
+        memory::unmap_page(test_virt).expect("smoke test unmap");
+        memory::free_frame(frame);
+        kprintln!(
+            "ruos: map test ok virt=0x{:X} phys=0x{:X}",
+            test_virt.as_u64(),
+            phys.as_u64(),
+        );
+    }
+
     apic::lapic::init(acpi_info.lapic_base, acpi_info.hhdm_offset, idt::VEC_SPURIOUS);
     apic::ioapic::init(acpi_info.ioapic_base, acpi_info.hhdm_offset);
     if let Err(e) = timer::init(100) {

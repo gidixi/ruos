@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod serial;
 mod memory;
+mod gdt;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -70,6 +71,8 @@ unsafe extern "C" fn kmain() -> ! {
         "ruos: alloc box=0x{:X} vec={:?}",
         *b, v
     );
+
+    gdt::init();
 
     hcf();
 }

@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: async tick=2
+HELLO     := ruos: mounted 1 boot modules
 
 .PHONY: all build limine iso run run-test clean
 
@@ -24,6 +24,7 @@ iso: build limine
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
+	cp user-bin/init.wasm $(ISO_ROOT)/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/

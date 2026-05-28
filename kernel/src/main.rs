@@ -16,6 +16,7 @@ mod apic;
 mod timer;
 mod keyboard;
 mod vfs;
+mod modules;
 mod console;
 mod executor;
 
@@ -194,6 +195,8 @@ unsafe extern "C" fn kmain() -> ! {
             hcf();
         }
     }
+
+    modules::mount_all();
 
     match console::fb_init::init() {
         Ok(mut fb) => {

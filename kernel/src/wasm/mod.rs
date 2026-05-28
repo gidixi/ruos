@@ -1,4 +1,5 @@
-//! Wasmi 1.x runtime hosting layer for ruos.
+//! Wasmi 1.x async fiber runtime for ruos.
+//! Task 3: Runtime struct removed; all wasm execution goes through Fiber.
 
 pub mod host;
 pub mod state;
@@ -6,54 +7,8 @@ pub mod suspend;
 pub mod fiber;
 
 use alloc::vec::Vec;
-use wasmi::{Engine, Linker, Module, Store};
 use crate::kprintln;
 use crate::vfs;
-use crate::wasm::state::RuntimeState;
-
-pub struct Runtime {
-    pub store: Store<RuntimeState>,
-    instance: wasmi::Instance,
-}
-
-impl Runtime {
-    pub fn new(bytes: &[u8]) -> Result<Self, wasmi::Error> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, bytes)?;
-        let mut store: Store<RuntimeState> = Store::new(&engine, RuntimeState::new());
-        let mut linker: Linker<RuntimeState> = Linker::new(&engine);
-        host::install(&mut linker)?;
-        // instantiate_and_start: instantiates the module AND runs the Wasm
-        // `start` function (if present). The user-visible `_start` is separate.
-        let instance = linker.instantiate_and_start(&mut store, &module)?;
-        Ok(Self { store, instance })
-    }
-
-    pub fn run(&mut self) -> i32 {
-        let start = match self
-            .instance
-            .get_typed_func::<(), ()>(&self.store, "_start")
-        {
-            Ok(f) => f,
-            Err(e) => {
-                kprintln!("ruos: wasm: no _start export: {}", e);
-                return -1;
-            }
-        };
-        match start.call(&mut self.store, ()) {
-            Ok(()) => 0,
-            Err(e) => {
-                // wasmi 1.x: use error.kind().as_i32_exit_status() for proc_exit.
-                if let Some(code) = e.kind().as_i32_exit_status() {
-                    code
-                } else {
-                    kprintln!("ruos: wasm trap: {}", e);
-                    -1
-                }
-            }
-        }
-    }
-}
 
 pub async fn run_at(path: &str) {
     let bytes = match read_all(path).await {

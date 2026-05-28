@@ -169,10 +169,67 @@ impl Fiber {
                     }
                 }
             }
-            // Other variants are implemented in Task 3.
-            other => {
-                kprintln!("ruos: wasm: SuspendReason {:?} not implemented", other);
-                28 // EINVAL
+            SuspendReason::KbdReadChar { buf_ptr, nread_ptr } => {
+                let b = crate::keyboard::queue::read_char().await;
+                let _ = self.write_to_memory(buf_ptr, &[b]);
+                let _ = self.write_u32(nread_ptr, 1);
+                0
+            }
+            SuspendReason::VfsRead { fd, buf_ptr, max_len, nread_ptr } => {
+                let mut buf = alloc::vec![0u8; max_len];
+                match crate::vfs::read(fd, &mut buf).await {
+                    Ok(n) => {
+                        let _ = self.write_to_memory(buf_ptr, &buf[..n]);
+                        let _ = self.write_u32(nread_ptr, n as u32);
+                        0
+                    }
+                    Err(_) => 8,
+                }
+            }
+            SuspendReason::VfsWrite { fd, bytes, nwritten_ptr } => {
+                match crate::vfs::write(fd, &bytes).await {
+                    Ok(n) => {
+                        let _ = self.write_u32(nwritten_ptr, n as u32);
+                        0
+                    }
+                    Err(_) => 8,
+                }
+            }
+            SuspendReason::VfsSeek { fd, offset, whence, newoffset_ptr } => {
+                match crate::vfs::seek(fd, offset, whence).await {
+                    Ok(n) => {
+                        let _ = self.write_to_memory(newoffset_ptr, &(n as u64).to_le_bytes());
+                        0
+                    }
+                    Err(_) => 8,
+                }
+            }
+            SuspendReason::VfsClose { fd } => {
+                let _ = crate::vfs::close(fd).await;
+                0
+            }
+            SuspendReason::PathOpen { path, flags, opened_fd_ptr } => {
+                match crate::vfs::open(&path, flags).await {
+                    Ok(fd) => {
+                        let state = self.store.data_mut();
+                        let mut wfd: Option<u32> = None;
+                        use crate::wasm::state::FdEntry;
+                        for (i, slot) in state.fds.iter_mut().enumerate().skip(3) {
+                            if slot.is_none() {
+                                *slot = Some(FdEntry::Vfs(fd));
+                                wfd = Some(i as u32);
+                                break;
+                            }
+                        }
+                        let wfd = wfd.unwrap_or_else(|| {
+                            state.fds.push(Some(FdEntry::Vfs(fd)));
+                            (state.fds.len() - 1) as u32
+                        });
+                        let _ = self.write_u32(opened_fd_ptr, wfd);
+                        0
+                    }
+                    Err(_) => 44, // ENOENT
+                }
             }
         }
     }

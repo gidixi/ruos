@@ -1,6 +1,5 @@
 //! WASIX file descriptor host fns.
-//! Task 2: fd_write (console), stubs for read/seek/close.
-//! Task 3: real fd_read / fd_seek / fd_close + VFS dispatch in fd_write.
+//! Task 3: all VFS/Stdin arms trap with SuspendReason; embassy_futures removed.
 
 use wasmi::{Caller, Error, Linker};
 use crate::wasm::state::{FdEntry, RuntimeState};
@@ -37,6 +36,29 @@ pub fn fd_write(
         }));
     }
 
+    // VFS arm: trap with SuspendReason::VfsWrite (single iov only).
+    if let Some(FdEntry::Vfs(vfd)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        if iovs_len != 1 {
+            return Ok(28); // EINVAL: multi-iov VFS writes not supported
+        }
+        let vfd = *vfd;
+        let mem = wasm_memory(&caller)?;
+        let buf_ptr = read_u32(&mem, &caller, iovs_ptr as usize)?;
+        let buf_len = read_u32(&mem, &caller, iovs_ptr as usize + 4)?;
+        const MAX: usize = 4096;
+        let mut buf = [0u8; MAX];
+        let n = (buf_len as usize).min(MAX);
+        mem.read(&caller, buf_ptr as usize, &mut buf[..n])
+            .map_err(|_| Error::i32_exit(-1))?;
+        let bytes_owned = buf[..n].to_vec();
+        return Err(Error::host(crate::wasm::suspend::SuspendReason::VfsWrite {
+            fd: vfd,
+            bytes: bytes_owned,
+            nwritten_ptr: nwritten_ptr as u32,
+        }));
+    }
+
+    // Console (stdout/stderr) arm: write all iovs directly.
     let mem = wasm_memory(&caller)?;
     let mut total: u32 = 0;
     for i in 0..iovs_len {
@@ -52,39 +74,21 @@ pub fn fd_write(
         mem.read(&caller, buf_ptr, &mut buf[..n])
             .map_err(|e| Error::new(alloc::format!("fd_write mem read: {}", e)))?;
 
-        let fd_entry = caller
-            .data()
-            .fds
-            .get(fd as usize)
-            .and_then(|x| x.as_ref())
-            .map(|e| match e {
-                FdEntry::Stdin => 3u8,          // 3 = stdin (not writable)
-                FdEntry::StdoutConsole => 0u8,  // 0 = console
-                FdEntry::Vfs(_) => 1u8,         // 1 = vfs
-                FdEntry::Socket(_) => 2u8,      // 2 = socket (handled above)
-            });
+        let is_console = matches!(
+            caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()),
+            Some(FdEntry::StdoutConsole)
+        );
 
-        match fd_entry {
-            Some(0) => {
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    use core::fmt::Write as _;
-                    let mut c = crate::console::CONSOLE.lock();
-                    let _ = c.write_str(s);
-                }
-                // non-utf8: silently skip
-                total += n as u32;
+        if is_console {
+            if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                use core::fmt::Write as _;
+                let mut c = crate::console::CONSOLE.lock();
+                let _ = c.write_str(s);
             }
-            Some(1) => {
-                // VFS-backed fd: dispatch to VFS write.
-                let vfd = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-                    Some(FdEntry::Vfs(v)) => *v,
-                    _ => return Ok(8),
-                };
-                let written = embassy_futures::block_on(crate::vfs::write(vfd, &buf[..n]))
-                    .map_err(|_| Error::i32_exit(-1))?;
-                total += written as u32;
-            }
-            _ => return Ok(8), // EBADF
+            // non-utf8: silently skip
+            total += n as u32;
+        } else {
+            return Ok(8); // EBADF
         }
     }
     write_u32(&mem, &mut caller, nwritten_ptr as usize, total)?;
@@ -92,7 +96,7 @@ pub fn fd_write(
 }
 
 pub fn fd_read(
-    mut caller: Caller<'_, RuntimeState>,
+    caller: Caller<'_, RuntimeState>,
     fd: i32,
     iovs_ptr: i32,
     iovs_len: i32,
@@ -117,77 +121,48 @@ pub fn fd_read(
         }));
     }
 
-    // Classify the fd up-front (avoid borrowing caller across async ops).
-    let fd_kind = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-        Some(FdEntry::Stdin) => 0u8,
-        Some(FdEntry::Vfs(v)) => { let _ = *v; 1u8 }
-        _ => return Ok(8), // EBADF
-    };
-
-    // Stdin: read exactly 1 byte from the keyboard queue, fill the first
-    // non-empty iov and return immediately.
-    if fd_kind == 0 {
+    // Stdin arm: trap with SuspendReason::KbdReadChar (single iov only).
+    if let Some(FdEntry::Stdin) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        if iovs_len != 1 {
+            return Ok(28); // EINVAL
+        }
         let mem = wasm_memory(&caller)?;
-        for i in 0..iovs_len {
-            let iov_at = (iovs_ptr + i * 8) as usize;
-            let buf_ptr = read_u32(&mem, &caller, iov_at)? as usize;
-            let buf_len = read_u32(&mem, &caller, iov_at + 4)? as usize;
-            if buf_len == 0 {
-                continue;
-            }
-            let b = embassy_futures::block_on(crate::keyboard::queue::read_char());
-            mem.write(&mut caller, buf_ptr, &[b])
-                .map_err(|_| Error::i32_exit(-1))?;
-            let mem2 = wasm_memory(&caller)?;
-            write_u32(&mem2, &mut caller, nread_ptr as usize, 1)?;
-            return Ok(0);
-        }
-        // All iovs were zero-length.
-        let mem2 = wasm_memory(&caller)?;
-        write_u32(&mem2, &mut caller, nread_ptr as usize, 0)?;
-        return Ok(0);
+        let buf_ptr = read_u32(&mem, &caller, iovs_ptr as usize)?;
+        return Err(Error::host(crate::wasm::suspend::SuspendReason::KbdReadChar {
+            buf_ptr,
+            nread_ptr: nread_ptr as u32,
+        }));
     }
 
-    // VFS-backed read.
-    let vfd = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-        Some(FdEntry::Vfs(v)) => *v,
-        _ => return Ok(8),
-    };
-    let mem = wasm_memory(&caller)?;
-    let mut total: u32 = 0;
-    for i in 0..iovs_len {
-        let iov_at = (iovs_ptr + i * 8) as usize;
-        let buf_ptr = read_u32(&mem, &caller, iov_at)? as usize;
-        let buf_len = read_u32(&mem, &caller, iov_at + 4)? as usize;
-        if buf_len == 0 {
-            continue;
+    // VFS arm: trap with SuspendReason::VfsRead (single iov only).
+    if let Some(FdEntry::Vfs(vfd)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        if iovs_len != 1 {
+            return Ok(28); // EINVAL
         }
-        const MAX: usize = 4096;
-        let n = buf_len.min(MAX);
-        let mut tmp = [0u8; MAX];
-        let read_n = embassy_futures::block_on(crate::vfs::read(vfd, &mut tmp[..n]))
-            .map_err(|_| Error::i32_exit(-1))?;
-        mem.write(&mut caller, buf_ptr, &tmp[..read_n])
-            .map_err(|_| Error::i32_exit(-1))?;
-        total += read_n as u32;
-        if read_n < n {
-            break;
-        }
+        let vfd = *vfd;
+        let mem = wasm_memory(&caller)?;
+        let buf_ptr = read_u32(&mem, &caller, iovs_ptr as usize)?;
+        let buf_len = read_u32(&mem, &caller, iovs_ptr as usize + 4)?;
+        return Err(Error::host(crate::wasm::suspend::SuspendReason::VfsRead {
+            fd: vfd,
+            buf_ptr,
+            max_len: buf_len as usize,
+            nread_ptr: nread_ptr as u32,
+        }));
     }
-    let mem2 = wasm_memory(&caller)?;
-    write_u32(&mem2, &mut caller, nread_ptr as usize, total)?;
-    Ok(0)
+
+    Ok(8) // EBADF
 }
 
 pub fn fd_seek(
-    mut caller: Caller<'_, RuntimeState>,
+    caller: Caller<'_, RuntimeState>,
     fd: i32,
     offset: i64,
     whence: i32,
     newoffset_ptr: i32,
 ) -> Result<i32, Error> {
-    let vfd = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-        Some(FdEntry::Vfs(v)) => *v,
+    let entry = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Vfs(vfd)) => *vfd,
         _ => return Ok(8), // EBADF
     };
     let w = match whence {
@@ -196,34 +171,30 @@ pub fn fd_seek(
         2 => crate::vfs::Whence::End,
         _ => return Ok(28), // EINVAL
     };
-    let new_off = embassy_futures::block_on(crate::vfs::seek(vfd, offset, w))
-        .map_err(|_| Error::i32_exit(-1))?;
-    let mem = wasm_memory(&caller)?;
-    mem.write(&mut caller, newoffset_ptr as usize, &(new_off as u64).to_le_bytes())
-        .map_err(|_| Error::i32_exit(-1))?;
-    Ok(0)
+    Err(Error::host(crate::wasm::suspend::SuspendReason::VfsSeek {
+        fd: entry,
+        offset,
+        whence: w,
+        newoffset_ptr: newoffset_ptr as u32,
+    }))
 }
 
 pub fn fd_close(
     mut caller: Caller<'_, RuntimeState>,
     fd: i32,
 ) -> Result<i32, Error> {
-    let taken = caller
-        .data_mut()
-        .fds
-        .get_mut(fd as usize)
-        .and_then(|x| x.take());
+    let taken = caller.data_mut().fds.get_mut(fd as usize).and_then(|x| x.take());
     match taken {
         Some(FdEntry::Vfs(vfd)) => {
-            let _ = embassy_futures::block_on(crate::vfs::close(vfd));
+            Err(Error::host(crate::wasm::suspend::SuspendReason::VfsClose { fd: vfd }))
         }
         Some(other) => {
             // Restore non-VFS entry (don't drop stdin/stdout).
             caller.data_mut().fds[fd as usize] = Some(other);
+            Ok(0)
         }
-        None => return Ok(8), // EBADF
+        None => Ok(8), // EBADF
     }
-    Ok(0)
 }
 
 pub fn fd_fdstat_get(

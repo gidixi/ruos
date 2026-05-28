@@ -14,6 +14,7 @@ mod acpi_init;
 mod apic;
 mod timer;
 mod keyboard;
+mod vfs;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

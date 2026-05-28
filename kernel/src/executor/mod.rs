@@ -52,8 +52,9 @@ pub fn run() -> ! {
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(kbd_echo_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
-    // T1: only run init.wasm for fiber/sleep proof. Server+client in T3.
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
+    spawner.spawn(wasm_task("/server.wasm")).unwrap();
+    spawner.spawn(wasm_task("/client.wasm")).unwrap();
     kprintln!("ruos: executor: all tasks spawned, entering poll loop");
 
     loop {

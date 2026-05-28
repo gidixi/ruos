@@ -1,8 +1,7 @@
 //! Kernel-side socket pool. Each wasm-side FD that is a socket maps
 //! to a smoltcp SocketHandle here. The wasm host fns manipulate this
-//! pool; the underlying smoltcp Interface is driven inline (no separate
-//! net_poll_task dependency — we call net::poll() directly in the
-//! spin loops so this works from inside a sync host fn).
+//! pool; the net_poll_task drives smoltcp via net::poll() so async
+//! wrappers just yield via Delay::ticks(1) and re-check.
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -66,12 +65,8 @@ pub fn listen(handle: SocketHandle, port: u16) -> Result<(), &'static str> {
     })
 }
 
-/// Connect a socket to a remote endpoint, then spin-poll until
-/// the connection is established (or fails).
-///
-/// NOTE: calls net::poll() directly in the spin loop so this can
-/// be called from synchronous (non-async) context.
-pub fn connect_sync(
+/// Async connect: initiate TCP connection then yield until Established.
+pub async fn connect(
     handle: SocketHandle,
     remote: IpEndpoint,
     local_port: u16,
@@ -84,9 +79,8 @@ pub fn connect_sync(
         let local: IpListenEndpoint = local_port.into();
         s.connect(ctx, remote, local).map_err(|_| "connect failed")
     })?;
-    // Spin-poll until Established or an error state.
-    for _ in 0..10_000 {
-        crate::net::poll();
+    // Yield until Established (net_poll_task drives smoltcp between yields).
+    loop {
         let done = without_interrupts(|| {
             let g = crate::net::NET.lock();
             let net = g.as_ref().expect("net not initialized");
@@ -103,17 +97,14 @@ pub fn connect_sync(
         if let Some(result) = done {
             return result;
         }
+        crate::executor::delay::Delay::ticks(1).await;
     }
-    Err("connect: timed out")
 }
 
-/// Block until a client connects to the listening socket.
-///
-/// NOTE: calls net::poll() directly so it can be used from host fns.
-pub fn accept_sync(handle: SocketHandle) -> Result<(), &'static str> {
+/// Async accept: yield until the listening socket transitions to Established.
+pub async fn accept(handle: SocketHandle) -> Result<(), &'static str> {
     use smoltcp::socket::tcp::State;
-    for _ in 0..100_000 {
-        crate::net::poll();
+    loop {
         let ready = without_interrupts(|| {
             let g = crate::net::NET.lock();
             let net = g.as_ref().expect("net not initialized");
@@ -122,15 +113,13 @@ pub fn accept_sync(handle: SocketHandle) -> Result<(), &'static str> {
         if ready {
             return Ok(());
         }
+        crate::executor::delay::Delay::ticks(1).await;
     }
-    Err("accept: timed out")
 }
 
-/// Synchronous receive: spin-poll until data is available, return
-/// bytes read (may be less than buf.len()).
-pub fn recv_sync(handle: SocketHandle, buf: &mut [u8]) -> Result<usize, &'static str> {
-    for _ in 0..100_000 {
-        crate::net::poll();
+/// Async recv: yield until data is available, return bytes read.
+pub async fn recv(handle: SocketHandle, buf: &mut [u8]) -> Result<usize, &'static str> {
+    loop {
         let n = without_interrupts(|| {
             let mut g = crate::net::NET.lock();
             let net = g.as_mut().expect("net not initialized");
@@ -146,14 +135,13 @@ pub fn recv_sync(handle: SocketHandle, buf: &mut [u8]) -> Result<usize, &'static
                 return Ok(n);
             }
         }
+        crate::executor::delay::Delay::ticks(1).await;
     }
-    Err("recv: timed out")
 }
 
-/// Synchronous send: spin-poll until the data can be written.
-pub fn send_sync(handle: SocketHandle, buf: &[u8]) -> Result<usize, &'static str> {
-    for _ in 0..100_000 {
-        crate::net::poll();
+/// Async send: yield until the socket TX buffer has room, then write.
+pub async fn send(handle: SocketHandle, buf: &[u8]) -> Result<usize, &'static str> {
+    loop {
         let n = without_interrupts(|| {
             let mut g = crate::net::NET.lock();
             let net = g.as_mut().expect("net not initialized");
@@ -169,6 +157,6 @@ pub fn send_sync(handle: SocketHandle, buf: &[u8]) -> Result<usize, &'static str
                 return Ok(n);
             }
         }
+        crate::executor::delay::Delay::ticks(1).await;
     }
-    Err("send: timed out")
 }

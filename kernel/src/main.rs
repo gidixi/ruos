@@ -200,11 +200,7 @@ unsafe extern "C" fn kmain() -> ! {
 
     modules::mount_all();
     net::init();
-
-    // Pre-establish TCP loopback sockets for server.wasm / client.wasm.
-    // This runs synchronously (spin-polls smoltcp) before the executor starts,
-    // so no cooperative scheduling issues.
-    wasm::setup_demo_sockets();
+    kprintln!("ruos: real ping-pong (no preload)");
 
     match console::fb_init::init() {
         Ok(mut fb) => {

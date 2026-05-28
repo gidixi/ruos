@@ -109,12 +109,85 @@ impl Fiber {
                 kprintln!("ruos: wasm fiber: sleep done, writing 1 event");
                 0
             }
-            // Other variants are implemented in Task 2 and Task 3.
+            SuspendReason::SockAccept { handle, new_fd_ptr } => {
+                kprintln!("ruos: wasm fiber: sock accept waiting");
+                match crate::net::sockets::accept(handle).await {
+                    Ok(()) => {
+                        // smoltcp's listen socket transitions to Established;
+                        // there's no separate new socket. Write current fd.
+                        let cur_fd: u32 = self.find_fd_for_handle(handle).unwrap_or(0);
+                        let _ = self.write_u32(new_fd_ptr, cur_fd);
+                        kprintln!("ruos: wasm fiber: sock accepted fd={}", cur_fd);
+                        0
+                    }
+                    Err(e) => {
+                        kprintln!("ruos: wasm fiber: sock accept err: {}", e);
+                        8
+                    }
+                }
+            }
+            SuspendReason::SockConnect { handle, remote, local_port } => {
+                kprintln!("ruos: wasm fiber: sock connect to {:?}:{}", remote.addr, remote.port);
+                match crate::net::sockets::connect(handle, remote, local_port).await {
+                    Ok(()) => {
+                        kprintln!("ruos: wasm fiber: sock connected");
+                        0
+                    }
+                    Err(e) => {
+                        kprintln!("ruos: wasm fiber: sock connect err: {}", e);
+                        8
+                    }
+                }
+            }
+            SuspendReason::SockRecv { handle, buf_ptr, max_len, nrecv_ptr } => {
+                kprintln!("ruos: wasm fiber: sock recv max={}", max_len);
+                let mut buf = alloc::vec![0u8; max_len];
+                match crate::net::sockets::recv(handle, &mut buf).await {
+                    Ok(n) => {
+                        let _ = self.write_to_memory(buf_ptr, &buf[..n]);
+                        let _ = self.write_u32(nrecv_ptr, n as u32);
+                        kprintln!("ruos: wasm fiber: sock recv n={}", n);
+                        0
+                    }
+                    Err(e) => {
+                        kprintln!("ruos: wasm fiber: sock recv err: {}", e);
+                        8
+                    }
+                }
+            }
+            SuspendReason::SockSend { handle, bytes, nsent_ptr } => {
+                kprintln!("ruos: wasm fiber: sock send len={}", bytes.len());
+                match crate::net::sockets::send(handle, &bytes).await {
+                    Ok(n) => {
+                        let _ = self.write_u32(nsent_ptr, n as u32);
+                        kprintln!("ruos: wasm fiber: sock sent n={}", n);
+                        0
+                    }
+                    Err(e) => {
+                        kprintln!("ruos: wasm fiber: sock send err: {}", e);
+                        8
+                    }
+                }
+            }
+            // Other variants are implemented in Task 3.
             other => {
-                kprintln!("ruos: wasm: SuspendReason {:?} not implemented in T1", other);
+                kprintln!("ruos: wasm: SuspendReason {:?} not implemented", other);
                 28 // EINVAL
             }
         }
+    }
+
+    fn find_fd_for_handle(&self, target: smoltcp::iface::SocketHandle) -> Option<u32> {
+        use crate::wasm::state::FdEntry;
+        let state = self.store.data();
+        for (fd, slot) in state.fds.iter().enumerate() {
+            if let Some(FdEntry::Socket(idx)) = slot {
+                if crate::net::sockets::POOL.handle(*idx) == Some(target) {
+                    return Some(fd as u32);
+                }
+            }
+        }
+        None
     }
 
     fn write_to_memory(&mut self, ptr: u32, bytes: &[u8]) -> Result<(), wasmi::Error> {

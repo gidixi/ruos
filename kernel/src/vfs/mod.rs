@@ -31,7 +31,9 @@ pub fn mount(prefix: &str, fs: FsImpl) -> Result<(), VfsError> {
 }
 
 /// Build the in-RAM root tmpfs, mount it at `/`, populate /dev + /tmp.
+/// Returns `AlreadyExists` if called twice (single init by design).
 pub fn init() -> Result<usize, VfsError> {
+    if !MOUNTS.lock().is_empty() { return Err(VfsError::AlreadyExists); }
     let fs = Tmpfs::new();
     fs.mkdir(&["dev"])?;
     fs.mkdir(&["tmp"])?;

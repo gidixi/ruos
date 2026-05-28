@@ -85,12 +85,17 @@ impl FileSystem for Tmpfs {
     async fn open(&self, path: &[&str], flags: OpenFlags) -> Result<FileImpl, VfsError> {
         let node = match self.walk(path) {
             Ok(n) => n,
+            // CREATE on miss: re-walks parent. Safe today because all VFS
+            // futures complete on a single poll under block_on (no preemption,
+            // no concurrent readers) — so the walk/insert pair is atomic from
+            // any observer's point of view. Revisit when Step 9 introduces a
+            // real executor that can suspend mid-future.
             Err(VfsError::NotFound) if flags.contains(OpenFlags::CREATE) => {
                 let (parent, name) = self.parent_and_name(path)?;
                 let mut p = parent.lock();
-                p.children.insert(name.to_string(),
-                    Arc::new(Mutex::new(TmpInode::new_reg())));
-                p.children.get(name).cloned().unwrap()
+                let arc = Arc::new(Mutex::new(TmpInode::new_reg()));
+                p.children.insert(name.to_string(), arc.clone());
+                arc
             }
             Err(e) => return Err(e),
         };
@@ -140,7 +145,8 @@ impl File for TmpfsFile {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
         let mut node = self.node.lock();
         let start = self.pos as usize;
-        let end = start + buf.len();
+        // Guard against integer wrap on huge positions / lengths.
+        let end = start.checked_add(buf.len()).ok_or(VfsError::NoSpace)?;
         if node.content.len() < end { node.content.resize(end, 0); }
         node.content[start..end].copy_from_slice(buf);
         drop(node);
@@ -154,8 +160,8 @@ impl File for TmpfsFile {
             Whence::Cur => self.pos as i64,
             Whence::End => len,
         };
-        let new = base + off;
-        if new < 0 { return Err(VfsError::InvalidPath); }
+        let new = base.checked_add(off).ok_or(VfsError::Invalid)?;
+        if new < 0 { return Err(VfsError::Invalid); }
         self.pos = new as u64;
         Ok(self.pos)
     }

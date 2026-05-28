@@ -76,9 +76,9 @@ Boots the ISO in QEMU headless under a 30 s timeout, captures the serial
 output, and asserts the full-success line. Expected serial:
 
 ```
-MinimalOS-rs: hello serial
-MinimalOS-rs: heap ok base=0xFFFF800000100000 size=4194304
-MinimalOS-rs: alloc box=0xCAFEBABE vec=[0, 1, 2, 3, 4]
+ruos: hello serial
+ruos: heap ok base=0xFFFF800000100000 size=4194304
+ruos: alloc box=0xCAFEBABE vec=[0, 1, 2, 3, 4]
 ```
 
 Final make output:

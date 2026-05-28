@@ -41,10 +41,10 @@ unsafe extern "C" fn kmain() -> ! {
     // Serial first: any failure below must be observable on the wire.
     let mut serial = serial::Serial::new();
     serial.init();
-    let _ = serial.write_str("MinimalOS-rs: hello serial\n");
+    let _ = serial.write_str("ruos: hello serial\n");
 
     if !BASE_REVISION.is_supported() {
-        let _ = serial.write_str("MinimalOS-rs: unsupported Limine base revision\n");
+        let _ = serial.write_str("ruos: unsupported Limine base revision\n");
         hcf();
     }
 
@@ -52,13 +52,13 @@ unsafe extern "C" fn kmain() -> ! {
     let info = match memory::init_heap() {
         Ok(info) => info,
         Err(e) => {
-            let _ = writeln!(serial, "MinimalOS-rs: heap fail: {}", e);
+            let _ = writeln!(serial, "ruos: heap fail: {}", e);
             hcf();
         }
     };
     let _ = writeln!(
         serial,
-        "MinimalOS-rs: heap ok base=0x{:X} size={}",
+        "ruos: heap ok base=0x{:X} size={}",
         info.virt_base, info.size
     );
 
@@ -67,7 +67,7 @@ unsafe extern "C" fn kmain() -> ! {
     let v: Vec<u32> = (0..5).collect();
     let _ = writeln!(
         serial,
-        "MinimalOS-rs: alloc box=0x{:X} vec={:?}",
+        "ruos: alloc box=0x{:X} vec={:?}",
         *b, v
     );
 

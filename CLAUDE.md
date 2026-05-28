@@ -1,4 +1,4 @@
-# CLAUDE.md — Regole del progetto MinimalOS
+# CLAUDE.md — Regole del progetto ruos
 
 ## Progetto
 

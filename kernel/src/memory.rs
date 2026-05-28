@@ -16,6 +16,16 @@ pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();
 
+/// The heap region claimed by `init_heap`, recorded so that the future physical
+/// frame allocator (Step 6) can mask these frames as already-owned and never hand
+/// them out again. Set exactly once on successful heap init.
+static HEAP_INFO: spin::Once<HeapInfo> = spin::Once::new();
+
+/// Returns the heap region (`None` before `init_heap` succeeds).
+pub fn heap_region() -> Option<HeapInfo> {
+    HEAP_INFO.get().copied()
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct HeapInfo {
     pub phys_base: u64,
@@ -72,5 +82,7 @@ pub fn init_heap() -> Result<HeapInfo, HeapInitError> {
             .map_err(|_| HeapInitError::ClaimFailed)?;
     }
 
-    Ok(HeapInfo { phys_base, virt_base, size: HEAP_SIZE })
+    let info = HeapInfo { phys_base, virt_base, size: HEAP_SIZE };
+    HEAP_INFO.call_once(|| info);
+    Ok(info)
 }

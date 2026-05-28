@@ -158,6 +158,36 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    let smoke = vfs::block_on(async {
+        use vfs::{open, write, read, seek, close, OpenFlags, Whence};
+        // /dev/null write
+        let fd = open("/dev/null", OpenFlags::WRITE).await?;
+        write(fd, b"hello").await?;
+        close(fd).await?;
+        // /tmp/x: create, write, seek to start, read back.
+        let fd = open(
+            "/tmp/x",
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::READ,
+        ).await?;
+        write(fd, b"abc").await?;
+        seek(fd, 0, Whence::Set).await?;
+        let mut buf = [0u8; 8];
+        let n = read(fd, &mut buf).await?;
+        close(fd).await?;
+        Ok::<(usize, [u8; 8]), vfs::VfsError>((n, buf))
+    });
+    match smoke {
+        Ok((n, buf)) => kprintln!(
+            "ruos: vfs smoke ok n={} buf=[{}]",
+            n,
+            core::str::from_utf8(&buf[..n]).unwrap_or("?"),
+        ),
+        Err(e) => {
+            kprintln!("ruos: vfs smoke fail: {}", e);
+            hcf();
+        }
+    }
+
     // Wait for the timer to fire enough times.
     while timer::ticks() < 10 {
         core::hint::spin_loop();

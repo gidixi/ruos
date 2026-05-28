@@ -55,3 +55,55 @@ pub fn init() -> Result<usize, VfsError> {
     mount("/", FsImpl::Tmpfs(fs))?;
     Ok(MOUNTS.lock().len())
 }
+
+use crate::vfs::fd::{FDS, allocate as fd_allocate, close as fd_close};
+
+/// Locate the FsImpl covering `abspath` and return the components below the
+/// mount point. Longest-prefix match.
+fn resolve<'a>(abspath: &'a [&'a str]) -> Result<(usize, Vec<&'a str>), VfsError> {
+    // For now: single mount at "/". Components match the full split.
+    let mounts = MOUNTS.lock();
+    if mounts.is_empty() { return Err(VfsError::NotFound); }
+    // Index 0 is the root mount; "/" prefix always matches.
+    Ok((0usize, abspath.to_vec()))
+}
+
+pub async fn open(path: &str, flags: OpenFlags) -> Result<Fd, VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let file = fs.open(&sub, flags).await?;
+    drop(mounts);
+    Ok(fd_allocate(file))
+}
+
+pub async fn close(fd: Fd) -> Result<(), VfsError> {
+    fd_close(fd)
+}
+
+pub async fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, VfsError> {
+    // Hold the FDS lock across the inner await: all current File impls
+    // (tmpfs, devices) resolve in a single poll, so no real suspension
+    // occurs and the lock is released before the outer block_on returns.
+    // When Step 9 brings an executor that can suspend, this needs the
+    // take-and-restore pattern instead.
+    let mut t = FDS.lock();
+    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
+        .as_mut().ok_or(VfsError::BadFd)?;
+    slot.file.read(buf).await
+}
+
+pub async fn write(fd: Fd, buf: &[u8]) -> Result<usize, VfsError> {
+    let mut t = FDS.lock();
+    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
+        .as_mut().ok_or(VfsError::BadFd)?;
+    slot.file.write(buf).await
+}
+
+pub async fn seek(fd: Fd, off: i64, whence: Whence) -> Result<u64, VfsError> {
+    let mut t = FDS.lock();
+    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
+        .as_mut().ok_or(VfsError::BadFd)?;
+    slot.file.seek(off, whence).await
+}

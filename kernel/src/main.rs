@@ -193,23 +193,19 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
-    let _fb_keep = match console::fb_init::init() {
+    match console::fb_init::init() {
         Ok(mut fb) => {
             let (w, h, p, b) = fb.dims();
             kprintln!("ruos: fb ok {}x{} pitch={} bpp={}", w, h, p, b);
             let ok = console::fb::self_test(&mut fb);
             kprintln!("ruos: fb test {}", if ok { "ok" } else { "fail" });
-            Some(fb)
+            console::CONSOLE.lock().attach_framebuffer(fb);
+            kprintln!("ruos: fb attached");
         }
         Err(e) => {
             kprintln!("ruos: fb fail: {}", e);
-            None
         }
-    };
-    // `_fb_keep` is forgotten so the live framebuffer stays alive for the
-    // remainder of boot. Task 3 stashes it inside CONSOLE for subsequent
-    // prints.
-    core::mem::forget(_fb_keep);
+    }
 
     // Wait for the timer to fire enough times.
     while timer::ticks() < 10 {

@@ -13,6 +13,7 @@ mod pic;
 mod acpi_init;
 mod apic;
 mod timer;
+mod keyboard;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -100,6 +101,8 @@ unsafe extern "C" fn kmain() -> ! {
         kprintln!("ruos: timer fail: {}", e);
         hcf();
     }
+
+    keyboard::init(&acpi_info.overrides);
 
     x86_64::instructions::interrupts::enable(); // sti
 

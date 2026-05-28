@@ -13,6 +13,8 @@ pub struct RuntimeState {
 }
 
 pub enum FdEntry {
+    /// Special: reads come from the keyboard queue. FD 0 (stdin).
+    Stdin,
     /// Special: writes go to the console. FD 1 and 2 use this in Task 2.
     StdoutConsole,
     /// VFS-backed file (populated in Task 3).
@@ -22,7 +24,7 @@ pub enum FdEntry {
 impl RuntimeState {
     pub fn new() -> Self {
         let mut fds: Vec<Option<FdEntry>> = (0..16).map(|_| None).collect();
-        fds[0] = None; // stdin: not connected
+        fds[0] = Some(FdEntry::Stdin); // stdin → keyboard queue
         fds[1] = Some(FdEntry::StdoutConsole); // stdout → console
         fds[2] = Some(FdEntry::StdoutConsole); // stderr → console
         Self {

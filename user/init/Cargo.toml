@@ -6,3 +6,6 @@ edition = "2021"
 [[bin]]
 name = "init"
 path = "src/main.rs"
+
+[dependencies]
+getrandom = "0.2"

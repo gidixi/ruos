@@ -34,7 +34,8 @@ pub fn fd_write(
             .get(fd as usize)
             .and_then(|x| x.as_ref())
             .map(|e| match e {
-                FdEntry::StdoutConsole => 0u8, // 0 = console
+                FdEntry::Stdin => 2u8,          // 2 = stdin (not writable)
+                FdEntry::StdoutConsole => 0u8,  // 0 = console
                 FdEntry::Vfs(_) => 1u8,         // 1 = vfs
             });
 
@@ -72,9 +73,41 @@ pub fn fd_read(
     iovs_len: i32,
     nread_ptr: i32,
 ) -> Result<i32, Error> {
+    // Classify the fd up-front (avoid borrowing caller across async ops).
+    let fd_kind = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Stdin) => 0u8,
+        Some(FdEntry::Vfs(v)) => { let _ = *v; 1u8 }
+        _ => return Ok(8), // EBADF
+    };
+
+    // Stdin: read exactly 1 byte from the keyboard queue, fill the first
+    // non-empty iov and return immediately.
+    if fd_kind == 0 {
+        let mem = wasm_memory(&caller)?;
+        for i in 0..iovs_len {
+            let iov_at = (iovs_ptr + i * 8) as usize;
+            let buf_ptr = read_u32(&mem, &caller, iov_at)? as usize;
+            let buf_len = read_u32(&mem, &caller, iov_at + 4)? as usize;
+            if buf_len == 0 {
+                continue;
+            }
+            let b = embassy_futures::block_on(crate::keyboard::queue::read_char());
+            mem.write(&mut caller, buf_ptr, &[b])
+                .map_err(|_| Error::i32_exit(-1))?;
+            let mem2 = wasm_memory(&caller)?;
+            write_u32(&mem2, &mut caller, nread_ptr as usize, 1)?;
+            return Ok(0);
+        }
+        // All iovs were zero-length.
+        let mem2 = wasm_memory(&caller)?;
+        write_u32(&mem2, &mut caller, nread_ptr as usize, 0)?;
+        return Ok(0);
+    }
+
+    // VFS-backed read.
     let vfd = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
         Some(FdEntry::Vfs(v)) => *v,
-        _ => return Ok(8), // EBADF
+        _ => return Ok(8),
     };
     let mem = wasm_memory(&caller)?;
     let mut total: u32 = 0;

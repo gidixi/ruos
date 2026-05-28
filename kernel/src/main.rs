@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
 mod serial;
+mod kprint;
 mod memory;
 mod gdt;
+mod idt;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -35,17 +38,15 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
-    use core::fmt::Write;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
     // Serial first: any failure below must be observable on the wire.
-    let mut serial = serial::Serial::new();
-    serial.init();
-    let _ = serial.write_str("ruos: hello serial\n");
+    crate::serial::SERIAL.lock().init();
+    kprintln!("ruos: hello serial");
 
     if !BASE_REVISION.is_supported() {
-        let _ = serial.write_str("ruos: unsupported Limine base revision\n");
+        kprintln!("ruos: unsupported Limine base revision");
         hcf();
     }
 
@@ -53,26 +54,24 @@ unsafe extern "C" fn kmain() -> ! {
     let info = match memory::init_heap() {
         Ok(info) => info,
         Err(e) => {
-            let _ = writeln!(serial, "ruos: heap fail: {}", e);
+            kprintln!("ruos: heap fail: {}", e);
             hcf();
         }
     };
-    let _ = writeln!(
-        serial,
-        "ruos: heap ok base=0x{:X} size={}",
-        info.virt_base, info.size
-    );
+    kprintln!("ruos: heap ok base=0x{:X} size={}", info.virt_base, info.size);
 
     // Smoke test: prove Box and Vec work through the global allocator.
     let b = Box::new(0xCAFEBABEu64);
     let v: Vec<u32> = (0..5).collect();
-    let _ = writeln!(
-        serial,
-        "ruos: alloc box=0x{:X} vec={:?}",
-        *b, v
-    );
+    kprintln!("ruos: alloc box=0x{:X} vec={:?}", *b, v);
 
+    // Step 5 — interrupt infrastructure.
     gdt::init();
+    idt::init();
+    kprintln!("ruos: idt up");
+
+    // #BP smoke test: CPU traps are not maskable by IF, so `sti` is not required.
+    core::arch::asm!("int3");
 
     hcf();
 }

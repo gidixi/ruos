@@ -7,7 +7,7 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         // Safety: 0x3F8 is the standard COM1 I/O port base.
         Serial { port: unsafe { SerialPort::new(0x3F8) } }
     }
@@ -25,3 +25,10 @@ impl fmt::Write for Serial {
         Ok(())
     }
 }
+
+/// Globally accessible spin-locked serial writer, used by `kprintln!` and by
+/// interrupt handlers. Call `SERIAL.lock().init()` exactly once at boot.
+pub static SERIAL: spin::Mutex<Serial> = spin::Mutex::new(Serial::new());
+
+// SAFETY: SerialPort accesses only its I/O port, which is exclusive-by-construction.
+unsafe impl Send for Serial {}

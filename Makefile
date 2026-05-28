@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: alloc box=0xCAFEBABE vec=[0, 1, 2, 3, 4]
+HELLO     := ruos: ticks=
 
 .PHONY: all build limine iso run run-test clean
 

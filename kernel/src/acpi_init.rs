@@ -47,6 +47,7 @@ pub struct AcpiInfo {
     pub lapic_base:  u64,
     pub ioapic_base: u64,
     pub overrides:   Vec<IrqOverride>,
+    pub hhdm_offset: u64,
 }
 
 #[derive(Debug)]
@@ -116,5 +117,5 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
         });
     }
 
-    Ok(AcpiInfo { lapic_base, ioapic_base, overrides })
+    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, hhdm_offset })
 }

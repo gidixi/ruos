@@ -29,6 +29,8 @@ pub fn init() {
         }
         idt.breakpoint.set_handler_fn(bp_handler);
 
+        idt[VEC_LAPIC_TIMER].set_handler_fn(crate::timer::timer_handler);
+
         idt
     });
     idt.load();

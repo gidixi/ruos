@@ -11,6 +11,8 @@ mod gdt;
 mod idt;
 mod pic;
 mod acpi_init;
+mod apic;
+mod timer;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -92,10 +94,21 @@ unsafe extern "C" fn kmain() -> ! {
         acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len()
     );
 
-    // `acpi_info` is consumed by Task 4 (LAPIC/IOAPIC bring-up) — kept on the
-    // stack until then.
-    let _ = &acpi_info;
+    apic::lapic::init(acpi_info.lapic_base, acpi_info.hhdm_offset, idt::VEC_SPURIOUS);
+    apic::ioapic::init(acpi_info.ioapic_base, acpi_info.hhdm_offset);
+    if let Err(e) = timer::init(100) {
+        kprintln!("ruos: timer fail: {}", e);
+        hcf();
+    }
 
+    x86_64::instructions::interrupts::enable(); // sti
+
+    // Wait for the timer to fire enough times.
+    while timer::ticks() < 10 {
+        core::hint::spin_loop();
+    }
+
+    kprintln!("ruos: ticks={}", timer::ticks());
     hcf();
 }
 

@@ -95,6 +95,18 @@ unsafe extern "C" fn kmain() -> ! {
         acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len()
     );
 
+    let frame_counts = match memory::init_frames() {
+        Ok(c) => c,
+        Err(e) => {
+            kprintln!("ruos: frames fail: {}", e);
+            hcf();
+        }
+    };
+    kprintln!(
+        "ruos: frames total={} used={} free={}",
+        frame_counts.total, frame_counts.used, frame_counts.free,
+    );
+
     apic::lapic::init(acpi_info.lapic_base, acpi_info.hhdm_offset, idt::VEC_SPURIOUS);
     apic::ioapic::init(acpi_info.ioapic_base, acpi_info.hhdm_offset);
     if let Err(e) = timer::init(100) {

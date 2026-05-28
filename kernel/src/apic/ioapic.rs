@@ -28,21 +28,21 @@ fn write(idx: u32, val: u32) {
     }
 }
 
-pub fn init(phys_base: u64, hhdm_offset: u64) {
-    // Limine's HHDM does not cover IOAPIC MMIO — map it explicitly as UC.
-    crate::apic::mmio::map_mmio_page(phys_base, hhdm_offset);
+pub fn init(phys_base: u64) {
+    let virt = crate::memory::map_io_page(x86_64::PhysAddr::new(phys_base))
+        .expect("ioapic mmio map");
     // SAFETY: single-threaded boot.
-    unsafe { IOAPIC_VIRT = phys_base + hhdm_offset; }
+    unsafe { IOAPIC_VIRT = virt.as_u64(); }
 
     // Read max redirection entry from IOAPICVER (index 0x01, bits 16..23).
     let ver = read(0x01);
-    let max_redir = ((ver >> 16) & 0xFF) as u32; // count is max+1
+    let max_redir = ((ver >> 16) & 0xFF) as u32;
 
     // Mask everything until explicit redirect() calls.
     for i in 0..=max_redir {
         let idx = REG_IOREDTBL_BASE + i * 2;
-        write(idx, 1 << 16);     // masked
-        write(idx + 1, 0);       // destination APIC id 0
+        write(idx, 1 << 16);
+        write(idx + 1, 0);
     }
 }
 

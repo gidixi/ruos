@@ -29,16 +29,16 @@ fn reg(off: u32) -> *mut u32 {
     unsafe { (LAPIC_VIRT + off as u64) as *mut u32 }
 }
 
-pub fn init(phys_base: u64, hhdm_offset: u64, spurious_vector: u8) {
-    // Limine's HHDM does not cover LAPIC MMIO — map it explicitly as UC.
-    crate::apic::mmio::map_mmio_page(phys_base, hhdm_offset);
+pub fn init(phys_base: u64, spurious_vector: u8) {
+    let virt = crate::memory::map_io_page(x86_64::PhysAddr::new(phys_base))
+        .expect("lapic mmio map");
     // SAFETY: single-threaded boot, no other writers to LAPIC_VIRT.
     unsafe {
-        LAPIC_VIRT = phys_base + hhdm_offset;
+        LAPIC_VIRT = virt.as_u64();
         // Enable LAPIC: set bit 8 in SVR, OR in the spurious vector.
         let cur = read_volatile(reg(REG_SVR));
         write_volatile(reg(REG_SVR), cur | (1 << 8) | spurious_vector as u32);
-        // Divide config = 16 (the canonical "no surprises" divisor).
+        // Divide config = 16.
         write_volatile(reg(REG_TIMER_DIV), 0x3);
         // Mask the timer until configured.
         write_volatile(reg(REG_LVT_TIMER), TIMER_MASKED);

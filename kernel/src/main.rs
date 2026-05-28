@@ -138,8 +138,8 @@ unsafe extern "C" fn kmain() -> ! {
         );
     }
 
-    apic::lapic::init(acpi_info.lapic_base, acpi_info.hhdm_offset, idt::VEC_SPURIOUS);
-    apic::ioapic::init(acpi_info.ioapic_base, acpi_info.hhdm_offset);
+    apic::lapic::init(acpi_info.lapic_base, idt::VEC_SPURIOUS);
+    apic::ioapic::init(acpi_info.ioapic_base);
     if let Err(e) = timer::init(100) {
         kprintln!("ruos: timer fail: {}", e);
         hcf();

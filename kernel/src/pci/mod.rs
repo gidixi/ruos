@@ -53,6 +53,12 @@ pub struct PciInitInfo {
 
 /// Enumerate every function on every bus of every ECAM region and publish the
 /// `PciDevice` list. `NoEcam` if `regions` is empty (caller decides fatality).
+///
+/// Flat scan (no bridge recursion, per spec). Note: the function-0 vendor probe
+/// reads through `EcamAccess`, so every `(bus, device)` slot in the MCFG bus
+/// range maps its 4 KiB ECAM page — up to 256*32 pages on a full 0..=255 range,
+/// even for absent slots. The pages are uncached MMIO (only page-table frames
+/// cost RAM) and `map_io_page` is idempotent; bounded by ECAM size.
 pub fn init(regions: &[crate::acpi_init::EcamRegion]) -> Result<PciInitInfo, PciError> {
     if regions.is_empty() {
         return Err(PciError::NoEcam);

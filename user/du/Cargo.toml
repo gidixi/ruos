@@ -1,0 +1,8 @@
+[package]
+name = "du"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "du"
+path = "src/main.rs"

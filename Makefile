@@ -4,8 +4,17 @@ LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
 HELLO     := shell: init.sh complete
-USER_WASMS := user-bin/init.wasm user-bin/server.wasm user-bin/client.wasm \
-              user-bin/shell.wasm user-bin/ls.wasm user-bin/cat.wasm user-bin/echo.wasm
+
+# Userspace .wasm tools shipped on the ISO. Root-level tools go to ISO_ROOT/,
+# /bin tools go to ISO_ROOT/bin/. New tools: just append to BIN_TOOLS.
+ROOT_WASMS := user-bin/init.wasm user-bin/server.wasm user-bin/client.wasm
+BIN_TOOLS  := shell ls cat echo \
+              mkdir rmdir rm cp mv \
+              head tail grep find diff du \
+              whoami id uname uptime free df lscpu dmesg \
+              ps kill pkill
+BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
+USER_WASMS := $(ROOT_WASMS) $(BIN_WASMS)
 
 .PHONY: all build limine iso run run-test test-boot clean user-wasm
 
@@ -21,33 +30,13 @@ limine:
 	fi
 	$(MAKE) -C $(LIMINE)
 
-user-bin/init.wasm: user/init/src/main.rs user/init/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p init
-	cp user/target/wasm32-wasip1/release/init.wasm user-bin/init.wasm
-
-user-bin/server.wasm: user/server/src/main.rs user/server/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p server
-	cp user/target/wasm32-wasip1/release/server.wasm user-bin/server.wasm
-
-user-bin/client.wasm: user/client/src/main.rs user/client/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p client
-	cp user/target/wasm32-wasip1/release/client.wasm user-bin/client.wasm
-
-user-bin/shell.wasm: user/shell/src/main.rs user/shell/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p shell
-	cp user/target/wasm32-wasip1/release/shell.wasm user-bin/shell.wasm
-
-user-bin/ls.wasm: user/ls/src/main.rs user/ls/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p ls
-	cp user/target/wasm32-wasip1/release/ls.wasm user-bin/ls.wasm
-
-user-bin/cat.wasm: user/cat/src/main.rs user/cat/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p cat
-	cp user/target/wasm32-wasip1/release/cat.wasm user-bin/cat.wasm
-
-user-bin/echo.wasm: user/echo/src/main.rs user/echo/Cargo.toml user/Cargo.toml
-	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p echo
-	cp user/target/wasm32-wasip1/release/echo.wasm user-bin/echo.wasm
+# Generic pattern rule for every user-bin/*.wasm. Cargo handles
+# incremental rebuilds; the per-crate manifest changes will retrigger
+# the cargo build (workspace shares target/), so we don't need to list
+# every .rs file as a prereq.
+user-bin/%.wasm: user/%/src/main.rs user/%/Cargo.toml user/Cargo.toml
+	source $$HOME/.cargo/env && cd user && cargo build --target wasm32-wasip1 --release -p $*
+	cp user/target/wasm32-wasip1/release/$*.wasm user-bin/$*.wasm
 
 .PHONY: user-wasm
 user-wasm: $(USER_WASMS)
@@ -58,13 +47,8 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
-	cp user-bin/init.wasm $(ISO_ROOT)/
-	cp user-bin/server.wasm $(ISO_ROOT)/
-	cp user-bin/client.wasm $(ISO_ROOT)/
-	cp user-bin/shell.wasm $(ISO_ROOT)/bin/
-	cp user-bin/ls.wasm $(ISO_ROOT)/bin/
-	cp user-bin/cat.wasm $(ISO_ROOT)/bin/
-	cp user-bin/echo.wasm $(ISO_ROOT)/bin/
+	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
+	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp user-bin/init.sh $(ISO_ROOT)/etc/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -97,13 +81,8 @@ test-boot: limine $(USER_WASMS) user-bin/init.sh
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
-	cp user-bin/init.wasm $(ISO_ROOT)/
-	cp user-bin/server.wasm $(ISO_ROOT)/
-	cp user-bin/client.wasm $(ISO_ROOT)/
-	cp user-bin/shell.wasm $(ISO_ROOT)/bin/
-	cp user-bin/ls.wasm $(ISO_ROOT)/bin/
-	cp user-bin/cat.wasm $(ISO_ROOT)/bin/
-	cp user-bin/echo.wasm $(ISO_ROOT)/bin/
+	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
+	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp user-bin/init.sh $(ISO_ROOT)/etc/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

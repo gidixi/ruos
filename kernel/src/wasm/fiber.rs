@@ -23,6 +23,10 @@ use crate::wasm::suspend::SuspendReason;
 pub struct Fiber {
     pub store: Store<RuntimeState>,
     instance: Instance,
+    /// Registered pid from `crate::proc` — None for the boot shell fiber
+    /// when the registry hasn't been wired yet. When Some, the run loop
+    /// honors cooperative kill requests via `proc::is_kill_pending`.
+    pid: Option<u32>,
 }
 
 impl Fiber {
@@ -37,7 +41,7 @@ impl Fiber {
         let mut linker: Linker<RuntimeState> = Linker::new(&engine);
         host::install(&mut linker)?;
         let instance = linker.instantiate_and_start(&mut store, &module)?;
-        Ok(Self { store, instance })
+        Ok(Self { store, instance, pid: None })
     }
 
     pub fn set_args(&mut self, args: alloc::vec::Vec<alloc::vec::Vec<u8>>) {
@@ -46,6 +50,10 @@ impl Fiber {
 
     pub fn set_cwd(&mut self, cwd: alloc::string::String) {
         self.store.data_mut().cwd = cwd;
+    }
+
+    pub fn set_pid(&mut self, pid: u32) {
+        self.pid = Some(pid);
     }
 
     pub async fn run(&mut self) -> i32 {
@@ -83,6 +91,13 @@ impl Fiber {
                         Some(reason) => {
                             crate::wtrace!("ruos: wasm fiber: suspend {:?}", reason);
                             let errno = self.dispatch(reason).await;
+                            // Cooperative kill: if userspace flipped our
+                            // kill flag while we were suspended, exit now
+                            // with the conventional SIGKILL code instead
+                            // of resuming the wasm function.
+                            if let Some(pid) = self.pid {
+                                if crate::proc::is_kill_pending(pid) { return 137; }
+                            }
                             let resume_args = [Val::I32(errno)];
                             let mut next_outputs: [Val; 0] = [];
                             inv = match state.resume(&mut self.store, &resume_args, &mut next_outputs) {
@@ -243,6 +258,58 @@ impl Fiber {
                     .await;
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0
+            }
+            SuspendReason::PathUnlink { path } => {
+                match crate::vfs::unlink(&path).await {
+                    Ok(()) => 0,
+                    Err(crate::vfs::VfsError::NotFound)    => 44, // ENOENT
+                    Err(crate::vfs::VfsError::IsDirectory) => 31, // EISDIR
+                    Err(_) => 8,                                  // EBADF/EIO bucket
+                }
+            }
+            SuspendReason::PathMkdir { path } => {
+                match crate::vfs::mkdir(&path).await {
+                    Ok(()) => 0,
+                    Err(crate::vfs::VfsError::AlreadyExists) => 20, // EEXIST
+                    Err(crate::vfs::VfsError::NotFound)      => 44, // ENOENT
+                    Err(crate::vfs::VfsError::NotDirectory)  => 54, // ENOTDIR
+                    Err(_) => 8,
+                }
+            }
+            SuspendReason::PathRmdir { path } => {
+                match crate::vfs::rmdir(&path).await {
+                    Ok(()) => 0,
+                    Err(crate::vfs::VfsError::NotFound)     => 44, // ENOENT
+                    Err(crate::vfs::VfsError::NotDirectory) => 54, // ENOTDIR
+                    Err(crate::vfs::VfsError::NotPermitted) => 55, // ENOTEMPTY
+                    Err(_) => 8,
+                }
+            }
+            SuspendReason::PathFilestat { path, buf_ptr } => {
+                match crate::vfs::stat(&path).await {
+                    Ok(st) => {
+                        let mut stat = [0u8; 64];
+                        stat[16] = match st.kind {
+                            crate::vfs::VfsKind::Reg    => 4,
+                            crate::vfs::VfsKind::Dir    => 3,
+                            crate::vfs::VfsKind::Device => 2,
+                        };
+                        stat[32..40].copy_from_slice(&st.size.to_le_bytes());
+                        let _ = self.write_to_memory(buf_ptr, &stat);
+                        0
+                    }
+                    Err(_) => 44, // ENOENT
+                }
+            }
+            SuspendReason::PathRename { src, dst } => {
+                match crate::vfs::rename(&src, &dst).await {
+                    Ok(()) => 0,
+                    Err(crate::vfs::VfsError::NotFound)      => 44,
+                    Err(crate::vfs::VfsError::AlreadyExists) => 20,
+                    Err(crate::vfs::VfsError::NotDirectory)  => 54,
+                    Err(crate::vfs::VfsError::Invalid)       => 28, // EINVAL
+                    Err(_) => 8,
+                }
             }
             SuspendReason::ReadDir { path, buf_ptr, buf_len, nread_ptr } => {
                 let entries = match crate::vfs::readdir(&path).await {

@@ -36,10 +36,10 @@ pub fn mount(prefix: &str, fs: FsImpl) -> Result<(), VfsError> {
 pub fn init() -> Result<usize, VfsError> {
     if !MOUNTS.lock().is_empty() { return Err(VfsError::AlreadyExists); }
     let fs = Tmpfs::new();
-    fs.mkdir(&["dev"])?;
-    fs.mkdir(&["tmp"])?;
-    fs.mkdir(&["bin"])?;
-    fs.mkdir(&["etc"])?;
+    fs.mkdir_sync(&["dev"])?;
+    fs.mkdir_sync(&["tmp"])?;
+    fs.mkdir_sync(&["bin"])?;
+    fs.mkdir_sync(&["etc"])?;
     fs.insert_inode(&["dev", "console"], TmpInode {
         kind: TmpKind::DevConsole,
         children: alloc::collections::BTreeMap::new(),
@@ -55,7 +55,7 @@ pub fn init() -> Result<usize, VfsError> {
         children: alloc::collections::BTreeMap::new(),
         content: alloc::vec::Vec::new(),
     })?;
-    fs.mkdir(&["dev", "pts"])?;
+    fs.mkdir_sync(&["dev", "pts"])?;
     const PTY_NAMES: [&str; crate::pty::NUM_PAIRS] = ["0", "1", "2", "3"];
     for (i, name) in PTY_NAMES.iter().enumerate() {
         fs.insert_inode(&["dev", "pts", name], TmpInode {
@@ -184,6 +184,48 @@ pub async fn stat(path: &str) -> Result<VfsStat, VfsError> {
     let mounts = MOUNTS.lock();
     let fs = &mounts[idx].1;
     let result = fs.stat(&sub).await;
+    drop(mounts);
+    result
+}
+
+pub async fn unlink(path: &str) -> Result<(), VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.unlink(&sub).await;
+    drop(mounts);
+    result
+}
+
+pub async fn mkdir(path: &str) -> Result<(), VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.mkdir(&sub).await;
+    drop(mounts);
+    result
+}
+
+pub async fn rmdir(path: &str) -> Result<(), VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.rmdir(&sub).await;
+    drop(mounts);
+    result
+}
+
+pub async fn rename(src: &str, dst: &str) -> Result<(), VfsError> {
+    let sp = path::split(src)?;
+    let dp = path::split(dst)?;
+    let (idx, src_sub) = resolve(&sp)?;
+    let (_, dst_sub) = resolve(&dp)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.rename(&src_sub, &dst_sub).await;
     drop(mounts);
     result
 }

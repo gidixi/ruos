@@ -1,0 +1,8 @@
+[package]
+name = "tail"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tail"
+path = "src/main.rs"

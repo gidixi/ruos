@@ -30,6 +30,8 @@ pub async fn run_at(path: &str) {
     };
     crate::wtrace!("ruos: wasm: instantiated {}", path);
     fb.set_args(alloc::vec![path.as_bytes().to_vec()]);
+    let pid = crate::proc::register(alloc::string::String::from(path.trim_start_matches('/')));
+    fb.set_pid(pid);
 
     // Pre-open socket FD 4 for server and client.
     // Server: allocate + listen (sync instant); cooperative accept happens in fiber dispatch.
@@ -69,6 +71,7 @@ pub async fn run_at(path: &str) {
     }
 
     let code = fb.run().await;
+    crate::proc::unregister(pid);
     let short = path.trim_start_matches('/');
     if code == 0 {
         kprintln!("ruos: {} exited cleanly", short);

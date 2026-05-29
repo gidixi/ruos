@@ -6,6 +6,7 @@ pub mod random;
 pub mod sock;
 pub mod proc;
 pub mod term;
+pub mod sysinfo;
 
 use wasmi::{Linker, Error};
 use crate::wasm::state::RuntimeState;
@@ -19,5 +20,6 @@ pub fn install(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     sock::link(linker)?;
     proc::link(linker)?;
     term::link(linker)?;
+    sysinfo::link(linker)?;
     Ok(())
 }

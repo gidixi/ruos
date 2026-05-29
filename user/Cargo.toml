@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["init", "server", "client", "shell", "ls", "cat", "echo"]
+members = [
+    "init", "server", "client",
+    "shell",
+    "ls", "cat", "echo",
+    "mkdir", "rmdir", "rm", "cp", "mv",
+    "head", "tail", "grep", "find", "diff", "du",
+    "whoami", "id", "uname", "uptime", "free", "df", "lscpu", "dmesg",
+    "ps", "kill", "pkill",
+]
 
 [profile.release]
 opt-level = "s"

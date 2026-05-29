@@ -25,6 +25,9 @@ pub trait FileSystem {
     async fn unlink(&self, path: &[&str]) -> Result<(), VfsError>;
     async fn readdir(&self, path: &[&str]) -> Result<Vec<VfsDirent>, VfsError>;
     async fn stat(&self, path: &[&str]) -> Result<VfsStat, VfsError>;
+    async fn mkdir(&self, path: &[&str]) -> Result<(), VfsError>;
+    async fn rmdir(&self, path: &[&str]) -> Result<(), VfsError>;
+    async fn rename(&self, src: &[&str], dst: &[&str]) -> Result<(), VfsError>;
 }
 
 use crate::vfs::tmpfs::Tmpfs;
@@ -48,5 +51,20 @@ impl FsImpl {
     }
     pub async fn stat(&self, path: &[&str]) -> Result<VfsStat, VfsError> {
         match self { FsImpl::Tmpfs(t) => t.stat(path).await }
+    }
+    pub async fn mkdir(&self, path: &[&str]) -> Result<(), VfsError> {
+        match self {
+            FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::mkdir(t, path).await,
+        }
+    }
+    pub async fn rmdir(&self, path: &[&str]) -> Result<(), VfsError> {
+        match self {
+            FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::rmdir(t, path).await,
+        }
+    }
+    pub async fn rename(&self, src: &[&str], dst: &[&str]) -> Result<(), VfsError> {
+        match self {
+            FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::rename(t, src, dst).await,
+        }
     }
 }

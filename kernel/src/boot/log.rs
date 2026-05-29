@@ -22,6 +22,10 @@ fn emit(level: &str, module: &str, args: core::fmt::Arguments) {
         let ms = ms_total % 1000;
         let mut c = crate::console::CONSOLE.lock();
         let _ = writeln!(c, "[T+{}.{:03}s] {} {:4} {}", s, ms, level, module, args);
+        drop(c);
+        let mut scratch = crate::klog::Scratch::new();
+        let _ = writeln!(scratch, "[T+{}.{:03}s] {} {:4} {}", s, ms, level, module, args);
+        crate::klog::push(scratch.as_bytes());
     });
 }
 

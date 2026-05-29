@@ -27,3 +27,4 @@ lscpu
 ps
 lspci
 ip
+cat /mnt/hello.txt

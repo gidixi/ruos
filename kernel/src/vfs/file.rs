@@ -32,6 +32,7 @@ pub trait File {
 
 use crate::vfs::tmpfs::TmpfsFile;
 use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile, PtySlaveFile};
+use crate::vfs::fat32::Fat32File;
 
 pub enum FileImpl {
     Tmp(TmpfsFile),
@@ -39,6 +40,7 @@ pub enum FileImpl {
     Null(NullFile),
     Zero(ZeroFile),
     PtySlave(PtySlaveFile),
+    Fat32(Fat32File),
 }
 
 impl FileImpl {
@@ -49,6 +51,7 @@ impl FileImpl {
             FileImpl::Null(f)     => f.read(buf).await,
             FileImpl::Zero(f)     => f.read(buf).await,
             FileImpl::PtySlave(f) => f.read(buf).await,
+            FileImpl::Fat32(f)    => f.read(buf).await,
         }
     }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
@@ -58,6 +61,7 @@ impl FileImpl {
             FileImpl::Null(f)     => f.write(buf).await,
             FileImpl::Zero(f)     => f.write(buf).await,
             FileImpl::PtySlave(f) => f.write(buf).await,
+            FileImpl::Fat32(f)    => f.write(buf).await,
         }
     }
     pub async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
@@ -67,6 +71,7 @@ impl FileImpl {
             FileImpl::Null(f)     => f.stat().await,
             FileImpl::Zero(f)     => f.stat().await,
             FileImpl::PtySlave(f) => f.stat().await,
+            FileImpl::Fat32(f)    => f.stat().await,
         }
     }
     pub async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError> {
@@ -76,6 +81,7 @@ impl FileImpl {
             FileImpl::Null(f)     => f.seek(off, whence).await,
             FileImpl::Zero(f)     => f.seek(off, whence).await,
             FileImpl::PtySlave(f) => f.seek(off, whence).await,
+            FileImpl::Fat32(f)    => f.seek(off, whence).await,
         }
     }
 }

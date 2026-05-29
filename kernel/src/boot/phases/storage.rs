@@ -35,8 +35,12 @@ pub fn init() -> Result<(), BootError> {
                 }
                 Err(e) => crate::bwarn!("ahci", "sector 0 read failed: {}", e),
             }
-            // Stash the port for the FAT mount step (Task 6 follow-up).
-            crate::ahci::set_port0(port);
+            // Mount the FAT32 volume at /mnt. Failures log and continue —
+            // boot still completes with tmpfs at /.
+            match crate::vfs::fat32::mount_from_ahci_port(port) {
+                Ok(()) => crate::binfo!("fat32", "mnt mounted FAT"),
+                Err(e) => crate::bwarn!("fat32", "mount /mnt failed: {}", e),
+            }
             break;
         }
     }

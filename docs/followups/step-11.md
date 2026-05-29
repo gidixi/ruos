@@ -163,3 +163,15 @@ possibile.
 
 **Fix:** crate condiviso `user/ruos-abi` con const layouts. Da
 riconsiderare quando arriveranno più tool che usano dirent.
+
+---
+
+## ✅ CLOSED (2026-05-29)
+
+- **F3** (embassy-futures unused) — chiuso da CHANGELOG/100.
+- **F4** (keyboard queue single-Waker race) — chiuso da Step 12 T3.
+- **F5** (path_open ignora oflags) — chiuso da CHANGELOG/100.
+- **F7** (fd_filestat_get size=0) — chiuso da CHANGELOG/100 (new
+  File::stat trait + vfs::stat_fd).
+- **F8** (verbose suspend kprintln) — chiuso da boot polish
+  (wasm-trace feature gate).

@@ -161,3 +161,13 @@ WASI `__wasi_event_t.userdata` (offset 0..8) deve essere copiato da
 (`thread::sleep`) il consumer non lo controlla. Per multi-sub
 (quando arriverà) userdata serve per identificare quale sub ha
 fired. Da estendere quando `poll_oneoff` riceverà più di una sub.
+
+---
+
+## ✅ CLOSED
+
+- **F4** (keyboard queue single-Waker race) — chiuso da Step 12 T3
+  (queue retired entirely). Vedi CHANGELOG/96.
+- **F5** (path_open ignora oflags) — chiuso da CHANGELOG/100 batch.
+- **F8** (verbose suspend kprintln) — chiuso da boot polish
+  (gated dietro `wasm-trace` feature). Vedi CHANGELOG/91.

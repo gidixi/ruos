@@ -202,3 +202,11 @@ import module. Dovremo registrare le stesse host fns anche su
 `init.wasm` ora è ~150 KB (banner + getrandom + std::fs). Wasmi
 interpreter parsa il modulo ad ogni boot. Per Step 11 valutare se
 val la pena pre-compilare AOT.
+
+---
+
+## ✅ CLOSED
+
+- **F-MAJOR** (fiber pattern) — chiuso da Step 10.5 (intero step).
+- **F1** (setup_demo_sockets) — chiuso da Step 10.5 T2.
+- **F2** (recv_sync/send_sync) — chiuso da Step 10.5 T2.

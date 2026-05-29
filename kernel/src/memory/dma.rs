@@ -52,6 +52,10 @@ unsafe impl Hal for KernelHal {
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _dir: BufferDirection) -> VPhysAddr {
+        // SAFETY: all kernel RAM (DMA frames, heap, stack) is HHDM-mapped at
+        // virt = phys + HHDM_OFFSET, so phys = virt - hhdm_offset(). virtio
+        // only passes buffers it allocated via dma_alloc or kernel-owned
+        // slices, all HHDM-resident, so the subtraction recovers a valid phys.
         let v = buffer.as_ptr() as *mut u8 as u64;
         v - crate::memory::mapper::hhdm_offset()
     }

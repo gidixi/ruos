@@ -218,9 +218,19 @@ pub fn ruos_net_iface(
                 let _ = writeln!(text, "lo    {}/{}", a, cidr.prefix_len());
             }
         }
-        // Ethernet (if present)
-        if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_ref()) {
-            let mac = dev.mac();
+        // Ethernet (at most one of virtio xor hardware nic active).
+        let (iface_opt, mac_opt) = if let (Some(iface), Some(dev)) =
+            (net.iface_net.as_mut(), net.dev_net.as_ref())
+        {
+            (Some(iface), Some(dev.mac()))
+        } else if let (Some(iface), Some(dev)) =
+            (net.iface_nic.as_mut(), net.dev_nic.as_ref())
+        {
+            (Some(iface), Some(dev.mac()))
+        } else {
+            (None, None)
+        };
+        if let (Some(iface), Some(mac)) = (iface_opt, mac_opt) {
             let mac_str = alloc::format!(
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]

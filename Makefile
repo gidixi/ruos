@@ -64,20 +64,34 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 		$(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
+# NIC = QEMU `-device` model for the Ethernet adapter. Override per invocation:
+#   make run NIC=e1000     # Intel e1000 path (covered in net/nic/e1000.rs)
+#   make run-test NIC=e1000
+# Default keeps virtio-net (Step 14 paravirtual fast path).
+NIC ?= virtio-net-pci
+
 run: iso
 	qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -m 512 \
-		-device qemu-xhci -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0
 
 run-test: iso
-	@echo "--- serial (timeout 120s) ---"
+	@echo "--- serial (timeout 120s, NIC=$(NIC)) ---"
 	@timeout 120 qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
-		-device qemu-xhci -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		| tee build/serial.log; \
 	grep -qF "$(HELLO)" build/serial.log || { echo TEST_FAIL_SHELL; exit 1; }; \
 	grep -qE "pci .* init ok devices=[1-9]" build/serial.log || { echo TEST_FAIL_PCI; exit 1; }; \
 	grep -qE "pci .* xhci @" build/serial.log || { echo TEST_FAIL_XHCI; exit 1; }; \
 	grep -qE "net .* dhcp bound ip=10\.0\.2\.15" build/serial.log || { echo TEST_FAIL_DHCP; exit 1; }; \
 	echo TEST_PASS
+
+# Per-NIC gates: each runs run-test with a specific QEMU adapter model and
+# asserts that adapter's family-specific 'net: <chip> mac=..' boot line.
+.PHONY: run-test-e1000
+run-test-e1000: iso
+	@$(MAKE) run-test NIC=e1000
+	@grep -qE "net .* e1000 mac=" build/serial.log || { echo TEST_FAIL_E1000_MAC; exit 1; }
+	@echo TEST_PASS_E1000
 
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"

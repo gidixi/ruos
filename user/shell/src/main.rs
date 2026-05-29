@@ -85,44 +85,91 @@ fn redraw_line(prompt: &str, buf: &[u8], cursor: usize) {
     std::io::stdout().flush().ok();
 }
 
-fn tab_complete(prefix: &[u8]) -> Vec<String> {
+/// Read a directory and return (name, is_dir) entries.
+fn readdir_entries(path: &str) -> Vec<(String, bool)> {
+    let mut buf = vec![0u8; 8192];
+    let mut n: u32 = 0;
+    let errno = unsafe {
+        readdir(
+            path.as_ptr() as u32,
+            path.len() as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+            &mut n as *mut u32 as u32,
+        )
+    };
+    let mut out = Vec::new();
+    if errno != 0 { return out; }
+    let mut o = 0usize;
+    while o + 12 <= n as usize {
+        let kind = buf[o];
+        let nlen = u16::from_le_bytes([buf[o + 2], buf[o + 3]]) as usize;
+        o += 12;
+        if o + nlen > n as usize { break; }
+        if let Ok(name) = std::str::from_utf8(&buf[o..o + nlen]) {
+            out.push((name.to_string(), kind == 1)); // kind 1 = Dir
+        }
+        o += nlen;
+    }
+    out
+}
+
+/// Command completion: builtins + /bin/*.wasm (stripped suffix).
+fn complete_command(prefix: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = vec![
         "cd".into(),
         "pwd".into(),
         "exit".into(),
         "help".into(),
     ];
-    let mut buf = vec![0u8; 4096];
-    let mut n: u32 = 0;
-    let p = "/bin";
-    let errno = unsafe {
-        readdir(
-            p.as_ptr() as u32,
-            p.len() as u32,
-            buf.as_mut_ptr() as u32,
-            buf.len() as u32,
-            &mut n as *mut u32 as u32,
-        )
-    };
-    if errno == 0 {
-        let mut o = 0usize;
-        while o + 12 <= n as usize {
-            let nlen = u16::from_le_bytes([buf[o + 2], buf[o + 3]]) as usize;
-            o += 12;
-            if o + nlen > n as usize {
-                break;
-            }
-            if let Ok(name) = std::str::from_utf8(&buf[o..o + nlen]) {
-                if name.ends_with(".wasm") {
-                    out.push(name.trim_end_matches(".wasm").to_string());
-                }
-            }
-            o += nlen;
+    for (name, _) in readdir_entries("/bin") {
+        if name.ends_with(".wasm") {
+            out.push(name.trim_end_matches(".wasm").to_string());
         }
     }
     let pref = std::str::from_utf8(prefix).unwrap_or("");
     out.retain(|c| c.starts_with(pref));
     out
+}
+
+/// Path completion: split token at last `/` → (dir, name_prefix).
+/// Readdir dir (or "." if no slash), filter entries by name_prefix,
+/// return candidates with directory prefix preserved + trailing "/" on
+/// dirs. Each candidate starts with the original prefix bytes so the
+/// suffix-insert logic in `read_line_raw` works correctly.
+fn complete_path(prefix: &[u8]) -> Vec<String> {
+    let s = std::str::from_utf8(prefix).unwrap_or("");
+    let (dir, name_prefix) = match s.rfind('/') {
+        Some(idx) => (&s[..idx + 1], &s[idx + 1..]),
+        None => ("", s),
+    };
+    let listing = if dir.is_empty() { "." } else {
+        // strip trailing / for readdir (it tolerates both, but be tidy)
+        dir.trim_end_matches('/')
+    };
+    let listing = if listing.is_empty() { "/" } else { listing };
+    let mut out = Vec::new();
+    for (name, is_dir) in readdir_entries(listing) {
+        if name.starts_with(name_prefix) {
+            let mut c = String::from(dir);
+            c.push_str(&name);
+            if is_dir { c.push('/'); }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Top-level completion dispatcher.
+/// `first_token` = true when completing the command name (no whitespace
+/// before the cursor in the current logical line). Otherwise the prefix
+/// is treated as a filesystem path.
+fn tab_complete(first_token: bool, prefix: &[u8]) -> Vec<String> {
+    if first_token {
+        complete_command(prefix)
+    } else {
+        complete_path(prefix)
+    }
 }
 
 fn read_line_raw(prompt: &str) -> Option<String> {
@@ -172,7 +219,11 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                     .take_while(|&i| !buf[i].is_ascii_whitespace())
                     .count();
                 let token_start = cursor - start_rev;
-                let candidates = tab_complete(&buf[token_start..cursor]);
+                // First token if nothing but whitespace precedes the
+                // current token. Subsequent tokens get path completion.
+                let first_token = (0..token_start)
+                    .all(|i| buf[i].is_ascii_whitespace());
+                let candidates = tab_complete(first_token, &buf[token_start..cursor]);
                 if candidates.len() == 1 {
                     let comp = candidates[0].as_bytes();
                     let prefix_len = cursor - token_start;

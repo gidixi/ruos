@@ -12,6 +12,7 @@ pub mod devices;
 pub use block_on::block_on;
 pub use error::VfsError;
 pub use file::{Fd, OpenFlags, Whence};
+pub use fs::{VfsDirent, VfsKind};
 
 // Real API (open/close/read/write/seek/init/mount) lands in Task 3.
 
@@ -137,4 +138,18 @@ pub async fn seek(fd: Fd, off: i64, whence: Whence) -> Result<u64, VfsError> {
         let r = entry.file.seek(off, whence).await;
         (entry, r)
     }).await
+}
+
+/// List directory entries at `path`. Single-shot — no streaming cookie.
+/// Holds the MOUNTS lock only for the brief lookup; the readdir future
+/// runs without it. tmpfs readdir locks the directory inode and clones
+/// names + kinds — independent of the FDS path.
+pub async fn readdir(path: &str) -> Result<Vec<VfsDirent>, VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.readdir(&sub).await;
+    drop(mounts);
+    result
 }

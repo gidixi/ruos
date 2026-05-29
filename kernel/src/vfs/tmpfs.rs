@@ -145,6 +145,25 @@ impl FileSystem for Tmpfs {
         p.children.remove(name);
         Ok(())
     }
+
+    async fn readdir(&self, path: &[&str]) -> Result<Vec<crate::vfs::fs::VfsDirent>, VfsError> {
+        use crate::vfs::fs::{VfsDirent, VfsKind};
+        let node = self.walk(path)?;
+        let g = node.lock();
+        if !matches!(g.kind, TmpKind::Dir) {
+            return Err(VfsError::NotDirectory);
+        }
+        let mut out: Vec<VfsDirent> = Vec::with_capacity(g.children.len());
+        for (name, inode) in g.children.iter() {
+            let kind = match inode.lock().kind {
+                TmpKind::Dir => VfsKind::Dir,
+                TmpKind::Reg => VfsKind::Reg,
+                TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero => VfsKind::Device,
+            };
+            out.push(VfsDirent { name: name.clone(), kind });
+        }
+        Ok(out)
+    }
 }
 
 pub struct TmpfsFile {

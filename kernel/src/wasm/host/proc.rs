@@ -284,6 +284,60 @@ pub fn ruos_reboot(_caller: Caller<'_, RuntimeState>) -> Result<(), Error> {
     crate::power::reboot();
 }
 
+/// ruos_net_set_static(ip0..3: i32, prefix: i32, gw0..3: i32, gw_present: i32)
+///   → errno. Sets the active Ethernet interface to a static address +
+///   default route. `gw_present=0` skips the gateway. Replaces any DHCP-bound
+///   address. Returns 0 on success, errno otherwise (8 = no iface, 22 invalid).
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_net_set_static(
+    _caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    prefix: i32,
+    gw0: i32, gw1: i32, gw2: i32, gw3: i32,
+    gw_present: i32,
+) -> Result<i32, Error> {
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+    if prefix < 0 || prefix > 32 { return Ok(22); } // EINVAL
+    let addr = Ipv4Address::new(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8);
+    let cidr = Ipv4Cidr::new(addr, prefix as u8);
+    let gw = if gw_present != 0 {
+        Some(Ipv4Address::new(gw0 as u8, gw1 as u8, gw2 as u8, gw3 as u8))
+    } else { None };
+
+    let mut g = crate::net::NET.lock();
+    let net = match g.as_mut() { Some(n) => n, None => return Ok(8) };
+    // Apply to whichever Ethernet iface exists.
+    let iface_opt = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
+    let iface = match iface_opt { Some(i) => i, None => return Ok(8) };
+    iface.update_ip_addrs(|a| {
+        a.clear();
+        a.push(IpCidr::Ipv4(cidr)).unwrap();
+    });
+    let _ = iface.routes_mut().remove_default_ipv4_route();
+    if let Some(g) = gw {
+        let _ = iface.routes_mut().add_default_ipv4_route(g);
+    }
+    // Cancel DHCP renew loop — operator override wins.
+    if let Some(h) = net.dhcp.take() {
+        net.net_sockets.remove(h);
+    }
+    crate::binfo!("net", "static ip={} gw={:?}", cidr, gw);
+    Ok(0)
+}
+
+/// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
+pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
+    use smoltcp::socket::dhcpv4;
+    let mut g = crate::net::NET.lock();
+    let net = match g.as_mut() { Some(n) => n, None => return Ok(8) };
+    if net.iface_net.is_none() && net.iface_nic.is_none() { return Ok(8); }
+    if net.dhcp.is_none() {
+        net.dhcp = Some(net.net_sockets.add(dhcpv4::Socket::new()));
+        crate::binfo!("net", "dhcp renew requested");
+    }
+    Ok(0)
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "exec", ruos_exec)?
@@ -292,6 +346,8 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
-        .func_wrap("ruos", "net_iface", ruos_net_iface)?;
+        .func_wrap("ruos", "net_iface", ruos_net_iface)?
+        .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
+        .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?;
     Ok(())
 }

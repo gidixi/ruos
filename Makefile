@@ -20,7 +20,8 @@ BIN_TOOLS  := shell ls cat echo \
               lspci ip \
               nano \
               touch wc clear which \
-              sort uniq cut tr tee
+              sort uniq cut tr tee \
+              ifconfig
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

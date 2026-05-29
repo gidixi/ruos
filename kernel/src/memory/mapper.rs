@@ -132,3 +132,17 @@ pub fn map_io_page(phys: PhysAddr) -> Result<VirtAddr, MapError> {
         Err(e) => Err(e),
     }
 }
+
+/// Map a multi-page MMIO window: every 4 KiB page covering `[phys, phys+bytes)`
+/// is mapped (uncached) via `map_io_page`. Returns the virt of `phys` itself.
+/// Idempotent per page.
+pub fn map_io_range(phys: PhysAddr, bytes: usize) -> Result<VirtAddr, MapError> {
+    let start = phys.as_u64() & !0xFFF;
+    let end = (phys.as_u64() + bytes as u64 + 0xFFF) & !0xFFF;
+    let mut p = start;
+    while p < end {
+        map_io_page(PhysAddr::new(p))?;
+        p += 0x1000;
+    }
+    Ok(hhdm_virt(phys))
+}

@@ -67,8 +67,42 @@ static SCANCODE_MAP: [u8; 89] = [
     0, 0, 0, 0, 0,
 ];
 
+/// Shifted variant for each base scancode (US QWERTY). 0 = no shifted form.
+static SCANCODE_MAP_SHIFTED: [u8; 89] = [
+    0,
+    0x1B,                                              // Esc
+    b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')',  // 1..0
+    b'_', b'+',                                        // - =
+    0x08,                                              // Backspace
+    b'\t',                                             // Tab
+    b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P',
+    b'{', b'}',                                        // [ ]
+    b'\n',                                             // Enter
+    0,                                                 // LCtrl
+    b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L',
+    b':', b'"',                                        // ; '
+    b'~',                                              // `
+    0,                                                 // LShift
+    b'|',                                              // \
+    b'Z', b'X', b'C', b'V', b'B', b'N', b'M',
+    b'<', b'>', b'?',                                  // , . /
+    0,                                                 // RShift
+    b'*',                                              // keypad *
+    0,                                                 // LAlt
+    b' ',                                              // Space
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                   // Caps + F1..F10
+    0, 0,                                              // NumLk ScrLk
+    b'7', b'8', b'9', b'-', b'4', b'5', b'6', b'+', b'1', b'2', b'3', b'0', b'.',
+    0, 0, 0, 0, 0,
+];
+
 /// Latch for the 0xE0 extended scancode prefix.
 static EXTENDED: AtomicBool = AtomicBool::new(false);
+
+/// Modifier state — sticky bits, updated on make/break codes.
+static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN:  AtomicBool = AtomicBool::new(false);
+static CAPS_LOCK:  AtomicBool = AtomicBool::new(false);
 
 /// Map an extended (post-0xE0) scancode to its ANSI escape sequence.
 /// Returns None for scancodes without a defined mapping.
@@ -99,7 +133,6 @@ pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
 
     // If the previous byte was 0xE0, decode as extended scancode.
     if EXTENDED.swap(false, Ordering::SeqCst) {
-        // Only process make-codes (bit 7 clear = press, not release).
         if scancode < 0x80 {
             if let Some(seq) = extended_to_ansi(scancode) {
                 for &b in seq {
@@ -111,15 +144,50 @@ pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
         return;
     }
 
-    // Regular scancode: ignore key-release events (bit 7 set).
-    if scancode < 0x80 {
-        let idx = scancode as usize;
-        if idx < SCANCODE_MAP.len() {
-            let ch = SCANCODE_MAP[idx];
-            if ch != 0 {
-                crate::pty::master_input_push(0, ch);
+    // Modifier make/break tracking (regular set 1).
+    // Make codes: 0x2A LShift, 0x36 RShift, 0x1D LCtrl, 0x3A CapsLock
+    // Break codes = make + 0x80.
+    let is_release = scancode & 0x80 != 0;
+    let base = scancode & 0x7F;
+    match base {
+        0x2A | 0x36 => { SHIFT_DOWN.store(!is_release, Ordering::SeqCst); apic::lapic::eoi(); return; }
+        0x1D        => { CTRL_DOWN.store(!is_release, Ordering::SeqCst);  apic::lapic::eoi(); return; }
+        0x3A        => {
+            if !is_release {
+                let prev = CAPS_LOCK.load(Ordering::SeqCst);
+                CAPS_LOCK.store(!prev, Ordering::SeqCst);
             }
+            apic::lapic::eoi();
+            return;
         }
+        _ => {}
+    }
+
+    // Skip key-release events for normal keys.
+    if is_release { apic::lapic::eoi(); return; }
+
+    let idx = base as usize;
+    if idx >= SCANCODE_MAP.len() { apic::lapic::eoi(); return; }
+
+    let shift = SHIFT_DOWN.load(Ordering::SeqCst);
+    let caps  = CAPS_LOCK.load(Ordering::SeqCst);
+    let ctrl  = CTRL_DOWN.load(Ordering::SeqCst);
+
+    let base_ch = SCANCODE_MAP[idx];
+    if base_ch == 0 { apic::lapic::eoi(); return; }
+
+    // Resolve final char: Shift uses shifted table; CapsLock affects only
+    // letters (toggles the shift effect); Ctrl+letter = byte (letter & 0x1F).
+    let mut ch = if shift { SCANCODE_MAP_SHIFTED[idx] } else { base_ch };
+    if caps && base_ch.is_ascii_alphabetic() {
+        // Toggle case relative to current.
+        ch = if (b'a'..=b'z').contains(&ch) { ch - 32 } else if (b'A'..=b'Z').contains(&ch) { ch + 32 } else { ch };
+    }
+    if ctrl && ch.is_ascii_alphabetic() {
+        ch &= 0x1F; // Ctrl-A=0x01 … Ctrl-Z=0x1A
+    }
+    if ch != 0 {
+        crate::pty::master_input_push(0, ch);
     }
 
     apic::lapic::eoi();

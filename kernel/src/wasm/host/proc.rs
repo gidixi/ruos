@@ -39,7 +39,9 @@ pub fn ruos_exec(
 /// ruos_chdir(path_ptr, path_len) -> errno
 ///
 /// Updates the caller's CWD. Path may be relative — resolved against
-/// the current CWD. No filesystem validation today (any path accepted).
+/// the current CWD. Validates that the target exists and is a
+/// directory before updating; returns ENOENT (44) if missing,
+/// ENOTDIR (54) if it's a regular/device file.
 pub fn ruos_chdir(
     mut caller: Caller<'_, RuntimeState>,
     path_ptr: i32,
@@ -52,6 +54,14 @@ pub fn ruos_chdir(
     let path = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let new_cwd = resolve_cwd(&caller.data().cwd, path);
+    // Root always exists; skip stat to avoid a corner case.
+    if new_cwd != "/" {
+        match crate::vfs::block_on(crate::vfs::stat(&new_cwd)) {
+            Ok(s) if matches!(s.kind, crate::vfs::VfsKind::Dir) => {}
+            Ok(_) => return Ok(54),  // ENOTDIR
+            Err(_) => return Ok(44), // ENOENT
+        }
+    }
     caller.data_mut().cwd = new_cwd;
     Ok(0)
 }

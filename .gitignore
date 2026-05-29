@@ -5,6 +5,7 @@
 
 # Editor / IDE
 .vscode/
+.claude/
 
 # OS / misc
 .DS_Store

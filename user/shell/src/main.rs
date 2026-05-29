@@ -125,6 +125,7 @@ fn complete_command(prefix: &[u8]) -> Vec<String> {
         "help".into(),
         "poweroff".into(),
         "reboot".into(),
+        "source".into(),
     ];
     for (name, _) in readdir_entries("/bin") {
         if name.ends_with(".wasm") {
@@ -367,7 +368,33 @@ fn run_command(line: &str) {
         "help"     => builtin_help(),
         "poweroff" => unsafe { poweroff() },
         "reboot"   => unsafe { reboot() },
+        "source" | "." => builtin_source(&argv),
         cmd        => { let _ = exec_external(cmd, &argv); }
+    }
+}
+
+/// Read a shell script from path and run each non-empty, non-comment
+/// line through `run_command`. Same semantics as the boot loop on
+/// `/etc/init.sh`. Recursive (a sourced script can `source` another).
+fn builtin_source(argv: &[&str]) {
+    let path = match argv.get(1) {
+        Some(p) => *p,
+        None => {
+            eprintln!("source: missing path");
+            return;
+        }
+    };
+    match fs::read_to_string(path) {
+        Ok(script) => {
+            for line in script.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                run_command(line);
+            }
+        }
+        Err(e) => eprintln!("source: {}: {}", path, e),
     }
 }
 
@@ -419,6 +446,7 @@ fn builtin_help() {
     println!("  help        this list");
     println!("  poweroff    halt the system");
     println!("  reboot      restart the system");
+    println!("  source <p>  run script (alias: . <p>)");
     println!("external: try 'ls /bin' to list available .wasm");
 }
 

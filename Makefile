@@ -6,15 +6,17 @@ ISO       := build/os.iso
 HELLO     := shell: init.sh complete
 
 # Userspace .wasm tools shipped on the ISO. Root-level tools go to ISO_ROOT/,
-# /bin tools go to ISO_ROOT/bin/. New tools: just append to BIN_TOOLS.
-ROOT_WASMS := user-bin/init.wasm user-bin/server.wasm user-bin/client.wasm
+# /bin tools go to ISO_ROOT/bin/, /root/ demo blobs go to ISO_ROOT/root/.
+# New tools: just append to BIN_TOOLS.
+ROOT_WASMS := user-bin/init.wasm
+ROOT_DEMOS := user-bin/server.wasm user-bin/client.wasm
 BIN_TOOLS  := shell ls cat echo \
               mkdir rmdir rm cp mv \
               head tail grep find diff du \
               whoami id uname uptime free df lscpu dmesg \
               ps kill pkill
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
-USER_WASMS := $(ROOT_WASMS) $(BIN_WASMS)
+USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
 .PHONY: all build limine iso run run-test test-boot clean user-wasm
 
@@ -44,10 +46,11 @@ user-wasm: $(USER_WASMS)
 iso: build limine $(USER_WASMS) user-bin/init.sh
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
-	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc
+	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
+	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp user-bin/init.sh $(ISO_ROOT)/etc/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
@@ -81,10 +84,11 @@ test-boot: limine $(USER_WASMS) user-bin/init.sh
 		--features boot-checks
 	rm -rf $(ISO_ROOT) $(ISO)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
-	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc
+	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
+	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp user-bin/init.sh $(ISO_ROOT)/etc/
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \

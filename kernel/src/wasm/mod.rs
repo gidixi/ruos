@@ -37,7 +37,7 @@ pub async fn run_at(path: &str) {
     // Server: allocate + listen (sync instant); cooperative accept happens in fiber dispatch.
     // Client: allocate + async connect (yields until Established, then inject FD 4).
     match path {
-        "/server.wasm" => {
+        "/root/server.wasm" => {
             let idx = crate::net::sockets::POOL.alloc_tcp();
             let handle = crate::net::sockets::POOL.handle(idx).expect("server socket");
             crate::net::sockets::listen(handle, 8080).expect("listen");
@@ -48,7 +48,7 @@ pub async fn run_at(path: &str) {
             }
             fds[4] = Some(crate::wasm::state::FdEntry::Socket(idx));
         }
-        "/client.wasm" => {
+        "/root/client.wasm" => {
             use smoltcp::wire::{IpAddress, IpEndpoint};
             let idx = crate::net::sockets::POOL.alloc_tcp();
             let handle = crate::net::sockets::POOL.handle(idx).expect("client socket");

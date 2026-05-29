@@ -52,9 +52,9 @@ pub fn run() -> ! {
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
     spawner.spawn(console_drain_task()).unwrap();
-    // Normal boot: only shell.wasm auto-spawns. init/server/client.wasm
-    // remain on disk and are runnable from the shell (e.g. `/init.wasm`,
-    // `/server.wasm`) for demo/debug purposes.
+    // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
+    // and server/client.wasm live under /root/ as runnable demo blobs
+    // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");

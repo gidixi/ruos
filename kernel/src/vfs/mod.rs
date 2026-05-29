@@ -41,6 +41,7 @@ pub fn init() -> Result<usize, VfsError> {
     fs.mkdir_sync(&["tmp"])?;
     fs.mkdir_sync(&["bin"])?;
     fs.mkdir_sync(&["etc"])?;
+    fs.mkdir_sync(&["mnt"])?; // mount-point placeholder for FAT (Step 15)
     fs.insert_inode(&["dev", "console"], TmpInode {
         kind: TmpKind::DevConsole,
         children: alloc::collections::BTreeMap::new(),

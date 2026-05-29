@@ -1,0 +1,8 @@
+[package]
+name = "tr"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tr"
+path = "src/main.rs"

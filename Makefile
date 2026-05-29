@@ -18,7 +18,9 @@ BIN_TOOLS  := shell ls cat echo \
               whoami id uname uptime free df lscpu dmesg \
               ps kill pkill \
               lspci ip \
-              nano
+              nano \
+              touch wc clear which \
+              sort uniq cut tr tee
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

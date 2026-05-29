@@ -1,7 +1,9 @@
 //! POSIX termios subset for PTY line discipline.
 //!
-//! 60-byte ABI matching wasi-libc's __wasi_termios_t so wasm guests
-//! can read/write the struct directly via tcgetattr/tcsetattr.
+//! 56-byte `#[repr(C)]` ABI. wasi-libc's `__wasi_termios_t` and shell.wasm's
+//! mirror extern "C" struct must agree on this layout exactly, since
+//! tcgetattr/tcsetattr `memcpy` the struct across the wasm-kernel boundary.
+//! Static-assert size below catches accidental field additions.
 
 pub const NCCS: usize = 32;
 
@@ -16,6 +18,11 @@ pub struct Termios {
     pub c_ispeed: u32,
     pub c_ospeed: u32,
 }
+
+// Step 12 F2: ABI lock. 4×u32 + 32×u8 + 2×u32 = 56 bytes (no padding —
+// all field alignments ≤ 4 bytes).
+const _: () = assert!(core::mem::size_of::<Termios>() == 56);
+const _: () = assert!(core::mem::align_of::<Termios>() == 4);
 
 // c_iflag bits
 pub const ICRNL:  u32 = 0o0100;

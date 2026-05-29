@@ -221,4 +221,13 @@ impl File for TmpfsFile {
         self.pos = new as u64;
         Ok(self.pos)
     }
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        let g = self.node.lock();
+        let (kind, size) = match g.kind {
+            TmpKind::Reg => (crate::vfs::fs::VfsKind::Reg, g.content.len() as u64),
+            TmpKind::Dir => (crate::vfs::fs::VfsKind::Dir, 0),
+            _ => (crate::vfs::fs::VfsKind::Device, 0),
+        };
+        Ok(crate::vfs::fs::VfsStat { kind, size })
+    }
 }

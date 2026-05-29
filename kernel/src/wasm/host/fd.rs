@@ -185,23 +185,45 @@ pub fn fd_close(
 }
 
 /// fd_filestat_get: return minimal wasi_filestat_t (64 bytes).
-/// Filetype 4 = REGULAR_FILE, size=0 (read_to_string works without it).
+/// Looks up the VFS Fd's underlying File and queries `stat()` for kind +
+/// size — closes Step 11 F7 (was hardcoded size=0, which forced std::fs
+/// callers like cat.wasm into a slow read-loop fallback).
 pub fn fd_filestat_get(
     mut caller: Caller<'_, RuntimeState>,
     fd: i32,
     buf_ptr: i32,
 ) -> Result<i32, Error> {
     use crate::wasm::state::FdEntry;
-    let filetype: u8 = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-        Some(FdEntry::Vfs(_)) => 4,   // REGULAR_FILE
-        Some(FdEntry::StdoutConsole) => 2, // CHARACTER_DEVICE
+    let vfs_fd = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Vfs(f)) => *f,
+        Some(FdEntry::StdoutConsole) => {
+            // Character device, size 0.
+            let mem = wasm_memory(&caller)?;
+            let mut stat = [0u8; 64];
+            stat[16] = 2; // CHARACTER_DEVICE
+            mem.write(&mut caller, buf_ptr as usize, &stat)
+                .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+            return Ok(0);
+        }
         _ => return Ok(8), // EBADF
+    };
+    // Run stat synchronously: all current File impls' stat futures
+    // complete in a single poll (no real I/O suspends).
+    let st = match crate::vfs::block_on(crate::vfs::stat_fd(vfs_fd)) {
+        Ok(s) => s,
+        Err(_) => return Ok(8),
+    };
+    let filetype: u8 = match st.kind {
+        crate::vfs::VfsKind::Reg    => 4, // REGULAR_FILE
+        crate::vfs::VfsKind::Dir    => 3, // DIRECTORY
+        crate::vfs::VfsKind::Device => 2, // CHARACTER_DEVICE
     };
     let mem = wasm_memory(&caller)?;
     // wasi_filestat_t layout (64 bytes):
     //   dev(8) ino(8) filetype(1)+pad(7) nlink(8) size(8) atim(8) mtim(8) ctim(8)
     let mut stat = [0u8; 64];
-    stat[16] = filetype; // filetype byte
+    stat[16] = filetype;
+    stat[32..40].copy_from_slice(&st.size.to_le_bytes());
     mem.write(&mut caller, buf_ptr as usize, &stat)
         .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
     Ok(0)

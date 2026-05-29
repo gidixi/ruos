@@ -43,11 +43,22 @@ pub struct IrqOverride {
     pub level_triggered: bool,
 }
 
+/// One ECAM window from MCFG: the physical base of a PCI segment's config space
+/// plus its inclusive bus range. Owned copy so `pci` never borrows `acpi` tables.
+#[derive(Debug, Copy, Clone)]
+pub struct EcamRegion {
+    pub segment:   u16,
+    pub base:      u64, // physical base of this segment's ECAM window (bus = bus_start)
+    pub bus_start: u8,
+    pub bus_end:   u8,  // inclusive
+}
+
 #[derive(Clone)]
 pub struct AcpiInfo {
     pub lapic_base:  u64,
     pub ioapic_base: u64,
     pub overrides:   Vec<IrqOverride>,
+    pub ecam:        Vec<EcamRegion>,
     pub hhdm_offset: u64,
 }
 
@@ -59,6 +70,7 @@ pub enum AcpiInitError {
     Parse,
     NoLapic,
     NoIoapic,
+    NoMcfg,
 }
 
 impl core::fmt::Display for AcpiInitError {
@@ -70,6 +82,7 @@ impl core::fmt::Display for AcpiInitError {
             AcpiInitError::Parse         => f.write_str("parse"),
             AcpiInitError::NoLapic       => f.write_str("no lapic"),
             AcpiInitError::NoIoapic      => f.write_str("no ioapic"),
+            AcpiInitError::NoMcfg        => f.write_str("no mcfg"),
         }
     }
 }
@@ -118,5 +131,20 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
         });
     }
 
-    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, hhdm_offset })
+    // ECAM (MCFG). Absence is non-fatal: only `pci::init` cares. PciConfigRegions
+    // copies into the Global allocator, so iterating it here does not borrow
+    // `tables` past this function.
+    let mut ecam: alloc::vec::Vec<EcamRegion> = alloc::vec::Vec::new();
+    if let Ok(regions) = acpi::mcfg::PciConfigRegions::new(&tables) {
+        for entry in regions.iter() {
+            ecam.push(EcamRegion {
+                segment:   entry.segment_group,
+                base:      entry.physical_address as u64,
+                bus_start: *entry.bus_range.start(),
+                bus_end:   *entry.bus_range.end(),
+            });
+        }
+    }
+
+    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, ecam, hhdm_offset })
 }

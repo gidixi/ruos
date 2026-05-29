@@ -31,11 +31,13 @@ pub fn init() -> Result<(), BootError> {
             crate::acpi_init::AcpiInitError::Parse         => "parse",
             crate::acpi_init::AcpiInitError::NoLapic       => "no lapic",
             crate::acpi_init::AcpiInitError::NoIoapic      => "no ioapic",
+            crate::acpi_init::AcpiInitError::NoMcfg        => "no mcfg",
         }))?;
     crate::binfo!(
         "mem",
-        "acpi ok lapic=0x{:X} ioapic=0x{:X} overrides={}",
-        acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len()
+        "acpi ok lapic=0x{:X} ioapic=0x{:X} overrides={} ecam={}",
+        acpi_info.lapic_base, acpi_info.ioapic_base, acpi_info.overrides.len(),
+        acpi_info.ecam.len()
     );
 
     // Frame allocator.

@@ -3,6 +3,7 @@
 //! acquires its address via DHCPv4.
 
 pub mod loopback;
+pub mod nic;
 pub mod sockets;
 pub mod virtio;
 

@@ -231,13 +231,46 @@ pub fn fd_filestat_get(
 
 pub fn fd_fdstat_get(
     mut caller: Caller<'_, RuntimeState>,
-    _fd: i32,
+    fd: i32,
     stat_ptr: i32,
 ) -> Result<i32, Error> {
+    use crate::wasm::state::FdEntry;
+    // Resolve filetype + grant full rights so wasi-libc allows read/write.
+    // wasi_fdstat_t layout (24 bytes):
+    //   fs_filetype: u8 (0)
+    //   pad: u8 (1)
+    //   fs_flags: u16 (2)
+    //   pad: u32 (4..8)
+    //   fs_rights_base: u64 (8..16)
+    //   fs_rights_inheriting: u64 (16..24)
+    // FD 3 is wasi-libc's preopen root "/" — virtual, not in fds Vec.
+    let filetype: u8 = if fd == 3 {
+        3 // DIRECTORY
+    } else {
+        match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+            Some(FdEntry::Vfs(vfs_fd)) => {
+                match crate::vfs::block_on(crate::vfs::stat_fd(*vfs_fd)) {
+                    Ok(s) => match s.kind {
+                        crate::vfs::VfsKind::Reg    => 4, // REGULAR_FILE
+                        crate::vfs::VfsKind::Dir    => 3, // DIRECTORY
+                        crate::vfs::VfsKind::Device => 2, // CHARACTER_DEVICE
+                    },
+                    Err(_) => 0,
+                }
+            }
+            Some(FdEntry::StdoutConsole) => 2,
+            Some(FdEntry::Socket(_))     => 7, // SOCKET_STREAM
+            _ => return Ok(8), // EBADF
+        }
+    };
+
+    let mut stat = [0u8; 24];
+    stat[0] = filetype;
+    // Grant all rights — we don't enforce ACL on the kernel side.
+    stat[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    stat[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
     let mem = wasm_memory(&caller)?;
-    // 24-byte zeroed fdstat is fine for stdout/stderr
-    let zeros = [0u8; 24];
-    mem.write(&mut caller, stat_ptr as usize, &zeros)
+    mem.write(&mut caller, stat_ptr as usize, &stat)
         .map_err(|e| Error::new(alloc::format!("fd_fdstat_get mem write: {}", e)))?;
     Ok(0)
 }

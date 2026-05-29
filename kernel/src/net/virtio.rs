@@ -62,6 +62,11 @@ impl VirtioNet {
         // dereference (PciTransport::new reads just `df`'s config space) lands on
         // a mapped page — instead of relying on the PCI enumeration scan having
         // mapped it as a side effect.
+        //
+        // NOTE: assumes the ECAM region's bus_start == 0 (always true on QEMU
+        // q35). The offset uses the absolute bus number; MmioCam's cam_offset
+        // does the same, so the two stay consistent. On a platform with
+        // bus_start != 0 both would need to subtract bus_start.
         let bdf_off = (u64::from(df.bus) << 20)
             | (u64::from(df.device) << 15)
             | (u64::from(df.function) << 12);

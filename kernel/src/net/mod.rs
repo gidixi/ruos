@@ -17,6 +17,9 @@ pub struct NetState {
     pub dev_lo:    loopback::Loopback,
     pub iface_net: Option<Interface>,
     pub dev_net:   Option<virtio::VirtioNet>,
+    // App TCP sockets currently route through iface_lo only (sockets::connect
+    // uses iface_lo.context()), i.e. loopback. Wiring app sockets over the
+    // Ethernet iface (iface_net/net_sockets) is a Step 16 (SSH) item.
     pub sockets:   SocketSet<'static>,      // app/loopback sockets (iface_lo)
     pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP (iface_net)
     pub dhcp:      Option<SocketHandle>,

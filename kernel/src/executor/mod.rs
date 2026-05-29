@@ -51,9 +51,9 @@ pub fn run() -> ! {
     crate::binfo!("user", "executor: spawning tasks");
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
-    spawner.spawn(wasm_task("/init.wasm")).unwrap();
-    spawner.spawn(wasm_task("/server.wasm")).unwrap();
-    spawner.spawn(wasm_task("/client.wasm")).unwrap();
+    // Normal boot: only shell.wasm auto-spawns. init/server/client.wasm
+    // remain on disk and are runnable from the shell (e.g. `/init.wasm`,
+    // `/server.wasm`) for demo/debug purposes.
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
@@ -138,12 +138,11 @@ async fn wasm_task(path: &'static str) {
 
 #[embassy_executor::task]
 async fn tick_task() {
-    kprintln!("ruos: executor up");
-    let mut n: u32 = 0;
+    // Boot scheduler heartbeat. Was a debug print loop; now silent —
+    // keeps the executor with at least one always-live task slot
+    // available so the run queue never becomes empty.
     loop {
-        delay::Delay::ticks(100).await; // 1s @ 100 Hz
-        kprintln!("ruos: async tick={}", n);
-        n = n.wrapping_add(1);
+        delay::Delay::ticks(1000).await; // 10s heartbeat
     }
 }
 

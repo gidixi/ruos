@@ -24,6 +24,16 @@ fn main() {
     } else {
         println!("shell: /etc/init.sh not found");
     }
+
+    // Pause 1s so test harness can catch the sentinel, then clear
+    // the screen and present an interactive shell prompt — Unix-style
+    // graphical boot handoff. ANSI: ESC[2J = clear, ESC[H = cursor home.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    print!("\x1b[2J\x1b[H");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    println!("\x1b[1;32mruos shell ready. type 'help' for builtins.\x1b[0m");
+
     loop {
         print_prompt();
         match read_line() {

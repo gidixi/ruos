@@ -9,10 +9,10 @@ fn main() {
         println!("init.wasm: argv0={}", arg0);
     }
 
-    println!("\x1b[1;32m╔══════════════════════════════════╗");
-    println!("║         Welcome to ruos          ║");
-    println!("║   wasm32-wasip1 / WASIX host     ║");
-    println!("╚══════════════════════════════════╝\x1b[0m");
+    println!("\x1b[1;32m+----------------------------------+");
+    println!("|         Welcome to ruos          |");
+    println!("|   wasm32-wasip1 / WASIX host     |");
+    println!("+----------------------------------+\x1b[0m");
 
     // Step 10.5 T1: cooperative sleep proof.
     // std::thread::sleep compiles to __wasi_poll_oneoff with a clock subscription.

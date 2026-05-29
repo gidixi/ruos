@@ -67,6 +67,10 @@ unsafe extern "C" fn kmain() -> ! {
         hcf();
     }
 
+    // Calibrate TSC against PIT — gives sub-millisecond boot clock for
+    // log lines that fire before the LAPIC timer comes up in `interrupts::init`.
+    boot::clock::init();
+
     boot::banner::stamp();
 
     match boot::run() {

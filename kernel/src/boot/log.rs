@@ -1,27 +1,27 @@
-//! Structured boot logger. Format: `[T+SECS.MILLISs] L  mod: msg`.
+//! Structured boot logger. Format: `[T+SS.MMMs] LEVEL mod  msg`.
 
 use core::fmt::Write;
 use x86_64::instructions::interrupts::without_interrupts;
 
 pub fn info(module: &str, args: core::fmt::Arguments) {
-    emit('I', module, args);
+    emit("INFO", module, args);
 }
 
 pub fn warn(module: &str, args: core::fmt::Arguments) {
-    emit('W', module, args);
+    emit("WARN", module, args);
 }
 
 pub fn error(module: &str, args: core::fmt::Arguments) {
-    emit('E', module, args);
+    emit("ERR ", module, args);
 }
 
-fn emit(level: char, module: &str, args: core::fmt::Arguments) {
+fn emit(level: &str, module: &str, args: core::fmt::Arguments) {
     without_interrupts(|| {
-        let ticks = crate::timer::ticks();
-        let s = ticks / 100;
-        let ms = (ticks % 100) * 10;
+        let ms_total = crate::boot::clock::elapsed_ms();
+        let s = ms_total / 1000;
+        let ms = ms_total % 1000;
         let mut c = crate::console::CONSOLE.lock();
-        let _ = writeln!(c, "[T+{:5}.{:03}s] {}  {:8} {}", s, ms, level, module, args);
+        let _ = writeln!(c, "[T+{}.{:03}s] {} {:4} {}", s, ms, level, module, args);
     });
 }
 
@@ -44,4 +44,17 @@ macro_rules! berr {
     ($module:literal, $($arg:tt)*) => {
         $crate::boot::log::error($module, core::format_args!($($arg)*))
     };
+}
+
+/// Wasm fiber dispatch trace — opt-in via `--features wasm-trace`. Default
+/// is silent so the boot log stays clean.
+#[cfg(feature = "wasm-trace")]
+#[macro_export]
+macro_rules! wtrace {
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
+}
+#[cfg(not(feature = "wasm-trace"))]
+#[macro_export]
+macro_rules! wtrace {
+    ($($arg:tt)*) => { () };
 }

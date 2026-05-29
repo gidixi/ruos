@@ -29,7 +29,7 @@ pub fn init(hz: u32) -> Result<(), &'static str> {
     if initial_count_u64 > u32::MAX as u64 { return Err("hz too low"); }
     let initial_count = initial_count_u64 as u32;
 
-    crate::binfo!("irq", "lapic calibrated {} ticks/sec, periodic count={}", lapic_per_sec, initial_count);
+    crate::binfo!("intr", "lapic calibrated {} ticks/sec, periodic count={}", lapic_per_sec, initial_count);
 
     lapic::set_timer_periodic(idt::VEC_LAPIC_TIMER, initial_count);
     Ok(())

@@ -77,7 +77,7 @@ impl Fiber {
                             return Self::error_to_exit(&e);
                         }
                         Some(reason) => {
-                            kprintln!("ruos: wasm fiber: suspend {:?}", reason);
+                            crate::wtrace!("ruos: wasm fiber: suspend {:?}", reason);
                             let errno = self.dispatch(reason).await;
                             let resume_args = [Val::I32(errno)];
                             let mut next_outputs: [Val; 0] = [];
@@ -99,7 +99,7 @@ impl Fiber {
     async fn dispatch(&mut self, reason: SuspendReason) -> i32 {
         match reason {
             SuspendReason::Sleep { ticks, events_ptr, nevents_ptr } => {
-                kprintln!("ruos: wasm fiber: sleeping {} ticks", ticks);
+                crate::wtrace!("ruos: wasm fiber: sleeping {} ticks", ticks);
                 crate::executor::delay::Delay::ticks(ticks).await;
                 // Write one clock subscription_event (32 bytes) at events_ptr.
                 // WASI wasi_event_t layout (32 bytes):
@@ -110,18 +110,18 @@ impl Fiber {
                 let event = [0u8; 32];
                 let _ = self.write_to_memory(events_ptr, &event);
                 let _ = self.write_u32(nevents_ptr, 1);
-                kprintln!("ruos: wasm fiber: sleep done, writing 1 event");
+                crate::wtrace!("ruos: wasm fiber: sleep done, writing 1 event");
                 0
             }
             SuspendReason::SockAccept { handle, new_fd_ptr } => {
-                kprintln!("ruos: wasm fiber: sock accept waiting");
+                crate::wtrace!("ruos: wasm fiber: sock accept waiting");
                 match crate::net::sockets::accept(handle).await {
                     Ok(()) => {
                         // smoltcp's listen socket transitions to Established;
                         // there's no separate new socket. Write current fd.
                         let cur_fd: u32 = self.find_fd_for_handle(handle).unwrap_or(0);
                         let _ = self.write_u32(new_fd_ptr, cur_fd);
-                        kprintln!("ruos: wasm fiber: sock accepted fd={}", cur_fd);
+                        crate::wtrace!("ruos: wasm fiber: sock accepted fd={}", cur_fd);
                         0
                     }
                     Err(e) => {
@@ -131,10 +131,10 @@ impl Fiber {
                 }
             }
             SuspendReason::SockConnect { handle, remote, local_port } => {
-                kprintln!("ruos: wasm fiber: sock connect to {:?}:{}", remote.addr, remote.port);
+                crate::wtrace!("ruos: wasm fiber: sock connect to {:?}:{}", remote.addr, remote.port);
                 match crate::net::sockets::connect(handle, remote, local_port).await {
                     Ok(()) => {
-                        kprintln!("ruos: wasm fiber: sock connected");
+                        crate::wtrace!("ruos: wasm fiber: sock connected");
                         0
                     }
                     Err(e) => {
@@ -144,13 +144,13 @@ impl Fiber {
                 }
             }
             SuspendReason::SockRecv { handle, buf_ptr, max_len, nrecv_ptr } => {
-                kprintln!("ruos: wasm fiber: sock recv max={}", max_len);
+                crate::wtrace!("ruos: wasm fiber: sock recv max={}", max_len);
                 let mut buf = alloc::vec![0u8; max_len];
                 match crate::net::sockets::recv(handle, &mut buf).await {
                     Ok(n) => {
                         let _ = self.write_to_memory(buf_ptr, &buf[..n]);
                         let _ = self.write_u32(nrecv_ptr, n as u32);
-                        kprintln!("ruos: wasm fiber: sock recv n={}", n);
+                        crate::wtrace!("ruos: wasm fiber: sock recv n={}", n);
                         0
                     }
                     Err(e) => {
@@ -160,11 +160,11 @@ impl Fiber {
                 }
             }
             SuspendReason::SockSend { handle, bytes, nsent_ptr } => {
-                kprintln!("ruos: wasm fiber: sock send len={}", bytes.len());
+                crate::wtrace!("ruos: wasm fiber: sock send len={}", bytes.len());
                 match crate::net::sockets::send(handle, &bytes).await {
                     Ok(n) => {
                         let _ = self.write_u32(nsent_ptr, n as u32);
-                        kprintln!("ruos: wasm fiber: sock sent n={}", n);
+                        crate::wtrace!("ruos: wasm fiber: sock sent n={}", n);
                         0
                     }
                     Err(e) => {

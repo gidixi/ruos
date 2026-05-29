@@ -28,3 +28,6 @@ ps
 lspci
 ip
 cat /mnt/hello.txt
+echo --- FAT write test ---
+cp /etc/init.sh /mnt/init.bak
+cat /mnt/init.bak | head -n 3

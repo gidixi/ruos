@@ -19,6 +19,9 @@ wasmi = { version = "1.0.9", default-features = false, features = ["prefer-btree
 embassy-futures = { version = "0.1", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "socket-tcp"] }
 
+[features]
+boot-checks = []
+
 [profile.dev]
 panic = "abort"
 

@@ -14,6 +14,7 @@ use smoltcp::time::Instant;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{Cam, Command, DeviceFunction, MmioCam, PciRoot};
+use x86_64::PhysAddr;
 
 use crate::memory::dma::KernelHal;
 
@@ -46,22 +47,34 @@ impl VirtioNet {
         dev.enable_mmio();
         dev.enable_bus_master();
 
-        // Build MmioCam over the HHDM virtual base of the ECAM window.
-        // SAFETY: `base` is `ecam_phys + HHDM_OFFSET` — the linear HHDM alias
-        // of the ECAM physical window.  MmioCam's `cam_offset` for this
-        // device_function indexes exactly the 4 KiB config page that was already
-        // mapped by `pci::init` via `map_io_page`.  The pointer is valid for
-        // at least as long as this function runs (HHDM mappings are permanent).
-        let base = crate::pci::ecam_virt_base()?;
-        let cam = unsafe { MmioCam::new(base as *mut u8, Cam::Ecam) };
-        let mut root = PciRoot::new(cam);
-
         // Build virtio-drivers DeviceFunction from the PciAddress we discovered.
         let df = DeviceFunction {
             bus:      dev.address.bus(),
             device:   dev.address.device(),
             function: dev.address.function(),
         };
+
+        // HHDM virtual base of the ECAM window; ecam_phys = base - hhdm_offset.
+        let base = crate::pci::ecam_virt_base()?;
+        let ecam_phys = base as u64 - crate::memory::mapper::hhdm_offset();
+
+        // Explicitly map THIS device's 4 KiB config page so MmioCam's only
+        // dereference (PciTransport::new reads just `df`'s config space) lands on
+        // a mapped page — instead of relying on the PCI enumeration scan having
+        // mapped it as a side effect.
+        let bdf_off = (u64::from(df.bus) << 20)
+            | (u64::from(df.device) << 15)
+            | (u64::from(df.function) << 12);
+        crate::memory::map_io_range(PhysAddr::new(ecam_phys + bdf_off), 0x1000).ok()?;
+
+        // Build MmioCam over the ECAM HHDM virtual base.
+        // SAFETY: `base` = ecam_phys + HHDM_OFFSET. Constructing the (256 MiB)
+        // MmioCam slice pointer is sound — it is a raw pointer, not a reference,
+        // so no backing is required until dereferenced. PciTransport::new below
+        // dereferences ONLY `df`'s 4 KiB config page, which we mapped just above;
+        // we never index any other device's page. HHDM mappings are permanent.
+        let cam = unsafe { MmioCam::new(base as *mut u8, Cam::Ecam) };
+        let mut root = PciRoot::new(cam);
 
         // Redundantly set Command bits via virtio-drivers so PciTransport::new
         // sees the device ready (our kernel already did this above, but
@@ -104,7 +117,11 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut tx = self.0.new_tx_buffer(len);
         let r = f(tx.packet_mut());
-        self.0.send(tx).expect("virtio: send failed");
+        // Log + drop the packet on TX error rather than panicking the kernel on a
+        // transient device hiccup. consume() must still return `r`.
+        if let Err(e) = self.0.send(tx) {
+            crate::bwarn!("net", "virtio: send failed: {:?}", e);
+        }
         r
     }
 }
@@ -131,8 +148,12 @@ impl Device for VirtioNet {
         // `rx.packet()` strips the virtio-net header and returns only the
         // Ethernet frame payload slice.
         let data = rx.packet().to_vec();
-        // Recycle the buffer slot back into the receive queue.
-        self.inner.recycle_rx_buffer(rx).ok()?;
+        // Recycle the buffer slot back into the receive queue. On error the slot
+        // is lost (queue shrinks by one) but the packet copy is already made, so
+        // we still deliver it; log rather than silently dropping the frame.
+        if let Err(e) = self.inner.recycle_rx_buffer(rx) {
+            crate::bwarn!("net", "virtio: recycle_rx_buffer failed: {:?}", e);
+        }
         Some((VirtioRxToken(data), VirtioTxToken(&mut self.inner)))
     }
 

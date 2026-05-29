@@ -83,30 +83,47 @@ impl Tmpfs {
 
 impl FileSystem for Tmpfs {
     async fn open(&self, path: &[&str], flags: OpenFlags) -> Result<FileImpl, VfsError> {
-        let node = match self.walk(path) {
-            Ok(n) => n,
-            // CREATE on miss: re-walks parent. Safe today because all VFS
-            // futures complete on a single poll under block_on (no preemption,
-            // no concurrent readers) — so the walk/insert pair is atomic from
-            // any observer's point of view. Revisit when Step 9 introduces a
-            // real executor that can suspend mid-future.
-            Err(VfsError::NotFound) if flags.contains(OpenFlags::CREATE) => {
-                let (parent, name) = self.parent_and_name(path)?;
-                let mut p = parent.lock();
-                let arc = Arc::new(Mutex::new(TmpInode::new_reg()));
-                p.children.insert(name.to_string(), arc.clone());
-                arc
-            }
-            Err(e) => return Err(e),
-        };
-        let kind = node.lock().kind;
-        match kind {
-            TmpKind::Dir => Err(VfsError::IsDirectory),
-            TmpKind::Reg => Ok(FileImpl::Tmp(TmpfsFile { node, pos: 0 })),
-            TmpKind::DevConsole => Ok(FileImpl::Console(ConsoleFile)),
-            TmpKind::DevNull    => Ok(FileImpl::Null(NullFile)),
-            TmpKind::DevZero    => Ok(FileImpl::Zero(ZeroFile)),
+        // Fast path: try to walk first. Common case for non-creating opens.
+        if let Ok(node) = self.walk(path) {
+            let kind = node.lock().kind;
+            return match kind {
+                TmpKind::Dir => Err(VfsError::IsDirectory),
+                TmpKind::Reg => Ok(FileImpl::Tmp(TmpfsFile { node, pos: 0 })),
+                TmpKind::DevConsole => Ok(FileImpl::Console(ConsoleFile)),
+                TmpKind::DevNull    => Ok(FileImpl::Null(NullFile)),
+                TmpKind::DevZero    => Ok(FileImpl::Zero(ZeroFile)),
+            };
         }
+        if !flags.contains(OpenFlags::CREATE) {
+            return Err(VfsError::NotFound);
+        }
+        // CREATE path: acquire the parent lock *first*, then double-check
+        // inside the lock that the child still doesn't exist. This closes
+        // the TOCTOU race between the walk above and the insert below —
+        // a race that became reachable with Step 10.5 cooperative fibers
+        // (multiple fibers can be mid-open concurrently).
+        let (parent, name) = self.parent_and_name(path)?;
+        let mut p = parent.lock();
+        if !matches!(p.kind, TmpKind::Dir) {
+            return Err(VfsError::NotDirectory);
+        }
+        // Concurrent insert: another fiber created the same path while
+        // we were between the walk and this lock. Adopt its inode.
+        if let Some(existing) = p.children.get(name).cloned() {
+            drop(p);
+            let kind = existing.lock().kind;
+            return match kind {
+                TmpKind::Dir => Err(VfsError::IsDirectory),
+                TmpKind::Reg => Ok(FileImpl::Tmp(TmpfsFile { node: existing, pos: 0 })),
+                TmpKind::DevConsole => Ok(FileImpl::Console(ConsoleFile)),
+                TmpKind::DevNull    => Ok(FileImpl::Null(NullFile)),
+                TmpKind::DevZero    => Ok(FileImpl::Zero(ZeroFile)),
+            };
+        }
+        let arc = Arc::new(Mutex::new(TmpInode::new_reg()));
+        p.children.insert(name.to_string(), arc.clone());
+        drop(p);
+        Ok(FileImpl::Tmp(TmpfsFile { node: arc, pos: 0 }))
     }
 
     async fn create(&self, path: &[&str]) -> Result<(), VfsError> {

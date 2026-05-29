@@ -29,6 +29,10 @@ name = "cut"
 version = "0.1.0"
 
 [[package]]
+name = "date"
+version = "0.1.0"
+
+[[package]]
 name = "df"
 version = "0.1.0"
 
@@ -126,6 +130,10 @@ version = "0.1.0"
 
 [[package]]
 name = "nano"
+version = "0.1.0"
+
+[[package]]
+name = "nc"
 version = "0.1.0"
 
 [[package]]

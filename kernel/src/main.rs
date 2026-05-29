@@ -30,6 +30,7 @@ mod pty;
 mod pci;
 mod blockdev;
 mod ahci;
+mod rtc;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

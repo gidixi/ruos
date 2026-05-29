@@ -21,7 +21,7 @@ BIN_TOOLS  := shell ls cat echo \
               nano \
               touch wc clear which \
               sort uniq cut tr tee \
-              ifconfig
+              ifconfig nc date
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

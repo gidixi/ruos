@@ -325,6 +325,85 @@ pub fn ruos_net_set_static(
     Ok(0)
 }
 
+/// ruos_time_get(year_ptr, month_ptr, day_ptr, hour_ptr, min_ptr, sec_ptr,
+///                epoch_ptr) -> errno. All fields are written through the
+/// wasm-memory pointers; epoch_ptr receives a u64 unix seconds value.
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_time_get(
+    mut caller: Caller<'_, RuntimeState>,
+    year_ptr: i32, month_ptr: i32, day_ptr: i32,
+    hour_ptr: i32, min_ptr: i32, sec_ptr: i32,
+    epoch_ptr: i32,
+) -> Result<i32, Error> {
+    let t = crate::rtc::now();
+    let epoch = crate::rtc::to_unix_epoch(&t);
+    let mem = wasm_memory(&caller)?;
+    let write = |mem: &wasmi::Memory, caller: &mut Caller<'_, RuntimeState>, p: i32, bytes: &[u8]| {
+        mem.write(caller, p as usize, bytes)
+            .map_err(|e| Error::new(alloc::format!("time_get write: {}", e)))
+    };
+    write(&mem, &mut caller, year_ptr,  &t.year.to_le_bytes())?;
+    write(&mem, &mut caller, month_ptr, &[t.month])?;
+    write(&mem, &mut caller, day_ptr,   &[t.day])?;
+    write(&mem, &mut caller, hour_ptr,  &[t.hour])?;
+    write(&mem, &mut caller, min_ptr,   &[t.minute])?;
+    write(&mem, &mut caller, sec_ptr,   &[t.second])?;
+    write(&mem, &mut caller, epoch_ptr, &epoch.to_le_bytes())?;
+    Ok(0)
+}
+
+/// ruos_tcp_dial(ip0..3, port, fd_out_ptr) -> errno.
+/// Allocate a TCP socket, inject it as a new wasm FD (written at fd_out_ptr),
+/// then trap with SuspendReason::SockConnect so the fiber awaits Established
+/// before returning to wasm. After success the caller can fd_read/fd_write on
+/// the returned FD; close it with fd_close.
+///
+/// Local port: 49152 + (idx % 16384) — ephemeral range, deterministic per slot.
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_tcp_dial(
+    mut caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    port: i32,
+    fd_out_ptr: i32,
+) -> Result<i32, Error> {
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+    use crate::wasm::state::FdEntry;
+    use crate::wasm::suspend::SuspendReason;
+
+    if port <= 0 || port > 0xFFFF { return Ok(22); }
+    let idx = crate::net::sockets::POOL.alloc_tcp();
+    let handle = match crate::net::sockets::POOL.handle(idx) {
+        Some(h) => h,
+        None    => return Ok(8),
+    };
+    let remote = IpEndpoint::new(
+        IpAddress::v4(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8),
+        port as u16,
+    );
+    let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
+
+    // Allocate a wasm-side FD pointing at this socket.
+    let fd = {
+        let fds = &mut caller.data_mut().fds;
+        // Scan for a None slot first; else extend.
+        let mut slot = None;
+        for (i, s) in fds.iter().enumerate() {
+            if s.is_none() { slot = Some(i); break; }
+        }
+        match slot {
+            Some(i) => { fds[i] = Some(FdEntry::Socket(idx)); i as i32 }
+            None    => { fds.push(Some(FdEntry::Socket(idx))); (fds.len() - 1) as i32 }
+        }
+    };
+    // Persist the FD to wasm memory for the caller.
+    let mem = wasm_memory(&caller)?;
+    mem.write(&mut caller, fd_out_ptr as usize, &fd.to_le_bytes())
+        .map_err(|e| Error::new(alloc::format!("tcp_dial fd_out write: {}", e)))?;
+
+    // Trap into SockConnect; the fiber driver awaits Established and resumes.
+    Err(Error::host(SuspendReason::SockConnect { handle, remote, local_port }))
+}
+
 /// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
 pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
     use smoltcp::socket::dhcpv4;
@@ -348,6 +427,8 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
         .func_wrap("ruos", "net_iface", ruos_net_iface)?
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
-        .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?;
+        .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?
+        .func_wrap("ruos", "tcp_dial", ruos_tcp_dial)?
+        .func_wrap("ruos", "time_get", ruos_time_get)?;
     Ok(())
 }

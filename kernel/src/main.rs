@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod serial;
 mod kprint;
+mod power;
 mod memory;
 mod gdt;
 mod idt;

@@ -134,10 +134,24 @@ pub fn ruos_readdir(
     }))
 }
 
+/// ruos_poweroff() -> never returns. Kernel halts the system.
+pub fn ruos_poweroff(_caller: Caller<'_, RuntimeState>) -> Result<(), Error> {
+    crate::kprintln!("ruos: poweroff requested by wasm");
+    crate::power::poweroff();
+}
+
+/// ruos_reboot() -> never returns. Kernel reboots the system.
+pub fn ruos_reboot(_caller: Caller<'_, RuntimeState>) -> Result<(), Error> {
+    crate::kprintln!("ruos: reboot requested by wasm");
+    crate::power::reboot();
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "exec", ruos_exec)?
         .func_wrap("ruos", "readdir", ruos_readdir)?
-        .func_wrap("ruos", "chdir", ruos_chdir)?;
+        .func_wrap("ruos", "chdir", ruos_chdir)?
+        .func_wrap("ruos", "poweroff", ruos_poweroff)?
+        .func_wrap("ruos", "reboot", ruos_reboot)?;
     Ok(())
 }

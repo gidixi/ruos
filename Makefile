@@ -61,11 +61,11 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 	$(LIMINE)/limine bios-install $(ISO)
 
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -m 512
+	qemu-system-x86_64 -machine q35 -cdrom $(ISO) -serial stdio -m 512 -device qemu-xhci
 
 run-test: iso
 	@echo "--- serial (timeout 120s) ---"
-	@timeout 120 qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+	@timeout 120 qemu-system-x86_64 -machine q35 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
 		| tee build/serial.log; \
 	grep -qF "$(HELLO)" build/serial.log && echo TEST_PASS || { echo TEST_FAIL; exit 1; }
 

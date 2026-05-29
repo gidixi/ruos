@@ -21,6 +21,7 @@ mod console;
 mod wasm;
 mod net;
 mod executor;
+mod boot;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -69,6 +70,8 @@ unsafe extern "C" fn kmain() -> ! {
         kprintln!("ruos: unsupported Limine base revision");
         hcf();
     }
+
+    boot::banner::stamp();
 
     // Heap init.
     let info = match memory::init_heap() {

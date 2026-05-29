@@ -23,6 +23,7 @@ mod modules;
 mod console;
 mod wasm;
 mod net;
+mod rng;
 mod executor;
 mod boot;
 mod pty;

@@ -11,6 +11,8 @@
 //!
 //! Probe order: the first matching PCI device wins. Loopback always works.
 
+pub mod ring;
+
 use alloc::vec::Vec;
 use core::fmt;
 

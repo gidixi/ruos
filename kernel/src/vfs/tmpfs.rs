@@ -164,6 +164,18 @@ impl FileSystem for Tmpfs {
         }
         Ok(out)
     }
+
+    async fn stat(&self, path: &[&str]) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        use crate::vfs::fs::{VfsStat, VfsKind};
+        let node = self.walk(path)?;
+        let g = node.lock();
+        let (kind, size) = match g.kind {
+            TmpKind::Dir => (VfsKind::Dir, 0u64),
+            TmpKind::Reg => (VfsKind::Reg, g.content.len() as u64),
+            TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero => (VfsKind::Device, 0u64),
+        };
+        Ok(VfsStat { kind, size })
+    }
 }
 
 pub struct TmpfsFile {

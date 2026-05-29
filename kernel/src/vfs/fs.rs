@@ -13,11 +13,18 @@ pub struct VfsDirent {
     pub kind: VfsKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct VfsStat {
+    pub kind: VfsKind,
+    pub size: u64,
+}
+
 pub trait FileSystem {
     async fn open(&self, path: &[&str], flags: OpenFlags) -> Result<FileImpl, VfsError>;
     async fn create(&self, path: &[&str]) -> Result<(), VfsError>;
     async fn unlink(&self, path: &[&str]) -> Result<(), VfsError>;
     async fn readdir(&self, path: &[&str]) -> Result<Vec<VfsDirent>, VfsError>;
+    async fn stat(&self, path: &[&str]) -> Result<VfsStat, VfsError>;
 }
 
 use crate::vfs::tmpfs::Tmpfs;
@@ -38,5 +45,8 @@ impl FsImpl {
     }
     pub async fn readdir(&self, path: &[&str]) -> Result<Vec<VfsDirent>, VfsError> {
         match self { FsImpl::Tmpfs(t) => t.readdir(path).await }
+    }
+    pub async fn stat(&self, path: &[&str]) -> Result<VfsStat, VfsError> {
+        match self { FsImpl::Tmpfs(t) => t.stat(path).await }
     }
 }

@@ -12,7 +12,7 @@ pub mod devices;
 pub use block_on::block_on;
 pub use error::VfsError;
 pub use file::{Fd, OpenFlags, Whence};
-pub use fs::{VfsDirent, VfsKind};
+pub use fs::{VfsDirent, VfsKind, VfsStat};
 
 // Real API (open/close/read/write/seek/init/mount) lands in Task 3.
 
@@ -150,6 +150,20 @@ pub async fn readdir(path: &str) -> Result<Vec<VfsDirent>, VfsError> {
     let mounts = MOUNTS.lock();
     let fs = &mounts[idx].1;
     let result = fs.readdir(&sub).await;
+    drop(mounts);
+    result
+}
+
+/// Get file metadata (kind + size) without opening the file. Suitable for
+/// `ls`/`stat`-style callers that need the kind/size enum without paying
+/// the FD-table allocation cost. Like readdir, MOUNTS lock is dropped
+/// after lookup; the inner await runs without it.
+pub async fn stat(path: &str) -> Result<VfsStat, VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    let fs = &mounts[idx].1;
+    let result = fs.stat(&sub).await;
     drop(mounts);
     result
 }

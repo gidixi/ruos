@@ -203,6 +203,10 @@ name = "wc"
 version = "0.1.0"
 
 [[package]]
+name = "wget"
+version = "0.1.0"
+
+[[package]]
 name = "which"
 version = "0.1.0"
 

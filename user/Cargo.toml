@@ -12,7 +12,7 @@ members = [
     "nano",
     "touch", "wc", "clear", "which",
     "sort", "uniq", "cut", "tr", "tee",
-    "ifconfig", "nc", "date",
+    "ifconfig", "nc", "date", "wget",
 ]
 
 [profile.release]

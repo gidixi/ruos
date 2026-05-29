@@ -74,7 +74,7 @@ pub async fn connect(
     without_interrupts(|| {
         let mut g = crate::net::NET.lock();
         let net = g.as_mut().expect("net not initialized");
-        let ctx = net.iface.context();
+        let ctx = net.iface_lo.context();
         let s = net.sockets.get_mut::<TcpSocket>(handle);
         let local: IpListenEndpoint = local_port.into();
         s.connect(ctx, remote, local).map_err(|_| "connect failed")

@@ -64,15 +64,18 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 	$(LIMINE)/limine bios-install $(ISO)
 
 run: iso
-	qemu-system-x86_64 -machine q35 -cdrom $(ISO) -serial stdio -m 512 -device qemu-xhci
+	qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -m 512 \
+		-device qemu-xhci -netdev user,id=net0 -device virtio-net-pci,netdev=net0
 
 run-test: iso
 	@echo "--- serial (timeout 120s) ---"
-	@timeout 120 qemu-system-x86_64 -machine q35 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+	@timeout 120 qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+		-device qemu-xhci -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
 		| tee build/serial.log; \
 	grep -qF "$(HELLO)" build/serial.log || { echo TEST_FAIL_SHELL; exit 1; }; \
 	grep -qE "pci .* init ok devices=[1-9]" build/serial.log || { echo TEST_FAIL_PCI; exit 1; }; \
 	grep -qE "pci .* xhci @" build/serial.log || { echo TEST_FAIL_XHCI; exit 1; }; \
+	grep -qE "net .* dhcp bound ip=10\.0\.2\.15" build/serial.log || { echo TEST_FAIL_DHCP; exit 1; }; \
 	echo TEST_PASS
 
 test-boot: limine $(USER_WASMS) user-bin/init.sh

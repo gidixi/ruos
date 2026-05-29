@@ -111,6 +111,18 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     Ok(frame)
 }
 
+/// Virtual (HHDM) alias of a physical address. Valid for any RAM/MMIO phys
+/// because Limine's HHDM covers all physical memory.
+pub fn hhdm_virt(phys: PhysAddr) -> VirtAddr {
+    let hhdm = *HHDM_OFFSET.get().expect("mapper: hhdm not initialized");
+    VirtAddr::new(phys.as_u64() + hhdm)
+}
+
+/// The HHDM offset (phys→virt delta). Panics if paging not initialized.
+pub fn hhdm_offset() -> u64 {
+    *HHDM_OFFSET.get().expect("mapper: hhdm not initialized")
+}
+
 pub fn map_io_page(phys: PhysAddr) -> Result<VirtAddr, MapError> {
     let hhdm = *HHDM_OFFSET.get().ok_or(MapError::NotInitialized)?;
     let virt = VirtAddr::new(phys.as_u64() + hhdm);
@@ -124,4 +136,18 @@ pub fn map_io_page(phys: PhysAddr) -> Result<VirtAddr, MapError> {
         Err(MapError::AlreadyMapped) => Ok(virt),
         Err(e) => Err(e),
     }
+}
+
+/// Map a multi-page MMIO window: every 4 KiB page covering `[phys, phys+bytes)`
+/// is mapped (uncached) via `map_io_page`. Returns the virt of `phys` itself.
+/// Idempotent per page.
+pub fn map_io_range(phys: PhysAddr, bytes: usize) -> Result<VirtAddr, MapError> {
+    let start = phys.as_u64() & !0xFFF;
+    let end = (phys.as_u64() + bytes as u64 + 0xFFF) & !0xFFF;
+    let mut p = start;
+    while p < end {
+        map_io_page(PhysAddr::new(p))?;
+        p += 0x1000;
+    }
+    Ok(hhdm_virt(phys))
 }

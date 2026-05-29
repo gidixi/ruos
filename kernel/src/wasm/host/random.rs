@@ -1,30 +1,8 @@
-//! WASIX random host fn. Weak xorshift PRNG seeded from TICKS.
-//! Step 14 (SSH) replaces with RDRAND-backed CSPRNG.
+//! WASI random_get host fn backed by the RDRAND-seeded ChaCha20 CSPRNG in `crate::rng`.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::RuntimeState;
 use crate::wasm::host::lifecycle::wasm_memory;
-
-static STATE: AtomicU64 = AtomicU64::new(0);
-
-fn ensure_seeded() {
-    if STATE.load(Ordering::Relaxed) == 0 {
-        let t = crate::timer::ticks();
-        let seed = t.wrapping_mul(0x2545F4914F6CDD1D) ^ 0xDEADBEEFCAFEBABE;
-        STATE.store(seed | 1, Ordering::Relaxed);
-    }
-}
-
-fn next() -> u64 {
-    ensure_seeded();
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    x
-}
 
 pub fn random_get(
     mut caller: Caller<'_, RuntimeState>,
@@ -32,13 +10,13 @@ pub fn random_get(
     buf_len: i32,
 ) -> Result<i32, Error> {
     let mem = wasm_memory(&caller)?;
+    let mut tmp = [0u8; 256];
     let mut remaining = buf_len as usize;
     let mut offset = buf_ptr as usize;
     while remaining > 0 {
-        let chunk = next().to_le_bytes();
-        let n = remaining.min(8);
-        mem.write(&mut caller, offset, &chunk[..n])
-            .map_err(|_| Error::i32_exit(-1))?;
+        let n = remaining.min(tmp.len());
+        crate::rng::fill(&mut tmp[..n]);
+        mem.write(&mut caller, offset, &tmp[..n]).map_err(|_| Error::i32_exit(-1))?;
         offset += n;
         remaining -= n;
     }

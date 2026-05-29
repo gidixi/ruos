@@ -85,6 +85,37 @@ impl Frames {
     fn counts(&self) -> FrameCounts {
         FrameCounts { total: self.total, used: self.used, free: self.total - self.used }
     }
+
+    /// Allocate `n` physically-contiguous free frames, returning the first
+    /// frame. O(total) bitmap scan; marks all `n` used. None if no run fits.
+    fn allocate_contiguous(&mut self, n: u64) -> Option<PhysFrame<Size4KiB>> {
+        if n == 0 { return None; }
+        let mut start: u64 = 0;
+        let mut run: u64 = 0;
+        let mut f: u64 = 0;
+        while f < self.total {
+            let (i, b) = Self::idx(f);
+            let free = (self.bitmap[i] >> b) & 1 == 0;
+            if free {
+                if run == 0 { start = f; }
+                run += 1;
+                if run == n {
+                    for g in start..start + n { self.bitmap[(g / 64) as usize] |= 1u64 << (g % 64); }
+                    self.used += n;
+                    return Some(PhysFrame::containing_address(PhysAddr::new(start * PAGE_SIZE)));
+                }
+            } else {
+                run = 0;
+            }
+            f += 1;
+        }
+        None
+    }
+
+    fn free_contiguous(&mut self, first: PhysFrame<Size4KiB>, n: u64) {
+        let base = first.start_address().as_u64() / PAGE_SIZE;
+        for g in base..base + n { self.mark_free(g); }
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for Frames {
@@ -172,6 +203,14 @@ pub fn free_frame(frame: PhysFrame<Size4KiB>) {
     if let Some(f) = FRAMES.lock().as_mut() {
         unsafe { f.deallocate_frame(frame); }
     }
+}
+
+pub fn allocate_contiguous(n: u64) -> Option<PhysFrame<Size4KiB>> {
+    FRAMES.lock().as_mut().and_then(|f| f.allocate_contiguous(n))
+}
+
+pub fn free_contiguous(first: PhysFrame<Size4KiB>, n: u64) {
+    if let Some(f) = FRAMES.lock().as_mut() { f.free_contiguous(first, n); }
 }
 
 pub fn frame_counts() -> FrameCounts {

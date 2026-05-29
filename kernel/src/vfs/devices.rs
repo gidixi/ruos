@@ -1,4 +1,4 @@
-//! Device files: console (serial), null, zero.
+//! Device files: console (serial), null, zero, pty-slave.
 
 use crate::vfs::error::VfsError;
 use crate::vfs::file::{File, Whence};
@@ -9,15 +9,12 @@ pub struct NullFile;
 pub struct ZeroFile;
 
 impl File for ConsoleFile {
-    /// Reads one byte from the global keyboard queue, blocking until a
-    /// char arrives. The queue is single-consumer; if any other code
-    /// path (e.g. the legacy `SuspendReason::KbdReadChar` route via
-    /// `FdEntry::Stdin`) drains the queue concurrently, reads here will
-    /// race. Step 11 fixes this by making the shell the sole keyboard
-    /// consumer (via /dev/console as stdin).
+    /// Reads one byte from PTY 0 master output (legacy /dev/console path).
+    /// Shell I/O now uses /dev/pts/0 directly; this remains for any code
+    /// that opens /dev/console for reading.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
         if buf.is_empty() { return Ok(0); }
-        let b = crate::keyboard::queue::read_char().await;
+        let b = crate::pty::master_output_read(0).await;
         buf[0] = b;
         Ok(1)
     }
@@ -47,4 +44,54 @@ impl File for ZeroFile {
     }
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> { Ok(buf.len()) }
     async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> { Ok(0) }
+}
+
+/// A file handle for one PTY slave endpoint. Reads block (async) until the
+/// line discipline delivers bytes into `slave_rx`; writes push bytes through
+/// `process_output` (which handles ONLCR etc.) into `master_out`.
+pub struct PtySlaveFile {
+    pub idx: usize,
+}
+
+impl File for PtySlaveFile {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
+        if buf.is_empty() { return Ok(0); }
+        let idx = self.idx;
+        core::future::poll_fn(|cx| {
+            use x86_64::instructions::interrupts::without_interrupts;
+            use core::task::Poll;
+            without_interrupts(|| {
+                let mut g = crate::pty::pair(idx).lock();
+                let mut n = 0;
+                while n < buf.len() {
+                    match g.slave_rx.pop_front() {
+                        Some(b) => { buf[n] = b; n += 1; }
+                        None => break,
+                    }
+                }
+                if n > 0 {
+                    Poll::Ready(Ok(n))
+                } else {
+                    g.slave_waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+        }).await
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
+        if buf.is_empty() { return Ok(0); }
+        let idx = self.idx;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut g = crate::pty::pair(idx).lock();
+            for &b in buf {
+                crate::pty::ldisc::process_output(&mut g, b);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> {
+        Err(VfsError::NotPermitted)
+    }
 }

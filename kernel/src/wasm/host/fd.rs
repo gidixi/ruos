@@ -121,19 +121,6 @@ pub fn fd_read(
         }));
     }
 
-    // Stdin arm: trap with SuspendReason::KbdReadChar (single iov only).
-    if let Some(FdEntry::Stdin) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
-        if iovs_len != 1 {
-            return Ok(28); // EINVAL
-        }
-        let mem = wasm_memory(&caller)?;
-        let buf_ptr = read_u32(&mem, &caller, iovs_ptr as usize)?;
-        return Err(Error::host(crate::wasm::suspend::SuspendReason::KbdReadChar {
-            buf_ptr,
-            nread_ptr: nread_ptr as u32,
-        }));
-    }
-
     // VFS arm: trap with SuspendReason::VfsRead (single iov only).
     if let Some(FdEntry::Vfs(vfd)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
         if iovs_len != 1 {
@@ -189,7 +176,7 @@ pub fn fd_close(
             Err(Error::host(crate::wasm::suspend::SuspendReason::VfsClose { fd: vfd }))
         }
         Some(other) => {
-            // Restore non-VFS entry (don't drop stdin/stdout).
+            // Restore non-VFS entry (don't drop StdoutConsole/Socket).
             caller.data_mut().fds[fd as usize] = Some(other);
             Ok(0)
         }
@@ -207,8 +194,7 @@ pub fn fd_filestat_get(
     use crate::wasm::state::FdEntry;
     let filetype: u8 = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
         Some(FdEntry::Vfs(_)) => 4,   // REGULAR_FILE
-        Some(FdEntry::Stdin)
-        | Some(FdEntry::StdoutConsole) => 2, // CHARACTER_DEVICE
+        Some(FdEntry::StdoutConsole) => 2, // CHARACTER_DEVICE
         _ => return Ok(8), // EBADF
     };
     let mem = wasm_memory(&caller)?;

@@ -27,7 +27,6 @@ pub enum SuspendReason {
     VfsSeek { fd: crate::vfs::Fd, offset: i64, whence: crate::vfs::Whence, newoffset_ptr: u32 },
     VfsClose { fd: crate::vfs::Fd },
     PathOpen { path: String, flags: crate::vfs::OpenFlags, opened_fd_ptr: u32 },
-    KbdReadChar { buf_ptr: u32, nread_ptr: u32 },
     Exec {
         path: alloc::string::String,
         argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,

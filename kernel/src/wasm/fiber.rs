@@ -173,12 +173,6 @@ impl Fiber {
                     }
                 }
             }
-            SuspendReason::KbdReadChar { buf_ptr, nread_ptr } => {
-                let b = crate::keyboard::queue::read_char().await;
-                let _ = self.write_to_memory(buf_ptr, &[b]);
-                let _ = self.write_u32(nread_ptr, 1);
-                0
-            }
             SuspendReason::VfsRead { fd, buf_ptr, max_len, nread_ptr } => {
                 let mut buf = alloc::vec![0u8; max_len];
                 match crate::vfs::read(fd, &mut buf).await {

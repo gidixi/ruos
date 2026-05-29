@@ -22,6 +22,7 @@ mod wasm;
 mod net;
 mod executor;
 mod boot;
+mod pty;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

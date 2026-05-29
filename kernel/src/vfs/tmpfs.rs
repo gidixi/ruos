@@ -9,10 +9,10 @@ use spin::Mutex;
 use crate::vfs::error::VfsError;
 use crate::vfs::file::{File, FileImpl, OpenFlags, Whence};
 use crate::vfs::fs::FileSystem;
-use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile};
+use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile, PtySlaveFile};
 
 #[derive(Copy, Clone)]
-pub enum TmpKind { Dir, Reg, DevConsole, DevNull, DevZero }
+pub enum TmpKind { Dir, Reg, DevConsole, DevNull, DevZero, PtySlave(usize) }
 
 pub struct TmpInode {
     pub kind: TmpKind,
@@ -89,9 +89,10 @@ impl FileSystem for Tmpfs {
             return match kind {
                 TmpKind::Dir => Err(VfsError::IsDirectory),
                 TmpKind::Reg => Ok(FileImpl::Tmp(TmpfsFile { node, pos: 0 })),
-                TmpKind::DevConsole => Ok(FileImpl::Console(ConsoleFile)),
-                TmpKind::DevNull    => Ok(FileImpl::Null(NullFile)),
-                TmpKind::DevZero    => Ok(FileImpl::Zero(ZeroFile)),
+                TmpKind::DevConsole     => Ok(FileImpl::Console(ConsoleFile)),
+                TmpKind::DevNull        => Ok(FileImpl::Null(NullFile)),
+                TmpKind::DevZero        => Ok(FileImpl::Zero(ZeroFile)),
+                TmpKind::PtySlave(idx)  => Ok(FileImpl::PtySlave(PtySlaveFile { idx })),
             };
         }
         if !flags.contains(OpenFlags::CREATE) {
@@ -115,9 +116,10 @@ impl FileSystem for Tmpfs {
             return match kind {
                 TmpKind::Dir => Err(VfsError::IsDirectory),
                 TmpKind::Reg => Ok(FileImpl::Tmp(TmpfsFile { node: existing, pos: 0 })),
-                TmpKind::DevConsole => Ok(FileImpl::Console(ConsoleFile)),
-                TmpKind::DevNull    => Ok(FileImpl::Null(NullFile)),
-                TmpKind::DevZero    => Ok(FileImpl::Zero(ZeroFile)),
+                TmpKind::DevConsole     => Ok(FileImpl::Console(ConsoleFile)),
+                TmpKind::DevNull        => Ok(FileImpl::Null(NullFile)),
+                TmpKind::DevZero        => Ok(FileImpl::Zero(ZeroFile)),
+                TmpKind::PtySlave(idx)  => Ok(FileImpl::PtySlave(PtySlaveFile { idx })),
             };
         }
         let arc = Arc::new(Mutex::new(TmpInode::new_reg()));
@@ -158,7 +160,8 @@ impl FileSystem for Tmpfs {
             let kind = match inode.lock().kind {
                 TmpKind::Dir => VfsKind::Dir,
                 TmpKind::Reg => VfsKind::Reg,
-                TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero => VfsKind::Device,
+                TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero
+                | TmpKind::PtySlave(_) => VfsKind::Device,
             };
             out.push(VfsDirent { name: name.clone(), kind });
         }
@@ -172,7 +175,8 @@ impl FileSystem for Tmpfs {
         let (kind, size) = match g.kind {
             TmpKind::Dir => (VfsKind::Dir, 0u64),
             TmpKind::Reg => (VfsKind::Reg, g.content.len() as u64),
-            TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero => (VfsKind::Device, 0u64),
+            TmpKind::DevConsole | TmpKind::DevNull | TmpKind::DevZero
+            | TmpKind::PtySlave(_) => (VfsKind::Device, 0u64),
         };
         Ok(VfsStat { kind, size })
     }

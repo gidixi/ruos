@@ -22,6 +22,12 @@ impl EcamAccess {
         self.regions.is_empty()
     }
 
+    /// Physical base address of the first ECAM region (segment 0, bus_start).
+    /// Used by `pci::ecam_virt_base()` to build a `MmioCam` for virtio-drivers.
+    pub fn first_base(&self) -> Option<u64> {
+        self.regions.first().map(|r| r.base)
+    }
+
     /// Physical address of `(addr, offset)` in ECAM, or `None` if `addr` is not
     /// covered by any region. Per-function config space is 4 KiB at
     /// `base + ((bus - bus_start) << 20 | device << 15 | function << 12)`.

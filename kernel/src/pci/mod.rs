@@ -104,6 +104,20 @@ pub fn devices() -> Vec<PciDevice> {
     }
 }
 
+/// HHDM virtual base of the first ECAM region, for virtio-drivers' `MmioCam`.
+///
+/// MmioCam indexes `base + cam_offset(device_function, reg)`.  Because
+/// `map_io_page` maps each page at `phys + HHDM_OFFSET`, and cam_offset for
+/// any device equals `ecam_phys_base_relative_offset`, the resulting virtual
+/// address is exactly the HHDM alias of that device's config page — which was
+/// already mapped by `pci::init`.  Only the single device's page is touched;
+/// the rest of the nominal 256 MiB ECAM window need not be mapped.
+pub fn ecam_virt_base() -> Option<usize> {
+    let base_phys = PCI.get()?.access.first_base()?;
+    let virt = crate::memory::map_io_page(x86_64::PhysAddr::new(base_phys)).ok()?;
+    Some(virt.as_u64() as usize)
+}
+
 /// First function matching (class, subclass, prog_if), or `None`.
 pub fn find_class(class: u8, subclass: u8, prog_if: u8) -> Option<PciDevice> {
     let s = PCI.get()?;

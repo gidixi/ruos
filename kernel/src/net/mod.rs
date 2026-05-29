@@ -3,6 +3,7 @@
 
 pub mod loopback;
 pub mod sockets;
+pub mod virtio;
 
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet};

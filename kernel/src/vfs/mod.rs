@@ -82,30 +82,59 @@ pub async fn close(fd: Fd) -> Result<(), VfsError> {
     fd_close(fd)
 }
 
+// Take-and-restore pattern: extract the FdEntry out of FDS, drop the
+// global lock, perform the I/O (which may suspend cooperatively under
+// Step 10.5 fibers), then restore the entry. Each VFS Fd is owned by
+// exactly one fiber at a time, so the gap between take and restore is
+// safe — no other code can observe the missing slot through normal
+// vfs API calls. A concurrent `close(fd)` while we're awaiting will
+// race: the slot will be None at restore time and we drop the file
+// silently (equivalent to closing during the I/O).
+async fn with_fd_take<F, T, FN>(fd: Fd, op: FN) -> Result<T, VfsError>
+where
+    FN: FnOnce(crate::vfs::fd::FdEntry) -> F,
+    F: core::future::Future<Output = (crate::vfs::fd::FdEntry, Result<T, VfsError>)>,
+{
+    let entry = {
+        let mut t = FDS.lock();
+        t.get_mut(fd as usize).and_then(|s| s.take()).ok_or(VfsError::BadFd)?
+    };
+    let (entry, result) = op(entry).await;
+    {
+        let mut t = FDS.lock();
+        if let Some(s) = t.get_mut(fd as usize) {
+            if s.is_none() {
+                // Slot still ours — restore. (If a concurrent close()
+                // already nilled it, leaving s as None and dropping
+                // `entry` matches the close-during-I/O semantics.)
+                *s = Some(entry);
+            } else {
+                // Slot reused by an open() that happened during the
+                // await window. Drop our entry; the new owner stays.
+                drop(entry);
+            }
+        }
+    }
+    result
+}
+
 pub async fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, VfsError> {
-    // Hold the FDS lock across the inner await: all current File impls
-    // (tmpfs, devices) resolve in a single poll, so no real suspension
-    // occurs and the lock is released before the outer block_on returns.
-    // When Step 9 brings an executor that can suspend, this needs the
-    // take-and-restore pattern instead.
-    let mut t = FDS.lock();
-    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
-        .as_mut().ok_or(VfsError::BadFd)?;
-    slot.file.read(buf).await
+    with_fd_take(fd, |mut entry| async move {
+        let r = entry.file.read(buf).await;
+        (entry, r)
+    }).await
 }
 
 pub async fn write(fd: Fd, buf: &[u8]) -> Result<usize, VfsError> {
-    // Same FDS-lock-across-await caveat as `read` (see comment there).
-    let mut t = FDS.lock();
-    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
-        .as_mut().ok_or(VfsError::BadFd)?;
-    slot.file.write(buf).await
+    with_fd_take(fd, |mut entry| async move {
+        let r = entry.file.write(buf).await;
+        (entry, r)
+    }).await
 }
 
 pub async fn seek(fd: Fd, off: i64, whence: Whence) -> Result<u64, VfsError> {
-    // Same FDS-lock-across-await caveat as `read` (see comment there).
-    let mut t = FDS.lock();
-    let slot = t.get_mut(fd as usize).ok_or(VfsError::BadFd)?
-        .as_mut().ok_or(VfsError::BadFd)?;
-    slot.file.seek(off, whence).await
+    with_fd_take(fd, |mut entry| async move {
+        let r = entry.file.seek(off, whence).await;
+        (entry, r)
+    }).await
 }

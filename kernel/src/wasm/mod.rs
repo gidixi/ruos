@@ -20,7 +20,7 @@ pub async fn run_at(path: &str) {
         }
     };
 
-    kprintln!("ruos: wasm: about to instantiate {}", path);
+    crate::wtrace!("ruos: wasm: about to instantiate {}", path);
     let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
         Ok(f) => f,
         Err(e) => {
@@ -28,7 +28,7 @@ pub async fn run_at(path: &str) {
             return;
         }
     };
-    kprintln!("ruos: wasm: instantiated {}", path);
+    crate::wtrace!("ruos: wasm: instantiated {}", path);
     fb.set_args(alloc::vec![path.as_bytes().to_vec()]);
 
     // Pre-open socket FD 4 for server and client.
@@ -39,7 +39,7 @@ pub async fn run_at(path: &str) {
             let idx = crate::net::sockets::POOL.alloc_tcp();
             let handle = crate::net::sockets::POOL.handle(idx).expect("server socket");
             crate::net::sockets::listen(handle, 8080).expect("listen");
-            kprintln!("ruos: server socket listening port=8080 idx={}", idx);
+            crate::wtrace!("ruos: server socket listening port=8080 idx={}", idx);
             let fds = &mut fb.store.data_mut().fds;
             if fds.len() <= 4 {
                 fds.resize_with(5, || None);
@@ -51,9 +51,9 @@ pub async fn run_at(path: &str) {
             let idx = crate::net::sockets::POOL.alloc_tcp();
             let handle = crate::net::sockets::POOL.handle(idx).expect("client socket");
             let remote = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 8080);
-            kprintln!("ruos: client socket connecting idx={}", idx);
+            crate::wtrace!("ruos: client socket connecting idx={}", idx);
             match crate::net::sockets::connect(handle, remote, 49152).await {
-                Ok(()) => kprintln!("ruos: client socket connected idx={}", idx),
+                Ok(()) => crate::wtrace!("ruos: client socket connected idx={}", idx),
                 Err(e) => {
                     kprintln!("ruos: client socket connect failed: {}", e);
                     return;

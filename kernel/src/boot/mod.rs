@@ -1,5 +1,6 @@
 //! Boot phase orchestration.
 
+pub mod clock;
 pub mod log;
 pub mod banner;
 pub mod error;

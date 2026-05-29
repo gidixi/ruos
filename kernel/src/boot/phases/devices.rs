@@ -16,6 +16,9 @@ pub fn init() -> Result<(), BootError> {
 
             crate::console::CONSOLE.lock().attach_framebuffer(fb);
             crate::binfo!("dev", "fb attached");
+            // Re-stamp banner so it also appears on the framebuffer (the
+            // initial stamp went only to serial since fb was off then).
+            crate::boot::banner::stamp();
         }
         Err(e) => {
             // Framebuffer is optional — serial console is always available.

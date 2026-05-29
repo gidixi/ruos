@@ -21,6 +21,7 @@ smoltcp = { version = "0.11", default-features = false, features = ["alloc", "me
 
 [features]
 boot-checks = []
+wasm-trace = []
 
 [profile.dev]
 panic = "abort"

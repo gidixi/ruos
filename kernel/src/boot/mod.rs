@@ -15,6 +15,7 @@ pub fn run() -> Result<core::convert::Infallible, BootError> {
     phases::arch::init()?;
     phases::mem::init()?;
     phases::interrupts::init()?;
+    phases::pci::init()?;
     phases::devices::init()?;
     phases::fs::init()?;
     phases::userland::init()

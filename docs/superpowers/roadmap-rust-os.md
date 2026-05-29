@@ -149,7 +149,7 @@ reale via USB.
 - Shell locale gira sopra PTY (sostituisce stdin/stdout diretti). Stessa
   astrazione che userà SSH.
 
-## Step 13 — PCI/PCIe enumeration (ECAM)
+## Step 13 — PCI/PCIe enumeration (ECAM) (✅ DONE)
 
 **Fondamenta comuni per ogni device PCIe** (NIC virtio-net dello Step 14, AHCI
 dello Step 15, futuri NVMe/xHCI). Spec:

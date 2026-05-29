@@ -11,5 +11,6 @@ pub enum BootError {
     VfsInit(&'static str),
     ModulesMount(&'static str),
     NetInit(&'static str),
+    PciInit(&'static str),
     Other(&'static str),
 }

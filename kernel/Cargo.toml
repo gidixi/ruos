@@ -17,6 +17,7 @@ vte = { version = "0.13", default-features = false, features = ["no_std"] }
 embassy-executor = { version = "0.6", default-features = false, features = ["nightly", "task-arena-size-65536"] }
 wasmi = { version = "1.0.9", default-features = false, features = ["prefer-btree-collections"] }
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "socket-tcp"] }
+pci_types = "0.10"
 
 [features]
 boot-checks = []

@@ -26,11 +26,61 @@ pub fn ruos_exec(
     mem.read(&caller, argv_ptr as usize, &mut argv_blob)
         .map_err(|_| Error::i32_exit(-1))?;
     let argv = decode_argv(&argv_blob).unwrap_or_default();
+    // Child inherits parent's CWD — POSIX semantics.
+    let cwd = caller.data().cwd.clone();
     Err(Error::host(SuspendReason::Exec {
         path,
         argv,
+        cwd,
         exit_code_ptr: exit_code_ptr as u32,
     }))
+}
+
+/// ruos_chdir(path_ptr, path_len) -> errno
+///
+/// Updates the caller's CWD. Path may be relative — resolved against
+/// the current CWD. No filesystem validation today (any path accepted).
+pub fn ruos_chdir(
+    mut caller: Caller<'_, RuntimeState>,
+    path_ptr: i32,
+    path_len: i32,
+) -> Result<i32, Error> {
+    let mem = wasm_memory(&caller)?;
+    let mut path_buf = alloc::vec![0u8; path_len as usize];
+    mem.read(&caller, path_ptr as usize, &mut path_buf)
+        .map_err(|_| Error::i32_exit(-1))?;
+    let path = core::str::from_utf8(&path_buf)
+        .map_err(|_| Error::i32_exit(-1))?;
+    let new_cwd = resolve_cwd(&caller.data().cwd, path);
+    caller.data_mut().cwd = new_cwd;
+    Ok(0)
+}
+
+/// Resolve a `path` against `base` (current CWD). Handles `.`, `..`,
+/// absolute path override, and trailing-slash normalization.
+pub fn resolve_cwd(base: &str, path: &str) -> alloc::string::String {
+    let mut out: Vec<&str> = Vec::new();
+    let combined = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        let mut s = alloc::string::String::from(base);
+        if !s.ends_with('/') { s.push('/'); }
+        s.push_str(path);
+        s
+    };
+    for seg in combined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => { out.pop(); }
+            s => out.push(s),
+        }
+    }
+    let mut result = alloc::string::String::from("/");
+    result.push_str(&out.join("/"));
+    if result.len() > 1 && result.ends_with('/') {
+        result.pop();
+    }
+    result
 }
 
 fn decode_argv(blob: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -63,9 +113,9 @@ pub fn ruos_readdir(
     let mut path_buf = alloc::vec![0u8; path_len as usize];
     mem.read(&caller, path_ptr as usize, &mut path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
-    let path = core::str::from_utf8(&path_buf)
-        .map_err(|_| Error::i32_exit(-1))?
-        .to_string();
+    let path_str = core::str::from_utf8(&path_buf)
+        .map_err(|_| Error::i32_exit(-1))?;
+    let path = resolve_cwd(&caller.data().cwd, path_str);
     Err(Error::host(SuspendReason::ReadDir {
         path,
         buf_ptr: buf_ptr as u32,
@@ -77,6 +127,7 @@ pub fn ruos_readdir(
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "exec", ruos_exec)?
-        .func_wrap("ruos", "readdir", ruos_readdir)?;
+        .func_wrap("ruos", "readdir", ruos_readdir)?
+        .func_wrap("ruos", "chdir", ruos_chdir)?;
     Ok(())
 }

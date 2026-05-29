@@ -44,6 +44,10 @@ impl Fiber {
         self.store.data_mut().args = args;
     }
 
+    pub fn set_cwd(&mut self, cwd: alloc::string::String) {
+        self.store.data_mut().cwd = cwd;
+    }
+
     pub async fn run(&mut self) -> i32 {
         // Get the _start function.
         let start = match self.instance.get_func(&self.store, "_start") {
@@ -229,13 +233,13 @@ impl Fiber {
                     Err(_) => 44, // ENOENT
                 }
             }
-            SuspendReason::Exec { path, argv, exit_code_ptr } => {
+            SuspendReason::Exec { path, argv, cwd, exit_code_ptr } => {
                 // Delegate to exec_queue: the exec_worker_task (a separate
                 // embassy task) will load+run the child on its own stack,
                 // avoiding the double-fault that occurs when wasmi compilation
                 // happens recursively inside this fiber's stack frame.
                 let code = crate::wasm::exec_queue::EXEC_QUEUE
-                    .post_and_wait(path, argv)
+                    .post_and_wait(path, argv, cwd)
                     .await;
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0

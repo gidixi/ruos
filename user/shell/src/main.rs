@@ -19,6 +19,7 @@ extern "C" {
 
     fn tcgetattr(fd: i32, ptr: u32) -> i32;
     fn tcsetattr(fd: i32, action: i32, ptr: u32) -> i32;
+    fn chdir(path_ptr: u32, path_len: u32) -> i32;
 }
 
 #[repr(C)]
@@ -319,6 +320,15 @@ fn builtin_pwd() {
 
 fn builtin_cd(argv: &[&str]) {
     let target = argv.get(1).copied().unwrap_or("/");
+    // Kernel-side CWD update (so child processes spawned via exec inherit
+    // the right directory). Path resolution (relative, .., .) is handled
+    // by the host fn.
+    let errno = unsafe { chdir(target.as_ptr() as u32, target.len() as u32) };
+    if errno != 0 {
+        eprintln!("cd: {}: errno {}", target, errno);
+        return;
+    }
+    // Mirror kernel CWD locally so the prompt and history look right.
     let mut cwd = CWD.lock().unwrap();
     let new = if target.starts_with('/') {
         target.to_string()
@@ -331,6 +341,7 @@ fn builtin_cd(argv: &[&str]) {
                 s.truncate(idx.max(1));
             }
         }
+        if s.is_empty() { s.push('/'); }
         s
     } else {
         let mut s = cwd.clone();

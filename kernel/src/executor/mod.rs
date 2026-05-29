@@ -110,7 +110,15 @@ async fn exec_worker_task() {
                     Ok(mut child) => {
                         child.set_args(slot.argv);
                         child.set_cwd(slot.cwd);
-                        child.run().await
+                        let pid = crate::proc::register(
+                            alloc::string::String::from(
+                                slot.path.trim_start_matches('/')
+                            )
+                        );
+                        child.set_pid(pid);
+                        let code = child.run().await;
+                        crate::proc::unregister(pid);
+                        code
                     }
                 }
             }

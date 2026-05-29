@@ -71,42 +71,79 @@ pub fn path_open(
     }))
 }
 
+fn read_path(
+    caller: &Caller<'_, RuntimeState>,
+    path_ptr: i32,
+    path_len: i32,
+) -> Result<alloc::string::String, Error> {
+    let mem = wasm_memory(caller)?;
+    let mut buf = alloc::vec![0u8; path_len as usize];
+    mem.read(caller, path_ptr as usize, &mut buf)
+        .map_err(|_| Error::i32_exit(-1))?;
+    let s = core::str::from_utf8(&buf).map_err(|_| Error::i32_exit(-1))?;
+    Ok(crate::wasm::host::proc::resolve_cwd(&caller.data().cwd, s))
+}
+
 pub fn path_unlink_file(
-    _: Caller<'_, RuntimeState>,
-    _: i32,
-    _: i32,
-    _: i32,
+    caller: Caller<'_, RuntimeState>,
+    _dir_fd: i32,
+    path_ptr: i32,
+    path_len: i32,
 ) -> Result<i32, Error> {
-    Ok(58) // ENOSYS
+    let path = read_path(&caller, path_ptr, path_len)?;
+    Err(Error::host(crate::wasm::suspend::SuspendReason::PathUnlink { path }))
 }
 
 pub fn path_create_directory(
-    _: Caller<'_, RuntimeState>,
-    _: i32,
-    _: i32,
-    _: i32,
+    caller: Caller<'_, RuntimeState>,
+    _dir_fd: i32,
+    path_ptr: i32,
+    path_len: i32,
 ) -> Result<i32, Error> {
-    Ok(58) // ENOSYS
+    let path = read_path(&caller, path_ptr, path_len)?;
+    Err(Error::host(crate::wasm::suspend::SuspendReason::PathMkdir { path }))
 }
 
 pub fn path_remove_directory(
-    _: Caller<'_, RuntimeState>,
-    _: i32,
-    _: i32,
-    _: i32,
+    caller: Caller<'_, RuntimeState>,
+    _dir_fd: i32,
+    path_ptr: i32,
+    path_len: i32,
 ) -> Result<i32, Error> {
-    Ok(58) // ENOSYS
+    let path = read_path(&caller, path_ptr, path_len)?;
+    Err(Error::host(crate::wasm::suspend::SuspendReason::PathRmdir { path }))
 }
 
+/// path_filestat_get(dir_fd, flags, path_ptr, path_len, buf_ptr) -> errno
+/// Writes a 64-byte wasi_filestat_t at buf_ptr — same layout as fd_filestat_get.
 pub fn path_filestat_get(
-    _: Caller<'_, RuntimeState>,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
+    caller: Caller<'_, RuntimeState>,
+    _dir_fd: i32,
+    _flags: i32,
+    path_ptr: i32,
+    path_len: i32,
+    buf_ptr: i32,
 ) -> Result<i32, Error> {
-    Ok(58) // ENOSYS
+    let path = read_path(&caller, path_ptr, path_len)?;
+    Err(Error::host(crate::wasm::suspend::SuspendReason::PathFilestat {
+        path,
+        buf_ptr: buf_ptr as u32,
+    }))
+}
+
+/// path_rename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len) -> errno
+pub fn path_rename(
+    caller: Caller<'_, RuntimeState>,
+    _old_fd: i32,
+    old_path_ptr: i32,
+    old_path_len: i32,
+    _new_fd: i32,
+    new_path_ptr: i32,
+    new_path_len: i32,
+) -> Result<i32, Error> {
+    let src = read_path(&caller, old_path_ptr, old_path_len)?;
+    let dst = read_path(&caller, new_path_ptr, new_path_len)?;
+    Err(Error::host(crate::wasm::suspend::SuspendReason::PathRename { src, dst }))
 }
 
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
@@ -115,6 +152,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("wasi_snapshot_preview1", "path_unlink_file", path_unlink_file)?
         .func_wrap("wasi_snapshot_preview1", "path_create_directory", path_create_directory)?
         .func_wrap("wasi_snapshot_preview1", "path_remove_directory", path_remove_directory)?
-        .func_wrap("wasi_snapshot_preview1", "path_filestat_get", path_filestat_get)?;
+        .func_wrap("wasi_snapshot_preview1", "path_filestat_get", path_filestat_get)?
+        .func_wrap("wasi_snapshot_preview1", "path_rename", path_rename)?;
     Ok(())
 }

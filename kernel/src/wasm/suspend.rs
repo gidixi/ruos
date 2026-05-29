@@ -39,6 +39,11 @@ pub enum SuspendReason {
         buf_len: usize,
         nread_ptr: u32,
     },
+    PathUnlink   { path: String },
+    PathMkdir    { path: String },
+    PathRmdir    { path: String },
+    PathFilestat { path: String, buf_ptr: u32 },
+    PathRename   { src: String, dst: String },
 }
 
 impl core::fmt::Display for SuspendReason {

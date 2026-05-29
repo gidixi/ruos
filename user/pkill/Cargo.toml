@@ -1,0 +1,8 @@
+[package]
+name = "pkill"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pkill"
+path = "src/main.rs"

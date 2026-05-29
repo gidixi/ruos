@@ -39,7 +39,9 @@ impl Tmpfs {
     }
 
     /// Create a directory at the given (already-split) path. Parent must exist.
-    pub fn mkdir(&self, path: &[&str]) -> Result<(), VfsError> {
+    /// Sync variant: used during boot seeding before the async executor exists.
+    /// Userspace must go through the `FileSystem::mkdir` async trait method.
+    pub fn mkdir_sync(&self, path: &[&str]) -> Result<(), VfsError> {
         let (parent, name) = self.parent_and_name(path)?;
         let mut p = parent.lock();
         if !matches!(p.kind, TmpKind::Dir) { return Err(VfsError::NotDirectory); }
@@ -179,6 +181,66 @@ impl FileSystem for Tmpfs {
             | TmpKind::PtySlave(_) => (VfsKind::Device, 0u64),
         };
         Ok(VfsStat { kind, size })
+    }
+
+    async fn mkdir(&self, path: &[&str]) -> Result<(), VfsError> {
+        self.mkdir_sync(path)
+    }
+
+    async fn rmdir(&self, path: &[&str]) -> Result<(), VfsError> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let mut p = parent.lock();
+        let child = p.children.get(name).cloned().ok_or(VfsError::NotFound)?;
+        {
+            let c = child.lock();
+            if !matches!(c.kind, TmpKind::Dir) { return Err(VfsError::NotDirectory); }
+            if !c.children.is_empty() { return Err(VfsError::NotPermitted); }
+        }
+        p.children.remove(name);
+        Ok(())
+    }
+
+    async fn rename(&self, src: &[&str], dst: &[&str]) -> Result<(), VfsError> {
+        // Identity rename: noop.
+        if src == dst { return Ok(()); }
+        // Reject moving a directory into one of its descendants.
+        let src_prefix_of_dst = src.len() < dst.len() && dst[..src.len()] == *src;
+        if src_prefix_of_dst { return Err(VfsError::Invalid); }
+
+        let (src_parent, src_name) = self.parent_and_name(src)?;
+        let (dst_parent, dst_name) = self.parent_and_name(dst)?;
+
+        // Same parent: in-place rename.
+        if Arc::ptr_eq(&src_parent, &dst_parent) {
+            let mut p = src_parent.lock();
+            let node = p.children.remove(src_name).ok_or(VfsError::NotFound)?;
+            if p.children.contains_key(dst_name) {
+                // Restore src and fail.
+                p.children.insert(src_name.to_string(), node);
+                return Err(VfsError::AlreadyExists);
+            }
+            p.children.insert(dst_name.to_string(), node);
+            return Ok(());
+        }
+
+        // Different parents: lock both in a stable order (by Arc pointer
+        // address) to avoid deadlock against a concurrent rename in the
+        // reverse direction.
+        let (a, b, swap) = {
+            let sp = Arc::as_ptr(&src_parent) as usize;
+            let dp = Arc::as_ptr(&dst_parent) as usize;
+            if sp < dp { (src_parent.clone(), dst_parent.clone(), false) }
+            else       { (dst_parent.clone(), src_parent.clone(), true)  }
+        };
+        let mut a_g = a.lock();
+        let mut b_g = b.lock();
+        let (sp_g, dp_g) = if swap { (&mut *b_g, &mut *a_g) } else { (&mut *a_g, &mut *b_g) };
+
+        if !matches!(dp_g.kind, TmpKind::Dir) { return Err(VfsError::NotDirectory); }
+        if dp_g.children.contains_key(dst_name) { return Err(VfsError::AlreadyExists); }
+        let node = sp_g.children.remove(src_name).ok_or(VfsError::NotFound)?;
+        dp_g.children.insert(dst_name.to_string(), node);
+        Ok(())
     }
 }
 

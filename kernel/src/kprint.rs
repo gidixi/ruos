@@ -10,6 +10,9 @@ macro_rules! kprintln {
         use core::fmt::Write as _;
         ::x86_64::instructions::interrupts::without_interrupts(|| {
             let _ = writeln!($crate::console::CONSOLE.lock(), $($arg)*);
+            let mut __scratch = $crate::klog::Scratch::new();
+            let _ = writeln!(__scratch, $($arg)*);
+            $crate::klog::push(__scratch.as_bytes());
         });
     }};
 }

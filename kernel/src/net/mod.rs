@@ -8,8 +8,6 @@ use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use crate::kprintln;
-
 pub struct NetState {
     pub iface: Interface,
     pub device: loopback::Loopback,
@@ -30,7 +28,6 @@ pub fn init() {
 
     let sockets = SocketSet::new(alloc::vec::Vec::new());
     *NET.lock() = Some(NetState { iface, device, sockets });
-    kprintln!("ruos: net init ok addr=127.0.0.1/8");
 }
 
 /// Called periodically by `net_poll_task` (every 10 ms).

@@ -3,6 +3,8 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
+DISK_IMG  := build/disk.img
+DISK_MB   := 64
 HELLO     := shell: init.sh complete
 
 # Userspace .wasm tools shipped on the ISO. Root-level tools go to ISO_ROOT/,
@@ -19,9 +21,21 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk
 
 all: iso
+
+# Persistent SATA disk image for AHCI tests. 64 MiB raw, FAT32, with a
+# marker file `hello.txt` for the smoke test. Rebuilt only if missing —
+# the test mounts read-write, so a stale disk after a run is fine.
+$(DISK_IMG):
+	mkdir -p build
+	dd if=/dev/zero of=$@.tmp bs=1M count=$(DISK_MB) status=none
+	mkfs.vfat -F 32 -n RUOS $@.tmp >/dev/null
+	echo 'hello from disk' | mcopy -i $@.tmp - ::/hello.txt
+	mv $@.tmp $@
+
+disk: $(DISK_IMG)
 
 build:
 	source $$HOME/.cargo/env && cd kernel && cargo build
@@ -70,19 +84,24 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 # Default keeps virtio-net (Step 14 paravirtual fast path).
 NIC ?= virtio-net-pci
 
-run: iso
-	qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -m 512 \
-		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0
-
-run-test: iso
-	@echo "--- serial (timeout 120s, NIC=$(NIC)) ---"
-	@timeout 120 qemu-system-x86_64 -machine q35 -cpu max -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+run: iso $(DISK_IMG)
+	qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -m 512 \
 		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
+		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
+		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
+
+run-test: iso $(DISK_IMG)
+	@echo "--- serial (timeout 120s, NIC=$(NIC)) ---"
+	@timeout 120 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
+		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
+		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
 		| tee build/serial.log; \
 	grep -qF "$(HELLO)" build/serial.log || { echo TEST_FAIL_SHELL; exit 1; }; \
 	grep -qE "pci .* init ok devices=[1-9]" build/serial.log || { echo TEST_FAIL_PCI; exit 1; }; \
 	grep -qE "pci .* xhci @" build/serial.log || { echo TEST_FAIL_XHCI; exit 1; }; \
 	grep -qE "net .* dhcp bound ip=10\.0\.2\.15" build/serial.log || { echo TEST_FAIL_DHCP; exit 1; }; \
+	grep -qF "ahci HBA up" build/serial.log || { echo TEST_FAIL_AHCI; exit 1; }; \
 	echo TEST_PASS
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and

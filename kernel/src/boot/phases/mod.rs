@@ -7,6 +7,7 @@ pub mod interrupts;
 pub mod pci;
 pub mod devices;
 pub mod fs;
+pub mod storage;
 pub mod userland;
 
 use spin::Mutex;

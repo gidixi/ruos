@@ -69,7 +69,7 @@ reale via USB.
 4. **Heap + global allocator.** `talc` su Limine memory map + HHDM.
 5. **IDT/GDT + APIC + timer + tastiera.** Crate `x86_64` 0.15 + `acpi` 5.x.
 
-## Step 6 — Frame allocator fisico + paging API completata
+## Step 6 — Frame allocator fisico + paging API completata (✅ DONE)
 
 - Frame allocator dalla Limine memory map (bitmap o stack di frame).
 - Reserve regions: heap region (esposta da `memory::heap_region()`), kernel
@@ -83,7 +83,7 @@ reale via USB.
 - NO per-process page tables. NO ring 3. È paging "di sistema": heap growth,
   mmap futuri, MMIO devices.
 
-## Step 7 — VFS minimale + tmpfs
+## Step 7 — VFS minimale + tmpfs (✅ DONE)
 
 - Trait `FileSystem`, `Inode`, `File` (open/read/write/seek/close + stat).
 - `tmpfs` in-RAM: tree di `Inode` con contenuto `Vec<u8>` per file regolari.
@@ -95,7 +95,7 @@ reale via USB.
 - FAT (`fatfs` no_std) + block driver (virtio-blk via `virtio-drivers`)
   arrivano DOPO, solo se serve persistenza. Step 7 finisce con tmpfs.
 
-## Step 8 — Framebuffer console
+## Step 8 — Framebuffer console (✅ DONE)
 
 - Limine `FramebufferRequest` (RGB/BGR, pitch, dimensioni).
 - Font bitmap 8x16 (es. font IBM VGA / `font8x8` crate).
@@ -105,7 +105,7 @@ reale via USB.
 - `kprintln!` ora scrive su MultiConsole. La seriale resta sempre attiva come
   debug log a doppio canale.
 
-## Step 9 — Async executor no_std
+## Step 9 — Async executor no_std (✅ DONE)
 
 - `embassy-executor` (consigliato: maturo, integrato con IRQ wake, scelta
   comune in OS hobby Rust) o alternative (`futures-lite` adattato).
@@ -114,7 +114,7 @@ reale via USB.
 - Niente `Thread` astratti; le "task" sono `Future` ognuno con il proprio stack
   (gestito dall'executor).
 
-## Step 10 — WASM runtime + WASI Preview 1
+## Step 10 — WASM runtime + WASI Preview 1 (✅ DONE)
 
 - Runtime: **`wasmi`** (Rust puro, `no_std`, interpreter) — match perfetto con
   lo stile del progetto. WAMR (C) via FFI è plan B se la performance non basta.
@@ -130,7 +130,7 @@ reale via USB.
   `cargo build --target wasm32-wasi` viene caricato da VFS (`/init.wasm`) ed
   eseguito; stampa "Hello from WASM!" sulla console.
 
-## Step 11 — Shell locale
+## Step 11 — Shell locale (✅ DONE)
 
 - Line editor minimale: input scancode → traduzione layout US (tabella),
   cursor ←/→, backspace, CR.
@@ -142,14 +142,116 @@ reale via USB.
   successivo).
 - Job control / pipe / redirezioni: DOPO, opzionali.
 
-## Step 12 — PTY (pseudo-terminal)
+## Step 12 — PTY (pseudo-terminal) (✅ DONE)
 
 - Coppia master/slave fd. Buffer circolare bidirezionale.
 - Line discipline: raw mode, cooked mode (echo + line buffering).
 - Shell locale gira sopra PTY (sostituisce stdin/stdout diretti). Stessa
   astrazione che userà SSH.
 
-## Step 13 — Mouse PS/2 + rlvgl + host functions grafiche
+## Step 13 — PCI/PCIe enumeration (ECAM)
+
+**Fondamenta comuni per ogni device PCIe** (NIC virtio-net dello Step 14, AHCI
+dello Step 15, futuri NVMe/xHCI). Spec:
+`docs/superpowers/specs/2026-05-29-rust-pci-ecam-design.md`.
+
+- Estrazione **ECAM** dalla tabella ACPI **MCFG** (`acpi` crate, già parsato) →
+  `Vec<EcamRegion>` su `AcpiInfo`. MCFG assente = non fatale (Vec vuoto).
+- Modulo `pci/`: addressing config-space via formula
+  `base + (bus<<20 | dev<<15 | fn<<12)`, accesso volatile su `map_io_page` (UC,
+  idempotente — riusa il Mapper dello Step 6).
+- Enumerazione piatta di tutti i bus/device/function di ogni regione ECAM →
+  `Vec<PciDevice>` (vendor/device id, class/subclass/prog-if, header type, BAR
+  decodificati con size-probing memoria/IO + 32/64-bit + prefetchable).
+- API consumer: `find_class(class, subclass, prog_if)` → device → `bar(n)` →
+  finestra MMIO. Helper Command-register: `enable_mmio()` (Memory Space),
+  `enable_bus_master()` (Bus Master, richiesto per DMA). Walker capability-list
+  (espone MSI/MSI-X per uno step MSI futuro; questo step solo enumera).
+- **Non-goal (YAGNI):** niente fallback porte legacy `0xCF8/0xCFC` (target =
+  `q35`, MCFG sempre presente), niente ricorsione PCI-to-PCI bridge (scan piatto),
+  niente programmazione MSI/MSI-X, niente hotplug/PM/IOMMU/SR-IOV.
+- **Smoke (`make run-test`):** QEMU `-machine q35 -device qemu-xhci` →
+  `ruos: pci init ok devices=N` (N≥1), `find_class(0x0C,03,30)` trova l'xHCI,
+  decode+sizing di BAR0 (BAR memoria 64-bit) loggato.
+
+## Step 14 — Networking
+
+- Driver `virtio-net` per QEMU/VBox (crate `virtio-drivers` o port). Device
+  PCIe → discovery via Step 13 (`pci::find_class`/BAR). Costruisce l'**allocator
+  DMA** (buffer fisicamente contigui) riusato poi da AHCI (Step 15).
+- Stack TCP `smoltcp` (no_std, ben mantenuto).
+- **CSPRNG critico**: `ChaCha20Rng` (crate `rand_chacha`) seedato all'init da
+  `RDRAND` (CPUID feature check + `rdrand` instruction). Esposto via:
+  - `random_get` di WASI (Step 10).
+  - API kernel per SSH (Step 16).
+- Test: DHCP + ping in QEMU.
+
+## Step 15 — AHCI / SATA disk + FAT persistente
+
+**Prerequisito: Step 13 (PCI/ECAM).** AHCI è un device PCIe → serve prima il
+sottosistema PCI (`find_class` + BAR decode + Command bits). Spec:
+`docs/superpowers/specs/2026-05-29-rust-pci-ecam-design.md`. Riusa l'allocator
+DMA introdotto dallo Step 14 (networking).
+
+Obiettivo: leggere/scrivere un disco SATA reale e montarci sopra un filesystem
+persistente (FAT), sostituendo il solo tmpfs RAM dello Step 7 dove serve durabilità.
+
+**Componenti:**
+
+1. **Discovery via PCI** — `pci::find_class(0x01, 0x06, 0x01)` (Mass Storage /
+   SATA / AHCI). BAR5 (`ABAR`) = base MMIO dei registri HBA. `enable_mmio()` +
+   `enable_bus_master()` (AHCI fa DMA).
+
+2. **HBA / port bring-up** — mappa `ABAR` (UC via `map_io_page`/`map_io_range`).
+   Registri generici: `CAP`, `GHC` (AHCI Enable + reset), `PI` (ports
+   implemented), `IS`. Per ogni porta attiva con device presente (`PxSSTS` DET):
+   stop engine (FRE/ST clear), alloca **Command List** (1 KiB) + **FIS Receive
+   Area** (256 B) + **Command Tables** (con PRDT) — buffer DMA fisicamente
+   contigui dal frame allocator (Step 6), indirizzo fisico nei registri
+   `PxCLB/PxFB`. Restart engine.
+
+3. **ATA command set** — `IDENTIFY DEVICE` (capacità, LBA48, modello).
+   `READ DMA EXT` / `WRITE DMA EXT` (LBA48) via FIS H2D, polling su `PxCI`/`PxIS`
+   inizialmente, IRQ dopo (vettore AHCI via IOAPIC, o MSI-X — spec PCI follow-up).
+
+4. **Block device layer** — nuovo trait kernel `BlockDevice { read_blocks,
+   write_blocks, block_size, block_count }`. AHCI port = una impl. Astrae anche
+   futuri NVMe/virtio-blk.
+
+5. **FAT su block device** — crate `fatfs` (no_std) sopra il `BlockDevice`.
+   Mount nel VFS (Step 7) come secondo mount (es. `/mnt` o `/`), accanto/al posto
+   di tmpfs. File `.wasm` caricabili da disco persistente invece che da initrd.
+
+6. **DMA infra** — i buffer AHCI (command list, FIS, PRDT data) richiedono
+   memoria DMA: fisicamente contigua, indirizzo fisico noto (HHDM `virt = phys +
+   offset`), uncached o flush appropriato. Riusa l'helper allocator DMA dello
+   Step 14 (condiviso anche con futuri xHCI/virtio).
+
+**Smoke contract (`make run-test`):** QEMU `q35` (controller AHCI built-in) +
+`-drive file=disk.img,format=raw,if=none,id=d0 -device ide-hd,drive=d0,bus=ahci.0`
+(o `-device ich9-ahci`). Asserzioni seriali: `ruos: ahci port0 sectors=N`
+(IDENTIFY ok), round-trip write→read di un settore con pattern verificato,
+mount FAT + `ls` di un file noto.
+
+**Note:** niente partizioni/GPT inizialmente (FAT su disco intero); niente
+write-back cache, niente NCQ multi-command (un command slot alla volta basta);
+TRIM/SMART/hotplug fuori scope. NVMe = step parallelo separato (stesso
+`BlockDevice`, controller PCIe diverso).
+
+**Dipendenze:** Step 6 (frame allocator per DMA) + Step 13 (PCI/ECAM) + Step 7
+(VFS per il mount) + Step 14 (allocator DMA). Indipendente da SSH/GUI.
+
+## Step 16 — SSH server
+
+- Crate: `sunset` (no_std, no_alloc anche se `alloc` adesso esiste — comunque
+  match perfetto) o `russh` (async, richiede alloc + executor — già pronto).
+- Auth: chiave pubblica hardcoded all'inizio (testabile via `ssh -i ...`).
+- Modello inizio: **exec non-interattivo** (`ssh user@ruos /bin/foo.wasm`) —
+  basta runtime WASM + VFS, senza PTY. Già utile.
+- Modello completo: **sessione interattiva** con PTY (Step 12) → shell
+  (Step 11) sopra.
+
+## Step 17 — Mouse PS/2 + rlvgl + host functions grafiche
 
 - Driver mouse PS/2 (porta 0x64 controller, IRQ12 via IOAPIC, scancode 3 byte).
 - Crate `rlvgl` (port Rust di LVGL, no_std).
@@ -160,27 +262,7 @@ reale via USB.
 - App WASM grafiche sono ruos-specific (legate alle host fn custom), non
   portabili agli altri WASI runtime. Trade-off accettato.
 
-## Step 14 — Networking
-
-- Driver `virtio-net` per QEMU/VBox (crate `virtio-drivers` o port).
-- Stack TCP `smoltcp` (no_std, ben mantenuto).
-- **CSPRNG critico**: `ChaCha20Rng` (crate `rand_chacha`) seedato all'init da
-  `RDRAND` (CPUID feature check + `rdrand` instruction). Esposto via:
-  - `random_get` di WASI (Step 10).
-  - API kernel per SSH (Step 15).
-- Test: DHCP + ping in QEMU.
-
-## Step 15 — SSH server
-
-- Crate: `sunset` (no_std, no_alloc anche se `alloc` adesso esiste — comunque
-  match perfetto) o `russh` (async, richiede alloc + executor — già pronto).
-- Auth: chiave pubblica hardcoded all'inizio (testabile via `ssh -i ...`).
-- Modello inizio: **exec non-interattivo** (`ssh user@ruos /bin/foo.wasm`) —
-  basta runtime WASM + VFS, senza PTY. Già utile.
-- Modello completo: **sessione interattiva** con PTY (Step 12) → shell
-  (Step 11) sopra.
-
-## Step 16 — SMP / multi-CPU
+## Step 18 — SMP / multi-CPU
 
 Oggi ruos è uniprocessor (UP): solo il BSP (CPU 0) gira; gli AP
 (Application Processors) restano in `wait-for-SIPI`. Banner stampa
@@ -244,9 +326,9 @@ condition prima invisibili).
 distribuisce wasm task su N core (osservabile via per-CPU log
 prefix tipo `[CPU 2] INFO ...`).
 
-**Rimandato post-Step-15 (SSH).** Single-CPU basta per WASIX
+**Rimandato post-Step-16 (SSH).** Single-CPU basta per WASIX
 bootstrap + shell + SSH locale. SMP serve quando arriverà:
-- Multi-utente SSH simultaneo (Step 15.5+)
+- Multi-utente SSH simultaneo (Step 16.5+)
 - Performance compute-heavy wasm (bash/python multi-thread)
 - Real hardware deployment con N core
 
@@ -267,18 +349,26 @@ bootstrap + shell + SSH locale. SMP serve quando arriverà:
                           [Step 9: async executor]
                                                |
                                                v
-                          [Step 10: WASM + WASI] --+--+--+
-                                                   |  |  |
-                                  [Step 11: shell] /  |  |
-                                          |           |  |
-                                          v           |  |
-                                  [Step 12: PTY] <----+  |
-                                                         |
-              [Step 13: mouse + rlvgl + draw host fn] <--+
-                                                         |
-              [Step 14: virtio-net + smoltcp + CSPRNG] --+--+
-                                                            |
-                                          [Step 15: SSH] <--+
+                          [Step 10: WASM + WASI] --+--+
+                                                   |  |
+                                  [Step 11: shell] /  |
+                                          |           |
+                                          v           |
+                                  [Step 12: PTY] <----+
+
+Catena critica north-star (accesso remoto):
+
+[Step 6: paging] ─┐
+[Step 7: VFS] ────┤
+                  v
+        [Step 13: PCI/ECAM] ──┬──▶ [Step 14: virtio-net + CSPRNG] ──▶ [Step 16: SSH]
+                              │                  │ (DMA infra)
+                              │                  v
+                              └──────────▶ [Step 15: AHCI + FAT] ──▶ (NVMe / virtio-blk)
+
+Rami indipendenti (qualsiasi momento dopo i loro prereq):
+  [Step 17: mouse + rlvgl]  ← framebuffer/executor (8,9)
+  [Step 18: SMP]            ← trasversale, alto rischio, ultimo
 ```
 
 ## Decisioni tecniche fissate
@@ -297,7 +387,8 @@ bootstrap + shell + SSH locale. SMP serve quando arriverà:
 ## Cosa NON è in roadmap (rifiutato esplicitamente)
 
 - Multi-utente Unix-style (uid/gid, permessi POSIX) — fuori scope hobby.
-- Multi-CPU/SMP — solo se serve dopo Step 15.
-- Filesystem on-disk persistente in Step 7 — solo tmpfs RAM. FAT/AHCI dopo.
+- Multi-CPU/SMP — solo se serve dopo Step 16.
+- Filesystem on-disk persistente in Step 7 — solo tmpfs RAM. FAT/AHCI spostati
+  allo Step 15 (richiede prima lo Step 13 PCI/ECAM).
 - Hardware reale "ben rifinito" — l'OS funzionerà su HW reale (Limine ISO USB)
   ma il primary target di sviluppo è QEMU + VBox.

@@ -174,7 +174,7 @@ dello Step 15, futuri NVMe/xHCI). Spec:
   `ruos: pci init ok devices=N` (N≥1), `find_class(0x0C,03,30)` trova l'xHCI,
   decode+sizing di BAR0 (BAR memoria 64-bit) loggato.
 
-## Step 14 — Networking
+## Step 14 — Networking (✅ DONE)
 
 - Driver `virtio-net` per QEMU/VBox (crate `virtio-drivers` o port). Device
   PCIe → discovery via Step 13 (`pci::find_class`/BAR). Costruisce l'**allocator

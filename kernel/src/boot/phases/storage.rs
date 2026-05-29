@@ -4,6 +4,7 @@
 //! SATA log a warning and continue (no `/mnt`).
 
 use crate::boot::BootError;
+use crate::blockdev::BlockDevice;
 
 pub fn init() -> Result<(), BootError> {
     let hba = match crate::ahci::init() {
@@ -14,8 +15,27 @@ pub fn init() -> Result<(), BootError> {
     // Walk Ports-Implemented; bring up every populated SATA port.
     for idx in 0..32 {
         if (hba.pi & (1 << idx)) == 0 { continue; }
-        if let Some(port) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
-            // Stash the first usable port for the FAT mount phase (Task 7).
+        if let Some(mut port) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
+            // Smoke: read sector 0 (FAT BPB) + confirm 0x55AA boot signature
+            // at bytes 510..512. End-to-end proof that READ DMA EXT works
+            // against the QEMU disk we formatted with mkfs.vfat.
+            let mut buf = alloc::vec![0u8; 512];
+            match port.read_blocks(0, &mut buf) {
+                Ok(()) => {
+                    let sig = u16::from_le_bytes([buf[510], buf[511]]);
+                    if sig == 0xAA55 {
+                        crate::binfo!(
+                            "ahci", "disk read OK sector 0 boot_sig=0x{:04x} oem={:?}",
+                            sig,
+                            core::str::from_utf8(&buf[3..11]).unwrap_or("?"),
+                        );
+                    } else {
+                        crate::bwarn!("ahci", "sector 0 read but no FAT sig (got 0x{:04x})", sig);
+                    }
+                }
+                Err(e) => crate::bwarn!("ahci", "sector 0 read failed: {}", e),
+            }
+            // Stash the port for the FAT mount step (Task 6 follow-up).
             crate::ahci::set_port0(port);
             break;
         }

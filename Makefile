@@ -67,7 +67,10 @@ run-test: iso
 	@echo "--- serial (timeout 120s) ---"
 	@timeout 120 qemu-system-x86_64 -machine q35 -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
 		| tee build/serial.log; \
-	grep -qF "$(HELLO)" build/serial.log && echo TEST_PASS || { echo TEST_FAIL; exit 1; }
+	grep -qF "$(HELLO)" build/serial.log || { echo TEST_FAIL_SHELL; exit 1; }; \
+	grep -qE "pci .* init ok devices=[1-9]" build/serial.log || { echo TEST_FAIL_PCI; exit 1; }; \
+	grep -qE "pci .* xhci @" build/serial.log || { echo TEST_FAIL_XHCI; exit 1; }; \
+	echo TEST_PASS
 
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"

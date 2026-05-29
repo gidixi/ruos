@@ -9,15 +9,12 @@ pub struct NullFile;
 pub struct ZeroFile;
 
 impl File for ConsoleFile {
-    /// Reads one byte from the global keyboard queue, blocking until a
-    /// char arrives. The queue is single-consumer; if any other code
-    /// path (e.g. the legacy `SuspendReason::KbdReadChar` route via
-    /// `FdEntry::Stdin`) drains the queue concurrently, reads here will
-    /// race. Step 11 fixes this by making the shell the sole keyboard
-    /// consumer (via /dev/console as stdin).
+    /// Reads one byte from PTY 0 master output (legacy /dev/console path).
+    /// Shell I/O now uses /dev/pts/0 directly; this remains for any code
+    /// that opens /dev/console for reading.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
         if buf.is_empty() { return Ok(0); }
-        let b = crate::keyboard::queue::read_char().await;
+        let b = crate::pty::master_output_read(0).await;
         buf[0] = b;
         Ok(1)
     }

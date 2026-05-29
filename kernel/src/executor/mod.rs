@@ -51,6 +51,7 @@ pub fn run() -> ! {
     crate::binfo!("user", "executor: spawning tasks");
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
+    spawner.spawn(console_drain_task()).unwrap();
     // Normal boot: only shell.wasm auto-spawns. init/server/client.wasm
     // remain on disk and are runnable from the shell (e.g. `/init.wasm`,
     // `/server.wasm`) for demo/debug purposes.
@@ -134,6 +135,23 @@ async fn net_poll_task() {
 #[embassy_executor::task(pool_size = 4)]
 async fn wasm_task(path: &'static str) {
     crate::wasm::run_at(path).await;
+}
+
+/// Drains PTY 0 master output and writes each byte to the framebuffer console.
+/// Shell output path: shell.wasm fd_write → PtySlaveFile::write → ldisc::process_output
+/// → pair[0].master_out → this task → CONSOLE.
+#[embassy_executor::task]
+async fn console_drain_task() {
+    loop {
+        let b = crate::pty::master_output_read(0).await;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            use core::fmt::Write;
+            let mut c = crate::console::CONSOLE.lock();
+            let buf = [b];
+            let s = core::str::from_utf8(&buf).unwrap_or("?");
+            let _ = c.write_str(s);
+        });
+    }
 }
 
 #[embassy_executor::task]

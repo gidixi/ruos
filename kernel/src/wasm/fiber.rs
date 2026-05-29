@@ -236,24 +236,13 @@ impl Fiber {
                 }
             }
             SuspendReason::Exec { path, argv, exit_code_ptr } => {
-                let bytes = match crate::wasm::read_all(&path).await {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let _ = self.write_u32(exit_code_ptr, u32::MAX);
-                        return 44; // ENOENT
-                    }
-                };
-                let mut child = match crate::wasm::fiber::Fiber::new(&bytes) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        let _ = self.write_u32(exit_code_ptr, u32::MAX);
-                        return 71;
-                    }
-                };
-                child.set_args(argv);
-                // Box::pin needed: child.run() is async and may itself call
-                // dispatch(Exec{...}), creating a recursive async future chain.
-                let code = alloc::boxed::Box::pin(child.run()).await as i32;
+                // Delegate to exec_queue: the exec_worker_task (a separate
+                // embassy task) will load+run the child on its own stack,
+                // avoiding the double-fault that occurs when wasmi compilation
+                // happens recursively inside this fiber's stack frame.
+                let code = crate::wasm::exec_queue::EXEC_QUEUE
+                    .post_and_wait(path, argv)
+                    .await;
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0
             }

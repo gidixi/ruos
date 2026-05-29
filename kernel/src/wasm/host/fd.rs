@@ -197,6 +197,30 @@ pub fn fd_close(
     }
 }
 
+/// fd_filestat_get: return minimal wasi_filestat_t (64 bytes).
+/// Filetype 4 = REGULAR_FILE, size=0 (read_to_string works without it).
+pub fn fd_filestat_get(
+    mut caller: Caller<'_, RuntimeState>,
+    fd: i32,
+    buf_ptr: i32,
+) -> Result<i32, Error> {
+    use crate::wasm::state::FdEntry;
+    let filetype: u8 = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Vfs(_)) => 4,   // REGULAR_FILE
+        Some(FdEntry::Stdin)
+        | Some(FdEntry::StdoutConsole) => 2, // CHARACTER_DEVICE
+        _ => return Ok(8), // EBADF
+    };
+    let mem = wasm_memory(&caller)?;
+    // wasi_filestat_t layout (64 bytes):
+    //   dev(8) ino(8) filetype(1)+pad(7) nlink(8) size(8) atim(8) mtim(8) ctim(8)
+    let mut stat = [0u8; 64];
+    stat[16] = filetype; // filetype byte
+    mem.write(&mut caller, buf_ptr as usize, &stat)
+        .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+    Ok(0)
+}
+
 pub fn fd_fdstat_get(
     mut caller: Caller<'_, RuntimeState>,
     _fd: i32,
@@ -255,6 +279,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("wasi_snapshot_preview1", "fd_close", fd_close)?
         .func_wrap("wasi_snapshot_preview1", "fd_seek", fd_seek)?
         .func_wrap("wasi_snapshot_preview1", "fd_fdstat_get", fd_fdstat_get)?
+        .func_wrap("wasi_snapshot_preview1", "fd_filestat_get", fd_filestat_get)?
         .func_wrap("wasi_snapshot_preview1", "fd_prestat_get", fd_prestat_get)?
         .func_wrap("wasi_snapshot_preview1", "fd_prestat_dir_name", fd_prestat_dir_name)?;
     Ok(())

@@ -5,6 +5,7 @@ pub mod host;
 pub mod state;
 pub mod suspend;
 pub mod fiber;
+pub mod exec_queue;
 
 use alloc::vec::Vec;
 use crate::kprintln;

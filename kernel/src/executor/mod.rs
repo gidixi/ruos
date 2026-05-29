@@ -55,6 +55,8 @@ pub fn run() -> ! {
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
     spawner.spawn(wasm_task("/server.wasm")).unwrap();
     spawner.spawn(wasm_task("/client.wasm")).unwrap();
+    spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
+    spawner.spawn(exec_worker_task()).unwrap();
     kprintln!("ruos: executor: all tasks spawned, entering poll loop");
 
     loop {
@@ -82,6 +84,46 @@ pub fn run() -> ! {
     }
 }
 
+/// Runs child WASM processes on behalf of shell fibers that issue exec()
+/// calls. This task has its own embassy-allocated stack frame, so wasmi
+/// compilation (which is stack-heavy) doesn't overflow the shell fiber.
+#[embassy_executor::task]
+async fn exec_worker_task() {
+    use crate::wasm::exec_queue::{EXEC_QUEUE, WaitForRequest};
+    use core::sync::atomic::Ordering;
+    loop {
+        // Wait for a request from a shell fiber.
+        let slot = WaitForRequest::new(&EXEC_QUEUE).await;
+
+        // Load and run the child wasm.
+        let code: i32 = match crate::wasm::read_all(&slot.path).await {
+            Err(_) => {
+                kprintln!("ruos: exec_worker: read {} failed", slot.path);
+                127 // command not found
+            }
+            Ok(bytes) => {
+                match crate::wasm::fiber::Fiber::new(&bytes) {
+                    Err(e) => {
+                        kprintln!("ruos: exec_worker: instantiate {} failed: {}", slot.path, e);
+                        126 // cannot execute
+                    }
+                    Ok(mut child) => {
+                        child.set_args(slot.argv);
+                        child.run().await
+                    }
+                }
+            }
+        };
+
+        // Signal completion to the waiting shell fiber.
+        EXEC_QUEUE.result.store(code, Ordering::SeqCst);
+        EXEC_QUEUE.done.store(true, Ordering::SeqCst);
+        if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
+            w.wake();
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn net_poll_task() {
     loop {
@@ -90,7 +132,7 @@ async fn net_poll_task() {
     }
 }
 
-#[embassy_executor::task(pool_size = 3)]
+#[embassy_executor::task(pool_size = 4)]
 async fn wasm_task(path: &'static str) {
     crate::wasm::run_at(path).await;
 }

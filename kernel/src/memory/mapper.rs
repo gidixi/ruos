@@ -118,6 +118,11 @@ pub fn hhdm_virt(phys: PhysAddr) -> VirtAddr {
     VirtAddr::new(phys.as_u64() + hhdm)
 }
 
+/// The HHDM offset (phys→virt delta). Panics if paging not initialized.
+pub fn hhdm_offset() -> u64 {
+    *HHDM_OFFSET.get().expect("mapper: hhdm not initialized")
+}
+
 pub fn map_io_page(phys: PhysAddr) -> Result<VirtAddr, MapError> {
     let hhdm = *HHDM_OFFSET.get().ok_or(MapError::NotInitialized)?;
     let virt = VirtAddr::new(phys.as_u64() + hhdm);

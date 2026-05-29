@@ -17,7 +17,8 @@ pub struct NetState {
     pub dev_lo:    loopback::Loopback,
     pub iface_net: Option<Interface>,
     pub dev_net:   Option<virtio::VirtioNet>,
-    pub sockets:   SocketSet<'static>,
+    pub sockets:   SocketSet<'static>,      // app/loopback sockets (iface_lo)
+    pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP (iface_net)
     pub dhcp:      Option<SocketHandle>,
     dhcp_bound:    bool,
 }
@@ -36,14 +37,19 @@ pub fn init() {
         a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
     });
 
-    let mut sockets = SocketSet::new(alloc::vec::Vec::new());
+    let sockets = SocketSet::new(alloc::vec::Vec::new());
+    // Separate SocketSet for the Ethernet interface. The DHCPv4 socket MUST NOT
+    // share a set with the loopback interface: smoltcp panics if a dhcpv4 socket
+    // is polled by a non-Ethernet (Ip-medium) interface, and iface_lo would hit
+    // it on every poll. Keeping it here means only iface_net ever services it.
+    let mut net_sockets = SocketSet::new(alloc::vec::Vec::new());
 
     let (iface_net, dev_net, dhcp) = match virtio::VirtioNet::find_and_init() {
         Some(mut nic) => {
             let mac = nic.mac();
             let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
             let iface = Interface::new(cfg, &mut nic, now());
-            let handle = sockets.add(dhcpv4::Socket::new());
+            let handle = net_sockets.add(dhcpv4::Socket::new());
             (Some(iface), Some(nic), Some(handle))
         }
         None => {
@@ -58,6 +64,7 @@ pub fn init() {
         iface_net,
         dev_net,
         sockets,
+        net_sockets,
         dhcp,
         dhcp_bound: false,
     });
@@ -74,15 +81,15 @@ pub fn poll() {
         // Always poll loopback.
         let _ = net.iface_lo.poll(t, &mut net.dev_lo, &mut net.sockets);
 
-        // Poll the Ethernet interface if present, then process DHCP events.
+        // Poll the Ethernet interface (its own SocketSet) if present.
         if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_mut()) {
-            let _ = iface.poll(t, dev, &mut net.sockets);
+            let _ = iface.poll(t, dev, &mut net.net_sockets);
         }
 
         // Process DHCP events: extract the event (releasing the socket borrow)
         // before touching iface_net.
         if let Some(h) = net.dhcp {
-            let event = net.sockets.get_mut::<dhcpv4::Socket>(h).poll();
+            let event = net.net_sockets.get_mut::<dhcpv4::Socket>(h).poll();
             // Copy the fields we need out of the event before we drop it —
             // Config::address (Ipv4Cidr) and Config::router (Option<Ipv4Address>)
             // are both Copy, but Config itself borrows the receive buffer, so we

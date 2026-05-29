@@ -20,6 +20,8 @@ extern "C" {
     fn tcgetattr(fd: i32, ptr: u32) -> i32;
     fn tcsetattr(fd: i32, action: i32, ptr: u32) -> i32;
     fn chdir(path_ptr: u32, path_len: u32) -> i32;
+    fn poweroff() -> !;
+    fn reboot() -> !;
 }
 
 #[repr(C)]
@@ -121,6 +123,8 @@ fn complete_command(prefix: &[u8]) -> Vec<String> {
         "pwd".into(),
         "exit".into(),
         "help".into(),
+        "poweroff".into(),
+        "reboot".into(),
     ];
     for (name, _) in readdir_entries("/bin") {
         if name.ends_with(".wasm") {
@@ -357,11 +361,13 @@ fn run_command(line: &str) {
         return;
     }
     match argv[0] {
-        "cd"   => builtin_cd(&argv),
-        "pwd"  => builtin_pwd(),
-        "exit" => std::process::exit(0),
-        "help" => builtin_help(),
-        cmd    => { let _ = exec_external(cmd, &argv); }
+        "cd"       => builtin_cd(&argv),
+        "pwd"      => builtin_pwd(),
+        "exit"     => std::process::exit(0),
+        "help"     => builtin_help(),
+        "poweroff" => unsafe { poweroff() },
+        "reboot"   => unsafe { reboot() },
+        cmd        => { let _ = exec_external(cmd, &argv); }
     }
 }
 
@@ -406,7 +412,13 @@ fn builtin_cd(argv: &[&str]) {
 }
 
 fn builtin_help() {
-    println!("ruos shell builtins: cd <path>, pwd, exit, help");
+    println!("ruos shell builtins:");
+    println!("  cd <path>   change directory");
+    println!("  pwd         print working directory");
+    println!("  exit        exit shell");
+    println!("  help        this list");
+    println!("  poweroff    halt the system");
+    println!("  reboot      restart the system");
     println!("external: try 'ls /bin' to list available .wasm");
 }
 

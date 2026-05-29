@@ -43,13 +43,8 @@ pub fn path_open(
         .map_err(|_| Error::i32_exit(-1))?;
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
-    let path: alloc::string::String = if path_str.starts_with('/') {
-        alloc::string::String::from(path_str)
-    } else {
-        let mut p = alloc::string::String::from("/");
-        p.push_str(path_str);
-        p
-    };
+    // Resolve relative path against caller's CWD.
+    let path = crate::wasm::host::proc::resolve_cwd(&caller.data().cwd, path_str);
 
     // O_DIRECTORY: not supported yet — readdir() exists but VFS::open
     // returns IsDirectory error for dirs. Return ENOTDIR if the caller

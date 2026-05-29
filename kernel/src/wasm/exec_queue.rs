@@ -15,6 +15,7 @@ use spin::Mutex;
 pub struct ExecSlot {
     pub path: alloc::string::String,
     pub argv: Vec<Vec<u8>>,
+    pub cwd: alloc::string::String,  // inherited CWD for the child
     pub exit_code: *mut i32, // pointer into caller's memory — valid until done flag
 }
 
@@ -51,8 +52,9 @@ impl ExecQueue {
         &'static self,
         path: alloc::string::String,
         argv: Vec<Vec<u8>>,
+        cwd: alloc::string::String,
     ) -> ExecFuture {
-        ExecFuture::new(self, path, argv)
+        ExecFuture::new(self, path, argv, cwd)
     }
 }
 
@@ -63,6 +65,7 @@ pub struct ExecFuture {
     posted: bool,
     path: alloc::string::String,
     argv: Vec<Vec<u8>>,
+    cwd: alloc::string::String,
 }
 
 impl ExecFuture {
@@ -70,8 +73,9 @@ impl ExecFuture {
         queue: &'static ExecQueue,
         path: alloc::string::String,
         argv: Vec<Vec<u8>>,
+        cwd: alloc::string::String,
     ) -> Self {
-        Self { queue, posted: false, path, argv }
+        Self { queue, posted: false, path, argv, cwd }
     }
 }
 
@@ -90,9 +94,11 @@ impl core::future::Future for ExecFuture {
             // Post the request.
             let path = core::mem::take(&mut self.path);
             let argv = core::mem::take(&mut self.argv);
+            let cwd = core::mem::take(&mut self.cwd);
             *self.queue.pending.lock() = Some(ExecSlot {
                 path,
                 argv,
+                cwd,
                 exit_code: core::ptr::null_mut(), // unused; result via AtomicI32
             });
             self.posted = true;

@@ -30,6 +30,7 @@ pub enum SuspendReason {
     Exec {
         path: alloc::string::String,
         argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        cwd: alloc::string::String,
         exit_code_ptr: u32,
     },
     ReadDir {

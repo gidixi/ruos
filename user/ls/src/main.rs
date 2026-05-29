@@ -9,7 +9,9 @@ extern "C" {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).cloned().unwrap_or_else(|| "/".to_string());
+    // No-arg ls = current directory ("." resolves via kernel's per-fiber
+    // CWD which is inherited from the shell via ruos_exec).
+    let path = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
     let mut buf = vec![0u8; 8192];
     let mut nread: u32 = 0;
     let errno = unsafe {

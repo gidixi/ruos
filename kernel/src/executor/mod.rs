@@ -109,6 +109,7 @@ async fn exec_worker_task() {
                     }
                     Ok(mut child) => {
                         child.set_args(slot.argv);
+                        child.set_cwd(slot.cwd);
                         child.run().await
                     }
                 }

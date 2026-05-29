@@ -1,5 +1,6 @@
 //! Per-instance runtime state for a wasm task.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicI32;
 
@@ -10,6 +11,10 @@ pub struct RuntimeState {
     pub args: Vec<Vec<u8>>,
     pub env: Vec<Vec<u8>>,
     pub exit_code: AtomicI32,
+    /// Current working directory. Relative paths in `path_open` are
+    /// resolved against this. New Fibers default to "/"; children
+    /// spawned via `ruos_exec` inherit the parent's CWD.
+    pub cwd: String,
 }
 
 pub enum FdEntry {
@@ -43,6 +48,7 @@ impl RuntimeState {
             args: Vec::new(),
             env: Vec::new(),
             exit_code: AtomicI32::new(0),
+            cwd: String::from("/"),
         }
     }
 }

@@ -134,11 +134,15 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
     // ECAM (MCFG). Absence is non-fatal: only `pci::init` cares. PciConfigRegions
     // copies into the Global allocator, so iterating it here does not borrow
     // `tables` past this function.
-    let mut ecam: alloc::vec::Vec<EcamRegion> = alloc::vec::Vec::new();
+    let mut ecam: Vec<EcamRegion> = Vec::new();
     if let Ok(regions) = acpi::mcfg::PciConfigRegions::new(&tables) {
         for entry in regions.iter() {
             ecam.push(EcamRegion {
                 segment:   entry.segment_group,
+                // `physical_address` is `usize` (the acpi crate narrows
+                // McfgEntry::base_address: u64). On x86_64 usize == u64, so this
+                // widens losslessly; a 32-bit port would already truncate inside
+                // the acpi iterator for ECAM windows above 4 GiB.
                 base:      entry.physical_address as u64,
                 bus_start: *entry.bus_range.start(),
                 bus_end:   *entry.bus_range.end(),

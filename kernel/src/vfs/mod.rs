@@ -55,6 +55,15 @@ pub fn init() -> Result<usize, VfsError> {
         children: alloc::collections::BTreeMap::new(),
         content: alloc::vec::Vec::new(),
     })?;
+    fs.mkdir(&["dev", "pts"])?;
+    const PTY_NAMES: [&str; crate::pty::NUM_PAIRS] = ["0", "1", "2", "3"];
+    for (i, name) in PTY_NAMES.iter().enumerate() {
+        fs.insert_inode(&["dev", "pts", name], TmpInode {
+            kind: TmpKind::PtySlave(i),
+            children: alloc::collections::BTreeMap::new(),
+            content: alloc::vec::Vec::new(),
+        })?;
+    }
     mount("/", FsImpl::Tmpfs(fs))?;
     Ok(MOUNTS.lock().len())
 }

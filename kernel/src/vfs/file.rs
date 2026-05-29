@@ -27,38 +27,42 @@ pub trait File {
 }
 
 use crate::vfs::tmpfs::TmpfsFile;
-use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile};
+use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile, PtySlaveFile};
 
 pub enum FileImpl {
     Tmp(TmpfsFile),
     Console(ConsoleFile),
     Null(NullFile),
     Zero(ZeroFile),
+    PtySlave(PtySlaveFile),
 }
 
 impl FileImpl {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
         match self {
-            FileImpl::Tmp(f)     => f.read(buf).await,
-            FileImpl::Console(f) => f.read(buf).await,
-            FileImpl::Null(f)    => f.read(buf).await,
-            FileImpl::Zero(f)    => f.read(buf).await,
+            FileImpl::Tmp(f)      => f.read(buf).await,
+            FileImpl::Console(f)  => f.read(buf).await,
+            FileImpl::Null(f)     => f.read(buf).await,
+            FileImpl::Zero(f)     => f.read(buf).await,
+            FileImpl::PtySlave(f) => f.read(buf).await,
         }
     }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
         match self {
-            FileImpl::Tmp(f)     => f.write(buf).await,
-            FileImpl::Console(f) => f.write(buf).await,
-            FileImpl::Null(f)    => f.write(buf).await,
-            FileImpl::Zero(f)    => f.write(buf).await,
+            FileImpl::Tmp(f)      => f.write(buf).await,
+            FileImpl::Console(f)  => f.write(buf).await,
+            FileImpl::Null(f)     => f.write(buf).await,
+            FileImpl::Zero(f)     => f.write(buf).await,
+            FileImpl::PtySlave(f) => f.write(buf).await,
         }
     }
     pub async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError> {
         match self {
-            FileImpl::Tmp(f)     => f.seek(off, whence).await,
-            FileImpl::Console(f) => f.seek(off, whence).await,
-            FileImpl::Null(f)    => f.seek(off, whence).await,
-            FileImpl::Zero(f)    => f.seek(off, whence).await,
+            FileImpl::Tmp(f)      => f.seek(off, whence).await,
+            FileImpl::Console(f)  => f.seek(off, whence).await,
+            FileImpl::Null(f)     => f.seek(off, whence).await,
+            FileImpl::Zero(f)     => f.seek(off, whence).await,
+            FileImpl::PtySlave(f) => f.seek(off, whence).await,
         }
     }
 }

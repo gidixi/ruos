@@ -6,6 +6,7 @@ pub fn init() -> Result<(), BootError> {
     let n = crate::vfs::init()
         .map_err(|_| BootError::VfsInit("vfs init failed"))?;
     crate::binfo!("fs", "vfs init ok mounts={}", n);
+    crate::pty::init();
 
     #[cfg(feature = "boot-checks")]
     {

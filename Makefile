@@ -3,7 +3,7 @@ KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
-HELLO     := ruos: real ping-pong (no preload)
+HELLO     := init.wasm: argv0=/init.wasm
 USER_WASMS := user-bin/init.wasm user-bin/server.wasm user-bin/client.wasm
 
 .PHONY: all build limine iso run run-test clean user-wasm

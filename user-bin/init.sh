@@ -25,3 +25,5 @@ free -h
 df -h
 lscpu
 ps
+lspci
+ip

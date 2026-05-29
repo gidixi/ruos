@@ -8,6 +8,7 @@ members = [
     "head", "tail", "grep", "find", "diff", "du",
     "whoami", "id", "uname", "uptime", "free", "df", "lscpu", "dmesg",
     "ps", "kill", "pkill",
+    "lspci", "ip",
 ]
 
 [profile.release]

@@ -79,6 +79,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip"
+version = "0.1.0"
+
+[[package]]
 name = "kill"
 version = "0.1.0"
 
@@ -94,6 +98,10 @@ version = "0.1.0"
 
 [[package]]
 name = "lscpu"
+version = "0.1.0"
+
+[[package]]
+name = "lspci"
 version = "0.1.0"
 
 [[package]]

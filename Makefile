@@ -14,7 +14,8 @@ BIN_TOOLS  := shell ls cat echo \
               mkdir rmdir rm cp mv \
               head tail grep find diff du \
               whoami id uname uptime free df lscpu dmesg \
-              ps kill pkill
+              ps kill pkill \
+              lspci ip
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

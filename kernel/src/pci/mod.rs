@@ -10,10 +10,13 @@ use alloc::vec::Vec;
 use core::fmt;
 use spin::{Mutex, Once};
 
-use pci_types::{Bar, CommandRegister, EndpointHeader, PciAddress, PciHeader};
+use pci_types::{CommandRegister, EndpointHeader, PciAddress, PciHeader};
 
 use ecam::EcamAccess;
 pub use device::PciDevice;
+// Re-exported so consumers (xHCI/AHCI drivers) match on BARs without depending
+// on `pci_types` directly.
+pub use pci_types::Bar;
 
 /// Global PCI state: the live accessor + the device snapshot list. Written once
 /// at `init` (single producer). The `Mutex` guards only the Vec publish/clone.
@@ -24,21 +27,25 @@ struct PciState {
 
 static PCI: Once<PciState> = Once::new();
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum PciError {
     NoEcam,
     NotInitialized,
+    AlreadyInitialized,
 }
 
 impl fmt::Display for PciError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PciError::NoEcam         => f.write_str("no ecam"),
-            PciError::NotInitialized => f.write_str("not initialized"),
+            PciError::NoEcam             => f.write_str("no ecam"),
+            PciError::NotInitialized     => f.write_str("not initialized"),
+            PciError::AlreadyInitialized => f.write_str("already initialized"),
         }
     }
 }
 
+/// Summary returned by [`init`]: the number of present functions discovered and
+/// the xHCI controller's address (`None` if no class `0C/03/30` function exists).
 pub struct PciInitInfo {
     pub device_count: usize,
     pub xhci: Option<PciAddress>,
@@ -49,6 +56,9 @@ pub struct PciInitInfo {
 pub fn init(regions: &[crate::acpi_init::EcamRegion]) -> Result<PciInitInfo, PciError> {
     if regions.is_empty() {
         return Err(PciError::NoEcam);
+    }
+    if PCI.is_completed() {
+        return Err(PciError::AlreadyInitialized);
     }
     let access = EcamAccess::new(regions);
     let mut devices: Vec<PciDevice> = Vec::new();
@@ -115,11 +125,16 @@ impl PciDevice {
     }
 
     fn update_command<F: FnOnce(CommandRegister) -> CommandRegister>(&self, f: F) {
-        if let Some(s) = PCI.get() {
-            let header = PciHeader::new(self.address);
-            if let Some(mut ep) = EndpointHeader::from_header(header, &s.access) {
-                ep.update_command(&s.access, f);
-            }
+        // Loudly no-op on the two "shouldn't happen" paths: a silently-skipped
+        // Bus-Master/Memory enable would leave a driver's DMA dead with no clue.
+        let Some(s) = PCI.get() else {
+            crate::bwarn!("pci", "update_command before pci::init for {:?}", self.address);
+            return;
+        };
+        let header = PciHeader::new(self.address);
+        match EndpointHeader::from_header(header, &s.access) {
+            Some(mut ep) => ep.update_command(&s.access, f),
+            None => crate::bwarn!("pci", "update_command on non-endpoint {:?}", self.address),
         }
     }
 }

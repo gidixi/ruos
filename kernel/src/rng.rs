@@ -36,6 +36,12 @@ pub fn init() {
         chunk.copy_from_slice(&rdrand_u64().to_le_bytes());
     }
     *RNG.lock() = Some(ChaCha20Rng::from_seed(seed));
+    // Scrub the seed off the stack — crypto hygiene for the entropy material
+    // (matters once SSH session keys derive from this RNG). volatile so the
+    // optimizer can't elide the dead store.
+    for b in seed.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
     crate::binfo!("rng", "chacha20 seeded (rdrand)");
 }
 

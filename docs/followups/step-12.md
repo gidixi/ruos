@@ -95,3 +95,12 @@ separato. Quando workload tastiera diventerà alto.
 
 History in-memory, persa al exit. Reboot azzera. Step 12.5/Step 14
 potrebbe persistere su VFS (`/var/.shell_history`).
+
+---
+
+## ✅ CLOSED (2026-05-29)
+
+- **F1** (ConsoleFile::read semanticamente wrong) — chiuso da
+  CHANGELOG/100 (EOF stub).
+- **F2** (Termios ABI vs wasi-libc) — chiuso da CHANGELOG/100
+  (static_assert size=56 + align=4 in `pty/termios.rs`).

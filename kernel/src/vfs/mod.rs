@@ -151,6 +151,15 @@ pub async fn seek(fd: Fd, off: i64, whence: Whence) -> Result<u64, VfsError> {
     }).await
 }
 
+/// Stat the file backing `fd` without changing its read cursor. Used by
+/// `wasi_snapshot_preview1::fd_filestat_get`. Closes Step 11 F7.
+pub async fn stat_fd(fd: Fd) -> Result<VfsStat, VfsError> {
+    with_fd_take(fd, |entry| async move {
+        let r = entry.file.stat().await;
+        (entry, r)
+    }).await
+}
+
 /// List directory entries at `path`. Single-shot — no streaming cookie.
 /// Holds the MOUNTS lock only for the brief lookup; the readdir future
 /// runs without it. tmpfs readdir locks the directory inode and clones

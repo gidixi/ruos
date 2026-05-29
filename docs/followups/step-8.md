@@ -66,3 +66,11 @@ ridipingere il prompt: funziona già. Ma `\x1b[0J` (clear to end-of-screen)
 è comune in app ncurses-style.
 
 **Fix:** leggere il param e gestire 0/1/2 in entrambi.
+
+---
+
+## ✅ CLOSED (2026-05-29)
+
+- **F3** — chiuso de-facto. Keyboard ISR non chiama più `kprintln!` (Step
+  11 T3 + Step 12 T3 retired path). Timer ISR usa solo atomics. No ISR
+  contende SERIAL → nessun deadlock. Vedi CHANGELOG/100.

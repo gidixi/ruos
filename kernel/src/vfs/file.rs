@@ -24,6 +24,10 @@ pub trait File {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError>;
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError>;
     async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError>;
+    /// Return file kind + size *without* changing the read cursor. Used
+    /// by `wasi_snapshot_preview1::fd_filestat_get` so guests doing
+    /// `read_to_end` can pre-size their buffer. Closes Step 11 F7.
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError>;
 }
 
 use crate::vfs::tmpfs::TmpfsFile;
@@ -54,6 +58,15 @@ impl FileImpl {
             FileImpl::Null(f)     => f.write(buf).await,
             FileImpl::Zero(f)     => f.write(buf).await,
             FileImpl::PtySlave(f) => f.write(buf).await,
+        }
+    }
+    pub async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        match self {
+            FileImpl::Tmp(f)      => f.stat().await,
+            FileImpl::Console(f)  => f.stat().await,
+            FileImpl::Null(f)     => f.stat().await,
+            FileImpl::Zero(f)     => f.stat().await,
+            FileImpl::PtySlave(f) => f.stat().await,
         }
     }
     pub async fn seek(&mut self, off: i64, whence: Whence) -> Result<u64, VfsError> {

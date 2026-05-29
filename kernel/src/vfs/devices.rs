@@ -9,14 +9,14 @@ pub struct NullFile;
 pub struct ZeroFile;
 
 impl File for ConsoleFile {
-    /// Reads one byte from PTY 0 master output (legacy /dev/console path).
-    /// Shell I/O now uses /dev/pts/0 directly; this remains for any code
-    /// that opens /dev/console for reading.
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
-        if buf.is_empty() { return Ok(0); }
-        let b = crate::pty::master_output_read(0).await;
-        buf[0] = b;
-        Ok(1)
+    /// `/dev/console` read returns EOF. Shell stdin lives at `/dev/pts/0`
+    /// (PTY slave) since Step 12. Reading from `/dev/console` would
+    /// previously have drained the master_output queue (Step 12 T3
+    /// implementer's workaround), feeding the shell its own stdout —
+    /// loop hazard. Step 12 F1: stub to EOF; semantics for /dev/console
+    /// will be revisited if/when a real device emerges.
+    async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, VfsError> {
+        Ok(0)
     }
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
         let mut serial = crate::serial::SERIAL.lock();
@@ -29,12 +29,18 @@ impl File for ConsoleFile {
     async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> {
         Err(VfsError::NotPermitted)
     }
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        Ok(crate::vfs::fs::VfsStat { kind: crate::vfs::fs::VfsKind::Device, size: 0 })
+    }
 }
 
 impl File for NullFile {
     async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, VfsError> { Ok(0) }
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> { Ok(buf.len()) }
     async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> { Ok(0) }
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        Ok(crate::vfs::fs::VfsStat { kind: crate::vfs::fs::VfsKind::Device, size: 0 })
+    }
 }
 
 impl File for ZeroFile {
@@ -44,6 +50,9 @@ impl File for ZeroFile {
     }
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> { Ok(buf.len()) }
     async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> { Ok(0) }
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        Ok(crate::vfs::fs::VfsStat { kind: crate::vfs::fs::VfsKind::Device, size: 0 })
+    }
 }
 
 /// A file handle for one PTY slave endpoint. Reads block (async) until the
@@ -93,5 +102,8 @@ impl File for PtySlaveFile {
 
     async fn seek(&mut self, _off: i64, _w: Whence) -> Result<u64, VfsError> {
         Err(VfsError::NotPermitted)
+    }
+    async fn stat(&self) -> Result<crate::vfs::fs::VfsStat, VfsError> {
+        Ok(crate::vfs::fs::VfsStat { kind: crate::vfs::fs::VfsKind::Device, size: 0 })
     }
 }

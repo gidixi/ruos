@@ -95,3 +95,10 @@ applica già il pattern corretto ("take waker, drop lock, then wake").
 
 **Fix:** collezionare i waker due in un piccolo array on-stack sotto il
 lock, rilasciare il guard, poi chiamare wake() su ciascuno.
+
+---
+
+## ✅ CLOSED
+
+- **F3** (0xE0 extended scancode latching) — chiuso da Step 12 T3
+  (keyboard ISR rewrite). Vedi CHANGELOG/96.

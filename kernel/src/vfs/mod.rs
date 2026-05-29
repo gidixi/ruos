@@ -8,6 +8,7 @@ pub mod fd;
 pub mod block_on;
 pub mod tmpfs;
 pub mod devices;
+pub mod fat32;
 
 pub use block_on::block_on;
 pub use error::VfsError;
@@ -40,6 +41,7 @@ pub fn init() -> Result<usize, VfsError> {
     fs.mkdir_sync(&["tmp"])?;
     fs.mkdir_sync(&["bin"])?;
     fs.mkdir_sync(&["etc"])?;
+    fs.mkdir_sync(&["mnt"])?; // mount-point placeholder for FAT (Step 15)
     fs.insert_inode(&["dev", "console"], TmpInode {
         kind: TmpKind::DevConsole,
         children: alloc::collections::BTreeMap::new(),
@@ -73,11 +75,27 @@ use crate::vfs::fd::{FDS, allocate as fd_allocate, close as fd_close};
 /// Locate the FsImpl covering `abspath` and return the components below the
 /// mount point. Longest-prefix match.
 fn resolve<'a>(abspath: &'a [&'a str]) -> Result<(usize, Vec<&'a str>), VfsError> {
-    // For now: single mount at "/". Components match the full split.
+    // Longest-prefix-match across registered mounts. Mount prefix "/foo/bar"
+    // strips two components and routes the remainder to that FS.
     let mounts = MOUNTS.lock();
     if mounts.is_empty() { return Err(VfsError::NotFound); }
-    // Index 0 is the root mount; "/" prefix always matches.
-    Ok((0usize, abspath.to_vec()))
+
+    let mut best_idx: usize = 0;
+    let mut best_depth: usize = 0;
+    for (idx, (prefix, _)) in mounts.iter().enumerate() {
+        // The root mount "/" trivially matches everything.
+        if prefix == "/" {
+            // Already the default.
+            continue;
+        }
+        let want: Vec<&str> = prefix.split('/').filter(|s| !s.is_empty()).collect();
+        if want.len() > abspath.len() { continue; }
+        if abspath[..want.len()] == want[..] && want.len() > best_depth {
+            best_idx = idx;
+            best_depth = want.len();
+        }
+    }
+    Ok((best_idx, abspath[best_depth..].to_vec()))
 }
 
 pub async fn open(path: &str, flags: OpenFlags) -> Result<Fd, VfsError> {

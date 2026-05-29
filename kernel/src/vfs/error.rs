@@ -12,6 +12,8 @@ pub enum VfsError {
     Invalid,
     Closed,
     NoSpace,
+    IoError,
+    Unsupported,
     Other,
 }
 
@@ -28,6 +30,8 @@ impl fmt::Display for VfsError {
             VfsError::Invalid       => "invalid",
             VfsError::Closed        => "closed",
             VfsError::NoSpace       => "no space",
+            VfsError::IoError       => "io error",
+            VfsError::Unsupported   => "unsupported",
             VfsError::Other         => "other",
         };
         f.write_str(s)

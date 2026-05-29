@@ -11,6 +11,7 @@
 //!
 //! Probe order: the first matching PCI device wins. Loopback always works.
 
+pub mod e1000;
 pub mod ring;
 
 use alloc::vec::Vec;
@@ -134,15 +135,74 @@ fn pci_probe() -> Option<(crate::pci::PciDevice, NicKind)> {
 /// The enum is kept around even with one variant so adding e1000e/rtl8139/...
 /// later is a single-line change (no API churn on `NetState`).
 pub enum Nic {
-    // E1000(e1000::E1000),    // populated by Task 3
+    E1000(e1000::E1000),
 }
 
 impl Nic {
     /// Hardware MAC address of the active NIC.
     pub fn mac(&self) -> [u8; 6] {
         match self {
-            // exhaustive once at least one variant exists
-            _ => unreachable!("no NIC variants yet"),
+            Nic::E1000(d) => d.mac(),
+        }
+    }
+}
+
+// ─── smoltcp::phy::Device dispatch onto the active variant ──────────────────
+//
+// Wrapping each driver inside `Nic` keeps NetState polymorphic over the family
+// without dyn-trait gymnastics. Each `match` is one arm per variant; we add an
+// arm here when we add a variant to the enum.
+
+use smoltcp::phy::{Device, DeviceCapabilities};
+use smoltcp::time::Instant;
+
+/// Receive token from one of the family drivers — enum dispatch to keep
+/// smoltcp's GAT bounds satisfiable.
+pub enum NicRxToken {
+    E1000(e1000::E1000RxToken),
+}
+
+/// Transmit token analogue.
+pub enum NicTxToken<'a> {
+    E1000(e1000::E1000TxToken<'a>),
+}
+
+impl smoltcp::phy::RxToken for NicRxToken {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, f: F) -> R {
+        match self {
+            NicRxToken::E1000(t) => t.consume(f),
+        }
+    }
+}
+
+impl<'a> smoltcp::phy::TxToken for NicTxToken<'a> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        match self {
+            NicTxToken::E1000(t) => t.consume(len, f),
+        }
+    }
+}
+
+impl Device for Nic {
+    type RxToken<'a> = NicRxToken where Self: 'a;
+    type TxToken<'a> = NicTxToken<'a> where Self: 'a;
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        match self {
+            Nic::E1000(d) => d.capabilities(),
+        }
+    }
+
+    fn receive(&mut self, ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        match self {
+            Nic::E1000(d) => d.receive(ts)
+                .map(|(rx, tx)| (NicRxToken::E1000(rx), NicTxToken::E1000(tx))),
+        }
+    }
+
+    fn transmit(&mut self, ts: Instant) -> Option<Self::TxToken<'_>> {
+        match self {
+            Nic::E1000(d) => d.transmit(ts).map(NicTxToken::E1000),
         }
     }
 }
@@ -171,6 +231,11 @@ pub fn probe_and_init() -> Option<Nic> {
         dev.address.device(),
         dev.address.function(),
     );
-    // Drivers will be wired here per task. For Task 1 we report and stop.
-    None
+    match kind {
+        NicKind::E1000 => e1000::E1000::find_and_init().map(Nic::E1000),
+        other => {
+            crate::bwarn!("nic", "no driver yet for {}", other.as_str());
+            None
+        }
+    }
 }

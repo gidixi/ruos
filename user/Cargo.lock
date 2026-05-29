@@ -113,6 +113,10 @@ name = "mv"
 version = "0.1.0"
 
 [[package]]
+name = "nano"
+version = "0.1.0"
+
+[[package]]
 name = "pkill"
 version = "0.1.0"
 

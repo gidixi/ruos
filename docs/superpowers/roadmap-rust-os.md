@@ -180,6 +180,76 @@ reale via USB.
 - Modello completo: **sessione interattiva** con PTY (Step 12) → shell
   (Step 11) sopra.
 
+## Step 16 — SMP / multi-CPU
+
+Oggi ruos è uniprocessor (UP): solo il BSP (CPU 0) gira; gli AP
+(Application Processors) restano in `wait-for-SIPI`. Banner stampa
+hardcoded "1 CPU" anche se VM ne ha 4+.
+
+Obiettivo: detect + bring-up + scheduler multi-core.
+
+**Componenti:**
+
+1. **Detect via ACPI MADT** — già parsato in Step 5, conta entries
+   `LocalApic` (LAPIC ID + processor UID + enable bit). Esponi via
+   `cpu::count()`. Banner mostra `N CPU (1 active)` → progressivamente
+   `N CPU active`.
+
+2. **AP trampoline** — codice 16-bit real-mode → 32 → 64-bit long-mode
+   in pagina fissa <1 MB (es. 0x8000). Setup GDT/IDT/CR3 condivisi col
+   BSP (o nuovi per-CPU). Jump a una `ap_entry` Rust.
+
+3. **INIT + SIPI sequence** — per ogni AP LAPIC ID:
+   - Write LAPIC ICR: vector=0, delivery_mode=INIT, level=Assert
+   - Delay 10 ms (timer Step 5)
+   - Write ICR: vector=trampoline_phys>>12, delivery_mode=SIPI
+   - Delay 200 µs, ripeti SIPI una volta (spec Intel SDM)
+   - Aspetta che AP segnali ready (atomic flag)
+
+4. **Per-CPU state** — struct con stack, current_task, lapic_id, GDT/TSS.
+   Accesso via `GS_BASE` MSR + `swapgs`. Layout:
+   ```rust
+   #[repr(C)] struct PerCpu {
+       cpu_id: u32, lapic_id: u32,
+       kernel_stack_top: u64,
+       current_fiber: *mut Fiber,
+       // ...
+   }
+   ```
+
+5. **Spinlock audit** — `spin::Mutex` su single-CPU è no-op effettivo
+   (no contention, only BSP runs). Su SMP serve:
+   - Memory ordering audit (SeqCst vs Acquire/Release)
+   - Lock contention paths (sock pool, FDS, MOUNTS, CONSOLE, PAIRS)
+   - Risolvere followups F2 (post-load-store-waker race in exec_queue),
+     F1 EXEC_QUEUE single-slot mpmc
+
+6. **Executor multi-CPU** — embassy raw oggi single-thread. Opzioni:
+   - Per-CPU run queue + work-stealing (Rayon-style)
+   - Global mpmc queue + N pollers
+   - Pinned tasks (specifico CPU per IRQ affinity)
+
+7. **IRQ routing** — IOAPIC redirect entries con destination LAPIC ID.
+   Distribuire IRQ (keyboard → CPU 0, network → CPU 1, ecc.) o
+   round-robin.
+
+8. **TLB shootdown** — quando una CPU unmap'a pagina condivisa, deve
+   notificare le altre via IPI per flush TLB locale. Critico per
+   sicurezza memoria.
+
+**Effort:** ~3-4 settimane. Alto rischio nuovi bug latenti (race
+condition prima invisibili).
+
+**Smoke contract:** 4 CPU attive, `cpu::count()` ritorna 4, executor
+distribuisce wasm task su N core (osservabile via per-CPU log
+prefix tipo `[CPU 2] INFO ...`).
+
+**Rimandato post-Step-15 (SSH).** Single-CPU basta per WASIX
+bootstrap + shell + SSH locale. SMP serve quando arriverà:
+- Multi-utente SSH simultaneo (Step 15.5+)
+- Performance compute-heavy wasm (bash/python multi-thread)
+- Real hardware deployment con N core
+
 ## Diagramma di dipendenza
 
 ```

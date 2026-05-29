@@ -16,13 +16,18 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 pub struct NetState {
     pub iface_lo:  Interface,
     pub dev_lo:    loopback::Loopback,
+    // Ethernet: at most ONE of (virtio | nic) is active. The matching iface_*
+    // is also populated; the other pair stays None. Splitting per-family lets
+    // smoltcp see a concrete device type at compile time (no enum dispatch).
     pub iface_net: Option<Interface>,
     pub dev_net:   Option<virtio::VirtioNet>,
+    pub iface_nic: Option<Interface>,
+    pub dev_nic:   Option<nic::Nic>,
     // App TCP sockets currently route through iface_lo only (sockets::connect
     // uses iface_lo.context()), i.e. loopback. Wiring app sockets over the
-    // Ethernet iface (iface_net/net_sockets) is a Step 16 (SSH) item.
+    // Ethernet iface is a Step 16 (SSH) item.
     pub sockets:   SocketSet<'static>,      // app/loopback sockets (iface_lo)
-    pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP (iface_net)
+    pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP
     pub dhcp:      Option<SocketHandle>,
     dhcp_bound:    bool,
 }
@@ -48,25 +53,37 @@ pub fn init() {
     // it on every poll. Keeping it here means only iface_net ever services it.
     let mut net_sockets = SocketSet::new(alloc::vec::Vec::new());
 
-    let (iface_net, dev_net, dhcp) = match virtio::VirtioNet::find_and_init() {
-        Some(mut nic) => {
-            let mac = nic.mac();
-            let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-            let iface = Interface::new(cfg, &mut nic, now());
-            let handle = net_sockets.add(dhcpv4::Socket::new());
-            (Some(iface), Some(nic), Some(handle))
-        }
-        None => {
-            crate::bwarn!("net", "no virtio-net found — loopback only");
-            (None, None, None)
-        }
-    };
+    // Prefer virtio-net (paravirtual, fast in VMs). Fall back to the first
+    // real-hardware NIC the `nic` probe table recognises (e1000 in MVP).
+    let mut iface_net: Option<Interface>      = None;
+    let mut dev_net:   Option<virtio::VirtioNet> = None;
+    let mut iface_nic: Option<Interface>      = None;
+    let mut dev_nic:   Option<nic::Nic>       = None;
+    let mut dhcp: Option<SocketHandle>        = None;
+
+    if let Some(mut d) = virtio::VirtioNet::find_and_init() {
+        let mac = d.mac();
+        let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        iface_net = Some(Interface::new(cfg, &mut d, now()));
+        dev_net   = Some(d);
+        dhcp      = Some(net_sockets.add(dhcpv4::Socket::new()));
+    } else if let Some(mut d) = nic::probe_and_init() {
+        let mac = d.mac();
+        let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        iface_nic = Some(Interface::new(cfg, &mut d, now()));
+        dev_nic   = Some(d);
+        dhcp      = Some(net_sockets.add(dhcpv4::Socket::new()));
+    } else {
+        crate::bwarn!("net", "no Ethernet NIC found — loopback only");
+    }
 
     *NET.lock() = Some(NetState {
         iface_lo,
         dev_lo,
         iface_net,
         dev_net,
+        iface_nic,
+        dev_nic,
         sockets,
         net_sockets,
         dhcp,
@@ -85,19 +102,18 @@ pub fn poll() {
         // Always poll loopback.
         let _ = net.iface_lo.poll(t, &mut net.dev_lo, &mut net.sockets);
 
-        // Poll the Ethernet interface (its own SocketSet) if present.
+        // Poll whichever Ethernet interface is active (virtio xor nic).
         if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_mut()) {
+            let _ = iface.poll(t, dev, &mut net.net_sockets);
+        }
+        if let (Some(iface), Some(dev)) = (net.iface_nic.as_mut(), net.dev_nic.as_mut()) {
             let _ = iface.poll(t, dev, &mut net.net_sockets);
         }
 
         // Process DHCP events: extract the event (releasing the socket borrow)
-        // before touching iface_net.
+        // before touching whichever iface owns the DHCP lease (virtio xor nic).
         if let Some(h) = net.dhcp {
             let event = net.net_sockets.get_mut::<dhcpv4::Socket>(h).poll();
-            // Copy the fields we need out of the event before we drop it —
-            // Config::address (Ipv4Cidr) and Config::router (Option<Ipv4Address>)
-            // are both Copy, but Config itself borrows the receive buffer, so we
-            // extract the values into owned locals here.
             let action: Option<(Option<smoltcp::wire::Ipv4Cidr>, Option<smoltcp::wire::Ipv4Address>)> =
                 match event {
                     Some(dhcpv4::Event::Configured(ref cfg)) => {
@@ -107,7 +123,9 @@ pub fn poll() {
                     None => None,
                 };
 
-            if let (Some(action), Some(iface)) = (action, net.iface_net.as_mut()) {
+            // Apply to whichever iface was created at init.
+            let iface = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
+            if let (Some(action), Some(iface)) = (action, iface) {
                 match action {
                     (Some(addr), router) => {
                         iface.update_ip_addrs(|a| {

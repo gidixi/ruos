@@ -50,7 +50,6 @@ pub fn run() -> ! {
     let spawner = exec.spawner();
     kprintln!("ruos: executor: spawning tasks");
     spawner.spawn(tick_task()).unwrap();
-    spawner.spawn(kbd_echo_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
     spawner.spawn(wasm_task("/server.wasm")).unwrap();
@@ -135,14 +134,6 @@ async fn net_poll_task() {
 #[embassy_executor::task(pool_size = 4)]
 async fn wasm_task(path: &'static str) {
     crate::wasm::run_at(path).await;
-}
-
-#[embassy_executor::task]
-async fn kbd_echo_task() {
-    loop {
-        let b = crate::keyboard::queue::read_char().await;
-        kprintln!("ruos: kbd echo={:?}", b as char);
-    }
 }
 
 #[embassy_executor::task]

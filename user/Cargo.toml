@@ -9,6 +9,7 @@ members = [
     "whoami", "id", "uname", "uptime", "free", "df", "lscpu", "dmesg",
     "ps", "kill", "pkill",
     "lspci", "ip",
+    "nano",
 ]
 
 [profile.release]

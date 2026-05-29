@@ -28,6 +28,17 @@ pub enum SuspendReason {
     VfsClose { fd: crate::vfs::Fd },
     PathOpen { path: String, flags: crate::vfs::OpenFlags, opened_fd_ptr: u32 },
     KbdReadChar { buf_ptr: u32, nread_ptr: u32 },
+    Exec {
+        path: alloc::string::String,
+        argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        exit_code_ptr: u32,
+    },
+    ReadDir {
+        path: alloc::string::String,
+        buf_ptr: u32,
+        buf_len: usize,
+        nread_ptr: u32,
+    },
 }
 
 impl core::fmt::Display for SuspendReason {

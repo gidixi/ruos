@@ -4,6 +4,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(arg0) = args.get(0) {
+        println!("init.wasm: argv0={}", arg0);
+    }
+
     println!("\x1b[1;32m╔══════════════════════════════════╗");
     println!("║         Welcome to ruos          ║");
     println!("║   wasm32-wasip1 / WASIX host     ║");

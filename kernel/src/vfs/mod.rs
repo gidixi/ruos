@@ -38,6 +38,8 @@ pub fn init() -> Result<usize, VfsError> {
     let fs = Tmpfs::new();
     fs.mkdir(&["dev"])?;
     fs.mkdir(&["tmp"])?;
+    fs.mkdir(&["bin"])?;
+    fs.mkdir(&["etc"])?;
     fs.insert_inode(&["dev", "console"], TmpInode {
         kind: TmpKind::DevConsole,
         children: alloc::collections::BTreeMap::new(),

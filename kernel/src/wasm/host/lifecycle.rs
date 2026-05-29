@@ -17,10 +17,21 @@ pub fn args_sizes_get(
 }
 
 pub fn args_get(
-    _caller: Caller<'_, RuntimeState>,
-    _argv_ptr: i32,
-    _argv_buf_ptr: i32,
+    mut caller: Caller<'_, RuntimeState>,
+    argv_ptr: i32,
+    argv_buf_ptr: i32,
 ) -> Result<i32, Error> {
+    let args = caller.data().args.clone();
+    let mem = wasm_memory(&caller)?;
+    let mut cursor = argv_buf_ptr as u32;
+    for (i, arg) in args.iter().enumerate() {
+        write_u32(&mem, &mut caller, argv_ptr as usize + i * 4, cursor)?;
+        let mut owned = arg.clone();
+        owned.push(0u8); // null terminator
+        mem.write(&mut caller, cursor as usize, &owned)
+            .map_err(|_| Error::i32_exit(-1))?;
+        cursor += owned.len() as u32;
+    }
     Ok(0)
 }
 

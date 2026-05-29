@@ -5,6 +5,7 @@ pub mod host;
 pub mod state;
 pub mod suspend;
 pub mod fiber;
+pub mod exec_queue;
 
 use alloc::vec::Vec;
 use crate::kprintln;
@@ -28,6 +29,7 @@ pub async fn run_at(path: &str) {
         }
     };
     kprintln!("ruos: wasm: instantiated {}", path);
+    fb.set_args(alloc::vec![path.as_bytes().to_vec()]);
 
     // Pre-open socket FD 4 for server and client.
     // Server: allocate + listen (sync instant); cooperative accept happens in fiber dispatch.
@@ -75,7 +77,7 @@ pub async fn run_at(path: &str) {
     }
 }
 
-async fn read_all(path: &str) -> Result<Vec<u8>, vfs::VfsError> {
+pub(crate) async fn read_all(path: &str) -> Result<Vec<u8>, vfs::VfsError> {
     let fd = vfs::open(path, vfs::OpenFlags::READ).await?;
     // Seek to end to find size; then seek back to start and read.
     let end = vfs::seek(fd, 0, vfs::Whence::End).await? as usize;

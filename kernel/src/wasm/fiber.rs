@@ -40,6 +40,10 @@ impl Fiber {
         Ok(Self { store, instance })
     }
 
+    pub fn set_args(&mut self, args: alloc::vec::Vec<alloc::vec::Vec<u8>>) {
+        self.store.data_mut().args = args;
+    }
+
     pub async fn run(&mut self) -> i32 {
         // Get the _start function.
         let start = match self.instance.get_func(&self.store, "_start") {
@@ -230,6 +234,55 @@ impl Fiber {
                     }
                     Err(_) => 44, // ENOENT
                 }
+            }
+            SuspendReason::Exec { path, argv, exit_code_ptr } => {
+                // Delegate to exec_queue: the exec_worker_task (a separate
+                // embassy task) will load+run the child on its own stack,
+                // avoiding the double-fault that occurs when wasmi compilation
+                // happens recursively inside this fiber's stack frame.
+                let code = crate::wasm::exec_queue::EXEC_QUEUE
+                    .post_and_wait(path, argv)
+                    .await;
+                let _ = self.write_u32(exit_code_ptr, code as u32);
+                0
+            }
+            SuspendReason::ReadDir { path, buf_ptr, buf_len, nread_ptr } => {
+                let entries = match crate::vfs::readdir(&path).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = self.write_u32(nread_ptr, 0);
+                        return 44;
+                    }
+                };
+                let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                for e in entries.iter() {
+                    let name_bytes = e.name.as_bytes();
+                    if name_bytes.len() > u16::MAX as usize { continue; }
+                    let kind_byte: u8 = match e.kind {
+                        crate::vfs::VfsKind::Reg => 0,
+                        crate::vfs::VfsKind::Dir => 1,
+                        crate::vfs::VfsKind::Device => 2,
+                    };
+                    let entry_path = {
+                        let mut s = path.clone();
+                        if !s.ends_with('/') { s.push('/'); }
+                        s.push_str(&e.name);
+                        s
+                    };
+                    let size: u64 = match crate::vfs::stat(&entry_path).await {
+                        Ok(s) => s.size,
+                        Err(_) => 0,
+                    };
+                    out.push(kind_byte);
+                    out.push(0);
+                    out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                    out.extend_from_slice(&size.to_le_bytes());
+                    out.extend_from_slice(name_bytes);
+                }
+                let n = out.len().min(buf_len);
+                let _ = self.write_to_memory(buf_ptr, &out[..n]);
+                let _ = self.write_u32(nread_ptr, n as u32);
+                0
             }
         }
     }

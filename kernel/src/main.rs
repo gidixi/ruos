@@ -28,6 +28,7 @@ mod executor;
 mod boot;
 mod pty;
 mod pci;
+mod blockdev;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

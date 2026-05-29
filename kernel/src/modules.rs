@@ -6,7 +6,7 @@
 //! the existing tmpfs at its declared path, so userspace .wasm files
 //! become regular VFS entries (`/init.wasm`, `/server.wasm`, ...).
 
-use crate::{kprintln, vfs};
+use crate::vfs;
 use crate::vfs::OpenFlags;
 use limine::request::ModulesRequest;
 
@@ -18,7 +18,7 @@ static MODULES: ModulesRequest = ModulesRequest::new();
 /// mounted.
 pub fn mount_all() -> usize {
     let Some(resp) = MODULES.response() else {
-        kprintln!("ruos: modules: no Limine response");
+        crate::bwarn!("mod", "no Limine modules response");
         return 0;
     };
     let mods = resp.modules();
@@ -29,14 +29,14 @@ pub fn mount_all() -> usize {
         let path = m.cmdline();
         match install(path, bytes) {
             Ok(()) => {
-                kprintln!("ruos: module mounted at {} ({} bytes)", path, bytes.len());
+                crate::binfo!("mod", "mounted {} ({} bytes)", path, bytes.len());
             }
             Err(e) => {
-                kprintln!("ruos: module install fail {}: {:?}", path, e);
+                crate::bwarn!("mod", "install fail {}: {:?}", path, e);
             }
         }
     }
-    kprintln!("ruos: mounted {} boot modules", mods.len());
+    crate::binfo!("mod", "mounted {} boot modules", mods.len());
     mods.len()
 }
 

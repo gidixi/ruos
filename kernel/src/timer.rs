@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::{apic::lapic, idt, kprintln};
+use crate::{apic::lapic, idt};
 
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -29,10 +29,7 @@ pub fn init(hz: u32) -> Result<(), &'static str> {
     if initial_count_u64 > u32::MAX as u64 { return Err("hz too low"); }
     let initial_count = initial_count_u64 as u32;
 
-    kprintln!(
-        "ruos: lapic calibrated {} ticks/sec, periodic count={}",
-        lapic_per_sec, initial_count
-    );
+    crate::binfo!("irq", "lapic calibrated {} ticks/sec, periodic count={}", lapic_per_sec, initial_count);
 
     lapic::set_timer_periodic(idt::VEC_LAPIC_TIMER, initial_count);
     Ok(())

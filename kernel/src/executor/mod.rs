@@ -48,7 +48,7 @@ pub fn run() -> ! {
     };
 
     let spawner = exec.spawner();
-    kprintln!("ruos: executor: spawning tasks");
+    crate::binfo!("user", "executor: spawning tasks");
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
     spawner.spawn(wasm_task("/init.wasm")).unwrap();
@@ -56,7 +56,7 @@ pub fn run() -> ! {
     spawner.spawn(wasm_task("/client.wasm")).unwrap();
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
-    kprintln!("ruos: executor: all tasks spawned, entering poll loop");
+    crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised

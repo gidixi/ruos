@@ -43,6 +43,7 @@ pub struct IrqOverride {
     pub level_triggered: bool,
 }
 
+#[derive(Clone)]
 pub struct AcpiInfo {
     pub lapic_base:  u64,
     pub ioapic_base: u64,

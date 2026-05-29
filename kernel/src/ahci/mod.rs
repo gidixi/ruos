@@ -15,6 +15,21 @@ pub mod port;
 pub use hba::{Hba, AhciError};
 pub use port::AhciPort;
 
+use spin::Mutex;
+
+/// Global slot for the first usable SATA port. Populated by
+/// `boot::phases::storage`; consumed by the FAT mount step (Task 7).
+static PORT0: Mutex<Option<AhciPort>> = Mutex::new(None);
+
+pub fn set_port0(p: AhciPort) {
+    *PORT0.lock() = Some(p);
+}
+
+/// Take the stashed port for moving into the FAT mount.
+pub fn take_port0() -> Option<AhciPort> {
+    PORT0.lock().take()
+}
+
 /// One-shot boot-time AHCI init. Discovers the HBA, resets it, returns the
 /// snapshot. Called once from `boot::phases::storage`.
 ///

@@ -6,8 +6,19 @@
 use crate::boot::BootError;
 
 pub fn init() -> Result<(), BootError> {
-    let _hba = crate::ahci::init();
-    // Task 2 stops at HBA discovery; per-port bring-up + FAT mount land in
-    // Tasks 3-7. Stash the snapshot in a kernel global later when we need it.
+    let hba = match crate::ahci::init() {
+        Some(h) => h,
+        None    => return Ok(()),
+    };
+
+    // Walk Ports-Implemented; bring up every populated SATA port.
+    for idx in 0..32 {
+        if (hba.pi & (1 << idx)) == 0 { continue; }
+        if let Some(port) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
+            // Stash the first usable port for the FAT mount phase (Task 7).
+            crate::ahci::set_port0(port);
+            break;
+        }
+    }
     Ok(())
 }

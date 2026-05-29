@@ -111,6 +111,13 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     Ok(frame)
 }
 
+/// Virtual (HHDM) alias of a physical address. Valid for any RAM/MMIO phys
+/// because Limine's HHDM covers all physical memory.
+pub fn hhdm_virt(phys: PhysAddr) -> VirtAddr {
+    let hhdm = *HHDM_OFFSET.get().expect("mapper: hhdm not initialized");
+    VirtAddr::new(phys.as_u64() + hhdm)
+}
+
 pub fn map_io_page(phys: PhysAddr) -> Result<VirtAddr, MapError> {
     let hhdm = *HHDM_OFFSET.get().ok_or(MapError::NotInitialized)?;
     let virt = VirtAddr::new(phys.as_u64() + hhdm);

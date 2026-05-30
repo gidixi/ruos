@@ -6,4 +6,15 @@ build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
-rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "relocation-model=static",
+    # Force curve25519-dalek's serial backend — its SIMD backend uses AVX2
+    # intrinsics that LLVM refuses to lower on x86_64-unknown-none.
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+    # Same story for poly1305 — its AVX2 autodetect compile path crashes
+    # in LLVM lowering. Force the software backend.
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "chacha20_force_soft",
+]

@@ -34,6 +34,55 @@ pub fn master_input_push(idx: usize, byte: u8) {
     ldisc::process_input(&mut g, byte);
 }
 
+/// Non-blocking poll of pair `idx`'s master output. Returns `Some(byte)` if
+/// available, `None` otherwise. Used by the SSH session bridge.
+pub fn master_output_try(idx: usize) -> Option<u8> {
+    if idx >= NUM_PAIRS { return None; }
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| {
+        let mut g = PAIRS[idx].lock();
+        g.master_out.pop_front()
+    })
+}
+
+/// Number of bytes currently queued in pair `idx`'s master output, without
+/// consuming them. The SSH bridge uses this to know when a finished shell's
+/// output has been fully drained before closing the channel.
+pub fn master_output_len(idx: usize) -> usize {
+    if idx >= NUM_PAIRS { return 0; }
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| PAIRS[idx].lock().master_out.len())
+}
+
+/// Atomic claim of pair `idx`. Returns true on success; subsequent claims
+/// of the same pair return false until [`release`] is called.
+pub fn try_claim(idx: usize) -> bool {
+    if idx >= NUM_PAIRS { return false; }
+    use core::sync::atomic::Ordering;
+    CLAIMED[idx].compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+pub fn release(idx: usize) {
+    if idx >= NUM_PAIRS { return; }
+    use core::sync::atomic::Ordering;
+    CLAIMED[idx].store(false, Ordering::SeqCst);
+}
+
+/// `true` while pair `idx` is claimed by a running process. The SSH bridge
+/// polls this: once the spawned shell exits and the dispatcher releases the
+/// pair, this flips to `false`, signalling the bridge to close the channel.
+pub fn is_claimed(idx: usize) -> bool {
+    if idx >= NUM_PAIRS { return false; }
+    use core::sync::atomic::Ordering;
+    CLAIMED[idx].load(Ordering::SeqCst)
+}
+
+use core::sync::atomic::AtomicBool;
+static CLAIMED: [AtomicBool; NUM_PAIRS] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+
 /// Future-friendly read of one byte from pair `idx`'s master output.
 /// Used by console_drain_task.
 pub async fn master_output_read(idx: usize) -> u8 {

@@ -186,7 +186,7 @@ dello Step 15, futuri NVMe/xHCI). Spec:
   - API kernel per SSH (Step 16).
 - Test: DHCP + ping in QEMU.
 
-## Step 15 — AHCI / SATA disk + FAT persistente
+## Step 15 — AHCI / SATA disk + FAT persistente (✅ DONE)
 
 **Prerequisito: Step 13 (PCI/ECAM).** AHCI è un device PCIe → serve prima il
 sottosistema PCI (`find_class` + BAR decode + Command bits). Spec:
@@ -241,15 +241,24 @@ TRIM/SMART/hotplug fuori scope. NVMe = step parallelo separato (stesso
 **Dipendenze:** Step 6 (frame allocator per DMA) + Step 13 (PCI/ECAM) + Step 7
 (VFS per il mount) + Step 14 (allocator DMA). Indipendente da SSH/GUI.
 
-## Step 16 — SSH server
+## Step 16 — SSH server (✅ DONE)
 
-- Crate: `sunset` (no_std, no_alloc anche se `alloc` adesso esiste — comunque
-  match perfetto) o `russh` (async, richiede alloc + executor — già pronto).
-- Auth: chiave pubblica hardcoded all'inizio (testabile via `ssh -i ...`).
-- Modello inizio: **exec non-interattivo** (`ssh user@ruos /bin/foo.wasm`) —
-  basta runtime WASM + VFS, senza PTY. Già utile.
-- Modello completo: **sessione interattiva** con PTY (Step 12) → shell
-  (Step 11) sopra.
+Spec/piano: `docs/superpowers/specs/2026-05-30-rust-step16-ssh-design.md`.
+Crate: **`sunset`** (no_std/no_alloc — match naturale), vendorizzato in
+`third_party/sunset/` per patchare la chiusura canale. Auth: chiave pubblica
+ed25519 hardcoded (`/mnt/auth.key`), host key persistente (`/mnt/host.key`).
+
+Funziona end-to-end, verificato con OpenSSH (`make run-ssh-test`):
+- KEX (curve25519-sha256) + chacha20-poly1305, CSPRNG da RDRAND.
+- Auth pubkey ed25519 con verifica firma reale.
+- **Sessione interattiva** su PTY (Step 12) → shell (Step 11): prompt,
+  line-editing, comandi, exit.
+- **Exec non-interattivo** (`ssh user@ruos cmd`): output completo (fix
+  early-EOF lato sunset, CHANGELOG 157).
+
+Limiti MVP (vedi spec + README): 1 sessione alla volta, 1 chiave, porta 22
+fissa, exec gira attraverso la shell (prompt nel risultato), no exit-status,
+no window-size, no SFTP/forwarding.
 
 ## Step 17 — Mouse PS/2 + rlvgl + host functions grafiche
 

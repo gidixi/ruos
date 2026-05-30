@@ -57,6 +57,8 @@ pub fn run() -> ! {
     // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
+    spawner.spawn(ssh_serve_task()).unwrap();
+    spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
 
     loop {
@@ -134,6 +136,11 @@ async fn exec_worker_task() {
 }
 
 #[embassy_executor::task]
+async fn ssh_serve_task() {
+    crate::ssh::server::serve_loop_pub().await;
+}
+
+#[embassy_executor::task]
 async fn net_poll_task() {
     loop {
         crate::net::poll();
@@ -144,6 +151,60 @@ async fn net_poll_task() {
 #[embassy_executor::task(pool_size = 4)]
 async fn wasm_task(path: &'static str) {
     crate::wasm::run_at(path).await;
+}
+
+/// SSH PTY dispatcher: drains PTY_QUEUE entries posted by the SSH server
+/// when a client opens an interactive shell channel. Each entry spawns
+/// `shell.wasm` on the requested PTY pair, binding FDs 0/1/2 to its slave.
+#[embassy_executor::task]
+async fn ssh_pty_dispatcher_task() {
+    loop {
+        let next = PTY_QUEUE.lock().pop_front();
+        if let Some((idx, path)) = next {
+            let bytes = match crate::wasm::read_all(&path).await {
+                Ok(b)  => b,
+                Err(_) => {
+                    kprintln!("ssh shell spawn: read {} failed", path);
+                    crate::pty::release(idx); // free the pair so the bridge closes
+                    continue;
+                }
+            };
+            let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
+                Ok(f)  => f,
+                Err(e) => {
+                    kprintln!("ssh shell spawn: instantiate {}: {}", path, e);
+                    crate::pty::release(idx);
+                    continue;
+                }
+            };
+            fb.rebind_stdio_pty(idx);
+            // argv = ["shell", "--no-init"] so the SSH shell skips replaying
+            // /etc/init.sh + the boot banner.
+            fb.set_args(alloc::vec![
+                b"shell".to_vec(),
+                b"--no-init".to_vec(),
+            ]);
+            let pid = crate::proc::register(
+                alloc::string::String::from(path.trim_start_matches('/')),
+            );
+            fb.set_pid(pid);
+            let code = fb.run().await;
+            crate::proc::unregister(pid);
+            crate::binfo!("ssh", "shell on pty {} exited code={}", idx, code);
+            crate::pty::release(idx);
+        } else {
+            delay::Delay::ticks(2).await;
+        }
+    }
+}
+
+static PTY_QUEUE:
+    spin::Mutex<alloc::collections::VecDeque<(usize, alloc::string::String)>> =
+    spin::Mutex::new(alloc::collections::VecDeque::new());
+
+/// Enqueue a shell-on-PTY spawn request. Picked up by ssh_pty_dispatcher_task.
+pub fn enqueue_shell_pty(idx: usize, path: alloc::string::String) {
+    PTY_QUEUE.lock().push_back((idx, path));
 }
 
 /// Drains PTY 0 master output and writes each byte to the framebuffer console.

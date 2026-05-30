@@ -31,6 +31,7 @@ mod pci;
 mod blockdev;
 mod ahci;
 mod rtc;
+mod ssh;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

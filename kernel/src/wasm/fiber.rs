@@ -56,6 +56,27 @@ impl Fiber {
         self.pid = Some(pid);
     }
 
+    /// Re-bind FDs 0/1/2 to /dev/pts/<idx> instead of the default pts/0.
+    /// Used by the SSH server when spawning a shell on a fresh PTY.
+    pub fn rebind_stdio_pty(&mut self, idx: usize) {
+        use crate::vfs::{self, OpenFlags};
+        use crate::wasm::state::FdEntry;
+        let path = alloc::format!("/dev/pts/{}", idx);
+        let mut fds = core::mem::take(&mut self.store.data_mut().fds);
+        for slot in 0..3 {
+            // Close the old entry (Vfs FD) before replacing.
+            if let Some(FdEntry::Vfs(old)) = fds.get(slot).and_then(|s| s.as_ref()) {
+                let old_fd = *old;
+                let _ = vfs::block_on(vfs::close(old_fd));
+            }
+            match vfs::block_on(vfs::open(&path, OpenFlags::READ | OpenFlags::WRITE)) {
+                Ok(fd) => { fds[slot] = Some(FdEntry::Vfs(fd)); }
+                Err(_) => { fds[slot] = None; }
+            }
+        }
+        self.store.data_mut().fds = fds;
+    }
+
     pub async fn run(&mut self) -> i32 {
         // Get the _start function.
         let start = match self.instance.get_func(&self.store, "_start") {

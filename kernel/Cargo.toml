@@ -20,6 +20,16 @@ smoltcp = { version = "0.11", default-features = false, features = ["alloc", "me
 virtio-drivers = "0.13"
 rand_chacha = { version = "0.3", default-features = false }
 pci_types = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# Force sha2 software backend: cpufeatures detection probes AVX intrinsics
+# that LLVM refuses on x86_64-unknown-none. Direct dep ensures the feature
+# unifies into the ed25519-dalek transitive dependency.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+sunset = { path = "../third_party/sunset", default-features = false }
+# getrandom needs an explicit custom backend on bare-metal — we wire it
+# to crate::rng via register_custom_getrandom! in ssh/rng_bridge.rs.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+log = { version = "0.4", default-features = false }
 
 [features]
 boot-checks = []
@@ -30,3 +40,6 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+lto = false
+codegen-units = 16
+debug = 1

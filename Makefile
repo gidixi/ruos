@@ -1,5 +1,5 @@
 SHELL     := /bin/bash      # required: 'build' recipe uses the 'source' builtin
-KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
+KERNEL    := kernel/target/x86_64-unknown-none/release/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
@@ -37,12 +37,15 @@ $(DISK_IMG):
 	dd if=/dev/zero of=$@.tmp bs=1M count=$(DISK_MB) status=none
 	mkfs.vfat -F 32 -n RUOS $@.tmp >/dev/null
 	echo 'hello from disk' | mcopy -i $@.tmp - ::/hello.txt
+	# Seed an empty authorized_keys file — Step 16 SSH server reads
+	# /mnt/auth.key. Tests / users can mcopy a real key on top later.
+	echo '# ssh-ed25519 pubkeys here, one per line' | mcopy -i $@.tmp - ::/auth.key
 	mv $@.tmp $@
 
 disk: $(DISK_IMG)
 
 build:
-	source $$HOME/.cargo/env && cd kernel && cargo build
+	source $$HOME/.cargo/env && cd kernel && cargo build --release
 
 limine:
 	@if [ ! -d $(LIMINE) ]; then \
@@ -119,6 +122,18 @@ run-test-e1000: iso
 	@$(MAKE) run-test NIC=e1000
 	@grep -qE "net .* e1000 mac=" build/serial.log || { echo TEST_FAIL_E1000_MAC; exit 1; }
 	@echo TEST_PASS_E1000
+
+# SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
+# fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
+.PHONY: run-ssh-test
+SSH_KEY := build/id_ed25519
+$(SSH_KEY):
+	mkdir -p build
+	ssh-keygen -t ed25519 -N '' -f $@ -q -C ruos-test
+ssh-key-on-disk: $(SSH_KEY) $(DISK_IMG)
+	mcopy -o -i $(DISK_IMG) $(SSH_KEY).pub ::/auth.key
+run-ssh-test: iso ssh-key-on-disk
+	bash tests/ssh-shell-test.sh
 
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"

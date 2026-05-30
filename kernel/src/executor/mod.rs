@@ -163,11 +163,19 @@ async fn ssh_pty_dispatcher_task() {
         if let Some((idx, path)) = next {
             let bytes = match crate::wasm::read_all(&path).await {
                 Ok(b)  => b,
-                Err(_) => { kprintln!("ssh shell spawn: read {} failed", path); continue; }
+                Err(_) => {
+                    kprintln!("ssh shell spawn: read {} failed", path);
+                    crate::pty::release(idx); // free the pair so the bridge closes
+                    continue;
+                }
             };
             let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
                 Ok(f)  => f,
-                Err(e) => { kprintln!("ssh shell spawn: instantiate {}: {}", path, e); continue; }
+                Err(e) => {
+                    kprintln!("ssh shell spawn: instantiate {}: {}", path, e);
+                    crate::pty::release(idx);
+                    continue;
+                }
             };
             fb.rebind_stdio_pty(idx);
             // argv = ["shell", "--no-init"] so the SSH shell skips replaying

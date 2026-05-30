@@ -51,6 +51,9 @@ pub async fn run_session(
     let mut pty_idx: Option<usize> = None;
     let mut auth_ok = false;
     let mut shell_started = false;
+    // Set once the spawned shell/command has exited and we've sent the
+    // channel EOF+CLOSE; the loop then drains the socket and ends.
+    let mut closing = false;
     // Byte counters for the channel<->PTY bridge, logged at session end.
     let mut rx_total: u64 = 0; // bytes SSH channel -> PTY (client input)
     let mut tx_total: u64 = 0; // bytes PTY -> SSH channel (shell output)
@@ -294,8 +297,45 @@ pub async fn run_session(
             }
         }
 
+        // 5) Shell finished → close the channel cleanly. Once the spawned
+        //    process released its PTY (is_claimed == false) and step 4 has
+        //    drained its remaining output, send EOF+CLOSE so the client —
+        //    including non-interactive `ssh host cmd` — receives the full
+        //    output. (sunset no longer auto-mirrors the client's early EOF.)
+        if shell_started && !closing {
+            if let Some(idx) = pty_idx {
+                if !crate::pty::is_claimed(idx) && crate::pty::master_output_len(idx) == 0 {
+                    if let Some(c) = chan.as_ref() {
+                        if runner.send_channel_close(c).is_ok() {
+                            crate::binfo!("ssh", "shell on pty {} done, closing channel", idx);
+                            closing = true;
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Closing and everything queued has reached the socket → done.
+        if closing && runner.output_buf().is_empty() {
+            break;
+        }
+
         if !progressed {
             Delay::ticks(1).await;
+        }
+    }
+    // Best-effort: flush any still-encoded output (e.g. the EOF/CLOSE) to the
+    // socket before tearing the connection down.
+    for _ in 0..256 {
+        let out = runner.output_buf().len();
+        if out == 0 { break; }
+        let mut chunk = [0u8; SOCK_CHUNK];
+        let n = out.min(SOCK_CHUNK);
+        chunk[..n].copy_from_slice(&runner.output_buf()[..n]);
+        match sockets::try_send(handle, &chunk[..n]) {
+            Some(0) | None => break,
+            Some(s)        => runner.consume_output(s),
         }
     }
     // Tidy up: discard channel + close socket.

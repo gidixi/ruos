@@ -646,6 +646,24 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         Ok(())
     }
 
+    /// ruos: send CHANNEL_EOF then CHANNEL_CLOSE for a server channel whose
+    /// application output is finished. Each is sent at most once. Call this
+    /// when the spawned program has produced all its output and exited, then
+    /// drain `output_buf()` to the socket so the packets reach the client
+    /// before the connection is torn down. (`Channel::handle_eof` no longer
+    /// auto-mirrors the peer's EOF, so the server controls its own EOF.)
+    pub fn send_channel_close(&mut self, chan: &ChanHandle) -> Result<()> {
+        let (eof, close) = self.conn.channels.eof_close(chan.0)?;
+        if let Some(p) = eof {
+            self.traf_out.send_packet(p, &mut self.keys)?;
+        }
+        if let Some(p) = close {
+            self.traf_out.send_packet(p, &mut self.keys)?;
+        }
+        self.wake();
+        Ok(())
+    }
+
     pub fn set_channel_read_waker(
         &mut self,
         ch: &ChanHandle,

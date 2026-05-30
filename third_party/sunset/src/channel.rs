@@ -109,6 +109,32 @@ impl Channels {
         Ok(())
     }
 
+    /// ruos: build the server's CHANNEL_EOF + CHANNEL_CLOSE packets for `num`,
+    /// each only once (tracked by `sent_eof`/`sent_close`). The caller writes
+    /// the returned packets out the wire. Used to close a server channel when
+    /// its application output is finished — the upstream `Channel::handle_eof`
+    /// no longer auto-mirrors the peer's EOF onto our output direction.
+    pub fn eof_close<'p>(
+        &mut self,
+        num: ChanNum,
+    ) -> Result<(Option<Packet<'p>>, Option<Packet<'p>>)> {
+        let ch = self.get_mut(num)?;
+        let snum = ch.send_num()?;
+        let eof = if !ch.sent_eof {
+            ch.sent_eof = true;
+            Some(packets::ChannelEof { num: snum }.into())
+        } else {
+            None
+        };
+        let close = if !ch.sent_close {
+            ch.sent_close = true;
+            Some(packets::ChannelClose { num: snum }.into())
+        } else {
+            None
+        };
+        Ok((eof, close))
+    }
+
     fn remove_any(&mut self, num: ChanNum) -> Result<()> {
         trace!("remove_any channel {}", num);
         self.ch[num.0 as usize] = None;
@@ -966,21 +992,21 @@ impl Channel {
         }
     }
 
-    fn handle_eof(&mut self, s: &mut TrafSend, is_client: bool) -> Result<()> {
-        //TODO: check existing state?
-        if !self.sent_eof {
-            s.send(packets::ChannelEof { num: self.send_num()? })?;
-            self.sent_eof = true;
-        }
-
-        // Wake readers on EOF
+    fn handle_eof(&mut self, _s: &mut TrafSend, is_client: bool) -> Result<()> {
+        // ruos patch: do NOT auto-mirror a CHANNEL_EOF back to the peer here.
+        // Receiving the peer's EOF only means "the peer will send no more
+        // data" on the input direction; it must not close our output
+        // direction. The upstream behaviour sent the server's EOF the moment
+        // a client closed its stdin, which (for `ssh host cmd` / piped stdin)
+        // truncated command output before it was produced. Our application
+        // sends EOF+CLOSE explicitly via `Runner::send_channel_close` once its
+        // output is finished (e.g. the spawned shell exits).
         self.wake_read(ChanData::Normal, is_client);
         if is_client {
             self.wake_read(ChanData::Stderr, is_client);
         }
 
         self.state = ChanState::RecvEof;
-        // todo!();
         Ok(())
     }
 

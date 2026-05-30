@@ -2,6 +2,7 @@
 //! Loopback is always 127.0.0.1/8. The Ethernet interface (when present)
 //! acquires its address via DHCPv4.
 
+pub mod icmp;
 pub mod loopback;
 pub mod nic;
 pub mod sockets;

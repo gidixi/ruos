@@ -44,6 +44,8 @@ pub enum SuspendReason {
     PathRmdir    { path: String },
     PathFilestat { path: String, buf_ptr: u32 },
     PathRename   { src: String, dst: String },
+    /// ICMPv4 echo (ping). `latency_ms_ptr` receives the round-trip in ms.
+    Ping { target: smoltcp::wire::Ipv4Address, timeout_ticks: u64, latency_ms_ptr: u32 },
 }
 
 impl core::fmt::Display for SuspendReason {

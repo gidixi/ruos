@@ -10,6 +10,9 @@ members = [
     "ps", "kill", "pkill",
     "lspci", "ip",
     "nano",
+    "touch", "wc", "clear", "which",
+    "sort", "uniq", "cut", "tr", "tee",
+    "ifconfig", "nc", "date", "wget", "ping",
 ]
 
 [profile.release]

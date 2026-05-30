@@ -284,6 +284,161 @@ pub fn ruos_reboot(_caller: Caller<'_, RuntimeState>) -> Result<(), Error> {
     crate::power::reboot();
 }
 
+/// ruos_net_set_static(ip0..3: i32, prefix: i32, gw0..3: i32, gw_present: i32)
+///   → errno. Sets the active Ethernet interface to a static address +
+///   default route. `gw_present=0` skips the gateway. Replaces any DHCP-bound
+///   address. Returns 0 on success, errno otherwise (8 = no iface, 22 invalid).
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_net_set_static(
+    _caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    prefix: i32,
+    gw0: i32, gw1: i32, gw2: i32, gw3: i32,
+    gw_present: i32,
+) -> Result<i32, Error> {
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+    if prefix < 0 || prefix > 32 { return Ok(22); } // EINVAL
+    let addr = Ipv4Address::new(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8);
+    let cidr = Ipv4Cidr::new(addr, prefix as u8);
+    let gw = if gw_present != 0 {
+        Some(Ipv4Address::new(gw0 as u8, gw1 as u8, gw2 as u8, gw3 as u8))
+    } else { None };
+
+    let mut g = crate::net::NET.lock();
+    let net = match g.as_mut() { Some(n) => n, None => return Ok(8) };
+    // Apply to whichever Ethernet iface exists.
+    let iface_opt = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
+    let iface = match iface_opt { Some(i) => i, None => return Ok(8) };
+    iface.update_ip_addrs(|a| {
+        a.clear();
+        a.push(IpCidr::Ipv4(cidr)).unwrap();
+    });
+    let _ = iface.routes_mut().remove_default_ipv4_route();
+    if let Some(g) = gw {
+        let _ = iface.routes_mut().add_default_ipv4_route(g);
+    }
+    // Cancel DHCP renew loop — operator override wins.
+    if let Some(h) = net.dhcp.take() {
+        net.net_sockets.remove(h);
+    }
+    crate::binfo!("net", "static ip={} gw={:?}", cidr, gw);
+    Ok(0)
+}
+
+/// ruos_ping(ip0..3, timeout_ms, latency_ms_ptr) -> errno.
+/// Sends one ICMP echo request, waits up to `timeout_ms` for a matching reply,
+/// writes round-trip ms at `latency_ms_ptr` on success. Returns 110 on
+/// timeout, other errno values on early failures (no iface = 8).
+pub fn ruos_ping(
+    _caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    timeout_ms: i32,
+    latency_ms_ptr: i32,
+) -> Result<i32, Error> {
+    use crate::wasm::suspend::SuspendReason;
+    let target = smoltcp::wire::Ipv4Address::new(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8);
+    let ms = if timeout_ms <= 0 { 1000 } else { timeout_ms as u64 };
+    // timer ticks @ 100 Hz = 10 ms each.
+    let timeout_ticks = (ms + 9) / 10;
+    Err(Error::host(SuspendReason::Ping {
+        target,
+        timeout_ticks,
+        latency_ms_ptr: latency_ms_ptr as u32,
+    }))
+}
+
+/// ruos_time_get(year_ptr, month_ptr, day_ptr, hour_ptr, min_ptr, sec_ptr,
+///                epoch_ptr) -> errno. All fields are written through the
+/// wasm-memory pointers; epoch_ptr receives a u64 unix seconds value.
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_time_get(
+    mut caller: Caller<'_, RuntimeState>,
+    year_ptr: i32, month_ptr: i32, day_ptr: i32,
+    hour_ptr: i32, min_ptr: i32, sec_ptr: i32,
+    epoch_ptr: i32,
+) -> Result<i32, Error> {
+    let t = crate::rtc::now();
+    let epoch = crate::rtc::to_unix_epoch(&t);
+    let mem = wasm_memory(&caller)?;
+    let write = |mem: &wasmi::Memory, caller: &mut Caller<'_, RuntimeState>, p: i32, bytes: &[u8]| {
+        mem.write(caller, p as usize, bytes)
+            .map_err(|e| Error::new(alloc::format!("time_get write: {}", e)))
+    };
+    write(&mem, &mut caller, year_ptr,  &t.year.to_le_bytes())?;
+    write(&mem, &mut caller, month_ptr, &[t.month])?;
+    write(&mem, &mut caller, day_ptr,   &[t.day])?;
+    write(&mem, &mut caller, hour_ptr,  &[t.hour])?;
+    write(&mem, &mut caller, min_ptr,   &[t.minute])?;
+    write(&mem, &mut caller, sec_ptr,   &[t.second])?;
+    write(&mem, &mut caller, epoch_ptr, &epoch.to_le_bytes())?;
+    Ok(0)
+}
+
+/// ruos_tcp_dial(ip0..3, port, fd_out_ptr) -> errno.
+/// Allocate a TCP socket, inject it as a new wasm FD (written at fd_out_ptr),
+/// then trap with SuspendReason::SockConnect so the fiber awaits Established
+/// before returning to wasm. After success the caller can fd_read/fd_write on
+/// the returned FD; close it with fd_close.
+///
+/// Local port: 49152 + (idx % 16384) — ephemeral range, deterministic per slot.
+#[allow(clippy::too_many_arguments)]
+pub fn ruos_tcp_dial(
+    mut caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    port: i32,
+    fd_out_ptr: i32,
+) -> Result<i32, Error> {
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+    use crate::wasm::state::FdEntry;
+    use crate::wasm::suspend::SuspendReason;
+
+    if port <= 0 || port > 0xFFFF { return Ok(22); }
+    let idx = crate::net::sockets::POOL.alloc_tcp();
+    let handle = match crate::net::sockets::POOL.handle(idx) {
+        Some(h) => h,
+        None    => return Ok(8),
+    };
+    let remote = IpEndpoint::new(
+        IpAddress::v4(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8),
+        port as u16,
+    );
+    let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
+
+    // Allocate a wasm-side FD pointing at this socket.
+    let fd = {
+        let fds = &mut caller.data_mut().fds;
+        // Scan for a None slot first; else extend.
+        let mut slot = None;
+        for (i, s) in fds.iter().enumerate() {
+            if s.is_none() { slot = Some(i); break; }
+        }
+        match slot {
+            Some(i) => { fds[i] = Some(FdEntry::Socket(idx)); i as i32 }
+            None    => { fds.push(Some(FdEntry::Socket(idx))); (fds.len() - 1) as i32 }
+        }
+    };
+    // Persist the FD to wasm memory for the caller.
+    let mem = wasm_memory(&caller)?;
+    mem.write(&mut caller, fd_out_ptr as usize, &fd.to_le_bytes())
+        .map_err(|e| Error::new(alloc::format!("tcp_dial fd_out write: {}", e)))?;
+
+    // Trap into SockConnect; the fiber driver awaits Established and resumes.
+    Err(Error::host(SuspendReason::SockConnect { handle, remote, local_port }))
+}
+
+/// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
+pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
+    use smoltcp::socket::dhcpv4;
+    let mut g = crate::net::NET.lock();
+    let net = match g.as_mut() { Some(n) => n, None => return Ok(8) };
+    if net.iface_net.is_none() && net.iface_nic.is_none() { return Ok(8); }
+    if net.dhcp.is_none() {
+        net.dhcp = Some(net.net_sockets.add(dhcpv4::Socket::new()));
+        crate::binfo!("net", "dhcp renew requested");
+    }
+    Ok(0)
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "exec", ruos_exec)?
@@ -292,6 +447,11 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
-        .func_wrap("ruos", "net_iface", ruos_net_iface)?;
+        .func_wrap("ruos", "net_iface", ruos_net_iface)?
+        .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
+        .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?
+        .func_wrap("ruos", "tcp_dial", ruos_tcp_dial)?
+        .func_wrap("ruos", "time_get", ruos_time_get)?
+        .func_wrap("ruos", "ping", ruos_ping)?;
     Ok(())
 }

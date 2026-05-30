@@ -11,6 +11,8 @@ extern "C" {
         exit_code_ptr: u32,
     ) -> i32;
 
+    fn exec_pipeline(buf_ptr: u32, buf_len: u32, exit_code_ptr: u32) -> i32;
+
     fn readdir(
         path_ptr: u32, path_len: u32,
         buf_ptr: u32, buf_len: u32,
@@ -364,6 +366,14 @@ fn main() {
 }
 
 fn run_command(line: &str) {
+    // Detect a pipeline: split on `|` outside quotes BEFORE tokenising.
+    let segments = split_pipeline(line);
+    if segments.len() > 1 {
+        let _ = run_pipeline(&segments);
+        return;
+    }
+
+    // Single command — existing path unchanged.
     let argv: Vec<&str> = line.split_whitespace().collect();
     if argv.is_empty() {
         return;
@@ -457,19 +467,33 @@ fn builtin_help() {
     println!("external: try 'ls /bin' to list available .wasm");
 }
 
-fn exec_external(cmd: &str, argv: &[&str]) -> i32 {
-    let candidates = if cmd.contains('/') {
-        vec![cmd.to_string()]
+/// Resolve a command name to an absolute path (e.g. `ls` → `/bin/ls.wasm`).
+/// Returns `Some(path)` if the resolved path exists (best-effort), or
+/// `Some(path)` unconditionally when the command already contains a `/`
+/// (let the kernel report the error). Returns `None` when resolution yields
+/// no candidate.
+fn resolve_path(cmd: &str) -> Option<String> {
+    if cmd.contains('/') {
+        Some(cmd.to_string())
     } else {
-        vec![format!("/bin/{}.wasm", cmd)]
-    };
-    for path in &candidates {
-        if let Some(code) = try_exec(path, argv) {
-            return code;
+        Some(format!("/bin/{}.wasm", cmd))
+    }
+}
+
+fn exec_external(cmd: &str, argv: &[&str]) -> i32 {
+    match resolve_path(cmd) {
+        Some(path) => {
+            if let Some(code) = try_exec(&path, argv) {
+                return code;
+            }
+            eprintln!("shell: {}: not found", cmd);
+            127
+        }
+        None => {
+            eprintln!("shell: {}: not found", cmd);
+            127
         }
     }
-    eprintln!("shell: {}: not found", cmd);
-    127
 }
 
 fn try_exec(path: &str, argv: &[&str]) -> Option<i32> {
@@ -500,4 +524,90 @@ fn try_exec(path: &str, argv: &[&str]) -> Option<i32> {
         )
     };
     if errno == 0 { Some(exit_code) } else { None }
+}
+
+/// Split `line` on `|` characters that are outside single/double quotes.
+fn split_pipeline(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut sq, mut dq) = (false, false);
+    for c in line.chars() {
+        match c {
+            '\'' if !dq => { sq = !sq; cur.push(c); }
+            '"'  if !sq => { dq = !dq; cur.push(c); }
+            '|'  if !sq && !dq => { out.push(cur.trim().to_string()); cur.clear(); }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    out
+}
+
+/// Serialize a list of pipeline stages into a binary blob understood by the
+/// kernel's `exec_pipeline` host function.
+///
+/// Format (all integers little-endian u32):
+///   nstages
+///   per stage: path_len, path bytes, argc, (arg_len, arg bytes) × argc
+fn serialize_pipeline(stages: &[(String, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(stages.len() as u32).to_le_bytes());
+    for (path, argv) in stages {
+        let p = path.as_bytes();
+        b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        b.extend_from_slice(p);
+        b.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+        for a in argv {
+            b.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            b.extend_from_slice(a);
+        }
+    }
+    b
+}
+
+/// Returns true if `name` is a shell builtin that cannot participate in a
+/// pipeline (builtins do not fork, so they cannot be piped).
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "cd" | "pwd" | "exit" | "help" | "poweroff" | "reboot" | "source" | ".")
+}
+
+/// Run a multi-stage pipeline. Each segment has already been split on `|`.
+/// Returns the exit code of the last stage, or 127 on setup errors.
+fn run_pipeline(segments: &[String]) -> i32 {
+    let mut stages: Vec<(String, Vec<Vec<u8>>)> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let argv: Vec<&str> = seg.split_whitespace().collect();
+        if argv.is_empty() {
+            eprintln!("shell: empty pipeline segment");
+            return 1;
+        }
+        let cmd = argv[0];
+        if is_builtin(cmd) {
+            eprintln!("shell: builtin '{}' not allowed in a pipeline", cmd);
+            return 1;
+        }
+        let path = match resolve_path(cmd) {
+            Some(p) => p,
+            None => {
+                eprintln!("shell: {}: not found", cmd);
+                return 127;
+            }
+        };
+        let argv_bytes: Vec<Vec<u8>> = argv.iter().map(|s| s.as_bytes().to_vec()).collect();
+        stages.push((path, argv_bytes));
+    }
+    let blob = serialize_pipeline(&stages);
+    let mut exit_code: i32 = 0;
+    let errno = unsafe {
+        exec_pipeline(
+            blob.as_ptr() as u32,
+            blob.len() as u32,
+            &mut exit_code as *mut i32 as u32,
+        )
+    };
+    match errno {
+        0 => exit_code,
+        7 => { eprintln!("shell: pipeline too long (max 4)"); 1 }
+        n => { eprintln!("shell: exec_pipeline errno {}", n); 1 }
+    }
 }

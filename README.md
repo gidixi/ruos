@@ -11,17 +11,26 @@ syscall ABI, and a proper VFS + filesystem.
 
 ## Status
 
+Userland = **WebAssembly** (`wasm32-wasi`); the WASM runtime is the sandbox.
+No Linux ABI, no CPU ring 3, no preemptive scheduler — concurrency is async
+cooperative (timer-IRQ wake). See the
+[pivot note](docs/superpowers/roadmap-rust-os.md) for the why.
+
 | Step | Description | Status |
 |------|-------------|--------|
-| 1 | Rust nightly toolchain + `x86_64-unknown-none` + `build-std` | ✅ |
-| 2 | Cargo + `Makefile` orchestrator (kernel ELF → Limine ISO) | ✅ |
-| 3 | `no_std` kernel that boots from Limine and writes to serial | ✅ |
-| 4 | Global allocator (`talc`) + heap on Limine memmap / HHDM | ✅ |
-| 5 | IDT, GDT, interrupt handlers (PIT, PS/2 keyboard) | ⏳ next |
-| 6 | Physical frame allocator + paging API (Rust-side) | — |
-| 7 | Tasking (TCB, context switch, scheduler) | — |
-| 8 | User mode + syscall ABI | — |
-| 9 | VFS + filesystem (tmpfs, FAT, block driver) | — |
+| 1–5 | Toolchain, ISO build, `no_std` boot, heap (`talc`), IDT/GDT/APIC/timer/PS2 | ✅ |
+| 6 | Physical frame allocator + paging API | ✅ |
+| 7 | VFS + tmpfs (in-RAM) | ✅ |
+| 8 | Framebuffer console (font, scroll, cursor) | ✅ |
+| 9 | Async executor (`no_std`, timer-IRQ wake) | ✅ |
+| 10 | WASM runtime (`wasmi`) + WASI Preview 1 | ✅ |
+| 11 | Local shell (line editing, PATH, exec `.wasm`, builtins) | ✅ |
+| 12 | PTY (pseudo-terminal, line discipline) | ✅ |
+| 13 | PCI/PCIe enumeration (ECAM) | ✅ |
+| 14 | Networking (virtio-net + e1000, `smoltcp`, RDRAND CSPRNG) | ✅ |
+| 15 | AHCI/SATA disk + persistent FAT (`/mnt`) | ✅ |
+| 16 | SSH server (`sunset`, ed25519 pubkey, PTY shell + exec) | ✅ |
+| 17 | Mouse PS/2 + `rlvgl` GUI + graphics host functions | ⏳ next |
 
 Detailed roadmap: [`docs/superpowers/roadmap-rust-os.md`](docs/superpowers/roadmap-rust-os.md).
 Per-step design specs and implementation plans live under
@@ -100,6 +109,51 @@ make run
 Launches QEMU with a display window; serial is mirrored to the host
 terminal.
 
+## SSH
+
+ruos runs an SSH server on port 22 (`sunset`, ed25519 public-key auth). It
+starts at boot once networking and the `/mnt` FAT volume are up. The **host
+key** is generated on first boot and persisted to `/mnt/host.key`. Authorized
+client keys are read from `/mnt/auth.key` (one ed25519 pubkey, OpenSSH format).
+
+**One-shot automated test** (boots QEMU, forwards `:2222`→guest `:22`, runs an
+interactive shell and a non-interactive exec, asserts the output):
+
+```bash
+make run-ssh-test
+```
+
+**Manual:** put your public key on the disk image, then connect. The Makefile
+forwards host `127.0.0.1:2222` to the guest's port 22.
+
+```bash
+# 1. Generate a throwaway client key (or reuse build/id_ed25519 from the test).
+ssh-keygen -t ed25519 -N '' -f build/id_ed25519 -C ruos
+
+# 2. Copy the *public* key onto the FAT image as /auth.key (8.3 short name).
+mcopy -o -i build/disk.img build/id_ed25519.pub ::/auth.key
+
+# 3. Boot ruos with the port-forward (see the run-ssh-test recipe), then:
+ssh -p 2222 -i build/id_ed25519 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    root@127.0.0.1            # interactive shell
+
+ssh -p 2222 -i build/id_ed25519 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    root@127.0.0.1 pwd        # non-interactive command
+```
+
+> OpenSSH refuses private keys that are world-readable. On the Windows DrvFs
+> mount the repo copy is `0777`; copy it somewhere native and `chmod 600`
+> first (the test script does this automatically).
+
+**Current limits (MVP):** one session at a time, one authorized key, fixed
+port 22, pubkey-only (ed25519), username not enforced, exec runs through the
+interactive shell (output includes the prompt) with no exit-status, no
+window-size / SFTP / forwarding. The server itself runs in ring 0 (the WASM
+runtime is the app sandbox, not the SSH server). A release build is required —
+debug-profile crypto is too slow (KEX > 60 s).
+
 ## Boot on real hardware (USB)
 
 The hybrid ISO can be written directly to a USB stick:
@@ -112,9 +166,10 @@ Replace `/dev/sdX` with your USB device (e.g. `/dev/sdb`).
 **Double-check the device — `dd` will overwrite it entirely.**
 
 Boot from the USB on any x86-64 PC; both BIOS and UEFI firmware are
-supported. The kernel currently writes only to COM1, so on real hardware you
-need a serial console (USB-to-serial cable, BMC/IPMI redirect, etc.) to see
-the output. Framebuffer text output is on the roadmap after Step 5.
+supported. Output goes to both the **framebuffer console** (Step 8) and COM1
+serial, and the PS/2 keyboard drives a local shell — so a monitor + keyboard
+is enough; a serial console (USB-to-serial, BMC/IPMI redirect) still mirrors
+everything if you need it.
 
 ## Repository layout
 

@@ -325,6 +325,28 @@ pub fn ruos_net_set_static(
     Ok(0)
 }
 
+/// ruos_ping(ip0..3, timeout_ms, latency_ms_ptr) -> errno.
+/// Sends one ICMP echo request, waits up to `timeout_ms` for a matching reply,
+/// writes round-trip ms at `latency_ms_ptr` on success. Returns 110 on
+/// timeout, other errno values on early failures (no iface = 8).
+pub fn ruos_ping(
+    _caller: Caller<'_, RuntimeState>,
+    ip0: i32, ip1: i32, ip2: i32, ip3: i32,
+    timeout_ms: i32,
+    latency_ms_ptr: i32,
+) -> Result<i32, Error> {
+    use crate::wasm::suspend::SuspendReason;
+    let target = smoltcp::wire::Ipv4Address::new(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8);
+    let ms = if timeout_ms <= 0 { 1000 } else { timeout_ms as u64 };
+    // timer ticks @ 100 Hz = 10 ms each.
+    let timeout_ticks = (ms + 9) / 10;
+    Err(Error::host(SuspendReason::Ping {
+        target,
+        timeout_ticks,
+        latency_ms_ptr: latency_ms_ptr as u32,
+    }))
+}
+
 /// ruos_time_get(year_ptr, month_ptr, day_ptr, hour_ptr, min_ptr, sec_ptr,
 ///                epoch_ptr) -> errno. All fields are written through the
 /// wasm-memory pointers; epoch_ptr receives a u64 unix seconds value.
@@ -429,6 +451,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
         .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?
         .func_wrap("ruos", "tcp_dial", ruos_tcp_dial)?
-        .func_wrap("ruos", "time_get", ruos_time_get)?;
+        .func_wrap("ruos", "time_get", ruos_time_get)?
+        .func_wrap("ruos", "ping", ruos_ping)?;
     Ok(())
 }

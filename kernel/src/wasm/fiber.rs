@@ -311,6 +311,15 @@ impl Fiber {
                     Err(_) => 8,
                 }
             }
+            SuspendReason::Ping { target, timeout_ticks, latency_ms_ptr } => {
+                match crate::net::icmp::ping(target, timeout_ticks).await {
+                    Ok(ms) => {
+                        let _ = self.write_u32(latency_ms_ptr, ms as u32);
+                        0
+                    }
+                    Err(_) => 110, // ETIMEDOUT-ish
+                }
+            }
             SuspendReason::ReadDir { path, buf_ptr, buf_len, nread_ptr } => {
                 let entries = match crate::vfs::readdir(&path).await {
                     Ok(v) => v,

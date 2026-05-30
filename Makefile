@@ -1,5 +1,5 @@
 SHELL     := /bin/bash      # required: 'build' recipe uses the 'source' builtin
-KERNEL    := kernel/target/x86_64-unknown-none/debug/kernel
+KERNEL    := kernel/target/x86_64-unknown-none/release/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
@@ -45,7 +45,7 @@ $(DISK_IMG):
 disk: $(DISK_IMG)
 
 build:
-	source $$HOME/.cargo/env && cd kernel && cargo build
+	source $$HOME/.cargo/env && cd kernel && cargo build --release
 
 limine:
 	@if [ ! -d $(LIMINE) ]; then \

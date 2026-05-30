@@ -64,10 +64,24 @@ pub async fn run_session(
             let mut chunk = [0u8; SOCK_CHUNK];
             let n = out_len.min(SOCK_CHUNK);
             chunk[..n].copy_from_slice(&runner.output_buf()[..n]);
-            if let Some(sent) = sockets::try_send(handle, &chunk[..n]) {
-                if sent == 0 { runner.close_output(); break; }
-                runner.consume_output(sent);
-                progressed = true;
+            match sockets::try_send(handle, &chunk[..n]) {
+                Some(0) => {
+                    crate::bwarn!("ssh", "iter={} try_send returned 0 (closed)", iter_count);
+                    runner.close_output();
+                    break;
+                }
+                Some(sent) => {
+                    if iter_count <= 10 {
+                        crate::binfo!("ssh", "iter={} sent {}/{} bytes", iter_count, sent, n);
+                    }
+                    runner.consume_output(sent);
+                    progressed = true;
+                }
+                None => {
+                    if iter_count <= 10 {
+                        crate::binfo!("ssh", "iter={} try_send None (can't yet)", iter_count);
+                    }
+                }
             }
         }
 
@@ -109,8 +123,8 @@ pub async fn run_session(
             Ok(_)                                       => "OtherOk",
             Err(_)                                      => "Err",
         };
-        if !matches!(ev_dbg, "OtherOk") {
-            crate::binfo!("ssh", "ev={}", ev_dbg);
+        if iter_count <= 20 || (!matches!(ev_dbg, "OtherOk")) {
+            crate::binfo!("ssh", "iter={} ev={}", iter_count, ev_dbg);
         }
         match pr {
             Ok(Event::Serv(ServEvent::Hostkeys(h))) => {

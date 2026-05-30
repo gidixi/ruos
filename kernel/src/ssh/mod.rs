@@ -23,8 +23,12 @@ pub struct Config {
 
 pub static CONFIG: Config = Config {
     port:          22,
-    host_key_path: "/mnt/etc/ssh/host_key",
-    authkeys_path: "/mnt/etc/ssh/authorized_keys",
+    // Top-level on /mnt for now — our FAT32 driver doesn't yet support
+    // mkdir, and pre-populating /etc/ssh/ in disk.img would add steps to
+    // the Makefile. Names kept inside the FAT 8.3 short-name limit
+    // (8-char base + 3-char ext) until LFN support lands.
+    host_key_path: "/mnt/host.key",
+    authkeys_path: "/mnt/auth.key",
 };
 
 #[derive(Debug)]

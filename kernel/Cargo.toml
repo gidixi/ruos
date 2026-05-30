@@ -20,6 +20,11 @@ smoltcp = { version = "0.11", default-features = false, features = ["alloc", "me
 virtio-drivers = "0.13"
 rand_chacha = { version = "0.3", default-features = false }
 pci_types = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# Force sha2 software backend: cpufeatures detection probes AVX intrinsics
+# that LLVM refuses on x86_64-unknown-none. Direct dep ensures the feature
+# unifies into the ed25519-dalek transitive dependency.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [features]
 boot-checks = []

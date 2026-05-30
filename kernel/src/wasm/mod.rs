@@ -6,6 +6,7 @@ pub mod state;
 pub mod suspend;
 pub mod fiber;
 pub mod exec_queue;
+pub mod ssh_spawn;
 
 use alloc::vec::Vec;
 use crate::kprintln;

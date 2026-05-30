@@ -34,6 +34,37 @@ pub fn master_input_push(idx: usize, byte: u8) {
     ldisc::process_input(&mut g, byte);
 }
 
+/// Non-blocking poll of pair `idx`'s master output. Returns `Some(byte)` if
+/// available, `None` otherwise. Used by the SSH session bridge.
+pub fn master_output_try(idx: usize) -> Option<u8> {
+    if idx >= NUM_PAIRS { return None; }
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| {
+        let mut g = PAIRS[idx].lock();
+        g.master_out.pop_front()
+    })
+}
+
+/// Atomic claim of pair `idx`. Returns true on success; subsequent claims
+/// of the same pair return false until [`release`] is called.
+pub fn try_claim(idx: usize) -> bool {
+    if idx >= NUM_PAIRS { return false; }
+    use core::sync::atomic::Ordering;
+    CLAIMED[idx].compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+pub fn release(idx: usize) {
+    if idx >= NUM_PAIRS { return; }
+    use core::sync::atomic::Ordering;
+    CLAIMED[idx].store(false, Ordering::SeqCst);
+}
+
+use core::sync::atomic::AtomicBool;
+static CLAIMED: [AtomicBool; NUM_PAIRS] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+
 /// Future-friendly read of one byte from pair `idx`'s master output.
 /// Used by console_drain_task.
 pub async fn master_output_read(idx: usize) -> u8 {

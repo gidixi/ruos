@@ -123,6 +123,38 @@ run-test-e1000: iso
 	@grep -qE "net .* e1000 mac=" build/serial.log || { echo TEST_FAIL_E1000_MAC; exit 1; }
 	@echo TEST_PASS_E1000
 
+# SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
+# fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
+.PHONY: run-ssh-test
+SSH_KEY := build/id_ed25519
+$(SSH_KEY):
+	mkdir -p build
+	ssh-keygen -t ed25519 -N '' -f $@ -q -C ruos-test
+ssh-key-on-disk: $(SSH_KEY) $(DISK_IMG)
+	mcopy -o -i $(DISK_IMG) $(SSH_KEY).pub ::/auth.key
+run-ssh-test: iso ssh-key-on-disk
+	@echo "--- SSH client test (timeout 60s) ---"
+	@rm -f build/serial.log
+	@(timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) \
+		-serial stdio -display none -no-reboot -m 512 \
+		-device qemu-xhci \
+		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+		-device virtio-net-pci,netdev=net0 \
+		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
+		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
+		> build/serial.log) & QEMUPID=$$! ; \
+	sleep 15 ; \
+	echo "--- launching ssh client ---" ; \
+	ssh -p 2222 -i $(SSH_KEY) \
+		-o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null \
+		-o ConnectTimeout=5 \
+		root@127.0.0.1 'echo hello-from-host' 2>&1 | tee build/ssh-client.log ; \
+	sleep 3 ; \
+	kill $$QEMUPID 2>/dev/null ; \
+	wait $$QEMUPID 2>/dev/null ; \
+	grep -F "auth ok" build/serial.log && echo TEST_PASS_SSH || { echo TEST_FAIL_AUTH; tail -30 build/serial.log; exit 1; }
+
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build \

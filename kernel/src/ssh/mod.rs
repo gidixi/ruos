@@ -8,6 +8,7 @@
 pub mod authkeys;
 pub mod channel;
 pub mod hostkey;
+pub mod rng_bridge;
 pub mod server;
 pub mod sunset_io;
 

@@ -57,6 +57,7 @@ pub fn run() -> ! {
     // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
+    spawner.spawn(ssh_serve_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
 
     loop {
@@ -131,6 +132,11 @@ async fn exec_worker_task() {
             w.wake();
         }
     }
+}
+
+#[embassy_executor::task]
+async fn ssh_serve_task() {
+    crate::ssh::server::serve_loop_pub().await;
 }
 
 #[embassy_executor::task]

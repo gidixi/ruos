@@ -12,4 +12,9 @@ rustflags = [
     # Force curve25519-dalek's serial backend — its SIMD backend uses AVX2
     # intrinsics that LLVM refuses to lower on x86_64-unknown-none.
     "--cfg", "curve25519_dalek_backend=\"serial\"",
+    # Same story for poly1305 — its AVX2 autodetect compile path crashes
+    # in LLVM lowering. Force the software backend.
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "chacha20_force_soft",
 ]

@@ -3,7 +3,7 @@
 //! Task 2 milestone: load/generate host key. Real socket bind + transport
 //! lands in Tasks 4-5.
 
-use crate::ssh::{hostkey, CONFIG, SshError};
+use crate::ssh::{authkeys, hostkey, CONFIG, SshError};
 
 pub fn spawn() -> Result<(), SshError> {
     let key = hostkey::load_or_generate(CONFIG.host_key_path)?;
@@ -14,6 +14,7 @@ pub fn spawn() -> Result<(), SshError> {
         pub_bytes[0], pub_bytes[1], pub_bytes[2], pub_bytes[3],
         pub_bytes[30], pub_bytes[31],
     );
+    let _keys = authkeys::load(CONFIG.authkeys_path)?;
     crate::bwarn!("ssh", "transport pending Tasks 4-5");
     Err(SshError::NotImplemented)
 }

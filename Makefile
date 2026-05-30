@@ -37,6 +37,9 @@ $(DISK_IMG):
 	dd if=/dev/zero of=$@.tmp bs=1M count=$(DISK_MB) status=none
 	mkfs.vfat -F 32 -n RUOS $@.tmp >/dev/null
 	echo 'hello from disk' | mcopy -i $@.tmp - ::/hello.txt
+	# Seed an empty authorized_keys file — Step 16 SSH server reads
+	# /mnt/auth.key. Tests / users can mcopy a real key on top later.
+	echo '# ssh-ed25519 pubkeys here, one per line' | mcopy -i $@.tmp - ::/auth.key
 	mv $@.tmp $@
 
 disk: $(DISK_IMG)

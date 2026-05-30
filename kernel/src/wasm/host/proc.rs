@@ -94,6 +94,69 @@ pub fn resolve_cwd(base: &str, path: &str) -> alloc::string::String {
     result
 }
 
+/// ruos_exec_pipeline(buf_ptr, buf_len, exit_code_ptr) -> errno.
+/// `buf` is the serialized stage list (see plan). Runs all stages concurrently
+/// joined by pipes; writes the last stage's exit code at `exit_code_ptr`.
+pub fn ruos_exec_pipeline(
+    caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_len: i32,
+    exit_code_ptr: i32,
+) -> Result<i32, Error> {
+    let mem = wasm_memory(&caller)?;
+    let mut blob = alloc::vec![0u8; buf_len as usize];
+    mem.read(&caller, buf_ptr as usize, &mut blob)
+        .map_err(|_| Error::i32_exit(-1))?;
+    let stages = match decode_pipeline(&blob) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(22), // EINVAL: malformed/empty
+    };
+    if stages.len() > crate::wasm::pipeline::PIPE_MAX_STAGES {
+        return Ok(7); // E2BIG: pipeline too long
+    }
+    let cwd = caller.data().cwd.clone();
+    // Inherit the calling shell's terminal (PTY) so the pipeline's
+    // terminal-facing FDs reach the right console (e.g. the SSH PTY), not
+    // the default /dev/pts/0. Falls back to 0 if fd 1 isn't a PTY.
+    let term_pts = match caller.data().fds.get(1).and_then(|s| s.as_ref()) {
+        Some(crate::wasm::state::FdEntry::Vfs(kfd)) => {
+            crate::vfs::fd::pts_index(*kfd).unwrap_or(0)
+        }
+        _ => 0,
+    };
+    Err(Error::host(SuspendReason::ExecPipeline {
+        stages,
+        cwd,
+        term_pts,
+        exit_code_ptr: exit_code_ptr as u32,
+    }))
+}
+
+/// Decode the pipeline blob. Returns Vec<(path, argv)>.
+fn decode_pipeline(blob: &[u8]) -> Option<Vec<(String, Vec<Vec<u8>>)>> {
+    let rd_u32 = |b: &[u8], o: usize| -> Option<u32> {
+        if o + 4 > b.len() { return None; }
+        Some(u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]))
+    };
+    let mut o = 0usize;
+    let n = rd_u32(blob, o)? as usize; o += 4;
+    let mut stages = Vec::with_capacity(n);
+    for _ in 0..n {
+        let plen = rd_u32(blob, o)? as usize; o += 4;
+        if o + plen > blob.len() { return None; }
+        let path = core::str::from_utf8(&blob[o..o+plen]).ok()?.to_string(); o += plen;
+        let argc = rd_u32(blob, o)? as usize; o += 4;
+        let mut argv = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            let alen = rd_u32(blob, o)? as usize; o += 4;
+            if o + alen > blob.len() { return None; }
+            argv.push(blob[o..o+alen].to_vec()); o += alen;
+        }
+        stages.push((path, argv));
+    }
+    Some(stages)
+}
+
 fn decode_argv(blob: &[u8]) -> Option<Vec<Vec<u8>>> {
     if blob.len() < 4 { return None; }
     let count = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
@@ -452,6 +515,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?
         .func_wrap("ruos", "tcp_dial", ruos_tcp_dial)?
         .func_wrap("ruos", "time_get", ruos_time_get)?
-        .func_wrap("ruos", "ping", ruos_ping)?;
+        .func_wrap("ruos", "ping", ruos_ping)?
+        .func_wrap("ruos", "exec_pipeline", ruos_exec_pipeline)?;
     Ok(())
 }

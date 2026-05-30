@@ -33,3 +33,5 @@ cp /etc/init.sh /mnt/init.bak
 cat /mnt/init.bak | head -n 3
 echo --- ping test ---
 ping -c 1 -W 2000 10.0.2.2
+echo --- pipe smoke ---
+ls /bin | wc -l

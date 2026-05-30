@@ -135,6 +135,10 @@ ssh-key-on-disk: $(SSH_KEY) $(DISK_IMG)
 run-ssh-test: iso ssh-key-on-disk
 	bash tests/ssh-shell-test.sh
 
+.PHONY: run-pipe-test
+run-pipe-test: iso ssh-key-on-disk
+	bash tests/pipe-test.sh
+
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build \

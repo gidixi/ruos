@@ -57,6 +57,7 @@ pub fn run() -> ! {
     // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
     spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
+    spawner.spawn(pipeline_worker_task()).unwrap();
     spawner.spawn(ssh_serve_task()).unwrap();
     spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
@@ -133,6 +134,11 @@ async fn exec_worker_task() {
             w.wake();
         }
     }
+}
+
+#[embassy_executor::task]
+async fn pipeline_worker_task() {
+    crate::wasm::pipeline::worker().await;
 }
 
 #[embassy_executor::task]

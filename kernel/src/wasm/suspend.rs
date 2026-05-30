@@ -33,6 +33,15 @@ pub enum SuspendReason {
         cwd: alloc::string::String,
         exit_code_ptr: u32,
     },
+    ExecPipeline {
+        stages: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<alloc::vec::Vec<u8>>)>,
+        cwd: alloc::string::String,
+        /// PTY pair index of the calling shell, so the pipeline's terminal-
+        /// facing FDs (first stdin, last stdout, all stderr) inherit it
+        /// instead of defaulting to /dev/pts/0.
+        term_pts: usize,
+        exit_code_ptr: u32,
+    },
     ReadDir {
         path: alloc::string::String,
         buf_ptr: u32,

@@ -170,6 +170,12 @@ async fn ssh_pty_dispatcher_task() {
                 Err(e) => { kprintln!("ssh shell spawn: instantiate {}: {}", path, e); continue; }
             };
             fb.rebind_stdio_pty(idx);
+            // argv = ["shell", "--no-init"] so the SSH shell skips replaying
+            // /etc/init.sh + the boot banner.
+            fb.set_args(alloc::vec![
+                b"shell".to_vec(),
+                b"--no-init".to_vec(),
+            ]);
             let pid = crate::proc::register(
                 alloc::string::String::from(path.trim_start_matches('/')),
             );

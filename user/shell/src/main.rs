@@ -316,23 +316,30 @@ fn read_line_raw(prompt: &str) -> Option<String> {
 fn main() {
     *CWD.lock().unwrap() = "/".to_string();
 
-    if let Ok(script) = fs::read_to_string("/etc/init.sh") {
-        for line in script.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            run_command(line);
-        }
-        println!("shell: init.sh complete");
-    } else {
-        println!("shell: /etc/init.sh not found");
-    }
+    // `--no-init` (passed by the SSH server when spawning a session shell)
+    // skips the boot script + banner so an SSH login lands straight at a
+    // clean prompt instead of replaying /etc/init.sh.
+    let no_init = std::env::args().any(|a| a == "--no-init");
 
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-    use std::io::Write;
-    print!("\x1b[2J\x1b[H");
-    std::io::stdout().flush().ok();
+    if !no_init {
+        if let Ok(script) = fs::read_to_string("/etc/init.sh") {
+            for line in script.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                run_command(line);
+            }
+            println!("shell: init.sh complete");
+        } else {
+            println!("shell: /etc/init.sh not found");
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        use std::io::Write;
+        print!("\x1b[2J\x1b[H");
+        std::io::stdout().flush().ok();
+    }
     println!("\x1b[1;32mruos shell ready. type 'help' for builtins.\x1b[0m");
 
     let saved = save_and_raw();

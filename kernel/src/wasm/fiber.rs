@@ -77,6 +77,21 @@ impl Fiber {
         self.store.data_mut().fds = fds;
     }
 
+    /// Replace this fiber's FD `slot` (0=stdin, 1=stdout, 2=stderr) with the
+    /// kernel VFS fd `fd`, closing the default `/dev/pts/0` entry it replaces.
+    /// Used by the pipeline coordinator to wire a stage to a pipe end.
+    pub fn bind_fd(&mut self, slot: usize, fd: crate::vfs::Fd) {
+        use crate::vfs;
+        use crate::wasm::state::FdEntry;
+        let fds = &mut self.store.data_mut().fds;
+        if slot >= fds.len() { return; }
+        if let Some(FdEntry::Vfs(old)) = fds[slot].as_ref() {
+            let old = *old;
+            let _ = vfs::block_on(vfs::close(old));
+        }
+        fds[slot] = Some(FdEntry::Vfs(fd));
+    }
+
     pub async fn run(&mut self) -> i32 {
         // Get the _start function.
         let start = match self.instance.get_func(&self.store, "_start") {

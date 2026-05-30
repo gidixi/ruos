@@ -1,20 +1,20 @@
 # ruos — a hobby x86-64 OS in Rust
 
 `ruos` is a hobby operating system written in Rust (`no_std`), booted by
-[Limine](https://github.com/limine-bootloader/limine). It currently boots in
-QEMU (BIOS or UEFI), prints to the serial port (COM1), initializes a kernel
-heap on Limine-mapped RAM, and uses `alloc::{Box, Vec, String, BTreeMap}`.
+[Limine](https://github.com/limine-bootloader/limine). It boots in QEMU
+(BIOS or UEFI), VirtualBox, and on real hardware via USB; runs `.wasm`
+userspace tools (coreutils, network tools, an editor); ships a TCP/IP
+stack with virtio-net and e1000 drivers; mounts an AHCI/SATA disk as FAT32
+at `/mnt`; and exposes an interactive shell over **SSH** (port 22, ed25519
+host key, password + pubkey auth).
 
-Long-term goal: evolve into an OS capable of running containers
-(Podman-style) — driving the design toward real tasking, user mode, a
-syscall ABI, and a proper VFS + filesystem.
+**North star** (pivot 2026-05-28): execute `.wasm` apps (WASI), GUI via
+`rlvgl`, remote access via SSH. Userland = WebAssembly (`wasm32-wasip1`);
+the WASM runtime is the sandbox. No Linux ABI, no CPU ring 3, no preemptive
+scheduler — concurrency is async cooperative (timer-IRQ wake). See the
+[pivot note](docs/superpowers/roadmap-rust-os.md) for the why.
 
 ## Status
-
-Userland = **WebAssembly** (`wasm32-wasi`); the WASM runtime is the sandbox.
-No Linux ABI, no CPU ring 3, no preemptive scheduler — concurrency is async
-cooperative (timer-IRQ wake). See the
-[pivot note](docs/superpowers/roadmap-rust-os.md) for the why.
 
 | Step | Description | Status |
 |------|-------------|--------|
@@ -29,7 +29,7 @@ cooperative (timer-IRQ wake). See the
 | 13 | PCI/PCIe enumeration (ECAM) | ✅ |
 | 14 | Networking (virtio-net + e1000, `smoltcp`, RDRAND CSPRNG) | ✅ |
 | 15 | AHCI/SATA disk + persistent FAT (`/mnt`) | ✅ |
-| 16 | SSH server (`sunset`, ed25519 pubkey, PTY shell + exec) | ✅ |
+| 16 | SSH server (`sunset`, ed25519 host key, pubkey **+ password** auth, PTY shell + exec, runs disklessly) | ✅ |
 | 17 | Mouse PS/2 + `rlvgl` GUI + graphics host functions | ⏳ next |
 
 Detailed roadmap: [`docs/superpowers/roadmap-rust-os.md`](docs/superpowers/roadmap-rust-os.md).
@@ -47,7 +47,10 @@ System packages (Ubuntu / Debian):
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential curl git xorriso qemu-system-x86
+sudo apt install -y build-essential curl git xorriso qemu-system-x86 \
+                    mtools dosfstools         # FAT image (/mnt) generation
+# Optional, only for the SSH password test:
+sudo apt install -y sshpass
 ```
 
 Rust toolchain (via [`rustup`](https://rustup.rs)):
@@ -77,28 +80,23 @@ The first `make iso` clones the Limine binary branch (`v11.4.1-binary`) into
 
 ## Test (automated, headless)
 
+The Makefile has separate targets for the boot smoke battery, SSH pubkey,
+SSH password (with `/mnt/passwd`), and SSH password from a diskless boot
+(compile-time default fallback):
+
 ```bash
-make run-test
+make run-test                  # boot + DHCP + AHCI + FAT + shell + pipe
+make run-ssh-test              # SSH client w/ ed25519 pubkey, exec + interactive
+make run-passwd-test           # SSH password from /mnt/passwd (sshpass)
+make run-passwd-diskless-test  # SSH password fallback, no -drive
 ```
 
-Boots the ISO in QEMU headless under a 30 s timeout, captures the serial
-output, and asserts the full-success line. Expected serial:
-
-```
-ruos: hello serial
-ruos: heap ok base=0xFFFF800000100000 size=4194304
-ruos: alloc box=0xCAFEBABE vec=[0, 1, 2, 3, 4]
-```
-
-Final make output:
-
-```
-TEST_PASS
-```
-
-The kernel halts after the smoke test; QEMU is killed by `timeout`, which is
-expected. The test verdict is based on the captured serial, not on QEMU's
-exit code.
+`run-test` swaps in `user-bin/smoke.sh` as `/etc/init.sh` so the boot
+exercises every `.wasm` tool, FAT R/W, ping, and a shell pipe. Each test
+captures the serial log under `build/`, greps for marker lines (e.g. `dhcp
+bound ip=10.0.2.15`, `mnt mounted FAT`, `auth ok user=root`) and prints
+`TEST_PASS_*` on success. The kernel halts after smoke; QEMU is killed by
+`timeout`, which is expected — the verdict is based on the captured serial.
 
 ## Run (interactive)
 
@@ -111,20 +109,37 @@ terminal.
 
 ## SSH
 
-ruos runs an SSH server on port 22 (`sunset`, ed25519 public-key auth). It
-starts at boot once networking and the `/mnt` FAT volume are up. The **host
-key** is generated on first boot and persisted to `/mnt/host.key`. Authorized
-client keys are read from `/mnt/auth.key` (one ed25519 pubkey, OpenSSH format).
+ruos runs an SSH server on port 22 (`sunset`, ed25519 host key). It starts
+at boot — no disk required: if `/mnt` is unavailable the host key is
+generated ephemerally in RAM (fingerprint changes every boot, fine for
+demos). Two auth methods, both enabled by default:
 
-**One-shot automated test** (boots QEMU, forwards `:2222`→guest `:22`, runs an
-interactive shell and a non-interactive exec, asserts the output):
+| Method | Source | Notes |
+|---|---|---|
+| **Password** | `/mnt/passwd` (PBKDF2-HMAC-SHA256), or compile-time default `RUOS_DEFAULT_PASSWORD` (defaults to `ruos`) | Out-of-the-box: ISO-only boot, no extra setup. |
+| **Pubkey** (ed25519) | `/mnt/auth.key` (OpenSSH format, one key per line) | Requires the disk image, but stronger and scriptable. |
+
+**Out-of-the-box (no disk attached, no key setup):**
 
 ```bash
-make run-ssh-test
+ssh root@<vm-ip>            # password: ruos
 ```
 
-**Manual:** put your public key on the disk image, then connect. The Makefile
-forwards host `127.0.0.1:2222` to the guest's port 22.
+Works in QEMU `make run` (host-fwd `127.0.0.1:2222`) and VirtualBox bridged
+networking. Change the default at build time:
+
+```bash
+make iso RUOS_PASSWORD=hunter2
+```
+
+**Seed a stronger PBKDF2 hash on disk (overrides the built-in default):**
+
+```bash
+make passwd-on-disk RUOS_PASSWORD=hunter2
+# regenerates /passwd in build/disk.img; surfaces in the guest as /mnt/passwd
+```
+
+**Pubkey:**
 
 ```bash
 # 1. Generate a throwaway client key (or reuse build/id_ed25519 from the test).
@@ -133,14 +148,10 @@ ssh-keygen -t ed25519 -N '' -f build/id_ed25519 -C ruos
 # 2. Copy the *public* key onto the FAT image as /auth.key (8.3 short name).
 mcopy -o -i build/disk.img build/id_ed25519.pub ::/auth.key
 
-# 3. Boot ruos with the port-forward (see the run-ssh-test recipe), then:
+# 3. Boot with port-forwarding (see make run / make run-ssh-test), then:
 ssh -p 2222 -i build/id_ed25519 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    root@127.0.0.1            # interactive shell
-
-ssh -p 2222 -i build/id_ed25519 \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    root@127.0.0.1 pwd        # non-interactive command
+    root@127.0.0.1
 ```
 
 > OpenSSH refuses private keys that are world-readable. On the Windows DrvFs
@@ -148,11 +159,15 @@ ssh -p 2222 -i build/id_ed25519 \
 > first (the test script does this automatically).
 
 **Current limits (MVP):** one session at a time, one authorized key, fixed
-port 22, pubkey-only (ed25519), username not enforced, exec runs through the
-interactive shell (output includes the prompt) with no exit-status, no
-window-size / SFTP / forwarding. The server itself runs in ring 0 (the WASM
-runtime is the app sandbox, not the SSH server). A release build is required —
-debug-profile crypto is too slow (KEX > 60 s).
+port 22, single password (no per-user accounts), username not enforced,
+exec runs through the interactive shell (output includes the prompt) with
+no exit-status, no window-size / SFTP / forwarding. The server itself runs
+in ring 0 (the WASM runtime is the app sandbox, not the SSH server). A
+release build is required — debug-profile crypto is too slow (KEX > 60 s).
+The compile-time default password lives in plain-text in the kernel
+binary and is convenience for demos, not a security mechanism — set
+`/mnt/passwd` (or your own `RUOS_DEFAULT_PASSWORD` at build time) for any
+real use.
 
 ## Boot on real hardware (USB)
 
@@ -177,21 +192,44 @@ everything if you need it.
 kernel/                 # Rust no_std kernel crate
   src/
     main.rs             # entry, Limine requests, kmain
-    serial.rs           # COM1 driver (uart_16550)
-    memory.rs           # global allocator (talc) + init_heap
+    boot/               # phased boot sequence (arch → mem → fs → user)
+    apic/, gdt.rs,      # interrupt setup (LAPIC/IOAPIC, GDT/TSS, IDT)
+      idt.rs, pic.rs
+    serial.rs, klog.rs, # COM1 driver + ring-buffer log + kprintln!
+      kprint.rs
+    memory/             # frame allocator + paging (talc + map/unmap_page)
+    acpi_init.rs        # ACPI MADT/ECAM parse
+    pci/                # PCIe enumeration (ECAM)
+    net/                # smoltcp stack + virtio-net + e1000 drivers
+    ahci/, blockdev.rs  # SATA driver + block device trait
+    vfs/                # tmpfs + FAT32 + /dev/{console,null,zero,pts/N}
+    pty/                # 4 master/slave pairs + line discipline
+    pipe/               # in-RAM pipe for shell pipelines
+    console/            # framebuffer console (font, AA blend, vte ANSI)
+    wasm/               # wasmi runtime, WASI shim, exec_queue, pipeline
+    ssh/                # sunset bridge + hostkey + authkeys + password
+    executor/           # embassy-executor + per-task wakers
+    proc.rs, modules.rs,# proc registry, Limine module mounts, RNG, RTC
+      rng.rs, rtc.rs,
+      timer.rs
   linker.ld             # higher-half ELF layout (ENTRY(kmain))
+  build.rs              # git SHA + build date + env tracking
   .cargo/config.toml    # target, build-std, rustflags
   rust-toolchain.toml   # pinned nightly + components
-Makefile                # build / iso / run / run-test / clean
-limine.conf             # Limine boot entry → /boot/kernel
+user/                   # WASI userspace crates (one per .wasm tool)
+user-bin/               # built .wasm artefacts (checked in) + init/smoke.sh
+Makefile                # iso / run / run-test / run-ssh-test / ...
+limine.conf             # Limine boot entry + module list
+tests/                  # bash drivers for SSH / pipe / passwd tests
 docs/superpowers/       # roadmap, design specs, implementation plans
 CHANGELOG/              # one Markdown entry per change (NN-yy-mm-dd-slug.md)
 LICENSE                 # GNU GPL v3.0
 ```
 
 Build artifacts live under `build/` and `kernel/target/` (gitignored).
-The Limine binary branch is vendored to `third_party/limine/` on first
-build (gitignored).
+The Limine binary branch is cloned to `third_party/limine/` on first build
+(gitignored); the `sunset` SSH library is vendored to `third_party/sunset/`
+and checked in.
 
 ## Reference / history
 

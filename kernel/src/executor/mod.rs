@@ -60,6 +60,7 @@ pub fn run() -> ! {
     spawner.spawn(pipeline_worker_task()).unwrap();
     spawner.spawn(ssh_serve_task()).unwrap();
     spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
+    spawner.spawn(pty_watchdog_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
 
     loop {
@@ -232,6 +233,41 @@ async fn console_drain_task() {
             let s = core::str::from_utf8(&buf).unwrap_or("?");
             let _ = c.write_str(s);
         });
+    }
+}
+
+/// Software watchdog over SSH-spawned PTY pairs. Boot shell on pair 0 is
+/// excluded — it has no notion of "session end" and a local user is allowed
+/// to leave the prompt idle indefinitely.
+///
+/// For pairs 1..NUM_PAIRS, if a claimed pair has had no I/O activity for
+/// IDLE_LIMIT_TICKS, we mark it for shutdown. The slave reader (the wasm
+/// shell blocked on stdin) wakes with EOF, exits its loop, the dispatcher
+/// releases the pair, and the slot is free for the next SSH connection.
+///
+/// Without this, an SSH session that drops abruptly and somehow bypasses
+/// the bridge's request_shutdown (kernel bug, sunset internal failure)
+/// would leak the pair until reboot. The watchdog is the safety net under
+/// the per-session SIGHUP.
+#[embassy_executor::task]
+async fn pty_watchdog_task() {
+    const CHECK_INTERVAL_TICKS: u64 = 1000;  // 10 s @ 100 Hz
+    const IDLE_LIMIT_TICKS:     u64 = 30000; // 5 min @ 100 Hz
+    loop {
+        delay::Delay::ticks(CHECK_INTERVAL_TICKS).await;
+        let now = crate::timer::ticks();
+        for idx in 1..crate::pty::NUM_PAIRS {
+            if !crate::pty::is_claimed(idx) { continue; }
+            if crate::pty::is_shutdown(idx) { continue; }
+            let last = crate::pty::last_activity(idx);
+            if now.saturating_sub(last) > IDLE_LIMIT_TICKS {
+                crate::bwarn!(
+                    "pty", "watchdog: pair {} idle {}s — shutting down",
+                    idx, now.saturating_sub(last) / 100,
+                );
+                crate::pty::request_shutdown(idx);
+            }
+        }
     }
 }
 

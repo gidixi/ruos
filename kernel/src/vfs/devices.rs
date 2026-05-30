@@ -66,7 +66,7 @@ impl File for PtySlaveFile {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
         if buf.is_empty() { return Ok(0); }
         let idx = self.idx;
-        core::future::poll_fn(|cx| {
+        let n = core::future::poll_fn(|cx| {
             use x86_64::instructions::interrupts::without_interrupts;
             use core::task::Poll;
             without_interrupts(|| {
@@ -79,13 +79,21 @@ impl File for PtySlaveFile {
                     }
                 }
                 if n > 0 {
-                    Poll::Ready(Ok(n))
+                    Poll::Ready(Ok::<usize, VfsError>(n))
+                } else if crate::pty::is_shutdown(idx) {
+                    // Pair was hung up (SSH session dropped / watchdog idle
+                    // timeout). Return EOF so the shell reading stdin exits
+                    // its loop instead of blocking forever and leaking the
+                    // PTY claim.
+                    Poll::Ready(Ok::<usize, VfsError>(0))
                 } else {
                     g.slave_waker = Some(cx.waker().clone());
                     Poll::Pending
                 }
             })
-        }).await
+        }).await?;
+        if n > 0 { crate::pty::touch_activity(idx); }
+        Ok(n)
     }
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
@@ -97,6 +105,7 @@ impl File for PtySlaveFile {
                 crate::pty::ldisc::process_output(&mut g, b);
             }
         });
+        crate::pty::touch_activity(idx);
         Ok(buf.len())
     }
 

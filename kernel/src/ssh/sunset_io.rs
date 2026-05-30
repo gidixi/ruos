@@ -381,6 +381,14 @@ pub async fn run_session(
         let _ = runner.channel_done(c);
     }
     sockets::close(handle);
+    // SIGHUP equivalent: if a shell was spawned for this session, tell its
+    // PTY that the master end is gone. The slave reader (shell.wasm stdin)
+    // sees EOF and exits its loop; the dispatcher then releases the pair.
+    // Without this, an abrupt disconnect (no `exit` typed by the user) leaks
+    // the PTY claim until next reboot.
+    if let Some(idx) = pty_idx {
+        crate::pty::request_shutdown(idx);
+    }
     crate::binfo!(
         "ssh", "session done (rx={} tx={} sent={} txdrop={})",
         rx_total, tx_total, sent_total, tx_dropped

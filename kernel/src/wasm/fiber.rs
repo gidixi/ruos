@@ -75,14 +75,14 @@ impl Fiber {
                     fds[slot] = Some(FdEntry::Vfs(fd));
                 }
                 Err(e) => {
-                    crate::bwarn!("ssh", "rebind_stdio_pty: open {} slot {} failed: {}",
+                    crate::bwarn!("wasm", "rebind_stdio_pty: open {} slot {} failed: {}",
                                   path, slot, e);
                     fds[slot] = None;
                 }
             }
         }
         self.store.data_mut().fds = fds;
-        crate::binfo!("ssh", "rebind_stdio_pty idx={} bound stdin={} stdout={} stderr={}",
+        crate::binfo!("wasm", "rebind_stdio_pty idx={} bound stdin={} stdout={} stderr={}",
                       idx, bound[0], bound[1], bound[2]);
     }
 

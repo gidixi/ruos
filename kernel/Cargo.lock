@@ -440,6 +440,7 @@ dependencies = [
  "embassy-executor",
  "getrandom",
  "limine",
+ "log",
  "noto-sans-mono-bitmap",
  "pci_types",
  "rand_chacha",
@@ -783,8 +784,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunset"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae1be9253047b033ccbedf6da75657b1c0f83e99e3c7953cbccf064e534bb10"
 dependencies = [
  "aes",
  "ascii",

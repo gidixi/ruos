@@ -19,6 +19,7 @@ struct SessionCtx {
 }
 
 pub fn spawn() -> Result<(), SshError> {
+    crate::ssh::rng_bridge::init_logger();
     let key = hostkey::load_or_generate(CONFIG.host_key_path)?;
     let pub_bytes = key.public();
     crate::binfo!(

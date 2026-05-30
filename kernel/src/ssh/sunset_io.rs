@@ -51,17 +51,14 @@ pub async fn run_session(
     let mut pty_idx: Option<usize> = None;
     let mut auth_ok = false;
     let mut shell_started = false;
-    let mut iter_count: u64 = 0;
+    // Byte counters for the channel<->PTY bridge, logged at session end.
+    let mut rx_total: u64 = 0; // bytes SSH channel -> PTY (client input)
+    let mut tx_total: u64 = 0; // bytes PTY -> SSH channel (shell output)
+    let mut tx_dropped: u64 = 0; // bytes pulled from PTY but write_channel refused
+    let mut sent_total: u64 = 0; // bytes actually handed to smoltcp via try_send
 
     loop {
-        iter_count += 1;
         let mut progressed = false;
-        if iter_count <= 10 || iter_count % 50 == 0 {
-            crate::binfo!(
-                "ssh", "iter={} outbuf={} authok={} chan={}",
-                iter_count, runner.output_buf().len(), auth_ok, chan.is_some()
-            );
-        }
 
         // 1) Drain runner.output_buf -> socket.
         let out_len = runner.output_buf().len();
@@ -72,22 +69,16 @@ pub async fn run_session(
             chunk[..n].copy_from_slice(&runner.output_buf()[..n]);
             match sockets::try_send(handle, &chunk[..n]) {
                 Some(0) => {
-                    crate::bwarn!("ssh", "iter={} try_send returned 0 (closed)", iter_count);
+                    crate::bwarn!("ssh", "try_send returned 0 (socket closed)");
                     runner.close_output();
                     break;
                 }
                 Some(sent) => {
-                    if iter_count <= 10 {
-                        crate::binfo!("ssh", "iter={} sent {}/{} bytes", iter_count, sent, n);
-                    }
+                    sent_total += sent as u64;
                     runner.consume_output(sent);
                     progressed = true;
                 }
-                None => {
-                    if iter_count <= 10 {
-                        crate::binfo!("ssh", "iter={} try_send None (can't yet)", iter_count);
-                    }
-                }
+                None => {} // socket TX buffer full; retry next iteration
             }
         }
 
@@ -131,27 +122,7 @@ pub async fn run_session(
         //    a labelled block so the &mut runner borrow is released before
         //    the channel-I/O section below.
         let session_done = 'evt: {
-        if iter_count <= 3 { crate::binfo!("ssh", "iter={} pre-progress", iter_count); }
         let pr = runner.progress();
-        if iter_count <= 3 { crate::binfo!("ssh", "iter={} post-progress", iter_count); }
-        let ev_dbg = match &pr {
-            Ok(Event::Serv(ServEvent::Hostkeys(_)))    => "Hostkeys",
-            Ok(Event::Serv(ServEvent::FirstAuth(_)))   => "FirstAuth",
-            Ok(Event::Serv(ServEvent::PasswordAuth(_))) => "PasswordAuth",
-            Ok(Event::Serv(ServEvent::PubkeyAuth(_)))  => "PubkeyAuth",
-            Ok(Event::Serv(ServEvent::OpenSession(_))) => "OpenSession",
-            Ok(Event::Serv(ServEvent::SessionPty(_)))  => "SessionPty",
-            Ok(Event::Serv(ServEvent::SessionEnv(_)))  => "SessionEnv",
-            Ok(Event::Serv(ServEvent::SessionShell(_))) => "SessionShell",
-            Ok(Event::Serv(ServEvent::SessionExec(_))) => "SessionExec",
-            Ok(Event::Serv(ServEvent::SessionSubsystem(_))) => "SessionSubsystem",
-            Ok(Event::Serv(ServEvent::Defunct))        => "Defunct",
-            Ok(_)                                       => "OtherOk",
-            Err(_)                                      => "Err",
-        };
-        if iter_count <= 20 || (!matches!(ev_dbg, "OtherOk")) {
-            crate::binfo!("ssh", "iter={} ev={}", iter_count, ev_dbg);
-        }
         match pr {
             Ok(Event::Serv(ServEvent::Hostkeys(h))) => {
                 let _ = h.hostkeys(&[&host_signkey]);
@@ -173,13 +144,8 @@ pub async fn run_session(
                     Ok(sunset::PubKey::Ed25519(epk)) => Some(epk.key.0),
                     _ => None,
                 };
-                crate::binfo!(
-                    "ssh", "PubkeyAuth user={} real={} have_key={} keys_total={}",
-                    user, real, key_bytes.is_some(), authkeys.len()
-                );
                 if let Some(kb) = key_bytes {
                     let matched = authkeys.iter().any(|k| k == &kb);
-                    crate::binfo!("ssh", "key match={} first8={:02x?}", matched, &kb[..8]);
                     if matched {
                         if real {
                             crate::binfo!("ssh", "auth ok user={} (real sig)", user);
@@ -236,8 +202,38 @@ pub async fn run_session(
                 progressed = true;
             }
             Ok(Event::Serv(ServEvent::SessionExec(e))) => {
-                // Phase-1 exec is deferred — non-PTY stdout teeing not wired.
-                let _ = e.fail();
+                // Run the command by spawning shell.wasm on a PTY and feeding
+                // "<cmd>\nexit\n" to its input. Output streams back over the
+                // channel via the bridge below. Same mechanism as the
+                // interactive shell, just pre-seeded with the command.
+                //
+                // KNOWN LIMITATION (sunset 0.4.0): a non-interactive client
+                // (`ssh host cmd`, or any piped stdin) closes its stdin
+                // immediately, sending CHANNEL_EOF. sunset's `handle_eof`
+                // (channel.rs) auto-mirrors EOF back on the server's output
+                // half before the command has produced output, so the client
+                // closes its read side and truncates the result. Interactive
+                // sessions (stdin stays open) are unaffected. A proper fix
+                // requires patching sunset to defer the server EOF until our
+                // program actually closes its output.
+                if chan.is_some() && !shell_started {
+                    let cmd = e.command().ok().map(|s| s.to_string()).unwrap_or_default();
+                    if let Some(idx) = alloc_and_spawn_shell() {
+                        pty_idx = Some(idx);
+                        shell_started = true;
+                        // Seed the command + exit into the PTY input queue.
+                        for b in cmd.bytes() { crate::pty::master_input_push(idx, b); }
+                        crate::pty::master_input_push(idx, b'\n');
+                        for b in b"exit\n" { crate::pty::master_input_push(idx, *b); }
+                        let _ = e.succeed();
+                        crate::binfo!("ssh", "exec '{}' on pty {}", cmd, idx);
+                    } else {
+                        let _ = e.fail();
+                        crate::bwarn!("ssh", "no free pty for exec");
+                    }
+                } else {
+                    let _ = e.fail();
+                }
                 progressed = true;
             }
             Ok(Event::Serv(ServEvent::SessionSubsystem(s))) => {
@@ -262,6 +258,7 @@ pub async fn run_session(
             match runner.read_channel(c, ChanData::Normal, &mut ch_in) {
                 Ok(n) if n > 0 => {
                     for &b in &ch_in[..n] { crate::pty::master_input_push(idx, b); }
+                    rx_total += n as u64;
                     progressed = true;
                 }
                 _ => {}
@@ -277,14 +274,22 @@ pub async fn run_session(
                 }
             }
             if filled > 0 {
-                if let Ok(w) = runner.write_channel(c, ChanData::Normal, &tx_buf[..filled]) {
-                    if w < filled {
-                        // Bytes lost — TODO: buffer locally. For MVP we
-                        // accept best-effort; the channel window should
-                        // refill on next pass.
-                        let _ = w;
+                match runner.write_channel(c, ChanData::Normal, &tx_buf[..filled]) {
+                    Ok(w) => {
+                        tx_total += w as u64;
+                        if w < filled {
+                            // Bytes lost — TODO: buffer locally. For MVP we
+                            // accept best-effort; the channel window should
+                            // refill on next pass.
+                            tx_dropped += (filled - w) as u64;
+                        }
+                        progressed = true;
                     }
-                    progressed = true;
+                    Err(_) => {
+                        // Channel not writable this pass; bytes already popped
+                        // from master_out are dropped.
+                        tx_dropped += filled as u64;
+                    }
                 }
             }
         }
@@ -298,7 +303,10 @@ pub async fn run_session(
         let _ = runner.channel_done(c);
     }
     sockets::close(handle);
-    crate::binfo!("ssh", "session done");
+    crate::binfo!(
+        "ssh", "session done (rx={} tx={} sent={} txdrop={})",
+        rx_total, tx_total, sent_total, tx_dropped
+    );
     Ok(())
 }
 

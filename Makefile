@@ -145,7 +145,8 @@ run-ssh-test: iso ssh-key-on-disk
 		> build/serial.log) & QEMUPID=$$! ; \
 	sleep 15 ; \
 	echo "--- launching ssh client ---" ; \
-	ssh -p 2222 -i $(SSH_KEY) \
+	cp $(SSH_KEY) /tmp/ruos_id && chmod 600 /tmp/ruos_id ; \
+	ssh -p 2222 -i /tmp/ruos_id \
 		-o StrictHostKeyChecking=no \
 		-o UserKnownHostsFile=/dev/null \
 		-o ConnectTimeout=5 \

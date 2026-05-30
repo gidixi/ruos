@@ -34,6 +34,16 @@ pub struct FramebufferConsole {
 
 unsafe impl Send for FramebufferConsole {}
 
+/// Per-channel linear blend `fg*α + bg*(1-α)` where α = intensity/255.
+/// Preserves Noto's grayscale anti-aliasing instead of hard-thresholding to 1-bit.
+#[inline]
+fn blend(fg: Rgb, bg: Rgb, intensity: u8) -> Rgb {
+    let a   = intensity as u32;
+    let ia  = 255 - a;
+    let mix = |f: u8, b: u8| (((f as u32) * a + (b as u32) * ia) / 255) as u8;
+    Rgb { r: mix(fg.r, bg.r), g: mix(fg.g, bg.g), b: mix(fg.b, bg.b) }
+}
+
 pub(crate) static FB_VIRT:       AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub(crate) static FB_PITCH:      AtomicU32     = AtomicU32::new(0);
 pub(crate) static FB_BPP:        AtomicU32     = AtomicU32::new(0);
@@ -149,7 +159,7 @@ impl FramebufferConsole {
         let oy = row * gh;
         for (ry, line) in raster.raster().iter().enumerate() {
             for (rx, intensity) in line.iter().enumerate() {
-                let color = if *intensity >= 128 { fg } else { bg };
+                let color = blend(fg, bg, *intensity);
                 self.pixel_write(ox + rx as u32, oy + ry as u32, color);
             }
         }
@@ -166,11 +176,16 @@ impl FramebufferConsole {
                 PixelLayout::Bgr => (c.b, c.g, c.r),
                 PixelLayout::Rgb => (c.r, c.g, c.b),
             };
-            write_volatile(p.add(0), b0);
-            write_volatile(p.add(1), b1);
-            write_volatile(p.add(2), b2);
             if self.info.bpp == 32 {
-                write_volatile(p.add(3), 0u8);
+                // Pack as one 32-bit store: byte0=b0, byte1=b1, byte2=b2, byte3=0.
+                // x86_64 LE → matches the per-byte store layout. Pitch and x*4 are
+                // 4-byte aligned with bpp=32, so the u32 write is aligned.
+                let packed = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16);
+                write_volatile(p as *mut u32, packed);
+            } else {
+                write_volatile(p.add(0), b0);
+                write_volatile(p.add(1), b1);
+                write_volatile(p.add(2), b2);
             }
         }
     }
@@ -190,7 +205,7 @@ pub fn self_test(fb: &mut FramebufferConsole) -> bool {
 
     for (ry, line) in raster.raster().iter().enumerate() {
         for (rx, intensity) in line.iter().enumerate() {
-            let expect = if *intensity >= 128 { fg } else { bg };
+            let expect = blend(fg, bg, *intensity);
             let off = ry * pitch + rx * bpp_bytes;
             // SAFETY: bounds checked by draw_glyph above.
             let (b0, b1, b2) = unsafe {

@@ -1,8 +1,8 @@
-//! Noto Sans Mono Size 16 lookup wrapper. Falls back to '?' on missing glyphs.
+//! Noto Sans Mono Size 24 lookup wrapper. Falls back to '?' on missing glyphs.
 
 use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight, RasterizedChar};
 
-pub const FONT_HEIGHT: RasterHeight = RasterHeight::Size16;
+pub const FONT_HEIGHT: RasterHeight = RasterHeight::Size24;
 pub const FONT_WEIGHT: FontWeight   = FontWeight::Regular;
 
 /// Glyph cell width in pixels. In noto-sans-mono-bitmap 0.3 this is

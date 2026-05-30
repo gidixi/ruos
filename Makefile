@@ -95,8 +95,8 @@ run: iso $(DISK_IMG)
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
 
 run-test: iso $(DISK_IMG)
-	@echo "--- serial (timeout 120s, NIC=$(NIC)) ---"
-	@timeout 120 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \

@@ -33,6 +33,11 @@ pub enum SuspendReason {
         cwd: alloc::string::String,
         exit_code_ptr: u32,
     },
+    ExecPipeline {
+        stages: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<alloc::vec::Vec<u8>>)>,
+        cwd: alloc::string::String,
+        exit_code_ptr: u32,
+    },
     ReadDir {
         path: alloc::string::String,
         buf_ptr: u32,

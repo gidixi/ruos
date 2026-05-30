@@ -72,6 +72,17 @@ pub fn init() -> Result<usize, VfsError> {
 
 use crate::vfs::fd::{FDS, allocate as fd_allocate, close as fd_close};
 
+/// Create an anonymous pipe. Returns `(read_fd, write_fd)` — two global VFS
+/// FDs with no path. The caller (pipeline coordinator) binds them to stage
+/// FDs and closes them when each stage exits so EOF propagates.
+pub fn pipe() -> (Fd, Fd) {
+    use crate::vfs::file::FileImpl;
+    let (r, w) = crate::pipe::new_pipe();
+    let read_fd  = fd_allocate(FileImpl::PipeRead(r));
+    let write_fd = fd_allocate(FileImpl::PipeWrite(w));
+    (read_fd, write_fd)
+}
+
 /// Locate the FsImpl covering `abspath` and return the components below the
 /// mount point. Longest-prefix match.
 fn resolve<'a>(abspath: &'a [&'a str]) -> Result<(usize, Vec<&'a str>), VfsError> {

@@ -19,4 +19,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=../.git/HEAD");
+    // RUOS_DEFAULT_PASSWORD is read by option_env! in ssh/password.rs.
+    // Without this, cargo would cache the compiled crate across env changes
+    // and the override would silently no-op until `cargo clean`.
+    println!("cargo:rerun-if-env-changed=RUOS_DEFAULT_PASSWORD");
 }

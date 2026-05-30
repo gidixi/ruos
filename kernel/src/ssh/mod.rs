@@ -8,6 +8,7 @@
 pub mod authkeys;
 pub mod channel;
 pub mod hostkey;
+pub mod password;
 pub mod rng_bridge;
 pub mod server;
 pub mod sunset_io;
@@ -20,6 +21,7 @@ pub struct Config {
     pub port:          u16,
     pub host_key_path: &'static str,
     pub authkeys_path: &'static str,
+    pub passwd_path:   &'static str,
 }
 
 pub static CONFIG: Config = Config {
@@ -30,6 +32,7 @@ pub static CONFIG: Config = Config {
     // (8-char base + 3-char ext) until LFN support lands.
     host_key_path: "/mnt/host.key",
     authkeys_path: "/mnt/auth.key",
+    passwd_path:   "/mnt/passwd",
 };
 
 #[derive(Debug)]

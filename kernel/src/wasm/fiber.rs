@@ -63,18 +63,27 @@ impl Fiber {
         use crate::wasm::state::FdEntry;
         let path = alloc::format!("/dev/pts/{}", idx);
         let mut fds = core::mem::take(&mut self.store.data_mut().fds);
+        let mut bound = [false; 3];
         for slot in 0..3 {
-            // Close the old entry (Vfs FD) before replacing.
             if let Some(FdEntry::Vfs(old)) = fds.get(slot).and_then(|s| s.as_ref()) {
                 let old_fd = *old;
                 let _ = vfs::block_on(vfs::close(old_fd));
             }
             match vfs::block_on(vfs::open(&path, OpenFlags::READ | OpenFlags::WRITE)) {
-                Ok(fd) => { fds[slot] = Some(FdEntry::Vfs(fd)); }
-                Err(_) => { fds[slot] = None; }
+                Ok(fd) => {
+                    bound[slot] = true;
+                    fds[slot] = Some(FdEntry::Vfs(fd));
+                }
+                Err(e) => {
+                    crate::bwarn!("ssh", "rebind_stdio_pty: open {} slot {} failed: {}",
+                                  path, slot, e);
+                    fds[slot] = None;
+                }
             }
         }
         self.store.data_mut().fds = fds;
+        crate::binfo!("ssh", "rebind_stdio_pty idx={} bound stdin={} stdout={} stderr={}",
+                      idx, bound[0], bound[1], bound[2]);
     }
 
     /// Replace this fiber's FD `slot` (0=stdin, 1=stdout, 2=stderr) with the
@@ -284,13 +293,13 @@ impl Fiber {
                     Err(_) => 44, // ENOENT
                 }
             }
-            SuspendReason::Exec { path, argv, cwd, exit_code_ptr } => {
+            SuspendReason::Exec { path, argv, cwd, term_pts, exit_code_ptr } => {
                 // Delegate to exec_queue: the exec_worker_task (a separate
                 // embassy task) will load+run the child on its own stack,
                 // avoiding the double-fault that occurs when wasmi compilation
                 // happens recursively inside this fiber's stack frame.
                 let code = crate::wasm::exec_queue::EXEC_QUEUE
-                    .post_and_wait(path, argv, cwd)
+                    .post_and_wait(path, argv, cwd, term_pts)
                     .await;
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0

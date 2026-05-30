@@ -25,6 +25,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 # that LLVM refuses on x86_64-unknown-none. Direct dep ensures the feature
 # unifies into the ed25519-dalek transitive dependency.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sunset = { path = "../third_party/sunset", default-features = false }
 # getrandom needs an explicit custom backend on bare-metal — we wire it
 # to crate::rng via register_custom_getrandom! in ssh/rng_bridge.rs.

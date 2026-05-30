@@ -16,6 +16,7 @@ pub struct ExecSlot {
     pub path: alloc::string::String,
     pub argv: Vec<Vec<u8>>,
     pub cwd: alloc::string::String,  // inherited CWD for the child
+    pub term_pts: usize,              // inherited terminal (PTY index) for the child
     pub exit_code: *mut i32, // pointer into caller's memory — valid until done flag
 }
 
@@ -53,8 +54,9 @@ impl ExecQueue {
         path: alloc::string::String,
         argv: Vec<Vec<u8>>,
         cwd: alloc::string::String,
+        term_pts: usize,
     ) -> ExecFuture {
-        ExecFuture::new(self, path, argv, cwd)
+        ExecFuture::new(self, path, argv, cwd, term_pts)
     }
 }
 
@@ -66,6 +68,7 @@ pub struct ExecFuture {
     path: alloc::string::String,
     argv: Vec<Vec<u8>>,
     cwd: alloc::string::String,
+    term_pts: usize,
 }
 
 impl ExecFuture {
@@ -74,8 +77,9 @@ impl ExecFuture {
         path: alloc::string::String,
         argv: Vec<Vec<u8>>,
         cwd: alloc::string::String,
+        term_pts: usize,
     ) -> Self {
-        Self { queue, posted: false, path, argv, cwd }
+        Self { queue, posted: false, path, argv, cwd, term_pts }
     }
 }
 
@@ -95,10 +99,12 @@ impl core::future::Future for ExecFuture {
             let path = core::mem::take(&mut self.path);
             let argv = core::mem::take(&mut self.argv);
             let cwd = core::mem::take(&mut self.cwd);
+            let term_pts = self.term_pts;
             *self.queue.pending.lock() = Some(ExecSlot {
                 path,
                 argv,
                 cwd,
+                term_pts,
                 exit_code: core::ptr::null_mut(), // unused; result via AtomicI32
             });
             self.posted = true;

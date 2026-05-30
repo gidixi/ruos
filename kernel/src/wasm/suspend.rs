@@ -31,6 +31,11 @@ pub enum SuspendReason {
         path: alloc::string::String,
         argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
         cwd: alloc::string::String,
+        /// PTY pair index of the calling shell so the spawned child's stdio
+        /// inherits it instead of defaulting to /dev/pts/0. Without this,
+        /// SSH-spawned shells run commands whose output lands on the boot
+        /// framebuffer rather than the SSH channel.
+        term_pts: usize,
         exit_code_ptr: u32,
     },
     ExecPipeline {

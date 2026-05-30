@@ -27,12 +27,21 @@ pub fn ruos_exec(
     mem.read(&caller, argv_ptr as usize, &mut argv_blob)
         .map_err(|_| Error::i32_exit(-1))?;
     let argv = decode_argv(&argv_blob).unwrap_or_default();
-    // Child inherits parent's CWD — POSIX semantics.
+    // Child inherits parent's CWD + terminal (PTY index). Same rationale as
+    // ruos_exec_pipeline: SSH-spawned shells must hand their PTY to children
+    // so command output reaches the SSH channel, not /dev/pts/0.
     let cwd = caller.data().cwd.clone();
+    let term_pts = match caller.data().fds.get(1).and_then(|s| s.as_ref()) {
+        Some(crate::wasm::state::FdEntry::Vfs(kfd)) => {
+            crate::vfs::fd::pts_index(*kfd).unwrap_or(0)
+        }
+        _ => 0,
+    };
     Err(Error::host(SuspendReason::Exec {
         path,
         argv,
         cwd,
+        term_pts,
         exit_code_ptr: exit_code_ptr as u32,
     }))
 }
@@ -118,12 +127,18 @@ pub fn ruos_exec_pipeline(
     // Inherit the calling shell's terminal (PTY) so the pipeline's
     // terminal-facing FDs reach the right console (e.g. the SSH PTY), not
     // the default /dev/pts/0. Falls back to 0 if fd 1 isn't a PTY.
-    let term_pts = match caller.data().fds.get(1).and_then(|s| s.as_ref()) {
+    let (term_pts, term_src) = match caller.data().fds.get(1).and_then(|s| s.as_ref()) {
         Some(crate::wasm::state::FdEntry::Vfs(kfd)) => {
-            crate::vfs::fd::pts_index(*kfd).unwrap_or(0)
+            match crate::vfs::fd::pts_index(*kfd) {
+                Some(i) => (i, "vfs-pts"),
+                None    => (0, "vfs-non-pts"),
+            }
         }
-        _ => 0,
+        Some(_) => (0, "non-vfs"),
+        None    => (0, "fd1-none"),
     };
+    crate::binfo!("pipe", "exec_pipeline stages={} term_pts={} ({})",
+                  stages.len(), term_pts, term_src);
     Err(Error::host(SuspendReason::ExecPipeline {
         stages,
         cwd,

@@ -35,6 +35,7 @@ pub async fn run_session(
     handle: SocketHandle,
     host_signkey: SignKey,
     authkeys: alloc::vec::Vec<[u8; 32]>,
+    passwd:   Option<alloc::sync::Arc<crate::ssh::password::PasswordCheck>>,
 ) -> Result<(), SshError> {
     let mut inbuf:  Box<[u8]> = alloc::vec![0u8; SSH_BUF].into_boxed_slice();
     let mut outbuf: Box<[u8]> = alloc::vec![0u8; SSH_BUF].into_boxed_slice();
@@ -47,6 +48,14 @@ pub async fn run_session(
     // (sent before the server's initial_sent flag flips) is silently
     // dropped on iter=1 — we'd then never make protocol progress.
     let mut pending_in: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Pending output bytes pulled from the PTY but not yet accepted by
+    // `runner.write_channel` (e.g. when the SSH channel's send window is
+    // momentarily exhausted under bridged VirtualBox networking, where
+    // throughput/latency differ from QEMU SLIRP). Retried each iteration
+    // before pulling fresh bytes from the PTY master output queue. Without
+    // this, the bridge silently drops shell stdout under back-pressure —
+    // observed symptom: typed commands run but the client sees no output.
+    let mut pending_out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut chan: Option<ChanHandle> = None;
     let mut pty_idx: Option<usize> = None;
     let mut auth_ok = false;
@@ -132,12 +141,27 @@ pub async fn run_session(
                 progressed = true;
             }
             Ok(Event::Serv(ServEvent::FirstAuth(mut a))) => {
-                let _ = a.enable_password_auth(false);
+                // Pubkey is always offered. Password offered only when a
+                // valid /mnt/passwd was parsed — otherwise the option
+                // shouldn't appear in the client's auth method list.
+                let _ = a.enable_password_auth(passwd.is_some());
                 let _ = a.enable_pubkey_auth(true);
                 progressed = true;
             }
             Ok(Event::Serv(ServEvent::PasswordAuth(a))) => {
-                let _ = a.reject();
+                let user = a.username().ok().map(|s| s.to_string()).unwrap_or_default();
+                let pw_ok = match (passwd.as_deref(), a.password()) {
+                    (Some(h), Ok(pw)) => crate::ssh::password::verify(pw, h),
+                    _                  => false,
+                };
+                if pw_ok {
+                    crate::binfo!("ssh", "auth ok user={} (password)", user);
+                    auth_ok = true;
+                    let _ = a.allow();
+                } else {
+                    crate::bwarn!("ssh", "auth reject user={} (bad password)", user);
+                    let _ = a.reject();
+                }
                 progressed = true;
             }
             Ok(Event::Serv(ServEvent::PubkeyAuth(a))) => {
@@ -267,31 +291,42 @@ pub async fn run_session(
                 _ => {}
             }
             // PTY master output (what shell.wasm printed) -> SSH channel.
-            let mut tx_buf = [0u8; 64];
-            let mut filled = 0usize;
-            while filled < tx_buf.len() {
-                if let Some(b) = crate::pty::master_output_try(idx) {
-                    tx_buf[filled] = b; filled += 1;
-                } else {
-                    break;
-                }
-            }
-            if filled > 0 {
-                match runner.write_channel(c, ChanData::Normal, &tx_buf[..filled]) {
-                    Ok(w) => {
+            // First retry any bytes the channel refused last iteration, then
+            // pull fresh bytes from the PTY. Anything still unaccepted goes
+            // back to `pending_out` for the next pass — never dropped.
+            if !pending_out.is_empty() {
+                match runner.write_channel(c, ChanData::Normal, &pending_out) {
+                    Ok(w) if w > 0 => {
                         tx_total += w as u64;
-                        if w < filled {
-                            // Bytes lost — TODO: buffer locally. For MVP we
-                            // accept best-effort; the channel window should
-                            // refill on next pass.
-                            tx_dropped += (filled - w) as u64;
-                        }
+                        pending_out.drain(0..w);
                         progressed = true;
                     }
-                    Err(_) => {
-                        // Channel not writable this pass; bytes already popped
-                        // from master_out are dropped.
-                        tx_dropped += filled as u64;
+                    _ => {} // channel still not writable; carry pending forward
+                }
+            }
+            if pending_out.is_empty() {
+                let mut tx_buf = [0u8; 64];
+                let mut filled = 0usize;
+                while filled < tx_buf.len() {
+                    if let Some(b) = crate::pty::master_output_try(idx) {
+                        tx_buf[filled] = b; filled += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if filled > 0 {
+                    match runner.write_channel(c, ChanData::Normal, &tx_buf[..filled]) {
+                        Ok(w) => {
+                            tx_total += w as u64;
+                            if w < filled {
+                                pending_out.extend_from_slice(&tx_buf[w..filled]);
+                            }
+                            progressed = true;
+                        }
+                        Err(_) => {
+                            // Channel not writable this pass; stash for retry.
+                            pending_out.extend_from_slice(&tx_buf[..filled]);
+                        }
                     }
                 }
             }
@@ -304,7 +339,10 @@ pub async fn run_session(
         //    output. (sunset no longer auto-mirrors the client's early EOF.)
         if shell_started && !closing {
             if let Some(idx) = pty_idx {
-                if !crate::pty::is_claimed(idx) && crate::pty::master_output_len(idx) == 0 {
+                if !crate::pty::is_claimed(idx)
+                    && crate::pty::master_output_len(idx) == 0
+                    && pending_out.is_empty()
+                {
                     if let Some(c) = chan.as_ref() {
                         if runner.send_channel_close(c).is_ok() {
                             crate::binfo!("ssh", "shell on pty {} done, closing channel", idx);

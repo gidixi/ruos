@@ -33,8 +33,14 @@ pub fn load_or_generate(path: &str) -> Result<HostKey, SshError> {
     }
     let mut seed = [0u8; 32];
     crate::rng::fill(&mut seed);
-    write_new(path, &seed)?;
-    crate::binfo!("ssh", "host key generated at {}", path);
+    match write_new(path, &seed) {
+        Ok(()) => crate::binfo!("ssh", "host key generated at {}", path),
+        Err(_) => crate::bwarn!(
+            "ssh",
+            "host key not persisted ({} unavailable) — ephemeral key, \
+             fingerprint changes every boot", path
+        ),
+    }
     Ok(HostKey { signing: SigningKey::from_bytes(&seed) })
 }
 

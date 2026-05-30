@@ -7,15 +7,18 @@ use spin::Mutex;
 use sunset::SignKey;
 
 use crate::executor::delay::Delay;
-use crate::ssh::{authkeys, hostkey, sunset_io, CONFIG, SshError};
+use alloc::sync::Arc;
 
-/// Cached host key + authorized keys, populated by `spawn()` and consumed
-/// by the per-session task at accept time.
+use crate::ssh::{authkeys, hostkey, password, sunset_io, CONFIG, SshError};
+
+/// Cached host key + authorized keys + optional password hash, populated by
+/// `spawn()` and consumed by the per-session task at accept time.
 static SESSION_CTX: Mutex<Option<SessionCtx>> = Mutex::new(None);
 
 struct SessionCtx {
-    signing: ed25519_dalek::SigningKey,
+    signing:  ed25519_dalek::SigningKey,
     authkeys: alloc::vec::Vec<[u8; 32]>,
+    passwd:   Option<Arc<password::PasswordCheck>>,
 }
 
 pub fn spawn() -> Result<(), SshError> {
@@ -28,11 +31,13 @@ pub fn spawn() -> Result<(), SshError> {
         pub_bytes[0], pub_bytes[1], pub_bytes[2], pub_bytes[3],
         pub_bytes[30], pub_bytes[31],
     );
-    let keys = authkeys::load(CONFIG.authkeys_path)?;
+    let keys   = authkeys::load(CONFIG.authkeys_path)?;
+    let passwd = password::load(CONFIG.passwd_path).map(Arc::new);
 
     *SESSION_CTX.lock() = Some(SessionCtx {
-        signing: key.signing,
+        signing:  key.signing,
         authkeys: keys,
+        passwd,
     });
 
     crate::binfo!("ssh", "listening on 0.0.0.0:{}", CONFIG.port);
@@ -67,14 +72,14 @@ async fn serve_loop() {
         crate::binfo!("ssh", "client connected");
 
         // Snapshot the session ctx for this connection.
-        let (signing, authkeys_v) = {
+        let (signing, authkeys_v, passwd_v) = {
             let g = SESSION_CTX.lock();
             let ctx = g.as_ref().expect("ssh ctx not initialised");
-            (ctx.signing.clone(), ctx.authkeys.clone())
+            (ctx.signing.clone(), ctx.authkeys.clone(), ctx.passwd.clone())
         };
         let host_sk = SignKey::Ed25519(signing);
 
-        if let Err(e) = sunset_io::run_session(handle, host_sk, authkeys_v).await {
+        if let Err(e) = sunset_io::run_session(handle, host_sk, authkeys_v, passwd_v).await {
             crate::bwarn!("ssh", "session: {}", e);
         }
         crate::binfo!("ssh", "client disconnected");

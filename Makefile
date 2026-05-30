@@ -7,6 +7,11 @@ DISK_IMG  := build/disk.img
 DISK_MB   := 64
 HELLO     := shell: init.sh complete
 
+# Script copied as /etc/init.sh into the ISO. Defaults to the minimal
+# greeter; `make run-test` overrides with user-bin/smoke.sh to run the
+# full assertion battery (slower boot, ~80s before shell prompt).
+INIT_SCRIPT ?= user-bin/init.sh
+
 # Userspace .wasm tools shipped on the ISO. Root-level tools go to ISO_ROOT/,
 # /bin tools go to ISO_ROOT/bin/, /root/ demo blobs go to ISO_ROOT/root/.
 # New tools: just append to BIN_TOOLS.
@@ -32,20 +37,28 @@ all: iso
 # Persistent SATA disk image for AHCI tests. 64 MiB raw, FAT32, with a
 # marker file `hello.txt` for the smoke test. Rebuilt only if missing —
 # the test mounts read-write, so a stale disk after a run is fine.
+#
+# Default-seeded files for SSH:
+#  - /auth.key : empty (placeholder). Inject your client pubkey via
+#                `make ssh-key-on-disk` (test key) or `mcopy` manually.
+#  - /passwd   : PBKDF2-HMAC-SHA256 of $(RUOS_PASSWORD) — default 'ruos'.
+#                Override per build: `make disk RUOS_PASSWORD=hunter2`.
+#                The SSH server offers password auth iff this file parses.
 $(DISK_IMG):
 	mkdir -p build
 	dd if=/dev/zero of=$@.tmp bs=1M count=$(DISK_MB) status=none
 	mkfs.vfat -F 32 -n RUOS $@.tmp >/dev/null
 	echo 'hello from disk' | mcopy -i $@.tmp - ::/hello.txt
-	# Seed an empty authorized_keys file — Step 16 SSH server reads
-	# /mnt/auth.key. Tests / users can mcopy a real key on top later.
 	echo '# ssh-ed25519 pubkeys here, one per line' | mcopy -i $@.tmp - ::/auth.key
+	RUOS_PASSWORD='$(RUOS_PASSWORD)' PASSWD_ITER=$(PASSWD_ITER) python3 -c "$$PASSWD_GEN" | mcopy -i $@.tmp - ::/passwd
 	mv $@.tmp $@
+	@echo "disk.img: SSH password seeded — login as any user with password='$(RUOS_PASSWORD)'"
 
 disk: $(DISK_IMG)
 
 build:
-	source $$HOME/.cargo/env && cd kernel && cargo build --release
+	source $$HOME/.cargo/env && cd kernel && \
+		RUOS_DEFAULT_PASSWORD='$(RUOS_PASSWORD)' cargo build --release
 
 limine:
 	@if [ ! -d $(LIMINE) ]; then \
@@ -65,7 +78,7 @@ user-bin/%.wasm: user/%/src/main.rs user/%/Cargo.toml user/Cargo.toml
 .PHONY: user-wasm
 user-wasm: $(USER_WASMS)
 
-iso: build limine $(USER_WASMS) user-bin/init.sh
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -74,7 +87,7 @@ iso: build limine $(USER_WASMS) user-bin/init.sh
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
-	cp user-bin/init.sh $(ISO_ROOT)/etc/
+	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
@@ -97,7 +110,8 @@ run: iso $(DISK_IMG)
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
 
-run-test: iso $(DISK_IMG)
+run-test: $(DISK_IMG)
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
 	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
 	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
@@ -135,11 +149,44 @@ ssh-key-on-disk: $(SSH_KEY) $(DISK_IMG)
 run-ssh-test: iso ssh-key-on-disk
 	bash tests/ssh-shell-test.sh
 
+# Bake a PBKDF2-HMAC-SHA256 password hash into disk.img as /passwd. The
+# kernel SSH server (sunset_io.rs) consumes /mnt/passwd at boot and
+# accepts the configured password as an alternative to pubkey auth.
+# Override per invocation: `make passwd-on-disk RUOS_PASSWORD=hunter2`.
+# Iteration count matches the verify-side check in password.rs (>=1000).
+RUOS_PASSWORD ?= ruos
+PASSWD_ITER   ?= 100000
+.PHONY: passwd-on-disk
+passwd-on-disk: $(DISK_IMG)
+	@RUOS_PASSWORD='$(RUOS_PASSWORD)' PASSWD_ITER=$(PASSWD_ITER) python3 -c "$$PASSWD_GEN" > build/passwd
+	mcopy -o -i $(DISK_IMG) build/passwd ::/passwd
+	@echo "passwd: hash written for password='$(RUOS_PASSWORD)' ($(PASSWD_ITER) iterations)"
+
+define PASSWD_GEN
+import os, hashlib, secrets
+pw    = os.environ['RUOS_PASSWORD']
+iters = int(os.environ['PASSWD_ITER'])
+salt  = secrets.token_bytes(16)
+h     = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iters)
+print(f'pbkdf2-sha256:{iters}:{salt.hex()}:{h.hex()}')
+endef
+export PASSWD_GEN
+
 .PHONY: run-pipe-test
 run-pipe-test: iso ssh-key-on-disk
 	bash tests/pipe-test.sh
 
-test-boot: limine $(USER_WASMS) user-bin/init.sh
+.PHONY: run-passwd-test
+run-passwd-test: iso passwd-on-disk
+	RUOS_PASSWORD='$(RUOS_PASSWORD)' bash tests/ssh-passwd-test.sh
+
+# Diskless boot test: no -drive on QEMU. Verifies SSH password works
+# against the compile-time fallback (no /mnt/passwd available).
+.PHONY: run-passwd-diskless-test
+run-passwd-diskless-test: iso
+	bash tests/ssh-passwd-diskless-test.sh
+
+test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -154,7 +201,7 @@ test-boot: limine $(USER_WASMS) user-bin/init.sh
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
-	cp user-bin/init.sh $(ISO_ROOT)/etc/
+	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/

@@ -113,6 +113,11 @@ async fn exec_worker_task() {
                     Ok(mut child) => {
                         child.set_args(slot.argv);
                         child.set_cwd(slot.cwd);
+                        // Bind the child's stdio to the caller's PTY (e.g.
+                        // /dev/pts/1 for an SSH-spawned shell) so command
+                        // output reaches the SSH channel instead of the
+                        // boot framebuffer's /dev/pts/0 default.
+                        child.rebind_stdio_pty(slot.term_pts);
                         let pid = crate::proc::register(
                             alloc::string::String::from(
                                 slot.path.trim_start_matches('/')

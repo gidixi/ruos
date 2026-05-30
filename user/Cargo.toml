@@ -13,6 +13,7 @@ members = [
     "touch", "wc", "clear", "which",
     "sort", "uniq", "cut", "tr", "tee",
     "ifconfig", "nc", "date", "wget", "ping",
+    "service",
 ]
 
 [profile.release]

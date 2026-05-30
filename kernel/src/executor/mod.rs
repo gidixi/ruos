@@ -61,6 +61,7 @@ pub fn run() -> ! {
     spawner.spawn(ssh_serve_task()).unwrap();
     spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
     spawner.spawn(pty_watchdog_task()).unwrap();
+    spawner.spawn(service_dispatcher_task()).unwrap();
     crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
 
     loop {
@@ -207,6 +208,54 @@ async fn ssh_pty_dispatcher_task() {
         } else {
             delay::Delay::ticks(2).await;
         }
+    }
+}
+
+/// Service dispatcher: drains `SERVICE_QUEUE` entries posted by
+/// `crate::service::start`. For each request, loads the named wasm
+/// module, builds a Fiber, registers it with `crate::proc`, drives it
+/// to completion, then updates the registry status.
+///
+/// Mirrors `exec_worker_task` (own task stack so wasmi compilation
+/// doesn't overflow whatever fiber happened to issue the start), but
+/// queues by service name rather than by absolute path.
+#[embassy_executor::task]
+async fn service_dispatcher_task() {
+    use crate::service::{WaitForServiceRequest, mark_running, mark_exited, mark_failed, path_of};
+    loop {
+        let name = WaitForServiceRequest.await;
+        let path = match path_of(name) {
+            Some(p) => p,
+            None    => {
+                crate::bwarn!("svc", "dispatcher: unknown name '{}'", name);
+                continue;
+            }
+        };
+        let bytes = match crate::wasm::read_all(path).await {
+            Ok(b) => b,
+            Err(_) => {
+                kprintln!("svc: read {} failed", path);
+                mark_failed(name, "read");
+                continue;
+            }
+        };
+        let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                kprintln!("svc: instantiate {}: {}", path, e);
+                mark_failed(name, "instantiate");
+                continue;
+            }
+        };
+        fb.set_args(alloc::vec![name.as_bytes().to_vec()]);
+        let pid = crate::proc::register(alloc::string::String::from(name));
+        fb.set_pid(pid);
+        mark_running(name, pid);
+        crate::binfo!("svc", "start name={} pid={} path={}", name, pid, path);
+        let code = fb.run().await;
+        crate::proc::unregister(pid);
+        mark_exited(name, code);
+        crate::binfo!("svc", "exit name={} code={}", name, code);
     }
 }
 

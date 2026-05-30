@@ -33,6 +33,7 @@ mod ahci;
 mod rtc;
 mod ssh;
 mod pipe;
+mod service;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

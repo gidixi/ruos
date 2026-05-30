@@ -7,11 +7,21 @@ pub fn init() -> Result<core::convert::Infallible, BootError> {
     crate::net::init();
     crate::binfo!("user", "net init 127.0.0.1/8 (loopback)");
 
+    // Service manager (init/systemd-lite) registry. Must come before the
+    // SSH spawn so the "ssh" builtin entry exists when we mark_running.
+    crate::service::init();
+
     // SSH server (Step 16). Non-fatal: stub returns NotImplemented until
     // Tasks 2-8 of `docs/superpowers/specs/2026-05-30-rust-step16-ssh-design.md`
-    // land. Log the outcome so we can see how far the chain reached.
+    // land. Log the outcome so we can see how far the chain reached. On
+    // success, flip the registry's `ssh` entry to Running with a synthetic
+    // pid (0 — the kernel-side task has no fiber pid) so the userspace
+    // `service` tool reflects reality.
     match crate::ssh::spawn() {
-        Ok(()) => crate::binfo!("ssh", "server ready"),
+        Ok(()) => {
+            crate::binfo!("ssh", "server ready");
+            crate::service::mark_running("ssh", 0);
+        }
         Err(e) => crate::bwarn!("ssh", "spawn: {}", e),
     }
 

@@ -21,11 +21,17 @@ QEMUPID=$!
 sleep 15
 timeout 20 ssh -T -p "$PORT" -i /tmp/ruos_id \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectTimeout=5 root@127.0.0.1 'ls / | grep bin' </dev/null \
+  -o ConnectTimeout=5 root@127.0.0.1 'ls /bin | wc -l' </dev/null \
   > build/pipe.log 2>/dev/null || true
 sleep 2
 kill "$QEMUPID" 2>/dev/null || true
 wait "$QEMUPID" 2>/dev/null || true
 echo "=== pipe.log ==="; cat -v build/pipe.log
-if grep -q 'bin' build/pipe.log; then echo TEST_PASS_PIPE; else
-  echo TEST_FAIL_PIPE; tail -20 build/serial.log; exit 1; fi
+# wc emits a bare count (e.g. "43"). A digit-only line CANNOT come from the
+# echoed command `ls /bin | wc -l`, so it proves the pipeline produced real
+# output AND it reached the SSH client (PTY-inheritance fix).
+if tr -d '\r' < build/pipe.log | grep -qE '^[[:space:]]*[0-9]+[[:space:]]*$'; then
+  echo TEST_PASS_PIPE
+else
+  echo TEST_FAIL_PIPE; tail -20 build/serial.log; exit 1
+fi

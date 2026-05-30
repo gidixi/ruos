@@ -24,6 +24,7 @@ type Stage = (String, Vec<Vec<u8>>); // (path, argv)
 struct PipeRequest {
     stages: Vec<Stage>,
     cwd: String,
+    term_pts: usize,
 }
 
 struct PipelineQueue {
@@ -46,10 +47,11 @@ pub struct PipelineFuture {
     posted: bool,
     stages: Vec<Stage>,
     cwd: String,
+    term_pts: usize,
 }
 
-pub fn post_and_wait(stages: Vec<Stage>, cwd: String) -> PipelineFuture {
-    PipelineFuture { posted: false, stages, cwd }
+pub fn post_and_wait(stages: Vec<Stage>, cwd: String, term_pts: usize) -> PipelineFuture {
+    PipelineFuture { posted: false, stages, cwd, term_pts }
 }
 
 impl Future for PipelineFuture {
@@ -61,7 +63,8 @@ impl Future for PipelineFuture {
             PIPELINE.result.store(0, Ordering::SeqCst);
             let stages = core::mem::take(&mut self.stages);
             let cwd = core::mem::take(&mut self.cwd);
-            *PIPELINE.pending.lock() = Some(PipeRequest { stages, cwd });
+            let term_pts = self.term_pts;
+            *PIPELINE.pending.lock() = Some(PipeRequest { stages, cwd, term_pts });
             self.posted = true;
             if let Some(w) = PIPELINE.worker_waker.lock().take() { w.wake(); }
         }
@@ -89,7 +92,7 @@ pub async fn worker() {
     use core::sync::atomic::Ordering;
     loop {
         let req = WaitForPipeline.await;
-        let code = run_pipeline(req.stages, req.cwd).await;
+        let code = run_pipeline(req.stages, req.cwd, req.term_pts).await;
         PIPELINE.result.store(code, Ordering::SeqCst);
         PIPELINE.done.store(true, Ordering::SeqCst);
         if let Some(w) = PIPELINE.shell_waker.lock().take() { w.wake(); }
@@ -122,8 +125,10 @@ impl Future for JoinAll {
     }
 }
 
-pub async fn run_pipeline(stages: Vec<Stage>, cwd: String) -> i32 {
+pub async fn run_pipeline(stages: Vec<Stage>, cwd: String, term_pts: usize) -> i32 {
     let n = stages.len();
+    crate::binfo!("pipe", "run n={} first={}", n,
+        stages.first().map(|s| s.0.as_str()).unwrap_or("?"));
     if n == 0 { return 0; }
     if n > PIPE_MAX_STAGES {
         kprintln!("ruos: pipeline too long ({} > {})", n, PIPE_MAX_STAGES);
@@ -164,13 +169,19 @@ pub async fn run_pipeline(stages: Vec<Stage>, cwd: String) -> i32 {
             };
             fb.set_args(argv);
             fb.set_cwd(cwd);
+            // Inherit the calling shell's terminal for all 3 FDs, then
+            // override the pipe-connected ends. Leaves stderr + the chain
+            // endpoints (first stdin, last stdout) on the shell's PTY.
+            fb.rebind_stdio_pty(term_pts);
             if let Some(fd) = stdin_fd { fb.bind_fd(0, fd); }
             if let Some(fd) = stdout_fd { fb.bind_fd(1, fd); }
             let pid = crate::proc::register(
                 alloc::string::String::from(path.trim_start_matches('/')),
             );
             fb.set_pid(pid);
+            crate::binfo!("pipe", "stage {} start in={:?} out={:?}", path, stdin_fd, stdout_fd);
             let code = fb.run().await;
+            crate::binfo!("pipe", "stage {} exit code={}", path, code);
             crate::proc::unregister(pid);
             for fd in &close_fds { let _ = crate::vfs::block_on(crate::vfs::close(*fd)); }
             code

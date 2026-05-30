@@ -115,9 +115,19 @@ pub fn ruos_exec_pipeline(
         return Ok(7); // E2BIG: pipeline too long
     }
     let cwd = caller.data().cwd.clone();
+    // Inherit the calling shell's terminal (PTY) so the pipeline's
+    // terminal-facing FDs reach the right console (e.g. the SSH PTY), not
+    // the default /dev/pts/0. Falls back to 0 if fd 1 isn't a PTY.
+    let term_pts = match caller.data().fds.get(1).and_then(|s| s.as_ref()) {
+        Some(crate::wasm::state::FdEntry::Vfs(kfd)) => {
+            crate::vfs::fd::pts_index(*kfd).unwrap_or(0)
+        }
+        _ => 0,
+    };
     Err(Error::host(SuspendReason::ExecPipeline {
         stages,
         cwd,
+        term_pts,
         exit_code_ptr: exit_code_ptr as u32,
     }))
 }

@@ -27,3 +27,17 @@ pub fn close(fd: Fd) -> Result<(), VfsError> {
     *slot = None;
     Ok(())
 }
+
+/// If `fd` is backed by a PTY slave, return its pair index. Used so exec'd
+/// children / pipeline stages can inherit the caller's terminal (its PTY)
+/// instead of defaulting to `/dev/pts/0`.
+pub fn pts_index(fd: Fd) -> Option<usize> {
+    let t = FDS.lock();
+    match t.get(fd as usize).and_then(|s| s.as_ref()) {
+        Some(e) => match &e.file {
+            FileImpl::PtySlave(f) => Some(f.idx),
+            _ => None,
+        },
+        None => None,
+    }
+}

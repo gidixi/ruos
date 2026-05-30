@@ -295,8 +295,8 @@ impl Fiber {
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0
             }
-            SuspendReason::ExecPipeline { stages, cwd, exit_code_ptr } => {
-                let code = crate::wasm::pipeline::post_and_wait(stages, cwd).await;
+            SuspendReason::ExecPipeline { stages, cwd, term_pts, exit_code_ptr } => {
+                let code = crate::wasm::pipeline::post_and_wait(stages, cwd, term_pts).await;
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0
             }

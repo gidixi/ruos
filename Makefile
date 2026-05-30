@@ -133,35 +133,7 @@ $(SSH_KEY):
 ssh-key-on-disk: $(SSH_KEY) $(DISK_IMG)
 	mcopy -o -i $(DISK_IMG) $(SSH_KEY).pub ::/auth.key
 run-ssh-test: iso ssh-key-on-disk
-	@echo "--- SSH interactive shell test (timeout 70s) ---"
-	@rm -f build/serial.log build/ssh-client.log
-	@pkill -f 'qemu-system-x86_64.*hostfwd' 2>/dev/null || true
-	@for i in $$(seq 1 30); do ss -ltn 2>/dev/null | grep -q ':2222 ' && sleep 1 || break; done
-	@(timeout 70 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) \
-		-serial stdio -display none -no-reboot -m 512 \
-		-device qemu-xhci \
-		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
-		-device virtio-net-pci,netdev=net0 \
-		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
-		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
-		> build/serial.log) & QEMUPID=$$! ; \
-	sleep 15 ; \
-	echo "--- launching ssh client (interactive shell, stdin held open) ---" ; \
-	cp $(SSH_KEY) /tmp/ruos_id && chmod 600 /tmp/ruos_id ; \
-	( printf 'pwd\n'; sleep 4; printf 'exit\n'; sleep 1 ) | \
-	timeout 25 ssh -tt -p 2222 -i /tmp/ruos_id \
-		-o StrictHostKeyChecking=no \
-		-o UserKnownHostsFile=/dev/null \
-		-o ConnectTimeout=5 \
-		root@127.0.0.1 > build/ssh-client.log 2>/dev/null || true ; \
-	sleep 2 ; \
-	kill $$QEMUPID 2>/dev/null ; \
-	wait $$QEMUPID 2>/dev/null ; \
-	echo "--- client received ---" ; cat -v build/ssh-client.log ; \
-	grep -F "auth ok" build/serial.log >/dev/null \
-		&& grep -F "ruos:/$$" build/ssh-client.log >/dev/null \
-		&& echo TEST_PASS_SSH \
-		|| { echo TEST_FAIL_SSH; tail -30 build/serial.log; exit 1; }
+	bash tests/ssh-shell-test.sh
 
 test-boot: limine $(USER_WASMS) user-bin/init.sh
 	@echo "--- build with boot-checks feature ---"

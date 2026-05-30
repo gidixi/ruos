@@ -41,6 +41,12 @@ pub async fn run_session(
     let mut runner = Runner::new_server(&mut inbuf[..], &mut outbuf[..]);
 
     let mut rxbuf = [0u8; SOCK_CHUNK];
+    // Pending input bytes that runner.input() refused (e.g. before
+    // initial_sent). Re-tried at the top of each iteration before
+    // pulling more from the socket. Without this, the client banner
+    // (sent before the server's initial_sent flag flips) is silently
+    // dropped on iter=1 — we'd then never make protocol progress.
+    let mut pending_in: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut chan: Option<ChanHandle> = None;
     let mut pty_idx: Option<usize> = None;
     let mut auth_ok = false;
@@ -85,19 +91,39 @@ pub async fn run_session(
             }
         }
 
-        // 2) Pull socket bytes -> runner.input.
-        match sockets::try_recv(handle, &mut rxbuf) {
-            Some(0) => { runner.close_input(); }
-            Some(n) => {
-                let mut slice = &rxbuf[..n];
-                while !slice.is_empty() {
-                    match runner.input(slice) {
-                        Ok(c) if c > 0 => { slice = &slice[c..]; progressed = true; }
-                        _              => break,
-                    }
+        // 2a) Retry pending input first (refused by runner.input earlier).
+        if !pending_in.is_empty() {
+            let mut consumed = 0;
+            while consumed < pending_in.len() {
+                match runner.input(&pending_in[consumed..]) {
+                    Ok(c) if c > 0 => { consumed += c; progressed = true; }
+                    _              => break,
                 }
             }
-            None => {}
+            if consumed > 0 {
+                pending_in.drain(0..consumed);
+            }
+        }
+
+        // 2b) Pull fresh socket bytes -> runner.input. Anything refused is
+        //     stashed in pending_in for the next iteration.
+        if pending_in.is_empty() {
+            match sockets::try_recv(handle, &mut rxbuf) {
+                Some(0) => { runner.close_input(); }
+                Some(n) => {
+                    let mut slice = &rxbuf[..n];
+                    while !slice.is_empty() {
+                        match runner.input(slice) {
+                            Ok(c) if c > 0 => { slice = &slice[c..]; progressed = true; }
+                            _              => break,
+                        }
+                    }
+                    if !slice.is_empty() {
+                        pending_in.extend_from_slice(slice);
+                    }
+                }
+                None => {}
+            }
         }
 
         // 3) Drive one progress event. Each match arm consumes the event
@@ -147,22 +173,25 @@ pub async fn run_session(
                     Ok(sunset::PubKey::Ed25519(epk)) => Some(epk.key.0),
                     _ => None,
                 };
+                crate::binfo!(
+                    "ssh", "PubkeyAuth user={} real={} have_key={} keys_total={}",
+                    user, real, key_bytes.is_some(), authkeys.len()
+                );
                 if let Some(kb) = key_bytes {
-                    if authkeys.iter().any(|k| k == &kb) {
+                    let matched = authkeys.iter().any(|k| k == &kb);
+                    crate::binfo!("ssh", "key match={} first8={:02x?}", matched, &kb[..8]);
+                    if matched {
                         if real {
                             crate::binfo!("ssh", "auth ok user={} (real sig)", user);
                             auth_ok = true;
-                            let _ = a.allow();
-                        } else {
-                            // Probe: just signal accepted candidate (sunset
-                            // handles `allow()` for the probe case correctly).
-                            let _ = a.allow();
                         }
+                        let _ = a.allow();
                     } else {
                         crate::bwarn!("ssh", "auth reject user={} (unknown key)", user);
                         let _ = a.reject();
                     }
                 } else {
+                    crate::bwarn!("ssh", "auth reject user={} (no ed25519 key)", user);
                     let _ = a.reject();
                 }
                 progressed = true;

@@ -170,12 +170,19 @@ pub fn try_recv(handle: SocketHandle, buf: &mut [u8]) -> Option<usize> {
         let mut g = crate::net::NET.lock();
         let net = g.as_mut().expect("net not initialized");
         let s = tcp_get_mut(net, handle);
-        if s.can_recv() {
-            s.recv_slice(buf).ok()
-        } else if matches!(s.state(), State::CloseWait | State::Closed | State::TimeWait) {
-            Some(0)
-        } else {
-            None
+        // Only signal close-of-input when the socket really moved to a closed
+        // state. While Established, recv_slice returning Ok(0) just means
+        // "no data right now" — surface that as None to the caller.
+        if matches!(s.state(), State::CloseWait | State::Closed | State::TimeWait) {
+            return Some(0);
+        }
+        if !s.can_recv() {
+            return None;
+        }
+        match s.recv_slice(buf) {
+            Ok(0)  => None,
+            Ok(n)  => Some(n),
+            Err(_) => None,
         }
     })
 }

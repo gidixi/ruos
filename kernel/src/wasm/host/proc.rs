@@ -22,6 +22,8 @@ pub fn ruos_exec(
     let path = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?
         .to_string();
+    let path = resolve_cwd(&caller.data().cwd, &path);
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     let argv_blob = match crate::wasm::host::mem::guest_read(&caller, argv_ptr, argv_len) {
         Ok(b) => b,
         Err(e) => return Ok(e),
@@ -118,14 +120,21 @@ pub fn ruos_exec_pipeline(
         Ok(b) => b,
         Err(e) => return Ok(e),
     };
-    let stages = match decode_pipeline(&blob) {
+    let raw_stages = match decode_pipeline(&blob) {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(22), // EINVAL: malformed/empty
     };
-    if stages.len() > crate::wasm::pipeline::PIPE_MAX_STAGES {
+    if raw_stages.len() > crate::wasm::pipeline::PIPE_MAX_STAGES {
         return Ok(7); // E2BIG: pipeline too long
     }
     let cwd = caller.data().cwd.clone();
+    // Canonicalize each stage path and capability-check against the task's grant.
+    let mut stages = Vec::with_capacity(raw_stages.len());
+    for (stage_path, stage_argv) in raw_stages {
+        let abs = resolve_cwd(&cwd, &stage_path);
+        if !caller.data().grants(&abs) { return Ok(76); } // ENOTCAPABLE
+        stages.push((abs, stage_argv));
+    }
     // Inherit the calling shell's terminal (PTY) so the pipeline's
     // terminal-facing FDs reach the right console (e.g. the SSH PTY), not
     // the default /dev/pts/0. Falls back to 0 if fd 1 isn't a PTY.
@@ -207,6 +216,7 @@ pub fn ruos_readdir(
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let path = resolve_cwd(&caller.data().cwd, path_str);
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(SuspendReason::ReadDir {
         path,
         buf_ptr: buf_ptr as u32,

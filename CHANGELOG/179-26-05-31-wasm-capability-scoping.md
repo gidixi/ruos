@@ -52,10 +52,18 @@ Operazioni coperte:
 | mkdir          | host/path.rs             | `read_path` → `path`       | `Ok(76)`         |
 | rmdir          | host/path.rs             | `read_path` → `path`       | `Ok(76)`         |
 | rename src+dst | host/path.rs             | `read_path` × 2 (src, dst) | `Ok(76)` × 2     |
+| readdir        | host/proc.rs             | `resolve_cwd` → `path`     | `Ok(76)`         |
+| exec           | host/proc.rs             | `resolve_cwd` → `path`     | `Ok(76)`         |
+| exec_pipeline  | host/proc.rs             | `resolve_cwd` per stage    | `Ok(76)`         |
 
 Nota: `path_open` e `OpenDir` condividono lo stesso check — il controllo avviene
 prima del branch `oflags & OFLAGS_DIRECTORY`, quindi copre entrambi i casi con
 una sola riga.
+
+`ruos_exec` e `ruos_exec_pipeline` beneficiano anche della canonicalizzazione via
+`resolve_cwd` prima del grant check: un path relativo (es. `./foo.wasm`) viene
+risolto in assoluto prima di passare al loader (il loader già si aspetta path
+assoluti come `/bin/ls.wasm`, e `resolve_cwd` su un path già assoluto è idempotente).
 
 ## Perché
 

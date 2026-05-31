@@ -149,6 +149,10 @@ name = "ps"
 version = "0.1.0"
 
 [[package]]
+name = "readdirtest"
+version = "0.1.0"
+
+[[package]]
 name = "rm"
 version = "0.1.0"
 

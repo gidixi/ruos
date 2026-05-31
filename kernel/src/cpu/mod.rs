@@ -33,19 +33,29 @@ unsafe impl Sync for PerCpuArray {}
 const ZEROED: PerCpu = PerCpu::zeroed();
 static mut PER_CPU: PerCpuArray = PerCpuArray([ZEROED; MAX_CPUS]);
 
+/// True iff the GS base, as seen by an actual `gs:`-relative memory access,
+/// holds the installed per-CPU pointer. Set by `init_bsp` after a *memory*
+/// probe (not a bare MSR read-back — see init_bsp).
+static GS_USABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// BSP per-CPU init. Call AFTER gdt::init (the GS segment-load done there zeroes
 /// the GS base) and AFTER lapic::init (the APIC ID register must be mapped).
-/// Sets PER_CPU[0] and the GS base so `this_cpu()` resolves via `gs:[0]`.
+/// Fills PER_CPU[0] and writes the GS base.
 ///
-/// Returns `true` if the GS-base write took effect (verified by read-back),
-/// `false` if the VMM/CPU silently ignored `wrmsr IA32_GS_BASE` — VirtualBox
-/// does this. On `false`, `this_cpu()` falls back to the BSP slot, so boot
-/// completes on a single CPU regardless. A future AP bring-up phase MUST
-/// require a `true` return before relying on per-core gs-base.
+/// Returns `true` if `gs:[0]` actually reads back the installed self-pointer.
+/// Returns `false` on VMMs that accept `wrmsr IA32_GS_BASE` into the MSR but do
+/// NOT update the hidden GS segment base used by `gs:`-relative accesses —
+/// VirtualBox does exactly this (the MSR read-back matches, yet `mov gs:[0]`
+/// still uses base 0 and faults). We therefore probe with a REAL memory access,
+/// not an MSR read-back. On `false`, `this_cpu()` uses the BSP slot directly and
+/// never touches `gs:[0]`, so boot completes on a single CPU regardless. A
+/// future AP bring-up phase MUST require `true` before relying on per-core
+/// gs-base to distinguish cores.
 pub fn init_bsp(kernel_stack_top: u64) -> bool {
     let lapic_id = crate::apic::lapic::apic_id();
     // SAFETY: single-threaded boot; no other accessor to PER_CPU yet.
-    unsafe {
+    let want = unsafe {
         let slot = core::ptr::addr_of_mut!(PER_CPU.0[0]);
         (*slot).cpu_id = 0;
         (*slot).lapic_id = lapic_id;
@@ -53,36 +63,54 @@ pub fn init_bsp(kernel_stack_top: u64) -> bool {
         (*slot).self_ptr = slot as *const PerCpu;
         let want = slot as u64;
         GsBase::write(VirtAddr::new(want));
-        // Verify the write took: some VMMs (VirtualBox) silently drop wrmsr to
-        // IA32_GS_BASE. If the read-back doesn't match, gs:[0] is unusable.
-        GsBase::read().as_u64() == want
-    }
+        want
+    };
+
+    // Best-effort liveness flag for a FUTURE AP phase. The MSR read-back is NOT
+    // a reliable proof that `gs:`-relative accesses work — VirtualBox accepts
+    // the wrmsr (read-back matches) yet leaves the hidden segment base at 0, so
+    // `mov gs:[0]` still faults. There is no fault-free way to probe the hidden
+    // base here, so Fase 0 simply never uses `gs:[0]` (see `this_cpu`). Record
+    // the read-back result as a hint; AP bring-up must do its own real probe
+    // (e.g. a guarded access with a recoverable #PF) before trusting gs-base.
+    let gs_ok = GsBase::read().as_u64() == want;
+    GS_USABLE.store(gs_ok, core::sync::atomic::Ordering::SeqCst);
+    gs_ok
 }
 
 /// &PerCpu for the current core.
 ///
-/// Reads the self-pointer at `gs:[0]`. If the GS base was never installed
-/// (gs:[0] == 0 — e.g. a VMM that ignored the GS-base write, or a call before
-/// `init_bsp`), falls back to the BSP slot `PER_CPU[0]`. This keeps boot alive
-/// on a single CPU even when gs-base is unavailable; it is correct because slot
-/// 0 IS the BSP and no AP is running. (AP bring-up will gate on init_bsp's bool.)
+/// In Fase 0 there is exactly one CPU (the BSP = slot 0) and NO AP is running,
+/// so the correct per-CPU block is unconditionally `PER_CPU[0]`. We return it
+/// directly WITHOUT a `gs:`-relative access — that is always safe and cannot
+/// #PF on any VMM (VirtualBox accepts the GS-base MSR but does not update the
+/// hidden segment base, so `mov gs:[0]` would fault on base 0). A future AP
+/// phase that brings up real cores will switch the multi-CPU path to
+/// [`this_cpu_via_gs`] only after `init_bsp` confirmed gs-base is usable.
 #[inline]
 pub fn this_cpu() -> &'static PerCpu {
-    // Check the GS base MSR first. If it is 0 (never installed, or a VMM that
-    // ignored the write), reading `gs:[0]` would dereference linear address 0
-    // and #PF — so we must NOT touch gs:[0] in that case. Read the MSR instead
-    // and fall back to the BSP slot.
-    if GsBase::read().as_u64() == 0 {
-        // SAFETY: PER_CPU.0[0] is a valid 'static; slot 0 is always the BSP.
-        return unsafe { &*core::ptr::addr_of!(PER_CPU.0[0]) };
-    }
+    // SAFETY: PER_CPU.0[0] is a valid 'static; slot 0 is the BSP, the only live
+    // CPU in Fase 0.
+    unsafe { &*core::ptr::addr_of!(PER_CPU.0[0]) }
+}
+
+/// &PerCpu resolved via the GS base (`gs:[0]` self-pointer). ONLY valid once a
+/// future AP phase has confirmed `init_bsp` returned `true` (gs-base usable).
+/// Not used in Fase 0; reading `gs:[0]` with an uninstalled base #PFs.
+#[inline]
+#[allow(dead_code)]
+pub unsafe fn this_cpu_via_gs() -> &'static PerCpu {
     let p: *const PerCpu;
-    // SAFETY: GS base is non-zero, set by init_bsp to a valid PerCpu whose
-    // offset 0 holds its own self-pointer.
-    unsafe {
-        core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nostack, preserves_flags));
-        &*p
-    }
+    core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nostack, preserves_flags));
+    &*p
+}
+
+/// Whether `gs:`-relative per-CPU access is usable on this machine (probed at
+/// `init_bsp`). AP bring-up must check this before using [`this_cpu_via_gs`].
+#[inline]
+#[allow(dead_code)]
+pub fn gs_usable() -> bool {
+    GS_USABLE.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 #[inline]

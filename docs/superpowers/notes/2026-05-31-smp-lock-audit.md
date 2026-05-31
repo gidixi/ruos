@@ -139,3 +139,25 @@ locks; per the task spec the honest result is "all sites already SMP-safe".
   scope for this phase); instead the invariant is documented explicitly so a
   future SMP phase knows this is the thing to revisit before starting an AP that
   calls `poll()`.
+
+## VirtualBox / GS-base caveat (post-fix, commit df1791a)
+
+The original `this_cpu()` read `gs:[0]`, with `init_bsp` "verifying" the GS base
+via an MSR read-back. This faulted (`#PF cr2=0x0`) on **VirtualBox**: VBox
+accepts `wrmsr IA32_GS_BASE` into the MSR (so `GsBase::read()` returns the
+written value) but does **not** update the hidden GS segment base used by
+`gs:`-relative accesses. The read-back matched, the guard passed, and
+`mov gs:[0]` still dereferenced linear address 0.
+
+**Fix:** Fase 0 never uses `gs:[0]`. `this_cpu()` returns `&PER_CPU[0]`
+unconditionally — correct because there is exactly one CPU (BSP = slot 0). The
+release binary contains **zero `%gs:` memory accesses** (objdump-verified).
+`init_bsp` still installs the GS base + records a best-effort `gs_usable()`
+hint; `this_cpu_via_gs()` (dead_code) exists for later use. Booted on real
+VirtualBox 7.2.8 + QEMU.
+
+**Mandatory for Fase 1 (AP bring-up):** an MSR read-back is NOT proof that
+`gs:`-relative access works. Before any per-core code uses `this_cpu_via_gs()`,
+the AP path MUST do a **fault-guarded real memory probe** of `gs:[0]`
+(recoverable #PF, attempt the access, confirm the value). On VMMs that don't
+honor gs-base, use an APIC-ID → dense-index lookup for the core id instead.

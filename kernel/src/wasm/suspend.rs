@@ -27,6 +27,13 @@ pub enum SuspendReason {
     VfsSeek { fd: crate::vfs::Fd, offset: i64, whence: crate::vfs::Whence, newoffset_ptr: u32 },
     VfsClose { fd: crate::vfs::Fd },
     PathOpen { path: String, flags: crate::vfs::OpenFlags, opened_fd_ptr: u32 },
+    /// `path_open(O_DIRECTORY)`: stat the path; if it's a directory allocate
+    /// an `FdEntry::Dir` and write its index, else ENOTDIR/ENOENT.
+    OpenDir { path: String, opened_fd_ptr: u32 },
+    /// WASI `fd_readdir`: enumerate `path` into `buf` as packed 24-byte
+    /// `__wasi_dirent_t` records (+ name bytes), skipping the first `cookie`
+    /// entries (`.`/`..` synthesised first). Writes bytes-used to `bufused_ptr`.
+    FdReadDir { path: String, cookie: u64, buf_ptr: u32, buf_len: usize, bufused_ptr: u32 },
     Exec {
         path: alloc::string::String,
         argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,

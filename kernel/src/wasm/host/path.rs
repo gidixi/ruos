@@ -3,9 +3,26 @@
 //! done in Fiber::dispatch after the async VFS open completes.
 
 use wasmi::{Caller, Linker, Error};
-use crate::wasm::state::RuntimeState;
+use crate::wasm::state::{FdEntry, RuntimeState};
 use crate::wasm::host::lifecycle::wasm_memory;
 use crate::vfs::OpenFlags;
+
+/// Resolve a (possibly relative) `path` against the base implied by `dir_fd`.
+///
+/// WASI paths are relative to a directory fd. When `dir_fd` refers to an open
+/// directory (`FdEntry::Dir`), relative paths resolve against THAT directory —
+/// this is what makes `std::fs::read_dir` work: after `fd_readdir`, std calls
+/// `path_filestat_get(dir_fd, "<entry>")` to stat each entry, expecting it
+/// resolved against the directory, not the cwd. For the virtual preopen fd 3
+/// (and any non-dir fd) we fall back to the cwd, which preserves the prior
+/// behavior for absolute paths and cwd-relative opens.
+fn resolve_at(caller: &Caller<'_, RuntimeState>, dir_fd: i32, path: &str) -> alloc::string::String {
+    let base = match caller.data().fds.get(dir_fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Dir(p)) => p.clone(),
+        _ => caller.data().cwd.clone(),
+    };
+    crate::wasm::host::proc::resolve_cwd(&base, path)
+}
 
 // WASI Preview 1 oflags bits
 const OFLAGS_CREAT:     i32 = 1 << 0;
@@ -27,7 +44,7 @@ const RIGHTS_FD_WRITE: i64 = 1 << 6;
 /// would inadvertently create the file. Closes Step 10.5 F5 + Step 11 F5.
 pub fn path_open(
     caller: Caller<'_, RuntimeState>,
-    _dir_fd: i32,
+    dir_fd: i32,
     _dir_flags: i32,
     path_ptr: i32,
     path_len: i32,
@@ -43,15 +60,19 @@ pub fn path_open(
         .map_err(|_| Error::i32_exit(-1))?;
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
-    // Resolve relative path against caller's CWD.
-    let path = crate::wasm::host::proc::resolve_cwd(&caller.data().cwd, path_str);
+    // Resolve relative path against dir_fd's directory (or cwd for the
+    // preopen / non-dir fds). See resolve_at.
+    let path = resolve_at(&caller, dir_fd, path_str);
 
-    // O_DIRECTORY: not supported yet — readdir() exists but VFS::open
-    // returns IsDirectory error for dirs. Return ENOTDIR if the caller
-    // wants a directory but our open doesn't model it.
+    // O_DIRECTORY: model the open directory as a first-class fd. Trap with
+    // OpenDir, which stats the path and (if it's a directory) allocates an
+    // FdEntry::Dir. This is the fd that wasi-libc's fdopendir/fd_readdir
+    // operates on.
     if oflags & OFLAGS_DIRECTORY != 0 {
-        // Let the VFS layer return IsDirectory (mapped to ENOTDIR later);
-        // pass READ-only to avoid creating.
+        return Err(Error::host(crate::wasm::suspend::SuspendReason::OpenDir {
+            path,
+            opened_fd_ptr: opened_fd_ptr as u32,
+        }));
     }
 
     let mut flags = OpenFlags::empty();
@@ -73,6 +94,7 @@ pub fn path_open(
 
 fn read_path(
     caller: &Caller<'_, RuntimeState>,
+    dir_fd: i32,
     path_ptr: i32,
     path_len: i32,
 ) -> Result<alloc::string::String, Error> {
@@ -81,36 +103,36 @@ fn read_path(
     mem.read(caller, path_ptr as usize, &mut buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let s = core::str::from_utf8(&buf).map_err(|_| Error::i32_exit(-1))?;
-    Ok(crate::wasm::host::proc::resolve_cwd(&caller.data().cwd, s))
+    Ok(resolve_at(caller, dir_fd, s))
 }
 
 pub fn path_unlink_file(
     caller: Caller<'_, RuntimeState>,
-    _dir_fd: i32,
+    dir_fd: i32,
     path_ptr: i32,
     path_len: i32,
 ) -> Result<i32, Error> {
-    let path = read_path(&caller, path_ptr, path_len)?;
+    let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathUnlink { path }))
 }
 
 pub fn path_create_directory(
     caller: Caller<'_, RuntimeState>,
-    _dir_fd: i32,
+    dir_fd: i32,
     path_ptr: i32,
     path_len: i32,
 ) -> Result<i32, Error> {
-    let path = read_path(&caller, path_ptr, path_len)?;
+    let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathMkdir { path }))
 }
 
 pub fn path_remove_directory(
     caller: Caller<'_, RuntimeState>,
-    _dir_fd: i32,
+    dir_fd: i32,
     path_ptr: i32,
     path_len: i32,
 ) -> Result<i32, Error> {
-    let path = read_path(&caller, path_ptr, path_len)?;
+    let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRmdir { path }))
 }
 
@@ -118,13 +140,13 @@ pub fn path_remove_directory(
 /// Writes a 64-byte wasi_filestat_t at buf_ptr — same layout as fd_filestat_get.
 pub fn path_filestat_get(
     caller: Caller<'_, RuntimeState>,
-    _dir_fd: i32,
+    dir_fd: i32,
     _flags: i32,
     path_ptr: i32,
     path_len: i32,
     buf_ptr: i32,
 ) -> Result<i32, Error> {
-    let path = read_path(&caller, path_ptr, path_len)?;
+    let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathFilestat {
         path,
         buf_ptr: buf_ptr as u32,
@@ -134,15 +156,15 @@ pub fn path_filestat_get(
 /// path_rename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len) -> errno
 pub fn path_rename(
     caller: Caller<'_, RuntimeState>,
-    _old_fd: i32,
+    old_fd: i32,
     old_path_ptr: i32,
     old_path_len: i32,
-    _new_fd: i32,
+    new_fd: i32,
     new_path_ptr: i32,
     new_path_len: i32,
 ) -> Result<i32, Error> {
-    let src = read_path(&caller, old_path_ptr, old_path_len)?;
-    let dst = read_path(&caller, new_path_ptr, new_path_len)?;
+    let src = read_path(&caller, old_fd, old_path_ptr, old_path_len)?;
+    let dst = read_path(&caller, new_fd, new_path_ptr, new_path_len)?;
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRename { src, dst }))
 }
 

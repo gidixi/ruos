@@ -11,11 +11,18 @@ pub fn init() -> Result<(), BootError> {
     crate::apic::lapic::init(acpi.lapic_base, crate::idt::VEC_SPURIOUS);
     crate::binfo!("intr", "LAPIC up base=0x{:X}", acpi.lapic_base);
 
-    // Per-CPU bring-up for the BSP: set GS base so this_cpu() works.
-    // Called AFTER lapic::init so the APIC ID register is mapped and readable.
+    // Per-CPU bring-up for the BSP: set GS base so this_cpu() resolves via
+    // gs:[0]. Called AFTER lapic::init so the APIC ID register is mapped.
     // AP cores are enumerated below (informational) but NOT started here.
-    crate::cpu::init_bsp(0); // kernel_stack_top: forward-looking, filled per-AP later
-    crate::binfo!("cpu", "cpu0 apic_id={} gs_base set", crate::cpu::this_cpu().lapic_id);
+    // init_bsp returns false on VMMs that silently ignore the GS-base MSR
+    // (VirtualBox); this_cpu() then falls back to the BSP slot, so boot
+    // continues on a single CPU regardless.
+    let gs_ok = crate::cpu::init_bsp(0); // kernel_stack_top filled per-AP later
+    crate::binfo!(
+        "cpu", "cpu0 apic_id={} gs_base={}",
+        crate::cpu::this_cpu().lapic_id,
+        if gs_ok { "set" } else { "unavailable (BSP-slot fallback)" }
+    );
 
     let n = acpi.cpus.len().max(1);
     crate::binfo!("cpu", "acpi: {} CPU(s) found ({} active, {} parked)", n, 1, n.saturating_sub(1));

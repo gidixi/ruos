@@ -35,8 +35,14 @@ static mut PER_CPU: PerCpuArray = PerCpuArray([ZEROED; MAX_CPUS]);
 
 /// BSP per-CPU init. Call AFTER gdt::init (the GS segment-load done there zeroes
 /// the GS base) and AFTER lapic::init (the APIC ID register must be mapped).
-/// Sets PER_CPU[0] and the GS base so `this_cpu()` works thereafter.
-pub fn init_bsp(kernel_stack_top: u64) {
+/// Sets PER_CPU[0] and the GS base so `this_cpu()` resolves via `gs:[0]`.
+///
+/// Returns `true` if the GS-base write took effect (verified by read-back),
+/// `false` if the VMM/CPU silently ignored `wrmsr IA32_GS_BASE` — VirtualBox
+/// does this. On `false`, `this_cpu()` falls back to the BSP slot, so boot
+/// completes on a single CPU regardless. A future AP bring-up phase MUST
+/// require a `true` return before relying on per-core gs-base.
+pub fn init_bsp(kernel_stack_top: u64) -> bool {
     let lapic_id = crate::apic::lapic::apic_id();
     // SAFETY: single-threaded boot; no other accessor to PER_CPU yet.
     unsafe {
@@ -45,16 +51,34 @@ pub fn init_bsp(kernel_stack_top: u64) {
         (*slot).lapic_id = lapic_id;
         (*slot).kernel_stack_top = kernel_stack_top;
         (*slot).self_ptr = slot as *const PerCpu;
-        GsBase::write(VirtAddr::new(slot as u64));
+        let want = slot as u64;
+        GsBase::write(VirtAddr::new(want));
+        // Verify the write took: some VMMs (VirtualBox) silently drop wrmsr to
+        // IA32_GS_BASE. If the read-back doesn't match, gs:[0] is unusable.
+        GsBase::read().as_u64() == want
     }
 }
 
-/// &PerCpu for the current core, via gs:[0] (the self-pointer at offset 0).
+/// &PerCpu for the current core.
+///
+/// Reads the self-pointer at `gs:[0]`. If the GS base was never installed
+/// (gs:[0] == 0 — e.g. a VMM that ignored the GS-base write, or a call before
+/// `init_bsp`), falls back to the BSP slot `PER_CPU[0]`. This keeps boot alive
+/// on a single CPU even when gs-base is unavailable; it is correct because slot
+/// 0 IS the BSP and no AP is running. (AP bring-up will gate on init_bsp's bool.)
 #[inline]
 pub fn this_cpu() -> &'static PerCpu {
+    // Check the GS base MSR first. If it is 0 (never installed, or a VMM that
+    // ignored the write), reading `gs:[0]` would dereference linear address 0
+    // and #PF — so we must NOT touch gs:[0] in that case. Read the MSR instead
+    // and fall back to the BSP slot.
+    if GsBase::read().as_u64() == 0 {
+        // SAFETY: PER_CPU.0[0] is a valid 'static; slot 0 is always the BSP.
+        return unsafe { &*core::ptr::addr_of!(PER_CPU.0[0]) };
+    }
     let p: *const PerCpu;
-    // SAFETY: init_bsp set the GS base to a valid PerCpu whose offset 0 holds
-    // its own self_ptr.
+    // SAFETY: GS base is non-zero, set by init_bsp to a valid PerCpu whose
+    // offset 0 holds its own self-pointer.
     unsafe {
         core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nostack, preserves_flags));
         &*p

@@ -5,7 +5,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 use crate::wasm::state::RuntimeState;
-use crate::wasm::host::lifecycle::wasm_memory;
 use crate::wasm::suspend::SuspendReason;
 
 pub fn ruos_exec(
@@ -16,16 +15,19 @@ pub fn ruos_exec(
     argv_len: i32,
     exit_code_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut path_buf = alloc::vec![0u8; path_len as usize];
-    mem.read(&caller, path_ptr as usize, &mut path_buf)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path_buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let path = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?
         .to_string();
-    let mut argv_blob = alloc::vec![0u8; argv_len as usize];
-    mem.read(&caller, argv_ptr as usize, &mut argv_blob)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path = resolve_cwd(&caller.data().cwd, &path);
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
+    let argv_blob = match crate::wasm::host::mem::guest_read(&caller, argv_ptr, argv_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let argv = decode_argv(&argv_blob).unwrap_or_default();
     // Child inherits parent's CWD + terminal (PTY index). Same rationale as
     // ruos_exec_pipeline: SSH-spawned shells must hand their PTY to children
@@ -57,13 +59,15 @@ pub fn ruos_chdir(
     path_ptr: i32,
     path_len: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut path_buf = alloc::vec![0u8; path_len as usize];
-    mem.read(&caller, path_ptr as usize, &mut path_buf)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path_buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let path = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let new_cwd = resolve_cwd(&caller.data().cwd, path);
+    // Capability check: reject targets outside the task's grant.
+    if !caller.data().grants(&new_cwd) { return Ok(76); } // ENOTCAPABLE
     // Root always exists; skip stat to avoid a corner case.
     if new_cwd != "/" {
         match crate::vfs::block_on(crate::vfs::stat(&new_cwd)) {
@@ -112,18 +116,25 @@ pub fn ruos_exec_pipeline(
     buf_len: i32,
     exit_code_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut blob = alloc::vec![0u8; buf_len as usize];
-    mem.read(&caller, buf_ptr as usize, &mut blob)
-        .map_err(|_| Error::i32_exit(-1))?;
-    let stages = match decode_pipeline(&blob) {
+    let blob = match crate::wasm::host::mem::guest_read(&caller, buf_ptr, buf_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
+    let raw_stages = match decode_pipeline(&blob) {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(22), // EINVAL: malformed/empty
     };
-    if stages.len() > crate::wasm::pipeline::PIPE_MAX_STAGES {
+    if raw_stages.len() > crate::wasm::pipeline::PIPE_MAX_STAGES {
         return Ok(7); // E2BIG: pipeline too long
     }
     let cwd = caller.data().cwd.clone();
+    // Canonicalize each stage path and capability-check against the task's grant.
+    let mut stages = Vec::with_capacity(raw_stages.len());
+    for (stage_path, stage_argv) in raw_stages {
+        let abs = resolve_cwd(&cwd, &stage_path);
+        if !caller.data().grants(&abs) { return Ok(76); } // ENOTCAPABLE
+        stages.push((abs, stage_argv));
+    }
     // Inherit the calling shell's terminal (PTY) so the pipeline's
     // terminal-facing FDs reach the right console (e.g. the SSH PTY), not
     // the default /dev/pts/0. Falls back to 0 if fd 1 isn't a PTY.
@@ -198,13 +209,14 @@ pub fn ruos_readdir(
     buf_len: i32,
     nread_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut path_buf = alloc::vec![0u8; path_len as usize];
-    mem.read(&caller, path_ptr as usize, &mut path_buf)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path_buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let path = resolve_cwd(&caller.data().cwd, path_str);
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(SuspendReason::ReadDir {
         path,
         buf_ptr: buf_ptr as u32,
@@ -241,15 +253,16 @@ pub fn ruos_pci_list(
         );
     }
     let bytes = text.as_bytes();
-    let mem = wasm_memory(&caller)?;
     let need = bytes.len() as u32;
-    mem.write(&mut caller, used_ptr as usize, &need.to_le_bytes())
-        .map_err(|e| Error::new(alloc::format!("pci_list used write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, need) {
+        return Ok(e);
+    }
     if (buf_len as usize) < bytes.len() {
         return Ok(8); // ENOBUFS
     }
-    mem.write(&mut caller, buf_ptr as usize, bytes)
-        .map_err(|e| Error::new(alloc::format!("pci_list buf write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -338,15 +351,16 @@ pub fn ruos_net_iface(
     drop(g);
 
     let bytes = text.as_bytes();
-    let mem = wasm_memory(&caller)?;
     let need = bytes.len() as u32;
-    mem.write(&mut caller, used_ptr as usize, &need.to_le_bytes())
-        .map_err(|e| Error::new(alloc::format!("net_iface used write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, need) {
+        return Ok(e);
+    }
     if (buf_len as usize) < bytes.len() {
         return Ok(8); // ENOBUFS
     }
-    mem.write(&mut caller, buf_ptr as usize, bytes)
-        .map_err(|e| Error::new(alloc::format!("net_iface buf write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -437,18 +451,20 @@ pub fn ruos_time_get(
 ) -> Result<i32, Error> {
     let t = crate::rtc::now();
     let epoch = crate::rtc::to_unix_epoch(&t);
-    let mem = wasm_memory(&caller)?;
-    let write = |mem: &wasmi::Memory, caller: &mut Caller<'_, RuntimeState>, p: i32, bytes: &[u8]| {
-        mem.write(caller, p as usize, bytes)
-            .map_err(|e| Error::new(alloc::format!("time_get write: {}", e)))
-    };
-    write(&mem, &mut caller, year_ptr,  &t.year.to_le_bytes())?;
-    write(&mem, &mut caller, month_ptr, &[t.month])?;
-    write(&mem, &mut caller, day_ptr,   &[t.day])?;
-    write(&mem, &mut caller, hour_ptr,  &[t.hour])?;
-    write(&mem, &mut caller, min_ptr,   &[t.minute])?;
-    write(&mem, &mut caller, sec_ptr,   &[t.second])?;
-    write(&mem, &mut caller, epoch_ptr, &epoch.to_le_bytes())?;
+    macro_rules! wt {
+        ($ptr:expr, $bytes:expr) => {
+            if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, $ptr, $bytes) {
+                return Ok(e);
+            }
+        };
+    }
+    wt!(year_ptr,  &t.year.to_le_bytes());
+    wt!(month_ptr, &[t.month]);
+    wt!(day_ptr,   &[t.day]);
+    wt!(hour_ptr,  &[t.hour]);
+    wt!(min_ptr,   &[t.minute]);
+    wt!(sec_ptr,   &[t.second]);
+    wt!(epoch_ptr, &epoch.to_le_bytes());
     Ok(0)
 }
 
@@ -471,6 +487,19 @@ pub fn ruos_tcp_dial(
     use crate::wasm::suspend::SuspendReason;
 
     if port <= 0 || port > 0xFFFF { return Ok(22); }
+
+    // Check both caps before touching the kernel socket pool — avoids leaking a
+    // socket allocation when the fd table is already full (MAX_FDS exhausted).
+    {
+        let fds = &caller.data().fds;
+        let socket_count = fds.iter().filter(|s| matches!(s, Some(FdEntry::Socket(_)))).count();
+        if socket_count >= crate::wasm::state::MAX_SOCKETS { return Ok(33); } // EMFILE (33)
+        // Determine whether a free fd slot exists before we alloc a kernel socket.
+        let fd_available = fds.iter().any(|s| s.is_none())
+            || fds.len() < crate::wasm::state::MAX_FDS;
+        if !fd_available { return Ok(33); } // EMFILE (33) — fd table full
+    }
+
     let idx = crate::net::sockets::POOL.alloc_tcp();
     let handle = match crate::net::sockets::POOL.handle(idx) {
         Some(h) => h,
@@ -482,23 +511,29 @@ pub fn ruos_tcp_dial(
     );
     let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
 
-    // Allocate a wasm-side FD pointing at this socket.
+    // Allocate a wasm-side FD pointing at this socket (bounded by MAX_FDS).
+    // The fd-availability check above guarantees this cannot fail.
     let fd = {
         let fds = &mut caller.data_mut().fds;
-        // Scan for a None slot first; else extend.
+        // Scan for a None slot first; else extend up to MAX_FDS.
         let mut slot = None;
         for (i, s) in fds.iter().enumerate() {
             if s.is_none() { slot = Some(i); break; }
         }
         match slot {
             Some(i) => { fds[i] = Some(FdEntry::Socket(idx)); i as i32 }
-            None    => { fds.push(Some(FdEntry::Socket(idx))); (fds.len() - 1) as i32 }
+            None if fds.len() < crate::wasm::state::MAX_FDS => {
+                fds.push(Some(FdEntry::Socket(idx)));
+                (fds.len() - 1) as i32
+            }
+            // Should be unreachable given the pre-check above.
+            None => return Ok(33), // EMFILE (33) — fd table full
         }
     };
     // Persist the FD to wasm memory for the caller.
-    let mem = wasm_memory(&caller)?;
-    mem.write(&mut caller, fd_out_ptr as usize, &fd.to_le_bytes())
-        .map_err(|e| Error::new(alloc::format!("tcp_dial fd_out write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, fd_out_ptr, &fd.to_le_bytes()) {
+        return Ok(e);
+    }
 
     // Trap into SockConnect; the fiber driver awaits Established and resumes.
     Err(Error::host(SuspendReason::SockConnect { handle, remote, local_port }))

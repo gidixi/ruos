@@ -2,22 +2,23 @@
 
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::RuntimeState;
-use crate::wasm::host::lifecycle::wasm_memory;
 
 pub fn random_get(
     mut caller: Caller<'_, RuntimeState>,
     buf_ptr: i32,
     buf_len: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
+    if buf_len < 0 { return Ok(crate::wasm::host::mem::EINVAL); }
     let mut tmp = [0u8; 256];
     let mut remaining = buf_len as usize;
-    let mut offset = buf_ptr as usize;
+    let mut offset = buf_ptr;
     while remaining > 0 {
         let n = remaining.min(tmp.len());
         crate::rng::fill(&mut tmp[..n]);
-        mem.write(&mut caller, offset, &tmp[..n]).map_err(|_| Error::i32_exit(-1))?;
-        offset += n;
+        if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, offset, &tmp[..n]) {
+            return Ok(e);
+        }
+        offset = offset.wrapping_add(n as i32);
         remaining -= n;
     }
     Ok(0)

@@ -13,11 +13,9 @@
 
 use wasmi::{Caller, Linker, Error};
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use crate::wasm::state::RuntimeState;
-use crate::wasm::host::lifecycle::wasm_memory;
 
 /// Format one entry into the buffer. Trailing newline included.
 fn format_entry(out: &mut String, info: &crate::service::ServiceInfo) {
@@ -45,15 +43,16 @@ pub fn ruos_service_list(
         format_entry(&mut text, &info);
     }
     let bytes = text.as_bytes();
-    let mem = wasm_memory(&caller)?;
     let need = bytes.len() as u32;
-    mem.write(&mut caller, used_ptr as usize, &need.to_le_bytes())
-        .map_err(|e| Error::new(alloc::format!("service_list used write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, need) {
+        return Ok(e);
+    }
     if (buf_len as usize) < bytes.len() {
         return Ok(8); // ENOBUFS
     }
-    mem.write(&mut caller, buf_ptr as usize, bytes)
-        .map_err(|e| Error::new(alloc::format!("service_list buf write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -94,15 +93,16 @@ pub fn ruos_service_status(
     let mut text = String::new();
     format_entry(&mut text, &info);
     let bytes = text.as_bytes();
-    let mem = wasm_memory(&caller)?;
     let need = bytes.len() as u32;
-    mem.write(&mut caller, used_ptr as usize, &need.to_le_bytes())
-        .map_err(|e| Error::new(alloc::format!("service_status used write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, need) {
+        return Ok(e);
+    }
     if (buf_len as usize) < bytes.len() {
         return Ok(8); // ENOBUFS
     }
-    mem.write(&mut caller, buf_ptr as usize, bytes)
-        .map_err(|e| Error::new(alloc::format!("service_status buf write: {}", e)))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -111,9 +111,7 @@ fn read_name(
     name_ptr: i32,
     name_len: i32,
 ) -> Result<String, Error> {
-    let mem = wasm_memory(caller)?;
-    let mut buf: Vec<u8> = alloc::vec![0u8; name_len as usize];
-    mem.read(caller, name_ptr as usize, &mut buf)
+    let buf = crate::wasm::host::mem::guest_read(caller, name_ptr, name_len)
         .map_err(|_| Error::i32_exit(-1))?;
     core::str::from_utf8(&buf)
         .map(|s| s.into())

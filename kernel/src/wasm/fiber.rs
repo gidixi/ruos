@@ -20,6 +20,10 @@ use crate::wasm::state::RuntimeState;
 use crate::wasm::host;
 use crate::wasm::suspend::SuspendReason;
 
+/// Per-host-call fuel budget. A pure-compute loop with no host calls burns this
+/// and is killed; an I/O-bound module refuels every host call and runs forever.
+const FUEL_PER_SLICE: u64 = 2_000_000_000;
+
 pub struct Fiber {
     pub store: Store<RuntimeState>,
     instance: Instance,
@@ -35,9 +39,12 @@ impl Fiber {
         // that call_resumable never triggers lazy translation mid-execution.
         let mut config = wasmi::Config::default();
         config.compilation_mode(wasmi::CompilationMode::Eager);
+        config.consume_fuel(true);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes)?;
         let mut store: Store<RuntimeState> = Store::new(&engine, RuntimeState::new());
+        let _ = store.set_fuel(FUEL_PER_SLICE);
+        store.limiter(|state| state as &mut dyn wasmi::ResourceLimiter);
         let mut linker: Linker<RuntimeState> = Linker::new(&engine);
         host::install(&mut linker)?;
         let instance = linker.instantiate_and_start(&mut store, &module)?;
@@ -143,6 +150,11 @@ impl Fiber {
                             if let Some(pid) = self.pid {
                                 if crate::proc::is_kill_pending(pid) { return 137; }
                             }
+                            // Refuel before every resume: I/O-bound modules
+                            // that yield on every host call run forever;
+                            // only a no-host-call tight loop can exhaust the
+                            // budget between two consecutive host calls.
+                            let _ = self.store.set_fuel(FUEL_PER_SLICE);
                             let resume_args = [Val::I32(errno)];
                             let mut next_outputs: [Val; 0] = [];
                             inv = match state.resume(&mut self.store, &resume_args, &mut next_outputs) {
@@ -153,8 +165,8 @@ impl Fiber {
                     }
                 }
                 ResumableCall::OutOfFuel(_) => {
-                    kprintln!("ruos: wasm: out of fuel (unexpected — fuel not configured)");
-                    return -1;
+                    kprintln!("wasm: task killed (fuel exhausted)");
+                    return 137;
                 }
             }
         }
@@ -283,10 +295,14 @@ impl Fiber {
                                 break;
                             }
                         }
-                        let wfd = wfd.unwrap_or_else(|| {
-                            state.fds.push(Some(FdEntry::Vfs(fd)));
-                            (state.fds.len() - 1) as u32
-                        });
+                        let wfd = match wfd {
+                            Some(i) => i,
+                            None if state.fds.len() < crate::wasm::state::MAX_FDS => {
+                                state.fds.push(Some(FdEntry::Vfs(fd)));
+                                (state.fds.len() - 1) as u32
+                            }
+                            None => return 33, // EMFILE (33) — fd table full
+                        };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0
                     }
@@ -310,10 +326,14 @@ impl Fiber {
                                 break;
                             }
                         }
-                        let wfd = wfd.unwrap_or_else(|| {
-                            state.fds.push(Some(FdEntry::Dir(path.clone())));
-                            (state.fds.len() - 1) as u32
-                        });
+                        let wfd = match wfd {
+                            Some(i) => i,
+                            None if state.fds.len() < crate::wasm::state::MAX_FDS => {
+                                state.fds.push(Some(FdEntry::Dir(path.clone())));
+                                (state.fds.len() - 1) as u32
+                            }
+                            None => return 33, // EMFILE (33) — fd table full
+                        };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0
                     }

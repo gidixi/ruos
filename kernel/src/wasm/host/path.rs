@@ -4,7 +4,6 @@
 
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::{FdEntry, RuntimeState};
-use crate::wasm::host::lifecycle::wasm_memory;
 use crate::vfs::OpenFlags;
 
 /// Resolve a (possibly relative) `path` against the base implied by `dir_fd`.
@@ -54,15 +53,18 @@ pub fn path_open(
     _fd_flags: i32,
     opened_fd_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut path_buf = alloc::vec![0u8; path_len as usize];
-    mem.read(&caller, path_ptr as usize, &mut path_buf)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path_buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     // Resolve relative path against dir_fd's directory (or cwd for the
     // preopen / non-dir fds). See resolve_at.
     let path = resolve_at(&caller, dir_fd, path_str);
+
+    // Capability check: reject paths outside the task's grant.
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
 
     // O_DIRECTORY: model the open directory as a first-class fd. Trap with
     // OpenDir, which stats the path and (if it's a directory) allocates an
@@ -98,9 +100,7 @@ fn read_path(
     path_ptr: i32,
     path_len: i32,
 ) -> Result<alloc::string::String, Error> {
-    let mem = wasm_memory(caller)?;
-    let mut buf = alloc::vec![0u8; path_len as usize];
-    mem.read(caller, path_ptr as usize, &mut buf)
+    let buf = crate::wasm::host::mem::guest_read(caller, path_ptr, path_len)
         .map_err(|_| Error::i32_exit(-1))?;
     let s = core::str::from_utf8(&buf).map_err(|_| Error::i32_exit(-1))?;
     Ok(resolve_at(caller, dir_fd, s))
@@ -113,6 +113,7 @@ pub fn path_unlink_file(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathUnlink { path }))
 }
 
@@ -123,6 +124,7 @@ pub fn path_create_directory(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathMkdir { path }))
 }
 
@@ -133,6 +135,7 @@ pub fn path_remove_directory(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRmdir { path }))
 }
 
@@ -147,6 +150,7 @@ pub fn path_filestat_get(
     buf_ptr: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathFilestat {
         path,
         buf_ptr: buf_ptr as u32,
@@ -164,7 +168,9 @@ pub fn path_rename(
     new_path_len: i32,
 ) -> Result<i32, Error> {
     let src = read_path(&caller, old_fd, old_path_ptr, old_path_len)?;
+    if !caller.data().grants(&src) { return Ok(76); } // ENOTCAPABLE — src
     let dst = read_path(&caller, new_fd, new_path_ptr, new_path_len)?;
+    if !caller.data().grants(&dst) { return Ok(76); } // ENOTCAPABLE — dst
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRename { src, dst }))
 }
 

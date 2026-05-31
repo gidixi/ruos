@@ -4,6 +4,7 @@
 use wasmi::{Caller, Error, Linker};
 use crate::wasm::state::{FdEntry, RuntimeState};
 use crate::wasm::host::lifecycle::{wasm_memory, read_u32, write_u32};
+use crate::wasm::host::mem::{guest_read_into, guest_write};
 
 pub fn fd_write(
     mut caller: Caller<'_, RuntimeState>,
@@ -26,8 +27,9 @@ pub fn fd_write(
         const MAX: usize = 4096;
         let mut buf = [0u8; MAX];
         let n = (buf_len as usize).min(MAX);
-        mem.read(&caller, buf_ptr as usize, &mut buf[..n])
-            .map_err(|_| Error::i32_exit(-1))?;
+        if let Err(e) = guest_read_into(&caller, buf_ptr as i32, &mut buf[..n]) {
+            return Ok(e);
+        }
         let bytes_owned = buf[..n].to_vec();
         return Err(Error::host(crate::wasm::suspend::SuspendReason::SockSend {
             handle,
@@ -53,8 +55,9 @@ pub fn fd_write(
         const MAX: usize = 4096;
         let mut buf = [0u8; MAX];
         let n = (buf_len as usize).min(MAX);
-        mem.read(&caller, buf_ptr as usize, &mut buf[..n])
-            .map_err(|_| Error::i32_exit(-1))?;
+        if let Err(e) = guest_read_into(&caller, buf_ptr as i32, &mut buf[..n]) {
+            return Ok(e);
+        }
         let bytes_owned = buf[..n].to_vec();
         return Err(Error::host(crate::wasm::suspend::SuspendReason::VfsWrite {
             fd: vfd,
@@ -68,7 +71,7 @@ pub fn fd_write(
     let mut total: u32 = 0;
     for i in 0..iovs_len {
         let iov_at = (iovs_ptr + i * 8) as usize;
-        let buf_ptr = read_u32(&mem, &caller, iov_at)? as usize;
+        let buf_ptr = read_u32(&mem, &caller, iov_at)? as i32;
         let buf_len = read_u32(&mem, &caller, iov_at + 4)? as usize;
         if buf_len == 0 {
             continue;
@@ -76,8 +79,9 @@ pub fn fd_write(
         const MAX: usize = 4096;
         let n = buf_len.min(MAX);
         let mut buf = [0u8; MAX];
-        mem.read(&caller, buf_ptr, &mut buf[..n])
-            .map_err(|e| Error::new(alloc::format!("fd_write mem read: {}", e)))?;
+        if let Err(e) = guest_read_into(&caller, buf_ptr, &mut buf[..n]) {
+            return Ok(e);
+        }
 
         let is_console = matches!(
             caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()),
@@ -237,20 +241,16 @@ pub fn fd_filestat_get(
         Some(FdEntry::Vfs(f)) => *f,
         Some(FdEntry::StdoutConsole) => {
             // Character device, size 0.
-            let mem = wasm_memory(&caller)?;
             let mut stat = [0u8; 64];
             stat[16] = 2; // CHARACTER_DEVICE
-            mem.write(&mut caller, buf_ptr as usize, &stat)
-                .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+            if let Err(e) = guest_write(&mut caller, buf_ptr, &stat) { return Ok(e); }
             return Ok(0);
         }
         Some(FdEntry::Dir(_)) => {
             // Directory, size 0.
-            let mem = wasm_memory(&caller)?;
             let mut stat = [0u8; 64];
             stat[16] = 3; // DIRECTORY
-            mem.write(&mut caller, buf_ptr as usize, &stat)
-                .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+            if let Err(e) = guest_write(&mut caller, buf_ptr, &stat) { return Ok(e); }
             return Ok(0);
         }
         _ => return Ok(8), // EBADF
@@ -266,14 +266,12 @@ pub fn fd_filestat_get(
         crate::vfs::VfsKind::Dir    => 3, // DIRECTORY
         crate::vfs::VfsKind::Device => 2, // CHARACTER_DEVICE
     };
-    let mem = wasm_memory(&caller)?;
     // wasi_filestat_t layout (64 bytes):
     //   dev(8) ino(8) filetype(1)+pad(7) nlink(8) size(8) atim(8) mtim(8) ctim(8)
     let mut stat = [0u8; 64];
     stat[16] = filetype;
     stat[32..40].copy_from_slice(&st.size.to_le_bytes());
-    mem.write(&mut caller, buf_ptr as usize, &stat)
-        .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+    if let Err(e) = guest_write(&mut caller, buf_ptr, &stat) { return Ok(e); }
     Ok(0)
 }
 
@@ -319,9 +317,7 @@ pub fn fd_fdstat_get(
     // Grant all rights — we don't enforce ACL on the kernel side.
     stat[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
     stat[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
-    let mem = wasm_memory(&caller)?;
-    mem.write(&mut caller, stat_ptr as usize, &stat)
-        .map_err(|e| Error::new(alloc::format!("fd_fdstat_get mem write: {}", e)))?;
+    if let Err(e) = guest_write(&mut caller, stat_ptr, &stat) { return Ok(e); }
     Ok(0)
 }
 
@@ -337,13 +333,11 @@ pub fn fd_prestat_get(
     if fd != 3 {
         return Ok(8); // EBADF — no more preopens
     }
-    let mem = wasm_memory(&caller)?;
     // wasi_prestat_t: u32 type=0 (dir), u32 name_len=1 (for "/")
     let mut stat = [0u8; 8];
     stat[0..4].copy_from_slice(&0u32.to_le_bytes()); // type = PREOPENTYPE_DIR
     stat[4..8].copy_from_slice(&1u32.to_le_bytes()); // name_len = 1
-    mem.write(&mut caller, stat_ptr as usize, &stat)
-        .map_err(|e| Error::new(alloc::format!("fd_prestat_get write: {}", e)))?;
+    if let Err(e) = guest_write(&mut caller, stat_ptr, &stat) { return Ok(e); }
     Ok(0)
 }
 
@@ -357,9 +351,7 @@ pub fn fd_prestat_dir_name(
     if fd != 3 {
         return Ok(8); // EBADF
     }
-    let mem = wasm_memory(&caller)?;
-    mem.write(&mut caller, path_ptr as usize, b"/")
-        .map_err(|e| Error::new(alloc::format!("fd_prestat_dir_name write: {}", e)))?;
+    if let Err(e) = guest_write(&mut caller, path_ptr, b"/") { return Ok(e); }
     Ok(0)
 }
 

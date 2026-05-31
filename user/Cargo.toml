@@ -15,6 +15,7 @@ members = [
     "ifconfig", "nc", "date", "wget", "ping",
     "service",
     "readdirtest",
+    "spinloop",
 ]
 
 [profile.release]

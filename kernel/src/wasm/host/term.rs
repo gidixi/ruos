@@ -2,7 +2,6 @@
 
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::{RuntimeState, FdEntry};
-use crate::wasm::host::lifecycle::wasm_memory;
 
 pub fn tcgetattr(
     mut caller: Caller<'_, RuntimeState>,
@@ -23,14 +22,14 @@ pub fn tcgetattr(
             core::mem::size_of::<crate::pty::termios::Termios>(),
         )
     };
-    let mem = wasm_memory(&caller)?;
-    mem.write(&mut caller, termios_ptr as usize, bytes)
-        .map_err(|_| Error::i32_exit(-1))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, termios_ptr, bytes) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
 pub fn tcsetattr(
-    mut caller: Caller<'_, RuntimeState>,
+    caller: Caller<'_, RuntimeState>,
     fd: i32,
     _action: i32,
     termios_ptr: i32,
@@ -46,9 +45,9 @@ pub fn tcsetattr(
             core::mem::size_of::<crate::pty::termios::Termios>(),
         )
     };
-    let mem = wasm_memory(&caller)?;
-    mem.read(&caller, termios_ptr as usize, bytes)
-        .map_err(|_| Error::i32_exit(-1))?;
+    if let Err(e) = crate::wasm::host::mem::guest_read_into(&caller, termios_ptr, bytes) {
+        return Ok(e);
+    }
     crate::pty::pair(pty_idx).lock().termios = termios;
     Ok(0)
 }

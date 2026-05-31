@@ -10,9 +10,12 @@ pub fn args_sizes_get(
 ) -> Result<i32, Error> {
     let argc = caller.data().args.len() as u32;
     let argv_buf: u32 = caller.data().args.iter().map(|a| a.len() as u32 + 1).sum();
-    let mem = wasm_memory(&caller)?;
-    write_u32(&mem, &mut caller, argc_ptr as usize, argc)?;
-    write_u32(&mem, &mut caller, argv_buf_size_ptr as usize, argv_buf)?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, argc_ptr, argc) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, argv_buf_size_ptr, argv_buf) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -22,15 +25,18 @@ pub fn args_get(
     argv_buf_ptr: i32,
 ) -> Result<i32, Error> {
     let args = caller.data().args.clone();
-    let mem = wasm_memory(&caller)?;
-    let mut cursor = argv_buf_ptr as u32;
+    let mut cursor = argv_buf_ptr;
     for (i, arg) in args.iter().enumerate() {
-        write_u32(&mem, &mut caller, argv_ptr as usize + i * 4, cursor)?;
+        let slot_ptr = argv_ptr.wrapping_add((i * 4) as i32);
+        if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, slot_ptr, cursor as u32) {
+            return Ok(e);
+        }
         let mut owned = arg.clone();
         owned.push(0u8); // null terminator
-        mem.write(&mut caller, cursor as usize, &owned)
-            .map_err(|_| Error::i32_exit(-1))?;
-        cursor += owned.len() as u32;
+        if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, cursor, &owned) {
+            return Ok(e);
+        }
+        cursor = cursor.wrapping_add(owned.len() as i32);
     }
     Ok(0)
 }
@@ -40,9 +46,12 @@ pub fn environ_sizes_get(
     environc_ptr: i32,
     environ_buf_size_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    write_u32(&mem, &mut caller, environc_ptr as usize, 0)?;
-    write_u32(&mem, &mut caller, environ_buf_size_ptr as usize, 0)?;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environc_ptr, 0) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environ_buf_size_ptr, 0) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -80,7 +89,6 @@ pub fn poll_oneoff(
     if nsubs < 1 {
         return Ok(28); // EINVAL
     }
-    let mem = wasm_memory(&caller)?;
 
     // WASI `__wasi_subscription_t` is 48 bytes:
     //   offset 0..8:   userdata (u64)
@@ -94,8 +102,9 @@ pub fn poll_oneoff(
     //   offset 32..40: precision (u64)
     //   offset 40..42: flags (u16, 0 = relative, 1 = ABSTIME)
     let mut sub = [0u8; 48];
-    mem.read(&caller, in_ptr as usize, &mut sub)
-        .map_err(|_| Error::i32_exit(-1))?;
+    if let Err(e) = crate::wasm::host::mem::guest_read_into(&caller, in_ptr, &mut sub) {
+        return Ok(e);
+    }
 
     // Check type byte at offset 8 (u16 LE).
     let sub_type = u16::from_le_bytes([sub[8], sub[9]]);
@@ -150,25 +159,26 @@ pub fn wasm_memory(caller: &Caller<'_, RuntimeState>) -> Result<Memory, Error> {
 }
 
 /// Write a little-endian u32 to wasm memory at `ptr`.
+/// Kept for fd.rs callers; internally routes through the audited accessor.
 pub fn write_u32(
-    mem: &Memory,
+    _mem: &Memory,
     caller: &mut Caller<'_, RuntimeState>,
     ptr: usize,
     val: u32,
 ) -> Result<(), Error> {
-    let bytes = val.to_le_bytes();
-    mem.write(caller, ptr, &bytes)
-        .map_err(|e| Error::new(alloc::format!("mem write: {}", e)))
+    crate::wasm::host::mem::guest_write_u32(caller, ptr as i32, val)
+        .map_err(|e| Error::new(alloc::format!("mem write errno: {}", e)))
 }
 
 /// Read a little-endian u32 from wasm memory at `ptr`.
+/// Kept for fd.rs callers; internally routes through the audited accessor.
 pub fn read_u32(
-    mem: &Memory,
+    _mem: &Memory,
     caller: &Caller<'_, RuntimeState>,
     ptr: usize,
 ) -> Result<u32, Error> {
     let mut buf = [0u8; 4];
-    mem.read(caller, ptr, &mut buf)
-        .map_err(|e| Error::new(alloc::format!("mem read: {}", e)))?;
+    crate::wasm::host::mem::guest_read_into(caller, ptr as i32, &mut buf)
+        .map_err(|e| Error::new(alloc::format!("mem read errno: {}", e)))?;
     Ok(u32::from_le_bytes(buf))
 }

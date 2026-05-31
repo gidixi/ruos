@@ -1,0 +1,12 @@
+[package]
+name = "boundcheck-test"
+version = "0.1.0"
+edition = "2021"
+# This is a host-native (std) crate whose sole purpose is to test the pure
+# `check_bounds` logic from `kernel/src/wasm/host/mem.rs`.  Keep the two
+# copies in sync: any change to check_bounds in the kernel must be mirrored
+# in src/lib.rs here.
+
+[[bin]]
+name = "boundcheck-test"
+path = "src/main.rs"

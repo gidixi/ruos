@@ -175,6 +175,43 @@ binary and is convenience for demos, not a security mechanism — set
 `/mnt/passwd` (or your own `RUOS_DEFAULT_PASSWORD` at build time) for any
 real use.
 
+## Security model
+
+ruos runs everything — kernel, WASM runtime, and all userspace tools — in
+**ring 0** (kernel privilege). The WASM runtime (`wasmi`) is the app sandbox,
+not the CPU's hardware privilege rings. There is no ring 3, no `SYSCALL`/`SYSRET`
+setup, and no per-process page tables.
+
+### Hardening present (Fase A — blast-radius)
+
+The following defences are implemented and tested:
+
+| Layer | Mechanism |
+|---|---|
+| Host-boundary safety | One audited guest-memory accessor (`kernel/src/wasm/host/mem.rs::check_bounds`). Every host fn that reads or writes WASM linear memory goes through this function — no raw `.read`/`.write` elsewhere. Fuzz-tested with adversarial cases (negative ptr/len, overflow, boundary) and an exhaustive small-grid never-panics run. |
+| Fuel metering | Each WASM task is given a 2 000 000 000 instruction budget. A pure compute loop with no host calls exhausts the budget and is killed (exit 137, logged as `wasm: task killed (fuel exhausted)`). I/O-bound tasks refuel on every host call and run indefinitely. |
+| Per-task resource limits | `wasmi::ResourceLimiter` caps memory pages and table elements per instance. |
+| Capability-scoped paths | Host path functions reject paths that escape the task's declared root (no `../` traversal past `/`). |
+| Non-deadlocking panic + reset | Kernel panics print a backtrace, drop locks, and trigger a controlled reboot — they do not deadlock the machine. |
+
+### Honest ceiling
+
+This is **defence-in-depth in ring 0**, not hardware isolation.
+
+- A memory-safety bug inside the `wasmi` interpreter itself, or in the
+  kernel's own `unsafe` blocks, is still fatal to the entire system — there
+  is no separate address space to contain it.
+- Only a separate address space **plus** CPU privilege level (e.g. ring 3 with
+  per-process page tables) could contain such a bug. That architecture is
+  explicitly out of scope per the project's WASM-as-sandbox thesis and would
+  require adding a preemptive scheduler, SYSCALL/SYSRET stubs, and GDT ring-3
+  segments.
+- The compile-time default password lives in plain text in the kernel binary
+  and is a convenience for demos only — it is not a security mechanism.
+- **Do not over-claim:** ruos is a hobby OS with a ring-0 WASM sandbox that
+  meaningfully reduces the blast radius of buggy app code. It is not a
+  hardened multi-tenant platform.
+
 ## Boot on real hardware (USB)
 
 The hybrid ISO can be written directly to a USB stick:

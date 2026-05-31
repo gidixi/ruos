@@ -27,11 +27,12 @@ BIN_TOOLS  := shell ls cat echo \
               touch wc clear which \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
-              service readdirtest
+              service readdirtest \
+              spinloop
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test
 
 all: iso
 
@@ -177,6 +178,10 @@ export PASSWD_GEN
 .PHONY: run-pipe-test
 run-pipe-test: iso ssh-key-on-disk
 	bash tests/pipe-test.sh
+
+.PHONY: run-fuel-test
+run-fuel-test: iso ssh-key-on-disk
+	bash tests/fuel-test.sh
 
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk

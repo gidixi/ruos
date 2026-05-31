@@ -22,6 +22,9 @@ pub struct RuntimeState {
     /// resolved against this. New Fibers default to "/"; children
     /// spawned via `ruos_exec` inherit the parent's CWD.
     pub cwd: String,
+    /// Capability grant: absolute path prefix this task may access. Default "/"
+    /// (full FS, no behavior change). Narrowed for spawned tools later.
+    pub root: String,
 }
 
 pub enum FdEntry {
@@ -60,7 +63,19 @@ impl RuntimeState {
             env: Vec::new(),
             exit_code: AtomicI32::new(0),
             cwd: String::from("/"),
+            root: String::from("/"),
         }
+    }
+}
+
+impl RuntimeState {
+    /// True if `abs` (an already-canonicalized absolute path) is within this
+    /// task's grant. "/" grants everything. Prevents `../` escapes because the
+    /// caller canonicalizes first.
+    pub fn grants(&self, abs: &str) -> bool {
+        if self.root == "/" { return true; }
+        let root = self.root.trim_end_matches('/');
+        abs == root || abs.starts_with(&alloc::format!("{}/", root))
     }
 }
 

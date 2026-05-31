@@ -63,6 +63,9 @@ pub fn path_open(
     // preopen / non-dir fds). See resolve_at.
     let path = resolve_at(&caller, dir_fd, path_str);
 
+    // Capability check: reject paths outside the task's grant.
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
+
     // O_DIRECTORY: model the open directory as a first-class fd. Trap with
     // OpenDir, which stats the path and (if it's a directory) allocates an
     // FdEntry::Dir. This is the fd that wasi-libc's fdopendir/fd_readdir
@@ -110,6 +113,7 @@ pub fn path_unlink_file(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathUnlink { path }))
 }
 
@@ -120,6 +124,7 @@ pub fn path_create_directory(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathMkdir { path }))
 }
 
@@ -130,6 +135,7 @@ pub fn path_remove_directory(
     path_len: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRmdir { path }))
 }
 
@@ -144,6 +150,7 @@ pub fn path_filestat_get(
     buf_ptr: i32,
 ) -> Result<i32, Error> {
     let path = read_path(&caller, dir_fd, path_ptr, path_len)?;
+    if !caller.data().grants(&path) { return Ok(76); } // ENOTCAPABLE
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathFilestat {
         path,
         buf_ptr: buf_ptr as u32,
@@ -161,7 +168,9 @@ pub fn path_rename(
     new_path_len: i32,
 ) -> Result<i32, Error> {
     let src = read_path(&caller, old_fd, old_path_ptr, old_path_len)?;
+    if !caller.data().grants(&src) { return Ok(76); } // ENOTCAPABLE — src
     let dst = read_path(&caller, new_fd, new_path_ptr, new_path_len)?;
+    if !caller.data().grants(&dst) { return Ok(76); } // ENOTCAPABLE — dst
     Err(Error::host(crate::wasm::suspend::SuspendReason::PathRename { src, dst }))
 }
 

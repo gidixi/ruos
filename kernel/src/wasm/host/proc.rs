@@ -64,6 +64,8 @@ pub fn ruos_chdir(
     let path = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     let new_cwd = resolve_cwd(&caller.data().cwd, path);
+    // Capability check: reject targets outside the task's grant.
+    if !caller.data().grants(&new_cwd) { return Ok(76); } // ENOTCAPABLE
     // Root always exists; skip stat to avoid a corner case.
     if new_cwd != "/" {
         match crate::vfs::block_on(crate::vfs::stat(&new_cwd)) {

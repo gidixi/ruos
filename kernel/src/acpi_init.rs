@@ -53,6 +53,16 @@ pub struct EcamRegion {
     pub bus_end:   u8,  // inclusive
 }
 
+/// Minimal CPU descriptor from the MADT/processor-info. Populated during ACPI
+/// parse so the boot phases can log CPU counts and pass lapic_id to the CPU
+/// module without re-parsing ACPI tables.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuInfo {
+    pub processor_uid: u32,
+    pub lapic_id:      u32,
+    pub is_bsp:        bool,
+}
+
 #[derive(Clone)]
 pub struct AcpiInfo {
     pub lapic_base:  u64,
@@ -60,6 +70,9 @@ pub struct AcpiInfo {
     pub overrides:   Vec<IrqOverride>,
     pub ecam:        Vec<EcamRegion>,
     pub hhdm_offset: u64,
+    /// CPUs listed in the MADT. Index 0 is always the BSP (if any); remaining
+    /// entries are APs. May be empty if no MADT processor entries found.
+    pub cpus:        Vec<CpuInfo>,
 }
 
 #[derive(Debug)]
@@ -113,6 +126,25 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
     };
 
     let platform = tables.platform_info().map_err(|_| AcpiInitError::Parse)?;
+
+    // ---- CPU enumeration (informational; APs are NOT started here) ----------
+    let mut cpus: Vec<CpuInfo> = Vec::new();
+    if let Some(pi) = platform.processor_info.as_ref() {
+        cpus.push(CpuInfo {
+            processor_uid: pi.boot_processor.processor_uid,
+            lapic_id:      pi.boot_processor.local_apic_id,
+            is_bsp:        true,
+        });
+        for ap in pi.application_processors.iter() {
+            cpus.push(CpuInfo {
+                processor_uid: ap.processor_uid,
+                lapic_id:      ap.local_apic_id,
+                is_bsp:        false,
+            });
+        }
+    }
+    // -------------------------------------------------------------------------
+
     let apic = match platform.interrupt_model {
         InterruptModel::Apic(a) => a,
         _ => return Err(AcpiInitError::NoLapic),
@@ -150,5 +182,5 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
         }
     }
 
-    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, ecam, hhdm_offset })
+    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, ecam, hhdm_offset, cpus })
 }

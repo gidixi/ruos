@@ -291,6 +291,47 @@ hardcoded "1 CPU" anche se VM ne ha 4+.
 
 Obiettivo: detect + bring-up + scheduler multi-core.
 
+### Fase 0 — fondamenta per-CPU (✅ DONE)
+
+Branch `feature/smp-phase0-percpu`. Spec: `docs/superpowers/specs/2026-05-31-smp-phase0-percpu-design.md`.
+Audit: `docs/superpowers/notes/2026-05-31-smp-lock-audit.md`.
+
+Deliverable completati (tutto su 1 CPU, nessun AP avviato):
+
+1. **`IrqMutex<T>`** — lock primitivo IRQ-safe: maschera IF durante il lock,
+   impedisce deadlock ISR-vs-thread anche su core singolo. Drop ripristina
+   lo stato IF salvato. Disponibile per futuri siti ISR-shared.
+
+2. **Per-CPU data via GS-base** — `struct PerCpu { cpu_id, lapic_id, … }`,
+   MAX_CPUS=16, array statico `PER_CPU`. BSP inizializzato con `init_bsp()`;
+   `this_cpu()` legge GS_BASE MSR senza lock. AP slot riservati per Fase 1.
+
+3. **Per-core GDT/TSS + double-fault IST** — array statici di 16 GDT/TSS e
+   16 stack double-fault (uno per CPU). `gdt::init(cpu_id)` carica il
+   descriptor del core corrente in GDTR e il relativo TSS in TR. BSP su
+   slot 0; i 16 KiB `DOUBLE_FAULT_STACKS` sono partizionati per indice.
+
+4. **Enumerazione CPU via ACPI MADT** — `acpi::enumerate_cpus()` itera le
+   entry `LocalApic` del MADT e popola una lista (`cpu::cpu_count()`). AP
+   rilevati ma **non avviati** (nessun INIT-SIPI-SIPI). Puramente informativo.
+
+5. **Lock audit completo (~52 siti)** — zero MUST-FIX: ogni sito di stato
+   condiviso già protetto da `spin::Mutex`, atomic con ordinamento corretto,
+   o init-once/per-core per costruzione. Invariante executor documentato:
+   un solo core (BSP) chiama `run()`/`poll()`; la run-queue **non è** ancora
+   SMP-safe (Fase 2).
+
+**Cosa NON fa Fase 0:** nessun AP avviato, nessun trampoline 16-bit, nessun
+INIT-SIPI-SIPI, nessun IRQ routing multi-core, nessun TLB shootdown. Il
+kernel gira esattamente come prima — stessa performance, stessa stabilità —
+ma ora ha le fondamenta strutturali per le fasi successive.
+
+**Rimane da fare:**
+- **Fase 1** — AP bring-up: trampoline 16→64-bit, INIT-SIPI-SIPI per ogni AP,
+  per-CPU LAPIC timer, atomic ready-flag, `cpu::count()` attivi.
+- **Fase 2** — Executor SMP-safe: run-queue mpmc o per-CPU + work-stealing,
+  rimozione dell'invariante single-core, IRQ routing e TLB shootdown.
+
 **Componenti:**
 
 1. **Detect via ACPI MADT** — già parsato in Step 5, conta entries

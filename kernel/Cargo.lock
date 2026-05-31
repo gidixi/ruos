@@ -454,6 +454,7 @@ dependencies = [
  "virtio-drivers",
  "vte",
  "wasmi",
+ "wasmi_core",
  "x86_64",
 ]
 

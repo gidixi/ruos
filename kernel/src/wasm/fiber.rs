@@ -44,6 +44,7 @@ impl Fiber {
         let module = Module::new(&engine, bytes)?;
         let mut store: Store<RuntimeState> = Store::new(&engine, RuntimeState::new());
         let _ = store.set_fuel(FUEL_PER_SLICE);
+        store.limiter(|state| state as &mut dyn wasmi::ResourceLimiter);
         let mut linker: Linker<RuntimeState> = Linker::new(&engine);
         host::install(&mut linker)?;
         let instance = linker.instantiate_and_start(&mut store, &module)?;
@@ -294,10 +295,14 @@ impl Fiber {
                                 break;
                             }
                         }
-                        let wfd = wfd.unwrap_or_else(|| {
-                            state.fds.push(Some(FdEntry::Vfs(fd)));
-                            (state.fds.len() - 1) as u32
-                        });
+                        let wfd = match wfd {
+                            Some(i) => i,
+                            None if state.fds.len() < crate::wasm::state::MAX_FDS => {
+                                state.fds.push(Some(FdEntry::Vfs(fd)));
+                                (state.fds.len() - 1) as u32
+                            }
+                            None => return 24, // EMFILE — fd table full
+                        };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0
                     }
@@ -321,10 +326,14 @@ impl Fiber {
                                 break;
                             }
                         }
-                        let wfd = wfd.unwrap_or_else(|| {
-                            state.fds.push(Some(FdEntry::Dir(path.clone())));
-                            (state.fds.len() - 1) as u32
-                        });
+                        let wfd = match wfd {
+                            Some(i) => i,
+                            None if state.fds.len() < crate::wasm::state::MAX_FDS => {
+                                state.fds.push(Some(FdEntry::Dir(path.clone())));
+                                (state.fds.len() - 1) as u32
+                            }
+                            None => return 24, // EMFILE — fd table full
+                        };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0
                     }

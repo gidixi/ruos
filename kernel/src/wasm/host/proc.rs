@@ -475,6 +475,14 @@ pub fn ruos_tcp_dial(
     use crate::wasm::suspend::SuspendReason;
 
     if port <= 0 || port > 0xFFFF { return Ok(22); }
+
+    // Cap sockets per task before allocating a kernel socket slot.
+    {
+        let fds = &caller.data().fds;
+        let socket_count = fds.iter().filter(|s| matches!(s, Some(FdEntry::Socket(_)))).count();
+        if socket_count >= crate::wasm::state::MAX_SOCKETS { return Ok(24); } // EMFILE
+    }
+
     let idx = crate::net::sockets::POOL.alloc_tcp();
     let handle = match crate::net::sockets::POOL.handle(idx) {
         Some(h) => h,
@@ -486,17 +494,21 @@ pub fn ruos_tcp_dial(
     );
     let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
 
-    // Allocate a wasm-side FD pointing at this socket.
+    // Allocate a wasm-side FD pointing at this socket (bounded by MAX_FDS).
     let fd = {
         let fds = &mut caller.data_mut().fds;
-        // Scan for a None slot first; else extend.
+        // Scan for a None slot first; else extend up to MAX_FDS.
         let mut slot = None;
         for (i, s) in fds.iter().enumerate() {
             if s.is_none() { slot = Some(i); break; }
         }
         match slot {
             Some(i) => { fds[i] = Some(FdEntry::Socket(idx)); i as i32 }
-            None    => { fds.push(Some(FdEntry::Socket(idx))); (fds.len() - 1) as i32 }
+            None if fds.len() < crate::wasm::state::MAX_FDS => {
+                fds.push(Some(FdEntry::Socket(idx)));
+                (fds.len() - 1) as i32
+            }
+            None => return Ok(24), // EMFILE — fd table full
         }
     };
     // Persist the FD to wasm memory for the caller.

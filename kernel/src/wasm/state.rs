@@ -4,6 +4,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicI32;
 
+/// Max simultaneous FDs per task. Past this, fd-allocating host fns return EMFILE.
+pub const MAX_FDS: usize = 128;
+/// Max simultaneous kernel sockets per task.
+pub const MAX_SOCKETS: usize = 16;
+/// Per-task linear-memory ceiling in bytes (wasmi ResourceLimiter).
+pub const MAX_LINEAR_MEM: usize = 64 * 1024 * 1024;
+
 pub struct RuntimeState {
     /// File descriptor table: index = FD, value = `FdEntry` (or None).
     /// FDs 0/1/2 are backed by /dev/pts/0 (PTY slave) after Task 3.
@@ -55,4 +62,38 @@ impl RuntimeState {
             cwd: String::from("/"),
         }
     }
+}
+
+// ── wasmi ResourceLimiter ──────────────────────────────────────────────────
+// Caps per-task linear memory growth to MAX_LINEAR_MEM (64 MiB) and tables
+// to a sane ceiling. Attached via Store::limiter in Fiber::new.
+// Signatures copied verbatim from wasmi_core-1.0.9/src/limiter.rs trait def.
+// instances/tables/memories match the DEFAULT_*_LIMIT consts in wasmi limits.rs.
+
+impl wasmi::ResourceLimiter for RuntimeState {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, wasmi_core::LimiterError> {
+        let cap = maximum
+            .map(|m| m.min(MAX_LINEAR_MEM))
+            .unwrap_or(MAX_LINEAR_MEM);
+        Ok(desired <= cap)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, wasmi_core::LimiterError> {
+        let cap = maximum.unwrap_or(4096);
+        Ok(desired <= cap)
+    }
+
+    fn instances(&self) -> usize { 10_000 }
+    fn tables(&self)    -> usize { 10_000 }
+    fn memories(&self)  -> usize { 10_000 }
 }

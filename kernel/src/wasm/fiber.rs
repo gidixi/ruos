@@ -301,7 +301,7 @@ impl Fiber {
                                 state.fds.push(Some(FdEntry::Vfs(fd)));
                                 (state.fds.len() - 1) as u32
                             }
-                            None => return 24, // EMFILE — fd table full
+                            None => return 33, // EMFILE (33) — fd table full
                         };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0
@@ -332,7 +332,7 @@ impl Fiber {
                                 state.fds.push(Some(FdEntry::Dir(path.clone())));
                                 (state.fds.len() - 1) as u32
                             }
-                            None => return 24, // EMFILE — fd table full
+                            None => return 33, // EMFILE (33) — fd table full
                         };
                         let _ = self.write_u32(opened_fd_ptr, wfd);
                         0

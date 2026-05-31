@@ -476,11 +476,16 @@ pub fn ruos_tcp_dial(
 
     if port <= 0 || port > 0xFFFF { return Ok(22); }
 
-    // Cap sockets per task before allocating a kernel socket slot.
+    // Check both caps before touching the kernel socket pool — avoids leaking a
+    // socket allocation when the fd table is already full (MAX_FDS exhausted).
     {
         let fds = &caller.data().fds;
         let socket_count = fds.iter().filter(|s| matches!(s, Some(FdEntry::Socket(_)))).count();
-        if socket_count >= crate::wasm::state::MAX_SOCKETS { return Ok(24); } // EMFILE
+        if socket_count >= crate::wasm::state::MAX_SOCKETS { return Ok(33); } // EMFILE (33)
+        // Determine whether a free fd slot exists before we alloc a kernel socket.
+        let fd_available = fds.iter().any(|s| s.is_none())
+            || fds.len() < crate::wasm::state::MAX_FDS;
+        if !fd_available { return Ok(33); } // EMFILE (33) — fd table full
     }
 
     let idx = crate::net::sockets::POOL.alloc_tcp();
@@ -495,6 +500,7 @@ pub fn ruos_tcp_dial(
     let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
 
     // Allocate a wasm-side FD pointing at this socket (bounded by MAX_FDS).
+    // The fd-availability check above guarantees this cannot fail.
     let fd = {
         let fds = &mut caller.data_mut().fds;
         // Scan for a None slot first; else extend up to MAX_FDS.
@@ -508,7 +514,8 @@ pub fn ruos_tcp_dial(
                 fds.push(Some(FdEntry::Socket(idx)));
                 (fds.len() - 1) as i32
             }
-            None => return Ok(24), // EMFILE — fd table full
+            // Should be unreachable given the pre-check above.
+            None => return Ok(33), // EMFILE (33) — fd table full
         }
     };
     // Persist the FD to wasm memory for the caller.

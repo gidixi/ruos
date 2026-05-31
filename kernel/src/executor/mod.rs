@@ -55,7 +55,7 @@ pub fn run() -> ! {
     // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
     // and server/client.wasm live under /root/ as runnable demo blobs
     // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
-    spawner.spawn(wasm_task("/bin/shell.wasm")).unwrap();
+    spawner.spawn(boot_shell_task()).unwrap();
     spawner.spawn(exec_worker_task()).unwrap();
     spawner.spawn(pipeline_worker_task()).unwrap();
     spawner.spawn(ssh_serve_task()).unwrap();
@@ -162,8 +162,31 @@ async fn net_poll_task() {
 }
 
 #[embassy_executor::task(pool_size = 4)]
+#[allow(dead_code)] // generic runner; kept for demo blobs / future auto-spawns
 async fn wasm_task(path: &'static str) {
     crate::wasm::run_at(path).await;
+}
+
+/// The local console (framebuffer + serial, on pts/0) shell, with respawn.
+///
+/// First launch replays `/etc/init.sh` (the boot sequence). If the user
+/// types `exit` — or the shell ever dies — it is respawned with a fresh
+/// interactive prompt (no init replay) so the local console is never left
+/// dead. Mirrors `init`/getty respawn on Unix: you can't really "log out"
+/// of the only physical console, it just comes back.
+///
+/// SSH sessions are independent (ssh_pty_dispatcher_task on pts/1..3) and
+/// unaffected: exiting an SSH session never touches this task.
+#[embassy_executor::task]
+async fn boot_shell_task() {
+    let mut first = true;
+    loop {
+        let code = crate::wasm::run_boot_shell(first).await;
+        first = false;
+        crate::binfo!("user", "boot shell exited code={} — respawning", code);
+        // Guard against a tight crash-loop if shell.wasm can't start.
+        delay::Delay::ticks(20).await; // 200 ms @ 100 Hz
+    }
 }
 
 /// SSH PTY dispatcher: drains PTY_QUEUE entries posted by the SSH server

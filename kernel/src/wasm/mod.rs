@@ -13,6 +13,43 @@ use alloc::vec::Vec;
 use crate::kprintln;
 use crate::vfs;
 
+/// Spawn `/bin/shell.wasm` on the default console PTY (pts/0) and run it to
+/// completion, returning its exit code. `replay_init` controls whether the
+/// shell replays `/etc/init.sh` + banner (true only on the very first boot
+/// launch; false on every respawn after the user types `exit`, so a fresh
+/// prompt appears without re-running the boot script). The local console is
+/// thus never left dead — same idea as `init`/getty respawn on Unix.
+pub async fn run_boot_shell(replay_init: bool) -> i32 {
+    const PATH: &str = "/bin/shell.wasm";
+    let bytes = match read_all(PATH).await {
+        Ok(b) => b,
+        Err(e) => {
+            kprintln!("ruos: boot shell: read {} failed: {:?}", PATH, e);
+            return 127;
+        }
+    };
+    let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            kprintln!("ruos: boot shell: instantiate failed: {}", e);
+            return 126;
+        }
+    };
+    if replay_init {
+        // argv = ["/bin/shell.wasm"] → shell replays /etc/init.sh.
+        fb.set_args(alloc::vec![PATH.as_bytes().to_vec()]);
+    } else {
+        // argv = ["shell", "--no-init"] → skip the boot script, fresh prompt.
+        fb.set_args(alloc::vec![b"shell".to_vec(), b"--no-init".to_vec()]);
+    }
+    let pid = crate::proc::register(alloc::string::String::from(PATH.trim_start_matches('/')));
+    fb.set_pid(pid);
+    let code = fb.run().await;
+    crate::proc::unregister(pid);
+    code
+}
+
+#[allow(dead_code)] // kept for /root/{server,client}.wasm demo blobs + future use
 pub async fn run_at(path: &str) {
     let bytes = match read_all(path).await {
         Ok(b) => b,

@@ -3,7 +3,7 @@
 use crate::boot::BootError;
 
 pub fn init() -> Result<(), BootError> {
-    crate::gdt::init();
+    crate::gdt::init(0); // BSP = slot 0
     crate::idt::init();
     crate::binfo!("arch", "GDT/TSS + IDT up");
 

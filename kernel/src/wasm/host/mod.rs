@@ -8,6 +8,7 @@ pub mod proc;
 pub mod term;
 pub mod sysinfo;
 pub mod service;
+pub mod mem;
 
 use wasmi::{Linker, Error};
 use crate::wasm::state::RuntimeState;

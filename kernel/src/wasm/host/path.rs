@@ -4,7 +4,6 @@
 
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::{FdEntry, RuntimeState};
-use crate::wasm::host::lifecycle::wasm_memory;
 use crate::vfs::OpenFlags;
 
 /// Resolve a (possibly relative) `path` against the base implied by `dir_fd`.
@@ -54,10 +53,10 @@ pub fn path_open(
     _fd_flags: i32,
     opened_fd_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut path_buf = alloc::vec![0u8; path_len as usize];
-    mem.read(&caller, path_ptr as usize, &mut path_buf)
-        .map_err(|_| Error::i32_exit(-1))?;
+    let path_buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
     let path_str = core::str::from_utf8(&path_buf)
         .map_err(|_| Error::i32_exit(-1))?;
     // Resolve relative path against dir_fd's directory (or cwd for the
@@ -98,9 +97,7 @@ fn read_path(
     path_ptr: i32,
     path_len: i32,
 ) -> Result<alloc::string::String, Error> {
-    let mem = wasm_memory(caller)?;
-    let mut buf = alloc::vec![0u8; path_len as usize];
-    mem.read(caller, path_ptr as usize, &mut buf)
+    let buf = crate::wasm::host::mem::guest_read(caller, path_ptr, path_len)
         .map_err(|_| Error::i32_exit(-1))?;
     let s = core::str::from_utf8(&buf).map_err(|_| Error::i32_exit(-1))?;
     Ok(resolve_at(caller, dir_fd, s))

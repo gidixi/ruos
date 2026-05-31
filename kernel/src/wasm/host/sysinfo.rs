@@ -4,7 +4,6 @@
 
 use wasmi::{Caller, Linker, Error};
 use crate::wasm::state::RuntimeState;
-use crate::wasm::host::lifecycle::wasm_memory;
 
 const KERNEL_NAME:   &str = "ruos";
 const KERNEL_REL:    &str = "0.1.0";
@@ -19,12 +18,13 @@ fn write_bytes_and_len(
     used_ptr: i32,
     data: &[u8],
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let n = data.len().min(buf_len as usize);
-    mem.write(&mut caller, buf_ptr as usize, &data[..n])
-        .map_err(|_| Error::i32_exit(-1))?;
-    mem.write(&mut caller, used_ptr as usize, &(n as u32).to_le_bytes())
-        .map_err(|_| Error::i32_exit(-1))?;
+    let n = data.len().min(buf_len.max(0) as usize);
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &data[..n]) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, n as u32) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -60,7 +60,6 @@ pub fn ruos_meminfo(
     mut caller: Caller<'_, RuntimeState>,
     buf_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
     let heap_total = crate::memory::HEAP_SIZE as u64;
     // talc 4.x does not expose a stable "bytes in use" API in our cfg, so
     // we leave heap_used as 0 — userspace `free` prints "?" for that
@@ -72,8 +71,9 @@ pub fn ruos_meminfo(
     out[8..16].copy_from_slice(&heap_used.to_le_bytes());
     out[16..24].copy_from_slice(&frames.total.to_le_bytes());
     out[24..32].copy_from_slice(&frames.used.to_le_bytes());
-    mem.write(&mut caller, buf_ptr as usize, &out)
-        .map_err(|_| Error::i32_exit(-1))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &out) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -122,13 +122,14 @@ pub fn ruos_dmesg(
     buf_len: i32,
     used_ptr: i32,
 ) -> Result<i32, Error> {
-    let mem = wasm_memory(&caller)?;
-    let mut tmp = alloc::vec![0u8; buf_len as usize];
+    let mut tmp = alloc::vec![0u8; buf_len.max(0) as usize];
     let n = crate::klog::read(&mut tmp);
-    mem.write(&mut caller, buf_ptr as usize, &tmp[..n])
-        .map_err(|_| Error::i32_exit(-1))?;
-    mem.write(&mut caller, used_ptr as usize, &(n as u32).to_le_bytes())
-        .map_err(|_| Error::i32_exit(-1))?;
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &tmp[..n]) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, n as u32) {
+        return Ok(e);
+    }
     Ok(0)
 }
 
@@ -156,12 +157,13 @@ pub fn ruos_proc_list(
         blob.extend_from_slice(&[0u8, 0u8]); // pad
         blob.extend_from_slice(name);
     }
-    let mem = wasm_memory(&caller)?;
-    let n = blob.len().min(buf_len as usize);
-    mem.write(&mut caller, buf_ptr as usize, &blob[..n])
-        .map_err(|_| Error::i32_exit(-1))?;
-    mem.write(&mut caller, used_ptr as usize, &(blob.len() as u32).to_le_bytes())
-        .map_err(|_| Error::i32_exit(-1))?;
+    let n = blob.len().min(buf_len.max(0) as usize);
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &blob[..n]) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, blob.len() as u32) {
+        return Ok(e);
+    }
     Ok(0)
 }
 

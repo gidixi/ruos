@@ -33,6 +33,7 @@ mod ahci;
 mod rtc;
 mod ssh;
 mod sync;
+mod cpu;
 mod pipe;
 mod service;
 

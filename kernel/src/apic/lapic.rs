@@ -92,3 +92,10 @@ pub fn set_timer_periodic(vector: u8, initial_count: u32) {
         write_volatile(reg(REG_TIMER_INIT), initial_count);
     }
 }
+
+/// Local APIC ID of the current core (xAPIC: register 0x20, bits 31:24).
+pub fn apic_id() -> u32 {
+    // SAFETY: init ran before this is ever called; reg(0x20) is the ID register.
+    let raw = unsafe { read_volatile(reg(0x20)) };
+    raw >> 24
+}

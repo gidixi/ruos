@@ -27,6 +27,13 @@ pub fn init() -> Result<core::convert::Infallible, BootError> {
 
     crate::binfo!("user", "executor starting");
 
+    // Quiet the on-screen console: from here on INFO no longer draws on the
+    // framebuffer, only WARN/ERR do. The ring buffer (`dmesg`) and the serial
+    // port still receive every line. Keeps the post-boot shell on screen
+    // clean instead of interleaving kernel events (ssh connects, watchdog,
+    // etc.) with user I/O — to see them, run `dmesg`.
+    crate::boot::log::set_console_level(crate::boot::log::LEVEL_WARN);
+
     // executor::run() -> ! satisfies any return type via the never-coerce rule.
     crate::executor::run();
 }

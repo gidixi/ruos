@@ -31,6 +31,14 @@ impl MultiConsole {
     pub fn attach_framebuffer(&mut self, fb: FramebufferConsole) {
         self.fb = Some(fb);
     }
+
+    /// Write to the serial port only, skipping the framebuffer. Used by the
+    /// log emitter to keep the serial a full debug/log wire (every line)
+    /// while the on-screen framebuffer console stays quiet for post-boot
+    /// INFO chatter. See `boot::log::emit`.
+    pub fn write_serial_only(&mut self, s: &str) {
+        Console::write_str(&mut self.serial, s);
+    }
 }
 
 impl fmt::Write for MultiConsole {

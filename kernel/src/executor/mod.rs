@@ -29,7 +29,17 @@ static WAKE_PENDING: AtomicBool = AtomicBool::new(true);
 /// (the context pointer). Our kernel is single-CPU with no concurrent
 /// access; the `UnsafeCell<MaybeUninit<…>>` pattern is safe here.
 struct ExecCell(UnsafeCell<MaybeUninit<RawExecutor>>);
-// SAFETY: single-CPU kernel; no concurrent access is possible.
+// SAFETY: exactly one core — the BSP — ever calls `run()` (from `kmain`),
+// and `run()` is the sole writer of the `UnsafeCell` and the sole caller of
+// `exec.poll()`. The cooperative executor is single-core BY DESIGN (the
+// 2026-05-28 pivot: concurrency = async cooperative on a single CPU, no
+// preemptive scheduler, no SMP run-queue). `crate::cpu::PER_CPU`/`this_cpu()`
+// provide per-core data for a FUTURE SMP phase, but the run-queue here is NOT
+// yet SMP-safe: `RawExecutor::poll` must be called serially and the spawn
+// queue is not cross-core-synchronized. A future SMP phase that brings up an
+// AP MUST revisit this `Sync` assertion before letting any second core touch
+// the executor (e.g. give each core its own executor, or add a real
+// SMP-safe run-queue). Today no AP is started, so no concurrent access exists.
 unsafe impl Sync for ExecCell {}
 
 static EXECUTOR: ExecCell = ExecCell(UnsafeCell::new(MaybeUninit::uninit()));

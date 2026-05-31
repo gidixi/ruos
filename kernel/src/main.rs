@@ -32,6 +32,7 @@ mod blockdev;
 mod ahci;
 mod rtc;
 mod ssh;
+mod sync;
 mod pipe;
 mod service;
 

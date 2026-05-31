@@ -260,6 +260,18 @@ Limiti MVP (vedi spec + README): 1 sessione alla volta, 1 chiave, porta 22
 fissa, exec gira attraverso la shell (prompt nel risultato), no exit-status,
 no window-size, no SFTP/forwarding.
 
+## Compatibilità WASI — incrementale (in corso)
+
+Lavoro trasversale di "aumento compatibilità WASI/WASIX", indipendente dagli
+step. Primo item landato:
+
+- **`fd_readdir`** (spec `docs/superpowers/specs/2026-05-31-rust-fd-readdir-design.md`,
+  CHANGELOG 171-175). `std::fs::read_dir` e crate tipo `walkdir`/`glob`
+  funzionano da un binario `wasm32-wasip1` `std` puro, senza binding custom.
+  Aggiunti: `FdEntry::Dir`, `path_open(O_DIRECTORY)`, host fn `fd_readdir`
+  (dirent Preview 1 + cookie), risoluzione path relativa a `dir_fd`. La host
+  fn legacy `ruos.readdir` (record 12-byte) resta per `ls`/`find`/`du`/`grep`.
+
 ## Step 17 — Mouse PS/2 + rlvgl + host functions grafiche
 
 - Driver mouse PS/2 (porta 0x64 controller, IRQ12 via IOAPIC, scancode 3 byte).

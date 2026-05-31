@@ -293,6 +293,88 @@ impl Fiber {
                     Err(_) => 44, // ENOENT
                 }
             }
+            SuspendReason::OpenDir { path, opened_fd_ptr } => {
+                match crate::vfs::stat(&path).await {
+                    Ok(s) if matches!(s.kind, crate::vfs::VfsKind::Dir) => {
+                        let state = self.store.data_mut();
+                        use crate::wasm::state::FdEntry;
+                        // Allocate at fd >= 4: 0/1/2 are stdio and fd 3 is the
+                        // virtual WASI preopen root ("/"). Handing out fd 3
+                        // here would alias the preopen and corrupt std's path
+                        // resolution (read_dir then fails with ENOENT).
+                        let mut wfd: Option<u32> = None;
+                        for (i, slot) in state.fds.iter_mut().enumerate().skip(4) {
+                            if slot.is_none() {
+                                *slot = Some(FdEntry::Dir(path.clone()));
+                                wfd = Some(i as u32);
+                                break;
+                            }
+                        }
+                        let wfd = wfd.unwrap_or_else(|| {
+                            state.fds.push(Some(FdEntry::Dir(path.clone())));
+                            (state.fds.len() - 1) as u32
+                        });
+                        let _ = self.write_u32(opened_fd_ptr, wfd);
+                        0
+                    }
+                    Ok(_)  => 54, // ENOTDIR — exists but not a directory
+                    Err(_) => 44, // ENOENT
+                }
+            }
+            SuspendReason::FdReadDir { path, cookie, buf_ptr, buf_len, bufused_ptr } => {
+                let vfs_entries = match crate::vfs::readdir(&path).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = self.write_u32(bufused_ptr, 0);
+                        return 44; // ENOENT
+                    }
+                };
+                // Full entry list: synthetic "." (idx 0), ".." (idx 1), then
+                // the VFS entries. (name, __wasi_filetype_t).
+                let mut all: alloc::vec::Vec<(alloc::string::String, u8)> =
+                    alloc::vec::Vec::with_capacity(vfs_entries.len() + 2);
+                all.push((alloc::string::String::from("."), 3));  // DIRECTORY
+                all.push((alloc::string::String::from(".."), 3)); // DIRECTORY
+                for e in vfs_entries.iter() {
+                    let dtype: u8 = match e.kind {
+                        crate::vfs::VfsKind::Dir    => 3, // DIRECTORY
+                        crate::vfs::VfsKind::Reg    => 4, // REGULAR_FILE
+                        crate::vfs::VfsKind::Device => 2, // CHARACTER_DEVICE
+                    };
+                    all.push((e.name.clone(), dtype));
+                }
+                // Pack 24-byte __wasi_dirent_t headers + names, skipping the
+                // first `cookie` entries. d_next = i + 1 so a resume call with
+                // cookie=K continues after entry K-1. A partial final entry is
+                // allowed: write as many bytes as fit, then stop.
+                let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                let start = cookie as usize;
+                'fill: for i in start..all.len() {
+                    let (name, dtype) = &all[i];
+                    let name_bytes = name.as_bytes();
+                    if name_bytes.len() > u32::MAX as usize { continue; }
+                    let mut hdr = [0u8; 24];
+                    hdr[0..8].copy_from_slice(&((i as u64) + 1).to_le_bytes()); // d_next
+                    // d_ino (8..16) left 0 — std::fs::read_dir doesn't use it.
+                    hdr[16..20].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes()); // d_namlen
+                    hdr[20] = *dtype; // d_type
+                    // pad (21..24) left 0.
+                    for chunk in [&hdr[..], name_bytes] {
+                        if out.len() >= buf_len { break 'fill; }
+                        let space = buf_len - out.len();
+                        if chunk.len() <= space {
+                            out.extend_from_slice(chunk);
+                        } else {
+                            out.extend_from_slice(&chunk[..space]);
+                            break 'fill;
+                        }
+                    }
+                }
+                let n = out.len().min(buf_len);
+                let _ = self.write_to_memory(buf_ptr, &out[..n]);
+                let _ = self.write_u32(bufused_ptr, n as u32);
+                0
+            }
             SuspendReason::Exec { path, argv, cwd, term_pts, exit_code_ptr } => {
                 // Delegate to exec_queue: the exec_worker_task (a separate
                 // embassy task) will load+run the child on its own stack,

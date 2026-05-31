@@ -32,6 +32,12 @@ scheduler — concurrency is async cooperative (timer-IRQ wake). See the
 | 16 | SSH server (`sunset`, ed25519 host key, pubkey **+ password** auth, PTY shell + exec, runs disklessly) | ✅ |
 | 17 | Mouse PS/2 + `rlvgl` GUI + graphics host functions | ⏳ next |
 
+WASI compatibility is growing incrementally alongside the roadmap: as of
+the latest work, `fd_readdir` is exported, so `std::fs::read_dir` and
+`walkdir`-style crates work from a plain `wasm32-wasip1` `std` binary (no
+custom `ruos.*` bindings needed). The legacy `ruos.readdir` host fn stays
+for the existing tools.
+
 Detailed roadmap: [`docs/superpowers/roadmap-rust-os.md`](docs/superpowers/roadmap-rust-os.md).
 Per-step design specs and implementation plans live under
 [`docs/superpowers/specs/`](docs/superpowers/specs/) and

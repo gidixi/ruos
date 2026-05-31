@@ -36,6 +36,11 @@ pub fn fd_write(
         }));
     }
 
+    // Directory arm: writing to a directory fd is EISDIR.
+    if let Some(FdEntry::Dir(_)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        return Ok(21); // EISDIR
+    }
+
     // VFS arm: trap with SuspendReason::VfsWrite (single iov only).
     if let Some(FdEntry::Vfs(vfd)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
         if iovs_len != 1 {
@@ -121,6 +126,11 @@ pub fn fd_read(
         }));
     }
 
+    // Directory arm: reading a directory fd is EISDIR (use fd_readdir).
+    if let Some(FdEntry::Dir(_)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        return Ok(21); // EISDIR
+    }
+
     // VFS arm: trap with SuspendReason::VfsRead (single iov only).
     if let Some(FdEntry::Vfs(vfd)) = caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
         if iovs_len != 1 {
@@ -139,6 +149,30 @@ pub fn fd_read(
     }
 
     Ok(8) // EBADF
+}
+
+/// WASI Preview 1 `fd_readdir(fd, buf, buf_len, cookie) -> (errno, bufused)`.
+/// Only valid on `FdEntry::Dir` fds; the actual async enumeration + dirent
+/// packing happens in the `FdReadDir` fiber handler.
+pub fn fd_readdir(
+    caller: Caller<'_, RuntimeState>,
+    fd: i32,
+    buf_ptr: i32,
+    buf_len: i32,
+    cookie: i64,
+    bufused_ptr: i32,
+) -> Result<i32, Error> {
+    let path = match caller.data().fds.get(fd as usize).and_then(|x| x.as_ref()) {
+        Some(FdEntry::Dir(p)) => p.clone(),
+        _ => return Ok(54), // ENOTDIR — not a directory fd
+    };
+    Err(Error::host(crate::wasm::suspend::SuspendReason::FdReadDir {
+        path,
+        cookie: cookie as u64,
+        buf_ptr: buf_ptr as u32,
+        buf_len: buf_len as usize,
+        bufused_ptr: bufused_ptr as u32,
+    }))
 }
 
 pub fn fd_seek(
@@ -175,6 +209,11 @@ pub fn fd_close(
         Some(FdEntry::Vfs(vfd)) => {
             Err(Error::host(crate::wasm::suspend::SuspendReason::VfsClose { fd: vfd }))
         }
+        Some(FdEntry::Dir(_)) => {
+            // Directory handle has no VFS fd to release — the slot is already
+            // cleared by the take() above. Done.
+            Ok(0)
+        }
         Some(other) => {
             // Restore non-VFS entry (don't drop StdoutConsole/Socket).
             caller.data_mut().fds[fd as usize] = Some(other);
@@ -201,6 +240,15 @@ pub fn fd_filestat_get(
             let mem = wasm_memory(&caller)?;
             let mut stat = [0u8; 64];
             stat[16] = 2; // CHARACTER_DEVICE
+            mem.write(&mut caller, buf_ptr as usize, &stat)
+                .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
+            return Ok(0);
+        }
+        Some(FdEntry::Dir(_)) => {
+            // Directory, size 0.
+            let mem = wasm_memory(&caller)?;
+            let mut stat = [0u8; 64];
+            stat[16] = 3; // DIRECTORY
             mem.write(&mut caller, buf_ptr as usize, &stat)
                 .map_err(|e| Error::new(alloc::format!("fd_filestat_get write: {}", e)))?;
             return Ok(0);
@@ -260,6 +308,8 @@ pub fn fd_fdstat_get(
             }
             Some(FdEntry::StdoutConsole) => 2,
             Some(FdEntry::Socket(_))     => 7, // SOCKET_STREAM
+            Some(FdEntry::Dir(_))        => 3, // DIRECTORY — load-bearing:
+            // wasi-libc's fdopendir verifies this before issuing fd_readdir.
             _ => return Ok(8), // EBADF
         }
     };
@@ -317,6 +367,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_write", fd_write)?
         .func_wrap("wasi_snapshot_preview1", "fd_read", fd_read)?
+        .func_wrap("wasi_snapshot_preview1", "fd_readdir", fd_readdir)?
         .func_wrap("wasi_snapshot_preview1", "fd_close", fd_close)?
         .func_wrap("wasi_snapshot_preview1", "fd_seek", fd_seek)?
         .func_wrap("wasi_snapshot_preview1", "fd_fdstat_get", fd_fdstat_get)?

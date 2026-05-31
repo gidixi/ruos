@@ -27,7 +27,7 @@ BIN_TOOLS  := shell ls cat echo \
               touch wc clear which \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
-              service
+              service readdirtest
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
@@ -128,6 +128,7 @@ run-test: $(DISK_IMG)
 	grep -qF "disk read OK sector 0" build/serial.log || { echo TEST_FAIL_AHCI_READ; exit 1; }; \
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
+	grep -qE "readdir-std: [1-9][0-9]* entries" build/serial.log || { echo TEST_FAIL_READDIR; exit 1; }; \
 	echo TEST_PASS
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and

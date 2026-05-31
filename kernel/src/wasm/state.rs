@@ -24,6 +24,10 @@ pub enum FdEntry {
     Vfs(crate::vfs::Fd),
     /// Kernel TCP socket (index into net::sockets::POOL).
     Socket(usize),
+    /// Open directory handle carrying its resolved absolute path. Created by
+    /// `path_open(O_DIRECTORY)`; consumed by `fd_readdir` (re-enumerated per
+    /// call — fine at our scale). No VFS handle to release on close.
+    Dir(String),
 }
 
 impl RuntimeState {

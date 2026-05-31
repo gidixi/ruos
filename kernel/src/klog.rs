@@ -59,6 +59,14 @@ pub fn push(bytes: &[u8]) {
     LOG.lock().push(bytes);
 }
 
+/// Best-effort push: appends `bytes` only if the ring lock is uncontested.
+/// Safe to call from a panic handler where we must not block.
+pub fn try_push(bytes: &[u8]) {
+    if let Some(mut ring) = LOG.try_lock() {
+        ring.push(bytes);
+    }
+}
+
 pub fn read(out: &mut [u8]) -> usize {
     LOG.lock().read(out)
 }

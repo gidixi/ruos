@@ -36,6 +36,10 @@ log = { version = "0.4", default-features = false }
 [features]
 boot-checks = []
 wasm-trace = []
+# When set, a kernel panic halts (cli; hlt loop) instead of rebooting.
+# Use for debugging: `cargo build --features panic-halt`.
+# Default (no flag): panic triggers a controlled reboot via power::reboot().
+panic-halt = []
 
 [profile.dev]
 panic = "abort"

@@ -277,6 +277,9 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
 /// find the HID boot keyboard interrupt-IN endpoint, then issue SET_CONFIGURATION.
 /// Returns the HidKeyboard descriptor on success.
 pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::HidKeyboard> {
+    // NB: this scratch page is intentionally leaked (not dma::dealloc'd). It is a
+    // single one-shot page used only during boot enumeration; freeing across the
+    // `?` early-returns isn't worth the control-flow risk for one page.
     let buf = crate::memory::dma::alloc(1)?;
 
     // ── 1. Read 9-byte config header for wTotalLength + bConfigurationValue ──
@@ -294,7 +297,6 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
     let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
     let total = (rd(2) as u16) | ((rd(3) as u16) << 8);
     let cfg_val = rd(5);
-    crate::binfo!("usb", "config total={} cfg_val={}", total, cfg_val);
 
     // ── 2. Read the full config block (capped at 4096) ────────────────────────
     let total = total.min(4096);
@@ -307,7 +309,6 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
     };
     let n = crate::usb::control::control_in(x, dev, s_all, &buf)?;
     let n = (n.min(total)) as usize;
-    crate::binfo!("usb", "config read n={}", n);
 
     // ── 3. Walk descriptors ───────────────────────────────────────────────────
     let mut pos: usize = 0;

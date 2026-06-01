@@ -63,15 +63,21 @@ pub fn configure_endpoint(
             let dev_ctx = input.device_mut();
             {
                 let slot = dev_ctx.slot_mut();
-                // Highest valid DCI must be updated to include the new endpoint.
+                // A0 is set, so the HC evaluates this Slot Context — it must be
+                // fully valid, not just Context Entries. Re-supply the root-hub
+                // port + speed (a stricter/real xHCI copies these into the output
+                // slot context; zeroing them rejects or corrupts the slot).
                 slot.set_context_entries(dci);
+                slot.set_root_hub_port_number(dev.port);
+                slot.set_speed(dev.speed);
             }
             {
                 let ep = dev_ctx.endpoint_mut(dci as usize);
                 ep.set_endpoint_type(EndpointType::InterruptIn);
                 ep.set_max_packet_size(kb.max_packet);
-                // xHCI interval field: bInterval from descriptor used directly
-                // (QEMU high-speed: bInterval=7 is already the xHCI exponent).
+                // xHCI Interval field: bInterval used directly. Correct for
+                // high-speed (bInterval already a 2^(n-1) exponent, QEMU usb-kbd);
+                // TODO full/low-speed keyboards need a frame->exponent conversion.
                 ep.set_interval(kb.interval);
                 ep.set_tr_dequeue_pointer(int_phys); // 64-byte aligned phys, no DCS
                 ep.set_dequeue_cycle_state();         // DCS = 1
@@ -99,6 +105,8 @@ pub fn configure_endpoint(
             {
                 let slot = dev_ctx.slot_mut();
                 slot.set_context_entries(dci);
+                slot.set_root_hub_port_number(dev.port);
+                slot.set_speed(dev.speed);
             }
             {
                 let ep = dev_ctx.endpoint_mut(dci as usize);

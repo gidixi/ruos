@@ -65,6 +65,12 @@ pub fn init_link(virt: x86_64::VirtAddr, phys: u64, cycle: bool) {
 
 /// Poll for a Command Completion event TRB (type 33) up to `CMD_TIMEOUT_MS`.
 /// Returns Some(words) on success, None on timeout.
+///
+/// ASSUMPTION (MVP): boot enumeration is strictly serial — one command in
+/// flight at a time and no concurrent transfers — so any non-CommandCompletion
+/// event seen here (a stray Port Status Change, etc.) is discarded and its slot
+/// consumed. Safe today because nothing else drives the rings during bring-up;
+/// a future concurrent design must route unexpected events instead of dropping.
 pub fn wait_cmd(x: &mut Xhci) -> Option<[u32; 4]> {
     let deadline = crate::boot::clock::elapsed_ms() + CMD_TIMEOUT_MS;
     loop {

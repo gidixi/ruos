@@ -96,6 +96,39 @@ pub fn init_cmd_link(x: &Xhci) {
     write_trb(x.cmd_ring.virt, LINK_IDX, w);
 }
 
+/// Enqueue one transfer TRB onto an EP transfer ring (NOT the command ring).
+/// Applies the current producer `*cycle` into word3 bit0, writes the TRB at
+/// `*enqueue`, advances the pointer, and handles Link-TRB wrap at LINK_IDX:
+/// rewrites the Link TRB with the current cycle, wraps to 0, and toggles
+/// `*cycle`. Does NOT ring any doorbell — caller does that after pushing all TRBs.
+///
+/// `words` should have word3 set with all bits EXCEPT cycle (bit0), which this
+/// function fills in from `*cycle`.
+pub fn enqueue_xfer(
+    ring: &crate::memory::dma::DmaRegion,
+    enqueue: &mut usize,
+    cycle: &mut bool,
+    mut words: [u32; 4],
+) {
+    // Bake current cycle bit into word3.
+    words[3] = (words[3] & !1) | (*cycle as u32);
+    write_trb(ring.virt, *enqueue, words);
+    *enqueue += 1;
+    if *enqueue == LINK_IDX {
+        // Rewrite Link TRB with current cycle, then wrap and toggle.
+        let phys = ring.phys.as_u64();
+        let link = [
+            (phys & 0xFFFF_FFFF) as u32,
+            (phys >> 32) as u32,
+            0,
+            (TRB_LINK << 10) | (1 << 1) | (*cycle as u32),
+        ];
+        write_trb(ring.virt, LINK_IDX, link);
+        *enqueue = 0;
+        *cycle = !*cycle;
+    }
+}
+
 /// Enqueue a command TRB (words 0..2 caller-provided; type+cycle applied here),
 /// then ring the command doorbell. Handles Link-TRB wrap at LINK_IDX.
 ///

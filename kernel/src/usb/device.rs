@@ -272,3 +272,48 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
         ep0_cycle: true,
     })
 }
+
+/// Read the 18-byte USB Device Descriptor from the addressed device and log
+/// VID, PID, class, max_packet_size0, and number of configurations.
+pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) {
+    let buf = match crate::memory::dma::alloc(1) {
+        Some(b) => b,
+        None => {
+            crate::bwarn!("usb", "device descriptor: DMA alloc failed");
+            return;
+        }
+    };
+
+    let setup = crate::usb::control::Setup {
+        req_type: 0x80,        // Device→Host, Standard, Device
+        request:  6,           // GET_DESCRIPTOR
+        value:    0x0100,      // Descriptor Type=Device (0x01), Index=0
+        index:    0,
+        length:   18,
+    };
+
+    match crate::usb::control::control_in(x, dev, setup, &buf) {
+        Some(n) if n >= 18 => {
+            let d = buf.virt.as_ptr::<u8>();
+            // SAFETY: DMA buffer is mapped, readable, and at least 18 bytes long.
+            let rd   = |o: usize| unsafe { core::ptr::read_volatile(d.add(o)) };
+            let rd16 = |o: usize| (rd(o) as u16) | ((rd(o + 1) as u16) << 8);
+            let vid      = rd16(8);
+            let pid      = rd16(10);
+            let class    = rd(4);
+            let mps0     = rd(7);
+            let num_cfg  = rd(17);
+            crate::binfo!(
+                "usb",
+                "dev {:04x}:{:04x} class={} maxpkt0={} numcfg={}",
+                vid, pid, class, mps0, num_cfg
+            );
+        }
+        Some(n) => {
+            crate::bwarn!("usb", "device descriptor short: got {} bytes", n);
+        }
+        None => {
+            crate::bwarn!("usb", "device descriptor read failed");
+        }
+    }
+}

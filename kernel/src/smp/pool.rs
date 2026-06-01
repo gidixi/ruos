@@ -59,10 +59,18 @@ pub fn submit(work: JobFn, input: &'static [u8]) -> Option<usize> {
             slot.input_len.store(input.len(), Ordering::SeqCst);
             slot.ran_on.store(u32::MAX, Ordering::SeqCst);
             QUEUE.lock().push_back(id);
+            // Wake any sleeping AP worker cores so one picks up the job.
+            crate::apic::lapic::send_ipi_all_but_self(crate::idt::VEC_WAKE);
             return Some(id);
         }
     }
     None
+}
+
+/// True if the job queue currently holds no work. Used by AP worker loops to
+/// decide between running jobs and sleeping (`hlt`).
+pub fn is_empty() -> bool {
+    QUEUE.lock().is_empty()
 }
 
 /// Take a QUEUED slot id off the queue (called by AP workers and the BSP

@@ -9,6 +9,8 @@ use crate::{kprintln, gdt};
 
 pub const VEC_LAPIC_TIMER: u8 = 0x20;
 pub const VEC_KEYBOARD:    u8 = 0x21;
+/// IPI vector the BSP sends to wake sleeping AP worker cores (SMP Fase 2).
+pub const VEC_WAKE:        u8 = 0x40;
 pub const VEC_SPURIOUS:    u8 = 0xFF;
 
 static IDT: spin::Once<InterruptDescriptorTable> = spin::Once::new();
@@ -31,6 +33,7 @@ pub fn init() {
 
         idt[VEC_LAPIC_TIMER].set_handler_fn(crate::timer::timer_handler);
         idt[VEC_KEYBOARD].set_handler_fn(crate::keyboard::keyboard_handler);
+        idt[VEC_WAKE].set_handler_fn(wake_handler);
 
         idt
     });
@@ -80,6 +83,12 @@ extern "x86-interrupt" fn df_handler(frame: InterruptStackFrame, _code: u64) -> 
 extern "x86-interrupt" fn bp_handler(frame: InterruptStackFrame) {
     kprintln!("ruos: bp ok rip=0x{:X}", frame.instruction_pointer.as_u64());
     // Resumable — handler returns; CPU continues at rip past the int3 instruction.
+}
+
+/// AP wake IPI handler. No-op beyond EOI — its only purpose is to pull a
+/// sleeping AP out of `hlt` so its worker loop re-checks the job queue.
+extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
+    crate::apic::lapic::eoi();
 }
 
 fn halt() -> ! {

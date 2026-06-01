@@ -1,9 +1,11 @@
 //! Application Processor entry point. Limine hands each AP here already in
 //! 64-bit long mode on a Limine-owned stack; we load this core's GDT/TSS and
-//! the shared IDT, register online, then enter a compute WORKER loop (Fase 2).
-//! APs pull pure-CPU jobs from the shared pool and run them on their core;
-//! when the queue is empty they PAUSE-spin (no STI/IPI — APs take no
-//! interrupts in Fase 2, they busy-poll the job queue).
+//! the shared IDT, enable this core's LAPIC, register online, then enter a
+//! compute WORKER loop (Fase 2). APs pull pure-CPU jobs from the shared pool
+//! and run them on their core; when the queue is empty they `hlt` (0% CPU) and
+//! sleep until the BSP wakes them with an IPI after submitting a job. The AP's
+//! only enabled interrupt is the wake IPI (its timer LVT is masked, keyboard
+//! IRQ routes to the BSP).
 
 use limine::mp::MpInfo;
 
@@ -17,21 +19,34 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Load this core's GDT/TSS (slot cpu_id) and the shared IDT.
     crate::gdt::init(cpu_id);
     crate::idt::load();
+    // Enable this core's LAPIC (so the wake IPI is serviced) + mask its timer.
+    crate::apic::lapic::init_ap(crate::idt::VEC_SPURIOUS);
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();
     ap_worker_loop()
 }
 
-/// AP worker loop: take pure-CPU jobs from the pool and run them on this core.
-/// Spin-waits (PAUSE) when there's no work — no STI/IPI in Fase 2, so the AP
-/// polls the queue rather than sleeping on an interrupt.
+/// AP worker loop: drain pure-CPU jobs from the pool, then `hlt` until a wake
+/// IPI arrives. The BSP sends the wake IPI on every `submit`. Anti-missed-wake:
+/// disable IRQs and re-check the queue before sleeping, so a job submitted
+/// between the drain and the `hlt` is not missed (the `sti; hlt` is atomic —
+/// the IPI cannot fire in the 1-instruction shadow of `sti`).
 fn ap_worker_loop() -> ! {
     let me = crate::cpu::cpu_id();
     loop {
-        match crate::smp::pool::take() {
-            Some(slot) => crate::smp::pool::run_slot(slot, me),
-            None => core::hint::spin_loop(),
+        // Drain all available jobs.
+        while let Some(slot) = crate::smp::pool::take() {
+            crate::smp::pool::run_slot(slot, me);
+        }
+        // No work: sleep until woken.
+        x86_64::instructions::interrupts::disable();
+        if crate::smp::pool::is_empty() {
+            // Atomic sti;hlt — the wake IPI cannot land between the two.
+            x86_64::instructions::interrupts::enable_and_hlt();
+        } else {
+            // A job arrived during the drain/disable window; re-enable and loop.
+            x86_64::instructions::interrupts::enable();
         }
     }
 }

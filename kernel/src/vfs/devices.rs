@@ -80,11 +80,13 @@ impl File for PtySlaveFile {
                 }
                 if n > 0 {
                     Poll::Ready(Ok::<usize, VfsError>(n))
-                } else if crate::pty::is_shutdown(idx) {
+                } else if crate::pty::is_shutdown(idx)
+                    || g.foreground_pid.map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+                {
                     // Pair was hung up (SSH session dropped / watchdog idle
-                    // timeout). Return EOF so the shell reading stdin exits
-                    // its loop instead of blocking forever and leaking the
-                    // PTY claim.
+                    // timeout), OR the foreground app was `^C`'d / killed.
+                    // Return EOF so a stdin-blocked app unwinds and exits
+                    // (its fiber's post-dispatch kill check then fires).
                     Poll::Ready(Ok::<usize, VfsError>(0))
                 } else {
                     g.slave_waker = Some(cx.waker().clone());

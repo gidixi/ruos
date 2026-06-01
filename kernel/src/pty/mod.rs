@@ -31,9 +31,47 @@ pub fn init() {
 pub fn master_input_push(idx: usize, byte: u8) {
     if idx >= NUM_PAIRS { return; }
     let mut g = PAIRS[idx].lock();
-    ldisc::process_input(&mut g, byte);
+    let kill = ldisc::process_input(&mut g, byte);
     drop(g);
+    // `^C` on a foreground app: request its cooperative kill AFTER releasing the
+    // pair lock (request_kill takes the proc REGISTRY lock; keeping the orders
+    // disjoint avoids any pair<->registry deadlock).
+    if let Some(pid) = kill {
+        crate::proc::request_kill(pid);
+    }
     touch_activity(idx);
+}
+
+/// Set (or clear) the foreground app pid for pair `idx`. The exec worker calls
+/// this when it starts a child on a terminal and again (with `None`) when the
+/// child exits, so `^C` knows which process to interrupt.
+pub fn set_foreground(idx: usize, pid: Option<u32>) {
+    if idx >= NUM_PAIRS { return; }
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| { PAIRS[idx].lock().foreground_pid = pid; });
+}
+
+/// Snapshot pair `idx`'s termios so the exec worker can restore it after a
+/// foreground child (which may have switched the terminal to raw) exits.
+pub fn termios_snapshot(idx: usize) -> termios::Termios {
+    use x86_64::instructions::interrupts::without_interrupts;
+    if idx >= NUM_PAIRS { return termios::Termios::default_cooked(); }
+    without_interrupts(|| PAIRS[idx].lock().termios)
+}
+
+/// Overwrite pair `idx`'s termios (used to restore a snapshot).
+pub fn set_termios(idx: usize, t: termios::Termios) {
+    use x86_64::instructions::interrupts::without_interrupts;
+    if idx >= NUM_PAIRS { return; }
+    without_interrupts(|| { PAIRS[idx].lock().termios = t; });
+}
+
+/// Reset pair `idx` to a sane cooked terminal. The exec worker calls this
+/// before running a foreground child so the child gets canonical input + `^C`
+/// signal handling regardless of the shell's raw line-editing mode. Apps that
+/// want raw (rtop, nano) set it themselves via `tcsetattr`.
+pub fn force_cooked(idx: usize) {
+    set_termios(idx, termios::Termios::default_cooked());
 }
 
 /// Non-blocking poll of pair `idx`'s master output. Returns `Some(byte)` if
@@ -156,7 +194,12 @@ pub async fn slave_read_one_timeout(idx: usize, timeout_ticks: u64) -> i32 {
             let mut g = PAIRS[idx].lock();
             if let Some(b) = g.slave_rx.pop_front() {
                 Some(b as i32)
-            } else if SHUTDOWN[idx].load(Ordering::Relaxed) {
+            } else if SHUTDOWN[idx].load(Ordering::Relaxed)
+                || g.foreground_pid.map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+            {
+                // Pair hung up, or the foreground app was `^C`'d / killed —
+                // report EOF so the reader unwinds and the fiber's kill check
+                // fires.
                 Some(-2)
             } else {
                 g.slave_waker = Some(cx.waker().clone());

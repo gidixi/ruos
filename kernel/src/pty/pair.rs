@@ -14,6 +14,12 @@ pub struct PtyPair {
     pub termios:      Termios,
     pub master_waker: Option<Waker>,
     pub slave_waker:  Option<Waker>,
+    /// PID of the app running in the foreground on this pair (set by the exec
+    /// worker while a child runs, cleared when it exits). `^C` (VINTR) in cooked
+    /// mode cooperatively kills this pid; a slave read returns EOF once its kill
+    /// is pending, so a stdin-blocked app unblocks and exits. `None` = at the
+    /// shell prompt, where `^C` only clears the current line.
+    pub foreground_pid: Option<u32>,
 }
 
 impl PtyPair {
@@ -27,6 +33,7 @@ impl PtyPair {
             termios:      Termios::default_cooked(),
             master_waker: None,
             slave_waker:  None,
+            foreground_pid: None,
         }
     }
 }

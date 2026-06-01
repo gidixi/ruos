@@ -142,7 +142,19 @@ async fn exec_worker_task() {
                             )
                         );
                         child.set_pid(pid);
+                        // Give the child a sane cooked terminal (so `^C` works
+                        // even though the shell runs its line editor in raw
+                        // mode) and mark it foreground so VINTR knows which pid
+                        // to kill. Restore the caller's termios + clear the
+                        // foreground when it exits. Apps wanting raw (rtop,
+                        // nano) switch it themselves and their own guard
+                        // restores cooked before we restore the shell's mode.
+                        let saved_termios = crate::pty::termios_snapshot(slot.term_pts);
+                        crate::pty::force_cooked(slot.term_pts);
+                        crate::pty::set_foreground(slot.term_pts, Some(pid));
                         let code = child.run().await;
+                        crate::pty::set_foreground(slot.term_pts, None);
+                        crate::pty::set_termios(slot.term_pts, saved_termios);
                         crate::proc::unregister(pid);
                         code
                     }

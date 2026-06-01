@@ -200,6 +200,12 @@ run-smp2-test: iso ssh-key-on-disk
 run-rtop-test: iso ssh-key-on-disk
 	bash tests/rtop-ssh-test.sh
 
+# Ctrl-C test: runs a long app over SSH, sends ^C, asserts the foreground app
+# is killed and the shell prompt returns (line-discipline VINTR + cooked exec).
+.PHONY: run-ctrlc-test
+run-ctrlc-test: iso ssh-key-on-disk
+	bash tests/ctrlc-ssh-test.sh
+
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk
 	RUOS_PASSWORD='$(RUOS_PASSWORD)' bash tests/ssh-passwd-test.sh

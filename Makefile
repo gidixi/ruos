@@ -194,6 +194,12 @@ run-smp-test: iso $(DISK_IMG)
 run-smp2-test: iso ssh-key-on-disk
 	bash tests/smp2-test.sh
 
+# rtop interactive test: runs rtop over SSH, asserts timer-driven auto-refresh
+# (multiple frames while idle) + clean 'q' quit (alt-screen restored).
+.PHONY: run-rtop-test
+run-rtop-test: iso ssh-key-on-disk
+	bash tests/rtop-ssh-test.sh
+
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk
 	RUOS_PASSWORD='$(RUOS_PASSWORD)' bash tests/ssh-passwd-test.sh

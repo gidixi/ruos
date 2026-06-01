@@ -75,10 +75,32 @@ fn fd_to_pty(caller: &Caller<'_, RuntimeState>, fd: i32) -> Option<usize> {
     }
 }
 
+/// ruos poll_stdin(buf_ptr, timeout_ticks) -> i32
+///
+/// Wait up to `timeout_ticks` (100 Hz) for one byte on stdin (fd 0). Returns
+/// 1 and writes the byte to `buf_ptr[0]` if a key arrived, 0 on timeout, -1 on
+/// EOF (stdin closed). Lets a TUI auto-refresh on a clock without blocking on
+/// a keystroke. The actual race lives in `Fiber::dispatch`.
+pub fn poll_stdin(
+    caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    timeout_ticks: i64,
+) -> Result<i32, Error> {
+    match fd_to_pty(&caller, 0) {
+        Some(idx) => Err(Error::host(crate::wasm::suspend::SuspendReason::ReadStdinTimeout {
+            pty_idx: idx,
+            buf_ptr: buf_ptr as u32,
+            timeout_ticks: timeout_ticks.max(0) as u64,
+        })),
+        None => Ok(-1), // stdin not a PTY → treat as EOF
+    }
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "tcgetattr", tcgetattr)?
         .func_wrap("ruos", "tcsetattr", tcsetattr)?
-        .func_wrap("ruos", "isatty", isatty)?;
+        .func_wrap("ruos", "isatty", isatty)?
+        .func_wrap("ruos", "poll_stdin", poll_stdin)?;
     Ok(())
 }

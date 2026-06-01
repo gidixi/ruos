@@ -93,6 +93,16 @@ extern "C" {
     fn proc_stat(buf_ptr: u32, buf_len: u32, used_ptr: u32) -> i32;
     fn meminfo(buf_ptr: u32) -> i32;
     fn uptime() -> i64;
+    fn poll_stdin(buf_ptr: u32, timeout_ticks: i64) -> i32;
+}
+
+/// Wait up to `timeout_ticks` (100 Hz) for one stdin byte. Returns `(code,
+/// byte)`: code 1 = `byte` is a keystroke, 0 = timeout (redraw), -1 = EOF.
+#[cfg(target_arch = "wasm32")]
+pub fn poll_key(timeout_ticks: i64) -> (i32, u8) {
+    let mut b = [0u8; 1];
+    let r = unsafe { poll_stdin(b.as_mut_ptr() as u32, timeout_ticks) };
+    (r, b[0])
 }
 
 /// Max cores we size the cpustat buffer for (matches kernel MAX_CPUS).

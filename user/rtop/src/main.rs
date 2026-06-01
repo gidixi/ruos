@@ -232,27 +232,13 @@ fn main() {
     let mut cur = b;
     loop {
         draw(&mut term, &prev, &cur);
-        // Sleep in 100 ms chunks; check for 'q'/Ctrl-C after each chunk.
-        // Because stdin in raw mode delivers each byte as it arrives,
-        // a read() will block until a key is pressed. We therefore try a
-        // best-effort read: sleep 100 ms, then attempt one read. If the user
-        // hasn't pressed a key the read blocks — so we cap iterations at 10
-        // and accept that 'q' takes up to 1 s to register (same model as nano
-        // which also blocks on read_byte()).
-        let mut quit = false;
-        'poll: for _ in 0..10 {
-            sleep_ms(100);
-            use std::io::Read;
-            let mut buf = [0u8; 1];
-            // On ruos wasm, stdin().read() may block; accept that limitation.
-            if let Ok(n) = std::io::stdin().read(&mut buf) {
-                if n == 1 && (buf[0] == b'q' || buf[0] == 3) {
-                    quit = true;
-                    break 'poll;
-                }
-            }
-        }
-        if quit { break; }
+        // Wait up to ~1 s for a key via the ruos poll_stdin host fn, which
+        // races the read against a timer: a keystroke returns immediately
+        // (instant 'q'), a timeout returns so we redraw (htop-style 1 Hz
+        // auto-refresh), and EOF (e.g. the SSH session closed) ends the loop.
+        let (code, ch) = poll_key(REFRESH_TICKS);
+        if code < 0 { break; }                              // stdin EOF
+        if code == 1 && (ch == b'q' || ch == 3) { break; }  // 'q' or Ctrl-C
         prev = cur;
         cur = match sys_read() {
             Some(s) => s,
@@ -260,3 +246,11 @@ fn main() {
         };
     }
 }
+
+/// Refresh cadence in 100 Hz timer ticks (100 ticks = 1 s).
+const REFRESH_TICKS: i64 = 100;
+
+#[cfg(target_arch = "wasm32")]
+fn poll_key(t: i64) -> (i32, u8) { sys::poll_key(t) }
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_key(_t: i64) -> (i32, u8) { (-1, 0) } // host stub (interactive path is wasm-only)

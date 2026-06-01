@@ -271,6 +271,22 @@ impl Fiber {
                     Err(_) => 8,
                 }
             }
+            SuspendReason::ReadStdinTimeout { pty_idx, buf_ptr, timeout_ticks } => {
+                // Direct timed read on the PTY slave. This does NOT go through
+                // `vfs::read`/`with_fd_take` (which removes the fd entry for the
+                // duration and would strand it if the future were dropped on a
+                // timeout). The pty read always resolves: byte (>=0), timeout
+                // (-1), or EOF (-2).
+                let r = crate::pty::slave_read_one_timeout(pty_idx, timeout_ticks).await;
+                if r >= 0 {
+                    let _ = self.write_to_memory(buf_ptr, &[r as u8]);
+                    1
+                } else if r == -2 {
+                    -1 // EOF (stdin closed)
+                } else {
+                    0  // timeout
+                }
+            }
             SuspendReason::VfsWrite { fd, bytes, nwritten_ptr } => {
                 match crate::vfs::write(fd, &bytes).await {
                     Ok(n) => {

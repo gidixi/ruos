@@ -136,6 +136,46 @@ pub fn last_activity(idx: usize) -> u64 {
     LAST_ACTIVITY[idx].load(Ordering::Relaxed)
 }
 
+/// Read one byte from pair `idx`'s slave (stdin), waiting up to `timeout_ticks`
+/// (100 Hz). Returns the byte (`0..=255`), `-1` on timeout, or `-2` on EOF
+/// (the pair was shut down). Unlike `vfs::read`, this operates directly on the
+/// pair and ALWAYS resolves — no fd-table entry is taken, so an early timeout
+/// never strands the fd. Lets an interactive TUI (rtop) refresh on a clock
+/// while still reacting instantly to keystrokes.
+pub async fn slave_read_one_timeout(idx: usize, timeout_ticks: u64) -> i32 {
+    if idx >= NUM_PAIRS { return -2; }
+    use core::future::Future;
+    let mut delay = core::pin::pin!(crate::executor::delay::Delay::ticks(timeout_ticks));
+    core::future::poll_fn(|cx| {
+        use x86_64::instructions::interrupts::without_interrupts;
+        use core::task::Poll;
+        // First, try to consume a byte (or detect EOF). Register the slave
+        // waker while we hold the lock so a byte arriving right after we look
+        // is guaranteed to wake us.
+        let ready: Option<i32> = without_interrupts(|| {
+            let mut g = PAIRS[idx].lock();
+            if let Some(b) = g.slave_rx.pop_front() {
+                Some(b as i32)
+            } else if SHUTDOWN[idx].load(Ordering::Relaxed) {
+                Some(-2)
+            } else {
+                g.slave_waker = Some(cx.waker().clone());
+                None
+            }
+        });
+        if let Some(v) = ready {
+            if v >= 0 { touch_activity(idx); }
+            return Poll::Ready(v);
+        }
+        // No byte yet — arm the timeout. `Delay` registers its own waker; the
+        // future always completes, so it is dropped (freeing its slot) cleanly.
+        if delay.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(-1);
+        }
+        Poll::Pending
+    }).await
+}
+
 /// Future-friendly read of one byte from pair `idx`'s master output.
 /// Used by console_drain_task.
 pub async fn master_output_read(idx: usize) -> u8 {

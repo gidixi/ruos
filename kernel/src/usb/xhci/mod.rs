@@ -214,6 +214,9 @@ pub fn init() {
         crate::bwarn!("usb", "noop FAIL");
     }
 
+    // ── Root port scan + reset (Task 4) ──────────────────────────────────────
+    let _port = crate::usb::device::scan_ports(&mut x);
+
     crate::usb::CTRL.call_once(|| crate::sync::IrqMutex::new(Some(x)));
 }
 

@@ -1,5 +1,6 @@
 //! USB stack: xHCI controller + HID keyboard. Polled (no MSI). See
 //! docs/superpowers/specs/2026-06-01-usb-xhci-hid-design.md.
+pub mod device;
 pub mod xhci;
 
 use crate::sync::IrqMutex;

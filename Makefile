@@ -206,6 +206,12 @@ run-rtop-test: iso ssh-key-on-disk
 run-ctrlc-test: iso ssh-key-on-disk
 	bash tests/ctrlc-ssh-test.sh
 
+# SSH idle-survival test: a connected session left idle must NOT be reaped by
+# the pty watchdog (bridge heartbeat keeps it alive; only leaked pairs reap).
+.PHONY: run-ssh-idle-test
+run-ssh-idle-test: iso ssh-key-on-disk
+	bash tests/ssh-idle-test.sh
+
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk
 	RUOS_PASSWORD='$(RUOS_PASSWORD)' bash tests/ssh-passwd-test.sh

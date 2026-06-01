@@ -280,6 +280,12 @@ pub async fn run_session(
 
         // 4) Bridge channel ↔ PTY (Task 8).
         if let (Some(c), Some(idx)) = (chan.as_ref(), pty_idx) {
+            // Heartbeat: a live bridge keeps the pair's activity timestamp
+            // fresh so the idle watchdog never reaps a CONNECTED session for
+            // mere inactivity (a user may sit at the prompt indefinitely). The
+            // watchdog then only reclaims pairs whose bridge has stopped —
+            // i.e. genuinely leaked after an undetected disconnect.
+            crate::pty::touch_activity(idx);
             // SSH -> PTY master input (what the user typed).
             let mut ch_in = [0u8; 64];
             match runner.read_channel(c, ChanData::Normal, &mut ch_in) {

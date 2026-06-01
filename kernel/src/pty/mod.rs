@@ -101,7 +101,17 @@ pub fn master_output_len(idx: usize) -> usize {
 pub fn try_claim(idx: usize) -> bool {
     if idx >= NUM_PAIRS { return false; }
     use core::sync::atomic::Ordering;
-    CLAIMED[idx].compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    let claimed = CLAIMED[idx]
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if claimed {
+        // Start the idle clock NOW. Without this the fresh session inherits the
+        // PREVIOUS session's release timestamp (or 0 on first use); once uptime
+        // exceeds the idle limit the watchdog would shut the new session down
+        // within one check interval — i.e. seconds after connecting.
+        LAST_ACTIVITY[idx].store(crate::timer::ticks(), Ordering::Relaxed);
+    }
+    claimed
 }
 
 pub fn release(idx: usize) {

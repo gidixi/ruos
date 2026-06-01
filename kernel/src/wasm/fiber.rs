@@ -119,10 +119,15 @@ impl Fiber {
         };
 
         let mut outputs: [Val; 0] = [];
+        let burst_start = crate::boot::clock::read_tsc();
         let mut inv = match start.call_resumable(&mut self.store, &[], &mut outputs) {
             Ok(i) => i,
             Err(e) => { kprintln!("ruos: wasm: call_resumable error: {}", e); return Self::error_to_exit(&e); }
         };
+        if let Some(pid) = self.pid {
+            crate::proc::add_cpu_tsc(pid, crate::boot::clock::read_tsc().saturating_sub(burst_start));
+            crate::proc::set_mem_bytes(pid, self.current_mem_bytes());
+        }
 
         loop {
             match inv {
@@ -157,7 +162,13 @@ impl Fiber {
                             let _ = self.store.set_fuel(FUEL_PER_SLICE);
                             let resume_args = [Val::I32(errno)];
                             let mut next_outputs: [Val; 0] = [];
-                            inv = match state.resume(&mut self.store, &resume_args, &mut next_outputs) {
+                            let burst_start = crate::boot::clock::read_tsc();
+                            let resumed = state.resume(&mut self.store, &resume_args, &mut next_outputs);
+                            if let Some(pid) = self.pid {
+                                crate::proc::add_cpu_tsc(pid, crate::boot::clock::read_tsc().saturating_sub(burst_start));
+                                crate::proc::set_mem_bytes(pid, self.current_mem_bytes());
+                            }
+                            inv = match resumed {
                                 Ok(i) => i,
                                 Err(e) => return Self::error_to_exit(&e),
                             };
@@ -524,6 +535,15 @@ impl Fiber {
             }
         }
         None
+    }
+
+    /// Current wasm linear-memory size in bytes (0 if no `memory` export).
+    fn current_mem_bytes(&self) -> u64 {
+        self.instance
+            .get_export(&self.store, "memory")
+            .and_then(|e| e.into_memory())
+            .map(|m| m.data(&self.store).len() as u64)
+            .unwrap_or(0)
     }
 
     fn write_to_memory(&mut self, ptr: u32, bytes: &[u8]) -> Result<(), wasmi::Error> {

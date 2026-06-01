@@ -1,3 +1,4 @@
+mod sys;
 // Spike: prove ratatui types + a custom-buffer render compile to wasm32-wasip1
 // without crossterm. Replaced by the real UI in a later task.
 use ratatui::buffer::Buffer;

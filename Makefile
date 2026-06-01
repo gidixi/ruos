@@ -133,6 +133,8 @@ run-test: $(DISK_IMG)
 	grep -qE "readdir-std: [1-9][0-9]* entries" build/serial.log || { echo TEST_FAIL_READDIR; exit 1; }; \
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
 		grep -qE "^cpu0:[0-9]+%" build/serial.log || { echo TEST_FAIL_RTOP_CORE; exit 1; }; \
+		grep -qE "usb  xhci up" build/serial.log || { echo TEST_FAIL_USB_UP; exit 1; }; \
+		grep -qE "usb  keyboard ready" build/serial.log || { echo TEST_FAIL_USB_KBD; exit 1; }; \
 	echo TEST_PASS
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and
@@ -211,6 +213,12 @@ run-ctrlc-test: iso ssh-key-on-disk
 .PHONY: run-ssh-idle-test
 run-ssh-idle-test: iso ssh-key-on-disk
 	bash tests/ssh-idle-test.sh
+
+# USB keyboard test: QMP send-key drives QEMU's usb-kbd; the typed token must be
+# echoed by the boot shell on serial (proves xHCI HID -> master_input_push(0)).
+.PHONY: run-usb-key-test
+run-usb-key-test: iso
+	bash tests/usb-key-test.sh
 
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk

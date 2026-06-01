@@ -326,9 +326,45 @@ INIT-SIPI-SIPI, nessun IRQ routing multi-core, nessun TLB shootdown. Il
 kernel gira esattamente come prima — stessa performance, stessa stabilità —
 ma ora ha le fondamenta strutturali per le fasi successive.
 
+### Fase 1 — AP bring-up → idle (✅ DONE)
+
+Branch `feature/smp-phase1-ap-bringup`. Spec: `docs/superpowers/specs/2026-06-01-smp-phase1-ap-bringup-design.md`.
+
+Deliverable completati:
+
+1. **Limine MpRequest** — Limine consegna gli AP già in long-mode (64-bit) con
+   stack temporaneo. Nessun trampoline 16-bit scritto a mano: il bootloader lo
+   gestisce. `MP_REQUEST` statico dichiarato prima di `kernel_main`.
+
+2. **`idt::load()` richiamato su ogni AP** — ogni AP carica il proprio IDTR
+   tramite `idt::load()` prima di abilitare le interruzioni, usando il descrittore
+   IDT condiviso con il BSP.
+
+3. **LAPIC-based `cpu_id`** — il cpu_id è derivato dal LAPIC ID letto a runtime
+   via MMIO (`0xFEE00020 >> 24`) e poi mappato in un indice denso via
+   `set_cpu_mapping`. Approccio VMM-independent: funziona su QEMU, VirtualBox e
+   hardware reale indifferentemente.
+
+4. **`smp::bringup()` coordinator** — per ogni AP Limine: assegna cpu_id denso,
+   chiama `cpu.bootstrap(ap_entry, id)` (INIT-SIPI-SIPI gestito dal firmware
+   Limine), attende con spin ≤ 200 M iterazioni che ogni AP chiami `mark_online`.
+   Log finale: `N/N APs online`.
+
+5. **AP entry Rust** — `ap_entry(cpu_id)`: carica GDT/TSS per-core (slot
+   `cpu_id`), legge LAPIC ID via MMIO, inizializza `PerCpu`, segnala
+   `mark_online(cpu_id)`, entra in `hlt` loop (parcheggio idle).
+
+6. **Test integrazione** — `make run-smp-test` (script `tests/smp-test.sh`):
+   QEMU `-smp 4`, 60 s timeout, asserisce `3/3 APs online` + assenza `#PF`.
+   Verificato su QEMU -smp 4 (3/3 online) e **VirtualBox con 4 vCPU**
+   (banner sha == HEAD, `acpi: 4 CPU(s) found`, `smp: 3/3 APs online`,
+   `init.sh complete`, nessun #PF).
+
+**Cosa NON fa Fase 1:** nessun IRQ/timer sugli AP, nessun executor multi-core,
+nessun TLB shootdown, nessun task pinned. Gli AP parcheggiano in `hlt`
+in attesa di Fase 2.
+
 **Rimane da fare:**
-- **Fase 1** — AP bring-up: trampoline 16→64-bit, INIT-SIPI-SIPI per ogni AP,
-  per-CPU LAPIC timer, atomic ready-flag, `cpu::count()` attivi.
 - **Fase 2** — Executor SMP-safe: run-queue mpmc o per-CPU + work-stealing,
   rimozione dell'invariante single-core, IRQ routing e TLB shootdown.
 

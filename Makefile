@@ -32,7 +32,7 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test
 
 all: iso
 
@@ -182,6 +182,10 @@ run-pipe-test: iso ssh-key-on-disk
 .PHONY: run-fuel-test
 run-fuel-test: iso ssh-key-on-disk
 	bash tests/fuel-test.sh
+
+.PHONY: run-smp-test
+run-smp-test: iso $(DISK_IMG)
+	bash tests/smp-test.sh
 
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk

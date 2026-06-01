@@ -34,12 +34,13 @@ mod rtc;
 mod ssh;
 mod sync;
 mod cpu;
+mod smp;
 mod pipe;
 mod service;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 use limine::{RequestsEndMarker, RequestsStartMarker};
 
 /// Tell Limine which base revision we support.
@@ -62,6 +63,10 @@ pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 #[link_section = ".requests"]
 pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+pub static MP_REQUEST: MpRequest = MpRequest::new(0);
 
 #[used]
 #[link_section = ".requests_start_marker"]

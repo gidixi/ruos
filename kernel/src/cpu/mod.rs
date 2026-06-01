@@ -3,10 +3,26 @@
 //! x86-64 per-CPU pattern. On 1 CPU only slot 0 (the BSP) is live; the later
 //! AP bring-up phase will call an `init_ap(n)` for the others.
 
+pub mod ap;
+
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::GsBase;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 pub const MAX_CPUS: usize = 16;
+
+/// Sentinel for an unmapped LAPIC ID slot.
+const NO_CPU: u8 = 0xFF;
+
+/// lapic_id (xAPIC 8-bit) -> dense cpu_id. Filled by `set_cpu_mapping` at
+/// bring-up; read by `cpu_id()` on every core.
+static LAPIC_TO_CPU: [AtomicU8; 256] = {
+    const Z: AtomicU8 = AtomicU8::new(NO_CPU);
+    [Z; 256]
+};
+
+/// Count of cores that have registered online via `mark_online`.
+static CPUS_ONLINE: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C)]
 pub struct PerCpu {
@@ -36,8 +52,7 @@ static mut PER_CPU: PerCpuArray = PerCpuArray([ZEROED; MAX_CPUS]);
 /// True iff the GS base, as seen by an actual `gs:`-relative memory access,
 /// holds the installed per-CPU pointer. Set by `init_bsp` after a *memory*
 /// probe (not a bare MSR read-back — see init_bsp).
-static GS_USABLE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static GS_USABLE: AtomicBool = AtomicBool::new(false);
 
 /// BSP per-CPU init. Call AFTER gdt::init (the GS segment-load done there zeroes
 /// the GS base) and AFTER lapic::init (the APIC ID register must be mapped).
@@ -74,24 +89,58 @@ pub fn init_bsp(kernel_stack_top: u64) -> bool {
     // the read-back result as a hint; AP bring-up must do its own real probe
     // (e.g. a guarded access with a recoverable #PF) before trusting gs-base.
     let gs_ok = GsBase::read().as_u64() == want;
-    GS_USABLE.store(gs_ok, core::sync::atomic::Ordering::SeqCst);
+    GS_USABLE.store(gs_ok, Ordering::SeqCst);
     gs_ok
 }
 
-/// &PerCpu for the current core.
-///
-/// In Fase 0 there is exactly one CPU (the BSP = slot 0) and NO AP is running,
-/// so the correct per-CPU block is unconditionally `PER_CPU[0]`. We return it
-/// directly WITHOUT a `gs:`-relative access — that is always safe and cannot
-/// #PF on any VMM (VirtualBox accepts the GS-base MSR but does not update the
-/// hidden segment base, so `mov gs:[0]` would fault on base 0). A future AP
-/// phase that brings up real cores will switch the multi-CPU path to
-/// [`this_cpu_via_gs`] only after `init_bsp` confirmed gs-base is usable.
+/// Register `lapic_id -> cpu_id` and populate PER_CPU[cpu_id]'s identity.
+/// Called by the BSP for itself (id 0) and for each AP BEFORE the AP starts.
+pub fn set_cpu_mapping(lapic_id: u32, cpu_id: u8) {
+    if (lapic_id as usize) < 256 {
+        LAPIC_TO_CPU[lapic_id as usize].store(cpu_id, Ordering::SeqCst);
+    }
+    // SAFETY: each slot is written once during single-threaded bring-up before
+    // the corresponding AP starts; the AP only reads its own slot afterwards.
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(PER_CPU.0[cpu_id as usize]);
+        (*slot).cpu_id = cpu_id as u32;
+        (*slot).lapic_id = lapic_id;
+        (*slot).self_ptr = slot as *const PerCpu;
+    }
+}
+
+/// An AP (or the BSP) marks itself online.
+pub fn mark_online() {
+    CPUS_ONLINE.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Number of cores that have registered online via `mark_online`.
+pub fn cpus_online() -> u32 {
+    CPUS_ONLINE.load(Ordering::SeqCst)
+}
+
+/// Dense cpu_id of the current core. Reads the LAPIC ID register (works on
+/// every core and every VMM — no `gs:[0]`, dodging VirtualBox's gs-base quirk)
+/// and maps it to a dense id. Returns 0 (BSP) if the LAPIC ID isn't mapped yet
+/// (e.g. very early boot before bring-up) — safe on a single CPU.
+#[inline]
+pub fn cpu_id() -> u32 {
+    let lapic = crate::apic::lapic::apic_id();
+    if (lapic as usize) < 256 {
+        let id = LAPIC_TO_CPU[lapic as usize].load(Ordering::SeqCst);
+        if id != NO_CPU {
+            return id as u32;
+        }
+    }
+    0
+}
+
+/// &PerCpu for the current core, resolved via `cpu_id()` (LAPIC-based, no gs).
 #[inline]
 pub fn this_cpu() -> &'static PerCpu {
-    // SAFETY: PER_CPU.0[0] is a valid 'static; slot 0 is the BSP, the only live
-    // CPU in Fase 0.
-    unsafe { &*core::ptr::addr_of!(PER_CPU.0[0]) }
+    // SAFETY: PER_CPU[cpu_id()] is a valid 'static; cpu_id() is in range
+    // (0..MAX_CPUS) by construction of the dense ids set in set_cpu_mapping.
+    unsafe { &*core::ptr::addr_of!(PER_CPU.0[cpu_id() as usize]) }
 }
 
 /// &PerCpu resolved via the GS base (`gs:[0]` self-pointer). ONLY valid once a
@@ -110,8 +159,5 @@ pub unsafe fn this_cpu_via_gs() -> &'static PerCpu {
 #[inline]
 #[allow(dead_code)]
 pub fn gs_usable() -> bool {
-    GS_USABLE.load(core::sync::atomic::Ordering::SeqCst)
+    GS_USABLE.load(Ordering::SeqCst)
 }
-
-#[inline]
-pub fn cpu_id() -> u32 { this_cpu().cpu_id }

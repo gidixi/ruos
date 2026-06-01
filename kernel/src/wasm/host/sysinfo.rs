@@ -178,6 +178,73 @@ pub fn ruos_proc_kill(_: Caller<'_, RuntimeState>, pid: i32) -> Result<i32, Erro
     if crate::proc::request_kill(pid as u32) { Ok(0) } else { Ok(3) }
 }
 
+/// ruos_proc_stat(buf_ptr, buf_len, used_ptr) -> errno
+///
+/// Like proc_list but each row carries cpu_tsc + mem_bytes:
+///   u32 count
+///   for each: u32 pid, u64 start_tick, u64 cpu_tsc, u64 mem_bytes,
+///             u16 name_len, u16 pad, name_bytes
+/// Writes the *full* required length to used_ptr; truncates the bytes
+/// written to buf_len so the caller can resize and retry.
+pub fn ruos_proc_stat(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_len: i32,
+    used_ptr: i32,
+) -> Result<i32, Error> {
+    let procs = crate::proc::list();
+    let mut blob = alloc::vec::Vec::new();
+    blob.extend_from_slice(&(procs.len() as u32).to_le_bytes());
+    for p in &procs {
+        blob.extend_from_slice(&p.pid.to_le_bytes());
+        blob.extend_from_slice(&p.start_tick.to_le_bytes());
+        blob.extend_from_slice(&p.cpu_tsc.to_le_bytes());
+        blob.extend_from_slice(&p.mem_bytes.to_le_bytes());
+        let name = p.name.as_bytes();
+        blob.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        blob.extend_from_slice(&[0u8, 0u8]); // pad
+        blob.extend_from_slice(name);
+    }
+    let n = blob.len().min(buf_len.max(0) as usize);
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &blob[..n]) {
+        return Ok(e);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, blob.len() as u32) {
+        return Ok(e);
+    }
+    Ok(0)
+}
+
+/// ruos_cpustat(buf_ptr, buf_len) -> errno
+///
+/// Little-endian blob:
+///   u32 ncores
+///   u64 tsc_per_ms
+///   for each core: u64 busy_tsc, u64 idle_tsc
+/// ncores = 1 (BSP) + online APs. Returns 0, or 8 (ERANGE) if buf too small.
+pub fn ruos_cpustat(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_len: i32,
+) -> Result<i32, Error> {
+    let ncores = 1 + crate::cpu::cpus_online() as usize;
+    let mut blob = alloc::vec::Vec::new();
+    blob.extend_from_slice(&(ncores as u32).to_le_bytes());
+    blob.extend_from_slice(&crate::boot::clock::tsc_per_ms().to_le_bytes());
+    for cpu in 0..ncores {
+        let (busy, idle) = crate::sched::cpustat::read(cpu);
+        blob.extend_from_slice(&busy.to_le_bytes());
+        blob.extend_from_slice(&idle.to_le_bytes());
+    }
+    if (buf_len.max(0) as usize) < blob.len() {
+        return Ok(8); // ERANGE
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &blob) {
+        return Ok(e);
+    }
+    Ok(0)
+}
+
 pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     linker
         .func_wrap("ruos", "uname",      ruos_uname)?
@@ -186,6 +253,8 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "cpuinfo",    ruos_cpuinfo)?
         .func_wrap("ruos", "dmesg",      ruos_dmesg)?
         .func_wrap("ruos", "proc_list",  ruos_proc_list)?
-        .func_wrap("ruos", "proc_kill",  ruos_proc_kill)?;
+        .func_wrap("ruos", "proc_kill",  ruos_proc_kill)?
+        .func_wrap("ruos", "cpustat",    ruos_cpustat)?
+        .func_wrap("ruos", "proc_stat",  ruos_proc_stat)?;
     Ok(())
 }

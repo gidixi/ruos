@@ -3,6 +3,7 @@
 pub mod control;
 pub mod device;
 pub mod hid;
+pub mod usage;
 pub mod xhci;
 
 use crate::sync::IrqMutex;

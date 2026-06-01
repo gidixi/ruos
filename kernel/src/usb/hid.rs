@@ -209,3 +209,46 @@ pub fn configure_endpoint(
         prev: [0u8; 8],
     })
 }
+
+/// Process one completed HID report: edge-detect newly pressed keys, inject
+/// their bytes into PTY 0, then re-queue a Normal TRB to receive the next report.
+pub fn on_report(x: &mut Xhci, st: &mut HidState) {
+    // Read the 8-byte report.
+    let mut rep = [0u8; 8];
+    let p = st.report.virt.as_ptr::<u8>();
+    for i in 0..8 {
+        rep[i] = unsafe { core::ptr::read_volatile(p.add(i)) };
+    }
+    let mods = rep[0];
+    let shift = mods & 0x22 != 0;
+    let ctrl  = mods & 0x11 != 0;
+    // Edge-detect: keys in rep[2..8] not in st.prev[2..8].
+    for i in 2..8 {
+        let code = rep[i];
+        if code == 0 || code == 0x01 { continue; }
+        let was_down = st.prev[2..8].contains(&code);
+        if !was_down {
+            if let Some(b) = crate::usb::usage::usage_to_byte(code, shift, ctrl) {
+                crate::pty::master_input_push(0, b);
+            }
+        }
+    }
+    st.prev = rep;
+    // Re-queue a Normal TRB for the next report.
+    let phys = st.report.phys.as_u64();
+    let normal = [
+        (phys & 0xFFFF_FFFF) as u32,
+        (phys >> 32) as u32,
+        8u32,
+        (1 << 10) | (1 << 5), // type=1 (Normal) | IOC
+    ];
+    crate::usb::xhci::ring::enqueue_xfer(
+        &st.int_ring,
+        &mut st.int_enqueue,
+        &mut st.int_cycle,
+        normal,
+    );
+    x.regs.doorbell.update_volatile_at(st.slot_id as usize, |d| {
+        d.set_doorbell_target(st.dci);
+    });
+}

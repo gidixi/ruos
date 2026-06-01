@@ -10,6 +10,9 @@ pub const TRB_LINK: u32 = 6;
 pub const TRB_NOOP_CMD: u32 = 23;
 pub const TRB_CMD_COMPLETION: u32 = 33;
 
+/// Timeout for command completion polling (ms).
+const CMD_TIMEOUT_MS: u64 = 50;
+
 #[inline]
 fn trb_ptr(virt: x86_64::VirtAddr, idx: usize) -> *mut u32 {
     (virt.as_u64() as usize + idx * TRB_BYTES) as *mut u32
@@ -45,6 +48,36 @@ pub fn trb_type(w: &[u32; 4]) -> u32 {
 /// Completion code of an event TRB (word2 bits 24..=31).
 pub fn completion_code(w: &[u32; 4]) -> u32 {
     (w[2] >> 24) & 0xFF
+}
+
+/// Install a Link TRB at the last slot of any 256-entry transfer ring.
+/// Used for EP0 and other transfer rings (not the command ring — use init_cmd_link
+/// for that). `phys` is the physical base of the ring, `cycle` is the initial DCS.
+pub fn init_link(virt: x86_64::VirtAddr, phys: u64, cycle: bool) {
+    let w = [
+        (phys & 0xFFFF_FFFF) as u32,
+        (phys >> 32) as u32,
+        0,
+        (TRB_LINK << 10) | (1 << 1) | (cycle as u32),
+    ];
+    write_trb(virt, LINK_IDX, w);
+}
+
+/// Poll for a Command Completion event TRB (type 33) up to `CMD_TIMEOUT_MS`.
+/// Returns Some(words) on success, None on timeout.
+pub fn wait_cmd(x: &mut Xhci) -> Option<[u32; 4]> {
+    let deadline = crate::boot::clock::elapsed_ms() + CMD_TIMEOUT_MS;
+    loop {
+        if let Some(ev) = poll_event(x) {
+            if trb_type(&ev) == TRB_CMD_COMPLETION {
+                return Some(ev);
+            }
+        }
+        if crate::boot::clock::elapsed_ms() >= deadline {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Install the Link TRB at LINK_IDX on the command ring (points to ring start,

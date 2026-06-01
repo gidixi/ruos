@@ -1,6 +1,7 @@
-//! USB device enumeration: root-port scan/reset, then (later tasks) slot
-//! allocation, addressing, descriptors.
+//! USB device enumeration: root-port scan/reset, slot allocation, addressing.
 use crate::usb::xhci::Xhci;
+use crate::usb::xhci::ring;
+use crate::memory::dma::DmaRegion;
 
 /// A reset, connected root port ready for enumeration.
 pub struct PortInfo {
@@ -89,4 +90,185 @@ pub fn scan_ports(x: &mut Xhci) -> Option<PortInfo> {
         crate::bwarn!("usb", "no usable port after scan");
     }
     found
+}
+
+/// An addressed USB device: slot allocated, EP0 transfer ring set up, Device Context
+/// installed in DCBAA. Ready for descriptor fetch (Task 6+).
+pub struct UsbDevice {
+    pub slot_id:     u8,
+    pub port:        u8,
+    pub speed:       u8,
+    pub max_packet0: u16,
+    pub ep0_ring:    DmaRegion,
+    pub input_ctx:   DmaRegion,
+    pub dev_ctx:     DmaRegion,
+    pub ep0_enqueue: usize,
+    pub ep0_cycle:   bool,
+}
+
+/// Enable Slot → build Input Context → allocate EP0 ring + Device Context →
+/// write DCBAA entry → Address Device command. Returns `None` on any failure.
+pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
+    use ::xhci::context::{
+        Input32Byte, Input64Byte,
+        InputHandler, DeviceHandler, SlotHandler, EndpointHandler,
+        EndpointType,
+    };
+
+    // ── 1. Enable Slot (command type 9) ─────────────────────────────────────
+    ring::enqueue_cmd(x, [0, 0, 0, 0], 9);
+    let ev = match ring::wait_cmd(x) {
+        Some(e) => e,
+        None => { crate::bwarn!("usb", "enable slot: timeout"); return None; }
+    };
+    let code = ring::completion_code(&ev);
+    if code != 1 {
+        crate::bwarn!("usb", "enable slot FAIL code={}", code);
+        return None;
+    }
+    let slot_id = ((ev[3] >> 24) & 0xFF) as u8;
+    crate::binfo!("usb", "slot {} enabled", slot_id);
+
+    // ── 2. MaxPacketSize0 by speed ───────────────────────────────────────────
+    let max_packet0: u16 = match p.speed {
+        4 => 512,
+        3 => 64,
+        _ => 8,
+    };
+
+    // ── 3. Allocate DMA regions ──────────────────────────────────────────────
+    let ep0_ring = match crate::memory::dma::alloc(1) {
+        Some(r) => r,
+        None => { crate::bwarn!("usb", "ep0 ring alloc failed"); return None; }
+    };
+    let dev_ctx = match crate::memory::dma::alloc(1) {
+        Some(r) => r,
+        None => { crate::bwarn!("usb", "dev ctx alloc failed"); return None; }
+    };
+    let input_ctx = match crate::memory::dma::alloc(1) {
+        Some(r) => r,
+        None => { crate::bwarn!("usb", "input ctx alloc failed"); return None; }
+    };
+
+    // ── 4. EP0 transfer ring: install Link TRB at index 255, DCS=1 ──────────
+    ring::init_link(ep0_ring.virt, ep0_ring.phys.as_u64(), true);
+
+    // ── 5. Write DCBAA[slot_id] = dev_ctx.phys ──────────────────────────────
+    unsafe {
+        x.dcbaa.virt.as_mut_ptr::<u64>()
+            .add(slot_id as usize)
+            .write_volatile(dev_ctx.phys.as_u64());
+    }
+
+    // ── 6. Build Input Context (csz-aware) and memcpy into input_ctx DMA ────
+    let csz = x.regs.capability.hccparams1.read_volatile().context_size();
+    // The xhci crate's set_tr_dequeue_pointer asserts 64-byte alignment and
+    // stores the raw address (no DCS). DCS is set separately via
+    // set_dequeue_cycle_state(). Our DMA pages are 4KiB-aligned, so fine.
+    let ep0_phys = ep0_ring.phys.as_u64();
+
+    if csz {
+        // 64-byte contexts
+        let mut input = Input64Byte::new_64byte();
+        {
+            let ctrl = input.control_mut();
+            ctrl.set_add_context_flag(0); // A0 = slot context
+            ctrl.set_add_context_flag(1); // A1 = EP0 context
+        }
+        {
+            let dev = input.device_mut();
+            {
+                let slot = dev.slot_mut();
+                slot.set_context_entries(1);
+                slot.set_root_hub_port_number(p.port);
+                slot.set_speed(p.speed);
+            }
+            {
+                let ep0 = dev.endpoint_mut(1); // DCI 1 = Control EP0
+                ep0.set_endpoint_type(EndpointType::Control);
+                ep0.set_max_packet_size(max_packet0);
+                ep0.set_tr_dequeue_pointer(ep0_phys); // 64-byte aligned phys
+                ep0.set_dequeue_cycle_state();         // DCS = 1
+                ep0.set_error_count(3);
+            }
+        }
+        let bytes = core::mem::size_of_val(&input);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &input as *const _ as *const u8,
+                input_ctx.virt.as_mut_ptr::<u8>(),
+                bytes,
+            );
+        }
+    } else {
+        // 32-byte contexts (QEMU default)
+        let mut input = Input32Byte::new_32byte();
+        {
+            let ctrl = input.control_mut();
+            ctrl.set_add_context_flag(0); // A0 = slot context
+            ctrl.set_add_context_flag(1); // A1 = EP0 context
+        }
+        {
+            let dev = input.device_mut();
+            {
+                let slot = dev.slot_mut();
+                slot.set_context_entries(1);
+                slot.set_root_hub_port_number(p.port);
+                slot.set_speed(p.speed);
+            }
+            {
+                let ep0 = dev.endpoint_mut(1); // DCI 1 = Control EP0
+                ep0.set_endpoint_type(EndpointType::Control);
+                ep0.set_max_packet_size(max_packet0);
+                ep0.set_tr_dequeue_pointer(ep0_phys); // 64-byte aligned phys
+                ep0.set_dequeue_cycle_state();         // DCS = 1
+                ep0.set_error_count(3);
+            }
+        }
+        let bytes = core::mem::size_of_val(&input);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &input as *const _ as *const u8,
+                input_ctx.virt.as_mut_ptr::<u8>(),
+                bytes,
+            );
+        }
+    }
+
+    // ── 7. Address Device command (type 11) ──────────────────────────────────
+    // word0 = input_ctx phys lo (16-byte aligned, low 4 bits = 0)
+    // word1 = input_ctx phys hi
+    // word2 = 0
+    // word3 bits 24..=31 = slot_id (enqueue_cmd preserves these bits)
+    let in_phys = input_ctx.phys.as_u64();
+    let addr_words = [
+        (in_phys & 0xFFFF_FFF0) as u32,
+        (in_phys >> 32) as u32,
+        0u32,
+        (slot_id as u32) << 24,
+    ];
+    ring::enqueue_cmd(x, addr_words, 11);
+    let ev2 = match ring::wait_cmd(x) {
+        Some(e) => e,
+        None => { crate::bwarn!("usb", "address device: timeout slot={}", slot_id); return None; }
+    };
+    let code2 = ring::completion_code(&ev2);
+    if code2 != 1 {
+        crate::bwarn!("usb", "address FAIL code={} slot={}", code2, slot_id);
+        return None;
+    }
+
+    crate::binfo!("usb", "slot {} addressed port={} speed={} mps0={}", slot_id, p.port, p.speed, max_packet0);
+
+    Some(UsbDevice {
+        slot_id,
+        port: p.port,
+        speed: p.speed,
+        max_packet0,
+        ep0_ring,
+        input_ctx,
+        dev_ctx,
+        ep0_enqueue: 0,
+        ep0_cycle: true,
+    })
 }

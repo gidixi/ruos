@@ -215,7 +215,12 @@ pub fn init() {
     }
 
     // ── Root port scan + reset (Task 4) ──────────────────────────────────────
-    let _port = crate::usb::device::scan_ports(&mut x);
+    if let Some(port) = crate::usb::device::scan_ports(&mut x) {
+        // ── Enable Slot + Address Device (Task 5) ─────────────────────────
+        if let Some(dev) = crate::usb::device::address_device(&mut x, &port) {
+            crate::usb::DEVICE.call_once(|| crate::sync::IrqMutex::new(Some(dev)));
+        }
+    }
 
     crate::usb::CTRL.call_once(|| crate::sync::IrqMutex::new(Some(x)));
 }

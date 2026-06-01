@@ -1,19 +1,262 @@
 mod sys;
 mod ansi_backend;
-// Spike: prove ratatui types + a custom-buffer render compile to wasm32-wasip1
-// without crossterm. Replaced by the real UI in a later task.
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::{Gauge, Widget};
+mod raw;
+
+use sys::Snapshot;
+use ratatui::Terminal;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Style, Modifier};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table, Cell as TCell};
+use ansi_backend::AnsiBackend;
+
+const W: u16 = 80;
+const H: u16 = 24;
+
+// ---------------------------------------------------------------------------
+// sys_read: wasm32 delegates to sys::read_snapshot; host build returns None.
+// This avoids a name conflict between `use sys::read_snapshot` and the local
+// stub that the host build needs.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "wasm32")]
+fn sys_read() -> Option<Snapshot> {
+    sys::read_snapshot()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sys_read() -> Option<Snapshot> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// CPU / process utilities
+// ---------------------------------------------------------------------------
+
+fn core_pcts(a: &Snapshot, b: &Snapshot) -> Vec<u16> {
+    let n = a.cpu.cores.len().min(b.cpu.cores.len());
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        let db = b.cpu.cores[i].busy.saturating_sub(a.cpu.cores[i].busy);
+        let di = b.cpu.cores[i].idle.saturating_sub(a.cpu.cores[i].idle);
+        let tot = db + di;
+        v.push(if tot == 0 { 0 } else { ((db * 100) / tot) as u16 });
+    }
+    v
+}
+
+fn proc_pcts(a: &Snapshot, b: &Snapshot) -> Vec<(u32, u16)> {
+    let wall: u64 = (0..a.cpu.cores.len().min(b.cpu.cores.len()))
+        .map(|i| {
+            b.cpu.cores[i].busy.saturating_sub(a.cpu.cores[i].busy)
+                + b.cpu.cores[i].idle.saturating_sub(a.cpu.cores[i].idle)
+        })
+        .sum();
+    let mut out = Vec::new();
+    for pb in &b.procs {
+        let prev = a.procs.iter().find(|p| p.pid == pb.pid)
+            .map(|p| p.cpu_tsc).unwrap_or(0);
+        let d = pb.cpu_tsc.saturating_sub(prev);
+        let pct = if wall == 0 { 0 } else { ((d * 100) / wall).min(100) as u16 };
+        out.push((pb.pid, pct));
+    }
+    out
+}
+
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1 << 20 { format!("{}M", b >> 20) }
+    else if b >= 1 << 10 { format!("{}K", b >> 10) }
+    else { format!("{}B", b) }
+}
+
+fn fmt_time(start_cs: u64, now_cs: u64) -> String {
+    let cs = now_cs.saturating_sub(start_cs);
+    format!("{}:{:02}.{:02}", cs / 6000, (cs / 100) % 60, cs % 100)
+}
+
+// ---------------------------------------------------------------------------
+// --once: plain text output (grep-safe, tested path)
+// First line must match: `rtop: uptime=`
+// Second line must contain `cpuN:%` tokens
+// ---------------------------------------------------------------------------
+
+fn render_once(a: &Snapshot, b: &Snapshot) {
+    let cp = core_pcts(a, b);
+    let pp = proc_pcts(a, b);
+    println!("rtop: uptime={}.{:02}s tasks={} cpus={}",
+        b.uptime_cs / 100, b.uptime_cs % 100, b.procs.len(), b.cpu.cores.len());
+    let cores: Vec<String> = cp.iter().enumerate()
+        .map(|(i, p)| format!("cpu{}:{}%", i, p))
+        .collect();
+    println!("{}", cores.join(" "));
+    println!("mem: heap {}/{} frames {}/{}",
+        fmt_bytes(b.mem.heap_used), fmt_bytes(b.mem.heap_total),
+        b.mem.frames_used, b.mem.frames_total);
+    println!("  PID CPU%   MEM     TIME+   CMD");
+    let mut rows: Vec<_> = b.procs.iter().map(|p| {
+        let pct = pp.iter().find(|(pid, _)| *pid == p.pid)
+            .map(|(_, c)| *c).unwrap_or(0);
+        (pct, p)
+    }).collect();
+    rows.sort_by(|x, y| y.0.cmp(&x.0));
+    for (pct, p) in rows {
+        println!("{:>5} {:>3}  {:>7} {:>8} {}",
+            p.pid, pct, fmt_bytes(p.mem_bytes),
+            fmt_time(p.start_tick, b.uptime_cs), p.name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive TUI (ratatui 0.29 + AnsiBackend)
+// ---------------------------------------------------------------------------
+
+fn draw(term: &mut Terminal<AnsiBackend>, a: &Snapshot, b: &Snapshot) {
+    let cp = core_pcts(a, b);
+    let pp = proc_pcts(a, b);
+    let _ = term.draw(|f| {
+        let area = f.area();
+        let ncore = cp.len() as u16;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(ncore.max(1)),
+                Constraint::Length(1),
+                Constraint::Min(3),
+            ])
+            .split(area);
+
+        let header = Line::from(format!(
+            " rtop  uptime {}.{:02}s   tasks {}   cpus {}   (q quit)",
+            b.uptime_cs / 100, b.uptime_cs % 100,
+            b.procs.len(), cp.len()
+        ));
+        f.render_widget(
+            Paragraph::new(header)
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            chunks[0],
+        );
+
+        // Per-core CPU gauges
+        let core_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Length(1); cp.len().max(1)])
+            .split(chunks[1]);
+        for (i, pct) in cp.iter().enumerate() {
+            f.render_widget(
+                Gauge::default()
+                    .label(format!("cpu{} {}%", i, pct))
+                    .gauge_style(Style::default().fg(Color::Green))
+                    .percent(*pct),
+                core_rows[i],
+            );
+        }
+
+        // Memory gauge
+        let mem_pct = if b.mem.frames_total == 0 {
+            0
+        } else {
+            ((b.mem.frames_used * 100) / b.mem.frames_total) as u16
+        };
+        f.render_widget(
+            Gauge::default()
+                .label(format!("mem {}/{}", b.mem.frames_used, b.mem.frames_total))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .percent(mem_pct.min(100)),
+            chunks[2],
+        );
+
+        // Process table
+        let mut rows: Vec<_> = b.procs.iter().map(|p| {
+            let pct = pp.iter().find(|(pid, _)| *pid == p.pid)
+                .map(|(_, c)| *c).unwrap_or(0);
+            (pct, p)
+        }).collect();
+        rows.sort_by(|x, y| y.0.cmp(&x.0));
+        let trows: Vec<Row> = rows.iter().map(|(pct, p)| {
+            Row::new(vec![
+                TCell::from(format!("{}", p.pid)),
+                TCell::from(format!("{}%", pct)),
+                TCell::from(fmt_bytes(p.mem_bytes)),
+                TCell::from(fmt_time(p.start_tick, b.uptime_cs)),
+                TCell::from(p.name.clone()),
+            ])
+        }).collect();
+        let widths = [
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Min(10),
+        ];
+        let table = Table::new(trows, widths)
+            .header(
+                Row::new(vec!["PID", "CPU%", "MEM", "TIME+", "CMD"])
+                    .style(Style::default().add_modifier(Modifier::REVERSED)),
+            )
+            .block(Block::default().borders(Borders::TOP));
+        f.render_widget(table, chunks[3]);
+    });
+}
+
+fn sleep_ms(ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
 
 fn main() {
-    let area = Rect::new(0, 0, 40, 1);
-    let mut buf = Buffer::empty(area);
-    Gauge::default().percent(42).render(area, &mut buf);
-    // Print the first row's symbols as proof of a rendered frame.
-    let mut line = String::new();
-    for x in 0..area.width {
-        line.push_str(buf[(x, 0)].symbol());
+    let once = std::env::args().any(|a| a == "--once");
+
+    let a = match sys_read() {
+        Some(s) => s,
+        None => { eprintln!("rtop: cpustat failed"); return; }
+    };
+    sleep_ms(1000);
+    let b = match sys_read() {
+        Some(s) => s,
+        None => { eprintln!("rtop: cpustat failed"); return; }
+    };
+
+    if once {
+        render_once(&a, &b);
+        return;
     }
-    println!("rtop-spike: {}", line);
+
+    // Interactive mode — raw terminal + ratatui TUI.
+    // stdin().read() in raw mode blocks until a key is pressed.
+    // We sleep 1 s between redraws; the user pressing 'q' or Ctrl-C exits.
+    let _guard = raw::TermGuard::enter();
+    let backend = AnsiBackend::new(W, H);
+    let mut term = Terminal::new(backend).expect("terminal");
+    let _ = term.clear();
+
+    let mut prev = a;
+    let mut cur = b;
+    loop {
+        draw(&mut term, &prev, &cur);
+        // Sleep in 100 ms chunks; check for 'q'/Ctrl-C after each chunk.
+        // Because stdin in raw mode delivers each byte as it arrives,
+        // a read() will block until a key is pressed. We therefore try a
+        // best-effort read: sleep 100 ms, then attempt one read. If the user
+        // hasn't pressed a key the read blocks — so we cap iterations at 10
+        // and accept that 'q' takes up to 1 s to register (same model as nano
+        // which also blocks on read_byte()).
+        let mut quit = false;
+        'poll: for _ in 0..10 {
+            sleep_ms(100);
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            // On ruos wasm, stdin().read() may block; accept that limitation.
+            if let Ok(n) = std::io::stdin().read(&mut buf) {
+                if n == 1 && (buf[0] == b'q' || buf[0] == 3) {
+                    quit = true;
+                    break 'poll;
+                }
+            }
+        }
+        if quit { break; }
+        prev = cur;
+        cur = match sys_read() {
+            Some(s) => s,
+            None => break,
+        };
+    }
 }

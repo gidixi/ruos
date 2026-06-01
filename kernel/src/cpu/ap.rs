@@ -33,17 +33,23 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
 /// between the drain and the `hlt` is not missed (the `sti; hlt` is atomic —
 /// the IPI cannot fire in the 1-instruction shadow of `sti`).
 fn ap_worker_loop() -> ! {
-    let me = crate::cpu::cpu_id();
+    let me = crate::cpu::cpu_id() as usize;
     loop {
-        // Drain all available jobs.
+        // Drain all available jobs, charging their run time as busy.
         while let Some(slot) = crate::smp::pool::take() {
-            crate::smp::pool::run_slot(slot, me);
+            let busy_start = crate::boot::clock::read_tsc();
+            crate::smp::pool::run_slot(slot, me as u32);
+            crate::sched::cpustat::add_busy(
+                me, crate::boot::clock::read_tsc().saturating_sub(busy_start));
         }
-        // No work: sleep until woken.
+        // No work: sleep until woken, charging the halt as idle.
         x86_64::instructions::interrupts::disable();
         if crate::smp::pool::is_empty() {
+            let idle_start = crate::boot::clock::read_tsc();
             // Atomic sti;hlt — the wake IPI cannot land between the two.
             x86_64::instructions::interrupts::enable_and_hlt();
+            crate::sched::cpustat::add_idle(
+                me, crate::boot::clock::read_tsc().saturating_sub(idle_start));
         } else {
             // A job arrived during the drain/disable window; re-enable and loop.
             x86_64::instructions::interrupts::enable();

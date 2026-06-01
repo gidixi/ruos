@@ -80,7 +80,10 @@ pub fn run() -> ! {
         WAKE_PENDING.store(false, Ordering::SeqCst);
         // SAFETY: raw::Executor::poll must be called serially. The
         // kernel is single-threaded and we call it only from here.
+        let poll_start = crate::boot::clock::read_tsc();
         unsafe { exec.poll(); }
+        crate::sched::cpustat::add_busy(
+            0, crate::boot::clock::read_tsc().saturating_sub(poll_start));
 
         // Disable IRQs to atomically check WAKE_PENDING and decide
         // between halt and re-poll. Without the disable, an ISR could
@@ -94,7 +97,10 @@ pub fn run() -> ! {
             // `sti; hlt`: the IRQ that wakes us cannot fire between
             // the two instructions (sti has a 1-instruction shadow).
             // The x86_64 crate exposes this as a safe function.
+            let hlt_start = crate::boot::clock::read_tsc();
             interrupts::enable_and_hlt();
+            crate::sched::cpustat::add_idle(
+                0, crate::boot::clock::read_tsc().saturating_sub(hlt_start));
         }
     }
 }

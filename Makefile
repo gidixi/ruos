@@ -109,7 +109,7 @@ NIC ?= virtio-net-pci
 
 run: iso $(DISK_IMG)
 	qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -m 512 \
-		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
+		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
 
@@ -117,7 +117,7 @@ run-test: $(DISK_IMG)
 	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
 	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
 	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
-		-device qemu-xhci -netdev user,id=net0 -device $(NIC),netdev=net0 \
+		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
 		| tee build/serial.log; \

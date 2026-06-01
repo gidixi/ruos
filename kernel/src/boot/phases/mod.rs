@@ -5,6 +5,7 @@ pub mod arch;
 pub mod mem;
 pub mod interrupts;
 pub mod pci;
+pub mod usb;
 pub mod devices;
 pub mod fs;
 pub mod storage;

@@ -352,7 +352,11 @@ async fn console_drain_task() {
 #[embassy_executor::task]
 async fn pty_watchdog_task() {
     const CHECK_INTERVAL_TICKS: u64 = 1000;  // 10 s @ 100 Hz
-    const IDLE_LIMIT_TICKS:     u64 = 30000; // 5 min @ 100 Hz
+    const IDLE_LIMIT_TICKS:     u64 = 30000; // 5 min @ 100 Hz — backstop for
+                                             // LEAKED pairs only; a live bridge
+                                             // heartbeats touch_activity so a
+                                             // connected idle session is never
+                                             // reaped (see ssh/sunset_io.rs).
     loop {
         delay::Delay::ticks(CHECK_INTERVAL_TICKS).await;
         let now = crate::timer::ticks();

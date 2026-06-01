@@ -7,9 +7,9 @@ use alloc::string::String;
 use core::fmt::Write as _;
 use crate::wasm::state::RuntimeState;
 
-/// Iterations per job — tuned so one job is ~tens of ms (measurable, not too
-/// long for tests).
-const ITERS: u64 = 4_000_000;
+/// Iterations per job — tuned so one job is ~tens of ms under QEMU TCG
+/// (emulated, so kernel-native code is slow): measurable but not test-hostile.
+const ITERS: u64 = 400_000;
 
 /// Fixed input buffer the jobs hash over. `'static` so it can be handed to the
 /// pool. Arbitrary but constant (deterministic result).
@@ -73,13 +73,18 @@ pub fn ruos_smp_bench(
     let parallel_ms = crate::boot::clock::elapsed_ms().saturating_sub(t0);
 
     // --- Sequential: run the same n_jobs inline on the BSP. ---
+    // black_box on the input AND the result so the compiler can't CSE/const-fold
+    // the identical pure calls into one (the parallel path goes through an opaque
+    // fn pointer, so it can't be folded — without black_box the sequential
+    // baseline would collapse to ~0 and the speedup would read 0).
     let t1 = crate::boot::clock::elapsed_ms();
     let mut acc: u64 = 0;
     for _ in 0..n_jobs {
-        acc = acc.wrapping_add(hash_job(&JOB_INPUT));
+        let r = hash_job(core::hint::black_box(&JOB_INPUT));
+        acc = acc.wrapping_add(core::hint::black_box(r));
     }
+    core::hint::black_box(acc);
     let sequential_ms = crate::boot::clock::elapsed_ms().saturating_sub(t1);
-    let _ = acc;
 
     // --- Report. ---
     let speedup_x100 = if parallel_ms == 0 { 0 } else { sequential_ms * 100 / parallel_ms };

@@ -1,9 +1,10 @@
-//! xHCI host controller driver — Task 2: controller bring-up.
+//! xHCI host controller driver — Task 3: TRB ring abstraction + No-Op round-trip.
 //!
 //! Sequence (xHCI 1.2 §4.2): find/enable PCI device, wait CNR, halt, reset,
 //! set MaxSlotsEn, allocate DCBAA + scratchpad + command ring + event ring,
-//! program registers, run.
+//! program registers, run, issue No-Op command, verify Command Completion event.
 pub mod regs;
+pub mod ring;
 
 use crate::memory::dma::{self, DmaRegion};
 use crate::pci;
@@ -177,7 +178,7 @@ pub fn init() {
     crate::binfo!("usb", "xhci up slots={} ports={}", max_slots, max_ports);
 
     // ── 12. Store global handle ───────────────────────────────────────────────
-    let xhci_ctrl = Xhci {
+    let mut x = Xhci {
         regs,
         max_slots,
         max_ports,
@@ -192,7 +193,28 @@ pub fn init() {
         event_cycle:   true,
         event_dequeue: 0,
     };
-    crate::usb::CTRL.call_once(|| crate::sync::IrqMutex::new(Some(xhci_ctrl)));
+
+    // ── 13. Install Link TRB + No-Op round-trip (Task 3) ─────────────────────
+    ring::init_cmd_link(&x);
+    ring::enqueue_cmd(&mut x, [0, 0, 0, 0], ring::TRB_NOOP_CMD);
+    // Wait up to 50 ms for a Command Completion event with Success (code 1).
+    let start = crate::boot::clock::elapsed_ms();
+    let mut ok = false;
+    while crate::boot::clock::elapsed_ms() - start < 50 {
+        if let Some(ev) = ring::poll_event(&mut x) {
+            if ring::trb_type(&ev) == ring::TRB_CMD_COMPLETION {
+                ok = ring::completion_code(&ev) == 1;
+                break;
+            }
+        }
+    }
+    if ok {
+        crate::binfo!("usb", "noop ok");
+    } else {
+        crate::bwarn!("usb", "noop FAIL");
+    }
+
+    crate::usb::CTRL.call_once(|| crate::sync::IrqMutex::new(Some(x)));
 }
 
 pub fn poll() {}

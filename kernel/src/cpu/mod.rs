@@ -3,6 +3,8 @@
 //! x86-64 per-CPU pattern. On 1 CPU only slot 0 (the BSP) is live; the later
 //! AP bring-up phase will call an `init_ap(n)` for the others.
 
+pub mod ap;
+
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::GsBase;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};

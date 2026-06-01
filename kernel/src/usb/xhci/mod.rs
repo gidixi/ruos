@@ -217,7 +217,14 @@ pub fn init() {
     // ── Root port scan + reset (Task 4) ──────────────────────────────────────
     if let Some(port) = crate::usb::device::scan_ports(&mut x) {
         // ── Enable Slot + Address Device (Task 5) ─────────────────────────
-        if let Some(dev) = crate::usb::device::address_device(&mut x, &port) {
+        if let Some(mut dev) = crate::usb::device::address_device(&mut x, &port) {
+            // ── Task 6: Read Device Descriptor (EP0 control-IN) ──────────
+            crate::usb::device::read_device_descriptor(&mut x, &mut dev);
+            // ── Task 7: Config descriptor + HID detect + SET_CONFIGURATION ─
+            let _kb = crate::usb::device::configure(&mut x, &mut dev);
+            if let Some(kb) = _kb {
+                crate::usb::KBD.call_once(|| crate::sync::IrqMutex::new(Some(kb)));
+            }
             crate::usb::DEVICE.call_once(|| crate::sync::IrqMutex::new(Some(dev)));
         }
     }

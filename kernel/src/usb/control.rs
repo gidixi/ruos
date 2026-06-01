@@ -89,3 +89,39 @@ pub fn control_in(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) 
     crate::bwarn!("usb", "control_in timeout (no Transfer Event in 200 ms)");
     None
 }
+
+/// Control transfer with no Data stage (e.g. SET_CONFIGURATION, SET_PROTOCOL).
+/// Pushes Setup(TRT=No Data) + Status(IN, IOC), rings EP0 doorbell, waits.
+pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
+    let w0 = (s.req_type as u32) | ((s.request as u32) << 8) | ((s.value as u32) << 16);
+    let w1 = (s.index as u32) | ((s.length as u32) << 16);
+    // Setup: IDT(bit6) | type 2 | TRT=0 (No Data Stage). word3 bits16..17 = 0.
+    let setup = [w0, w1, 8u32, (1 << 6) | (2 << 10)];
+    // Status for a no-data / OUT transfer is IN (DIR=1), with IOC.
+    let status = [0u32, 0u32, 0u32, (4 << 10) | (1 << 5) | (1 << 16)];
+    crate::usb::xhci::ring::enqueue_xfer(
+        &dev.ep0_ring, &mut dev.ep0_enqueue, &mut dev.ep0_cycle, setup,
+    );
+    crate::usb::xhci::ring::enqueue_xfer(
+        &dev.ep0_ring, &mut dev.ep0_enqueue, &mut dev.ep0_cycle, status,
+    );
+    x.regs.doorbell.update_volatile_at(dev.slot_id as usize, |d| {
+        d.set_doorbell_target(1);
+    });
+    let start = crate::boot::clock::elapsed_ms();
+    while crate::boot::clock::elapsed_ms() - start < 100 {
+        if let Some(ev) = crate::usb::xhci::ring::poll_event(x) {
+            if crate::usb::xhci::ring::trb_type(&ev) == 32 {
+                let code = crate::usb::xhci::ring::completion_code(&ev);
+                if code != 1 {
+                    crate::bwarn!("usb", "control_out code={}", code);
+                    return false;
+                }
+                return true;
+            }
+        }
+        core::hint::spin_loop();
+    }
+    crate::bwarn!("usb", "control_out timeout");
+    false
+}

@@ -273,6 +273,124 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
     })
 }
 
+/// Read the Configuration Descriptor, walk interface/endpoint descriptors to
+/// find the HID boot keyboard interrupt-IN endpoint, then issue SET_CONFIGURATION.
+/// Returns the HidKeyboard descriptor on success.
+pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::HidKeyboard> {
+    let buf = crate::memory::dma::alloc(1)?;
+
+    // ── 1. Read 9-byte config header for wTotalLength + bConfigurationValue ──
+    let s9 = crate::usb::control::Setup {
+        req_type: 0x80,
+        request:  6,
+        value:    0x0200, // Config descriptor, index 0
+        index:    0,
+        length:   9,
+    };
+    if crate::usb::control::control_in(x, dev, s9, &buf)? < 9 {
+        crate::bwarn!("usb", "config header: short read");
+        return None;
+    }
+    let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
+    let total = (rd(2) as u16) | ((rd(3) as u16) << 8);
+    let cfg_val = rd(5);
+    crate::binfo!("usb", "config total={} cfg_val={}", total, cfg_val);
+
+    // ── 2. Read the full config block (capped at 4096) ────────────────────────
+    let total = total.min(4096);
+    let s_all = crate::usb::control::Setup {
+        req_type: 0x80,
+        request:  6,
+        value:    0x0200,
+        index:    0,
+        length:   total,
+    };
+    let n = crate::usb::control::control_in(x, dev, s_all, &buf)?;
+    let n = (n.min(total)) as usize;
+    crate::binfo!("usb", "config read n={}", n);
+
+    // ── 3. Walk descriptors ───────────────────────────────────────────────────
+    let mut pos: usize = 0;
+    // (iface_num, class, subclass, protocol)
+    let mut cur_iface: Option<(u8, u8, u8, u8)> = None;
+    let mut found: Option<crate::usb::hid::HidKeyboard> = None;
+
+    while pos + 2 <= n {
+        let blen = rd(pos) as usize;
+        if blen == 0 || pos + blen > n {
+            break;
+        }
+        let dtype = rd(pos + 1);
+        match dtype {
+            4 => {
+                // Interface descriptor
+                if pos + 9 <= n {
+                    cur_iface = Some((rd(pos + 2), rd(pos + 5), rd(pos + 6), rd(pos + 7)));
+                }
+            }
+            5 => {
+                // Endpoint descriptor
+                if pos + 7 <= n {
+                    if let Some((iface, cls, sub, proto)) = cur_iface {
+                        let addr = rd(pos + 2);
+                        let attr = rd(pos + 3);
+                        let is_in  = (addr & 0x80) != 0;
+                        let is_int = (attr & 0x03) == 3;
+                        if cls == 3 && sub == 1 && proto == 1 && is_in && is_int
+                            && found.is_none()
+                        {
+                            let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
+                            found = Some(crate::usb::hid::HidKeyboard {
+                                iface,
+                                ep_addr:    addr,
+                                max_packet: mps,
+                                interval:   rd(pos + 6),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        pos += blen;
+    }
+
+    match found {
+        Some(kb) => {
+            crate::binfo!(
+                "usb",
+                "HID kbd iface={} ep=0x{:02x} mps={} interval={}",
+                kb.iface, kb.ep_addr, kb.max_packet, kb.interval
+            );
+        }
+        None => {
+            crate::bwarn!("usb", "no HID boot keyboard found");
+            return None;
+        }
+    }
+
+    // ── 4. SET_CONFIGURATION ─────────────────────────────────────────────────
+    let ok = crate::usb::control::control_out(
+        x,
+        dev,
+        crate::usb::control::Setup {
+            req_type: 0x00,
+            request:  9,
+            value:    cfg_val as u16,
+            index:    0,
+            length:   0,
+        },
+    );
+    if ok {
+        crate::binfo!("usb", "slot {} configured", dev.slot_id);
+    } else {
+        crate::bwarn!("usb", "set_config failed");
+        return None;
+    }
+
+    found
+}
+
 /// Read the 18-byte USB Device Descriptor from the addressed device and log
 /// VID, PID, class, max_packet_size0, and number of configurations.
 pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) {

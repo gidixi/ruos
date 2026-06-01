@@ -2,6 +2,7 @@
 //! docs/superpowers/specs/2026-06-01-usb-xhci-hid-design.md.
 pub mod control;
 pub mod device;
+pub mod hid;
 pub mod xhci;
 
 use crate::sync::IrqMutex;
@@ -12,6 +13,9 @@ pub(crate) static CTRL: Once<IrqMutex<Option<xhci::Xhci>>> = Once::new();
 
 /// Global addressed USB device, set once after Enable Slot + Address Device.
 pub(crate) static DEVICE: Once<IrqMutex<Option<device::UsbDevice>>> = Once::new();
+
+/// Global HID boot keyboard endpoint info, set once when a HID keyboard is found.
+pub(crate) static KBD: Once<IrqMutex<Option<hid::HidKeyboard>>> = Once::new();
 
 /// Bring up the xHCI controller and enumerate devices. Non-fatal: logs and
 /// returns if there is no controller or bring-up fails.

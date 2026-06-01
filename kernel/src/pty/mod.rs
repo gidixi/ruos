@@ -31,9 +31,47 @@ pub fn init() {
 pub fn master_input_push(idx: usize, byte: u8) {
     if idx >= NUM_PAIRS { return; }
     let mut g = PAIRS[idx].lock();
-    ldisc::process_input(&mut g, byte);
+    let kill = ldisc::process_input(&mut g, byte);
     drop(g);
+    // `^C` on a foreground app: request its cooperative kill AFTER releasing the
+    // pair lock (request_kill takes the proc REGISTRY lock; keeping the orders
+    // disjoint avoids any pair<->registry deadlock).
+    if let Some(pid) = kill {
+        crate::proc::request_kill(pid);
+    }
     touch_activity(idx);
+}
+
+/// Set (or clear) the foreground app pid for pair `idx`. The exec worker calls
+/// this when it starts a child on a terminal and again (with `None`) when the
+/// child exits, so `^C` knows which process to interrupt.
+pub fn set_foreground(idx: usize, pid: Option<u32>) {
+    if idx >= NUM_PAIRS { return; }
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| { PAIRS[idx].lock().foreground_pid = pid; });
+}
+
+/// Snapshot pair `idx`'s termios so the exec worker can restore it after a
+/// foreground child (which may have switched the terminal to raw) exits.
+pub fn termios_snapshot(idx: usize) -> termios::Termios {
+    use x86_64::instructions::interrupts::without_interrupts;
+    if idx >= NUM_PAIRS { return termios::Termios::default_cooked(); }
+    without_interrupts(|| PAIRS[idx].lock().termios)
+}
+
+/// Overwrite pair `idx`'s termios (used to restore a snapshot).
+pub fn set_termios(idx: usize, t: termios::Termios) {
+    use x86_64::instructions::interrupts::without_interrupts;
+    if idx >= NUM_PAIRS { return; }
+    without_interrupts(|| { PAIRS[idx].lock().termios = t; });
+}
+
+/// Reset pair `idx` to a sane cooked terminal. The exec worker calls this
+/// before running a foreground child so the child gets canonical input + `^C`
+/// signal handling regardless of the shell's raw line-editing mode. Apps that
+/// want raw (rtop, nano) set it themselves via `tcsetattr`.
+pub fn force_cooked(idx: usize) {
+    set_termios(idx, termios::Termios::default_cooked());
 }
 
 /// Non-blocking poll of pair `idx`'s master output. Returns `Some(byte)` if
@@ -134,6 +172,51 @@ pub fn touch_activity(idx: usize) {
 pub fn last_activity(idx: usize) -> u64 {
     if idx >= NUM_PAIRS { return 0; }
     LAST_ACTIVITY[idx].load(Ordering::Relaxed)
+}
+
+/// Read one byte from pair `idx`'s slave (stdin), waiting up to `timeout_ticks`
+/// (100 Hz). Returns the byte (`0..=255`), `-1` on timeout, or `-2` on EOF
+/// (the pair was shut down). Unlike `vfs::read`, this operates directly on the
+/// pair and ALWAYS resolves — no fd-table entry is taken, so an early timeout
+/// never strands the fd. Lets an interactive TUI (rtop) refresh on a clock
+/// while still reacting instantly to keystrokes.
+pub async fn slave_read_one_timeout(idx: usize, timeout_ticks: u64) -> i32 {
+    if idx >= NUM_PAIRS { return -2; }
+    use core::future::Future;
+    let mut delay = core::pin::pin!(crate::executor::delay::Delay::ticks(timeout_ticks));
+    core::future::poll_fn(|cx| {
+        use x86_64::instructions::interrupts::without_interrupts;
+        use core::task::Poll;
+        // First, try to consume a byte (or detect EOF). Register the slave
+        // waker while we hold the lock so a byte arriving right after we look
+        // is guaranteed to wake us.
+        let ready: Option<i32> = without_interrupts(|| {
+            let mut g = PAIRS[idx].lock();
+            if let Some(b) = g.slave_rx.pop_front() {
+                Some(b as i32)
+            } else if SHUTDOWN[idx].load(Ordering::Relaxed)
+                || g.foreground_pid.map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+            {
+                // Pair hung up, or the foreground app was `^C`'d / killed —
+                // report EOF so the reader unwinds and the fiber's kill check
+                // fires.
+                Some(-2)
+            } else {
+                g.slave_waker = Some(cx.waker().clone());
+                None
+            }
+        });
+        if let Some(v) = ready {
+            if v >= 0 { touch_activity(idx); }
+            return Poll::Ready(v);
+        }
+        // No byte yet — arm the timeout. `Delay` registers its own waker; the
+        // future always completes, so it is dropped (freeing its slot) cleanly.
+        if delay.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(-1);
+        }
+        Poll::Pending
+    }).await
 }
 
 /// Future-friendly read of one byte from pair `idx`'s master output.

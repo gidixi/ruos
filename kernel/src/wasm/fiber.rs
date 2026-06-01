@@ -119,10 +119,15 @@ impl Fiber {
         };
 
         let mut outputs: [Val; 0] = [];
+        let burst_start = crate::boot::clock::read_tsc();
         let mut inv = match start.call_resumable(&mut self.store, &[], &mut outputs) {
             Ok(i) => i,
             Err(e) => { kprintln!("ruos: wasm: call_resumable error: {}", e); return Self::error_to_exit(&e); }
         };
+        if let Some(pid) = self.pid {
+            crate::proc::add_cpu_tsc(pid, crate::boot::clock::read_tsc().saturating_sub(burst_start));
+            crate::proc::set_mem_bytes(pid, self.current_mem_bytes());
+        }
 
         loop {
             match inv {
@@ -157,7 +162,13 @@ impl Fiber {
                             let _ = self.store.set_fuel(FUEL_PER_SLICE);
                             let resume_args = [Val::I32(errno)];
                             let mut next_outputs: [Val; 0] = [];
-                            inv = match state.resume(&mut self.store, &resume_args, &mut next_outputs) {
+                            let burst_start = crate::boot::clock::read_tsc();
+                            let resumed = state.resume(&mut self.store, &resume_args, &mut next_outputs);
+                            if let Some(pid) = self.pid {
+                                crate::proc::add_cpu_tsc(pid, crate::boot::clock::read_tsc().saturating_sub(burst_start));
+                                crate::proc::set_mem_bytes(pid, self.current_mem_bytes());
+                            }
+                            inv = match resumed {
                                 Ok(i) => i,
                                 Err(e) => return Self::error_to_exit(&e),
                             };
@@ -258,6 +269,22 @@ impl Fiber {
                         0
                     }
                     Err(_) => 8,
+                }
+            }
+            SuspendReason::ReadStdinTimeout { pty_idx, buf_ptr, timeout_ticks } => {
+                // Direct timed read on the PTY slave. This does NOT go through
+                // `vfs::read`/`with_fd_take` (which removes the fd entry for the
+                // duration and would strand it if the future were dropped on a
+                // timeout). The pty read always resolves: byte (>=0), timeout
+                // (-1), or EOF (-2).
+                let r = crate::pty::slave_read_one_timeout(pty_idx, timeout_ticks).await;
+                if r >= 0 {
+                    let _ = self.write_to_memory(buf_ptr, &[r as u8]);
+                    1
+                } else if r == -2 {
+                    -1 // EOF (stdin closed)
+                } else {
+                    0  // timeout
                 }
             }
             SuspendReason::VfsWrite { fd, bytes, nwritten_ptr } => {
@@ -524,6 +551,15 @@ impl Fiber {
             }
         }
         None
+    }
+
+    /// Current wasm linear-memory size in bytes (0 if no `memory` export).
+    fn current_mem_bytes(&self) -> u64 {
+        self.instance
+            .get_export(&self.store, "memory")
+            .and_then(|e| e.into_memory())
+            .map(|m| m.data(&self.store).len() as u64)
+            .unwrap_or(0)
     }
 
     fn write_to_memory(&mut self, ptr: u32, bytes: &[u8]) -> Result<(), wasmi::Error> {

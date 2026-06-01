@@ -28,7 +28,8 @@ BIN_TOOLS  := shell ls cat echo \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
               service readdirtest \
-              spinloop smptest
+              spinloop smptest \
+              rtop
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
@@ -130,6 +131,8 @@ run-test: $(DISK_IMG)
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
 	grep -qE "readdir-std: [1-9][0-9]* entries" build/serial.log || { echo TEST_FAIL_READDIR; exit 1; }; \
+		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
+		grep -qE "^cpu0:[0-9]+%" build/serial.log || { echo TEST_FAIL_RTOP_CORE; exit 1; }; \
 	echo TEST_PASS
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and
@@ -190,6 +193,18 @@ run-smp-test: iso $(DISK_IMG)
 .PHONY: run-smp2-test
 run-smp2-test: iso ssh-key-on-disk
 	bash tests/smp2-test.sh
+
+# rtop interactive test: runs rtop over SSH, asserts timer-driven auto-refresh
+# (multiple frames while idle) + clean 'q' quit (alt-screen restored).
+.PHONY: run-rtop-test
+run-rtop-test: iso ssh-key-on-disk
+	bash tests/rtop-ssh-test.sh
+
+# Ctrl-C test: runs a long app over SSH, sends ^C, asserts the foreground app
+# is killed and the shell prompt returns (line-discipline VINTR + cooked exec).
+.PHONY: run-ctrlc-test
+run-ctrlc-test: iso ssh-key-on-disk
+	bash tests/ctrlc-ssh-test.sh
 
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk

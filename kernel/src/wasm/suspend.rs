@@ -23,6 +23,11 @@ pub enum SuspendReason {
     SockRecv { handle: SocketHandle, buf_ptr: u32, max_len: usize, nrecv_ptr: u32 },
     SockSend { handle: SocketHandle, bytes: Vec<u8>, nsent_ptr: u32 },
     VfsRead { fd: crate::vfs::Fd, buf_ptr: u32, max_len: usize, nread_ptr: u32 },
+    /// Wait up to `timeout_ticks` (100 Hz) for one byte on `fd`, racing the
+    /// read against a timer. Lets interactive TUIs (rtop) refresh on a clock
+    /// while still responding instantly to keys. The host fn returns 1 (byte
+    /// written to `buf_ptr`), 0 (timeout), or -1 (EOF).
+    ReadStdinTimeout { pty_idx: usize, buf_ptr: u32, timeout_ticks: u64 },
     VfsWrite { fd: crate::vfs::Fd, bytes: Vec<u8>, nwritten_ptr: u32 },
     VfsSeek { fd: crate::vfs::Fd, offset: i64, whence: crate::vfs::Whence, newoffset_ptr: u32 },
     VfsClose { fd: crate::vfs::Fd },

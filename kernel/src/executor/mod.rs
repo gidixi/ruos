@@ -80,7 +80,10 @@ pub fn run() -> ! {
         WAKE_PENDING.store(false, Ordering::SeqCst);
         // SAFETY: raw::Executor::poll must be called serially. The
         // kernel is single-threaded and we call it only from here.
+        let poll_start = crate::boot::clock::read_tsc();
         unsafe { exec.poll(); }
+        crate::sched::cpustat::add_busy(
+            0, crate::boot::clock::read_tsc().saturating_sub(poll_start));
 
         // Disable IRQs to atomically check WAKE_PENDING and decide
         // between halt and re-poll. Without the disable, an ISR could
@@ -94,7 +97,10 @@ pub fn run() -> ! {
             // `sti; hlt`: the IRQ that wakes us cannot fire between
             // the two instructions (sti has a 1-instruction shadow).
             // The x86_64 crate exposes this as a safe function.
+            let hlt_start = crate::boot::clock::read_tsc();
             interrupts::enable_and_hlt();
+            crate::sched::cpustat::add_idle(
+                0, crate::boot::clock::read_tsc().saturating_sub(hlt_start));
         }
     }
 }
@@ -136,7 +142,19 @@ async fn exec_worker_task() {
                             )
                         );
                         child.set_pid(pid);
+                        // Give the child a sane cooked terminal (so `^C` works
+                        // even though the shell runs its line editor in raw
+                        // mode) and mark it foreground so VINTR knows which pid
+                        // to kill. Restore the caller's termios + clear the
+                        // foreground when it exits. Apps wanting raw (rtop,
+                        // nano) switch it themselves and their own guard
+                        // restores cooked before we restore the shell's mode.
+                        let saved_termios = crate::pty::termios_snapshot(slot.term_pts);
+                        crate::pty::force_cooked(slot.term_pts);
+                        crate::pty::set_foreground(slot.term_pts, Some(pid));
                         let code = child.run().await;
+                        crate::pty::set_foreground(slot.term_pts, None);
+                        crate::pty::set_termios(slot.term_pts, saved_termios);
                         crate::proc::unregister(pid);
                         code
                     }

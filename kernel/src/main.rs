@@ -35,6 +35,7 @@ mod ssh;
 mod sync;
 mod cpu;
 mod smp;
+mod sched;
 mod pipe;
 mod service;
 

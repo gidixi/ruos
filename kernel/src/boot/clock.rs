@@ -17,7 +17,7 @@ static TSC_PER_MS: AtomicU64 = AtomicU64::new(0);
 /// Read the TSC. Inline asm; non-serializing (good enough for our
 /// millisecond-granularity logger).
 #[inline(always)]
-fn rdtsc() -> u64 {
+pub fn read_tsc() -> u64 {
     let lo: u32;
     let hi: u32;
     unsafe {
@@ -52,10 +52,10 @@ fn calibrate_tsc_per_ms() -> u64 {
         pit_ch2.write((initial & 0xFF) as u8);
         pit_ch2.write((initial >> 8) as u8);
 
-        let tsc_start = rdtsc();
+        let tsc_start = read_tsc();
         // Wait until PIT bit 5 of port 0x61 is set (one-shot expired).
         while (port_61.read() & 0x20) == 0 {}
-        let tsc_end = rdtsc();
+        let tsc_end = read_tsc();
 
         (tsc_end - tsc_start) / 10  // = TSC per 1 ms
     }
@@ -68,7 +68,7 @@ pub fn init() {
     TSC_PER_MS.store(freq, Ordering::Release);
     // BOOT_TSC stamped *after* calibration; we want elapsed_ms() to
     // start from 0 at the first post-init log, not the calibrate point.
-    BOOT_TSC.store(rdtsc(), Ordering::Release);
+    BOOT_TSC.store(read_tsc(), Ordering::Release);
 }
 
 /// Milliseconds since `init()`.
@@ -76,6 +76,11 @@ pub fn elapsed_ms() -> u64 {
     let freq = TSC_PER_MS.load(Ordering::Acquire);
     if freq == 0 { return 0; }
     let boot = BOOT_TSC.load(Ordering::Acquire);
-    let now = rdtsc();
+    let now = read_tsc();
     now.saturating_sub(boot) / freq
+}
+
+/// Calibrated TSC ticks per millisecond (0 until `init()` runs).
+pub fn tsc_per_ms() -> u64 {
+    TSC_PER_MS.load(Ordering::Acquire)
 }

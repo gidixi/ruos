@@ -26,6 +26,8 @@ free -h
 df -h
 lscpu
 ps
+echo --- rtop batch ---
+rtop --once
 lspci
 ip
 cat /mnt/hello.txt

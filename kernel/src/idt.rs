@@ -37,6 +37,12 @@ pub fn init() {
     idt.load();
 }
 
+/// Load the already-built IDT on the current core (used by APs). `init()` must
+/// have run on the BSP first to build the shared IDT.
+pub fn load() {
+    IDT.get().expect("idt::init() not called before idt::load()").load();
+}
+
 extern "x86-interrupt" fn de_handler(frame: InterruptStackFrame) {
     kprintln!("ruos: #DE at rip=0x{:X}", frame.instruction_pointer.as_u64());
     halt();

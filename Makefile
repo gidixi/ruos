@@ -28,11 +28,11 @@ BIN_TOOLS  := shell ls cat echo \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
               service readdirtest \
-              spinloop
+              spinloop smptest
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test
 
 all: iso
 
@@ -186,6 +186,10 @@ run-fuel-test: iso ssh-key-on-disk
 .PHONY: run-smp-test
 run-smp-test: iso $(DISK_IMG)
 	bash tests/smp-test.sh
+
+.PHONY: run-smp2-test
+run-smp2-test: iso ssh-key-on-disk
+	bash tests/smp2-test.sh
 
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk

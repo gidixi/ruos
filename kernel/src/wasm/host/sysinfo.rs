@@ -11,7 +11,7 @@ const KERNEL_VER:    &str = "wasm-userland";
 const KERNEL_MACH:   &str = "x86_64";
 const KERNEL_NODE:   &str = "ruos";
 
-fn write_bytes_and_len(
+pub(crate) fn write_bytes_and_len(
     mut caller: Caller<'_, RuntimeState>,
     buf_ptr: i32,
     buf_len: i32,

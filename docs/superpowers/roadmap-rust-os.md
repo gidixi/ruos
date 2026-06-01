@@ -364,9 +364,42 @@ Deliverable completati:
 nessun TLB shootdown, nessun task pinned. Gli AP parcheggiano in `hlt`
 in attesa di Fase 2.
 
-**Rimane da fare:**
-- **Fase 2** — Executor SMP-safe: run-queue mpmc o per-CPU + work-stealing,
-  rimozione dell'invariante single-core, IRQ routing e TLB shootdown.
+### Fase 2 — kernel compute offload pool (✅ DONE)
+
+Branch `feature/smp-phase2-executor`. Spec: `docs/superpowers/specs/2026-06-01-smp-phase2-compute-pool-design.md`.
+
+Deliverable completati:
+
+1. **SMP-safe work queue** — coda MPSC (`crossbeam-queue` SegQueue) condivisa tra
+   BSP e AP. Il BSP inserisce job kernel (`SmpJob = Box<dyn FnOnce() + Send>`);
+   ogni AP gira in un busy-poll loop (`ap_worker_loop`) estraendo ed eseguendo job.
+   Nessun `hlt`, nessun STI, nessun preemption sugli AP.
+
+2. **Host function `ruos_smp_bench`** — interfaccia WASM→kernel (modulo `ruos`,
+   fn `smp_bench`) che esegue un benchmark dual-phase: fase parallela (N job CPU
+   distribuiti sulla pool) + fase sequenziale (stessa work sul BSP). Restituisce
+   un report ASCII: `parallel=Xms sequential=Yms speedup=Z.ZZx cores=[a,b,c]`.
+
+3. **Tool WASI `smptest`** — binario `wasm32-wasip1` che invoca `ruos_smp_bench`
+   e stampa il report. Montato in `/bin/smptest.wasm` via ISO.
+
+4. **Speedup reale misurato** — su QEMU `-smp 4` (1 BSP + 3 AP): speedup tipico
+   ~3.3× (es. `parallel=152ms sequential=506ms speedup=3.32x cores=[1,2,3]`).
+   I core `[1,2,3]` confermano che tutti e 3 gli AP hanno eseguito job distinti.
+
+5. **Test integrazione** — `make run-smp2-test` (script `tests/smp2-test.sh`):
+   QEMU `-smp 4`, boot + SSH + `smptest` via PTY, asserisce `speedup >= 1.5x` e
+   `>= 2 core distinti`. Verificato su QEMU (3.32x, 3 core) e VirtualBox con 6
+   vCPU (`5/5 APs online`, banner sha == HEAD, `init.sh complete`, nessun #PF).
+
+**Cosa NON fa Fase 2:** nessun `.wasm` girato sugli AP (solo job kernel), nessun
+IPI-wake (AP usa busy-poll), nessun work-stealing per-CPU, nessun async executor
+multi-core. Il BSP mantiene l'executor cooperativo invariato.
+
+**Rimane da fare (futuro):**
+- **Fase 3** — Executor SMP-safe: run-queue mpmc o per-CPU + work-stealing,
+  IPI-wake per AP idle, routing IRQ su AP, TLB shootdown, esecuzione `.wasm`
+  su AP con WASM runtime thread-safe.
 
 **Componenti:**
 

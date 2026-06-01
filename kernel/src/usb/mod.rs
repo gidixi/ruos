@@ -17,6 +17,10 @@ pub(crate) static DEVICE: Once<IrqMutex<Option<device::UsbDevice>>> = Once::new(
 /// Global HID boot keyboard endpoint info, set once when a HID keyboard is found.
 pub(crate) static KBD: Once<IrqMutex<Option<hid::HidKeyboard>>> = Once::new();
 
+/// Global HID keyboard running state (interrupt ring + report buf), set once
+/// after Configure Endpoint succeeds.
+pub(crate) static HID: Once<IrqMutex<Option<hid::HidState>>> = Once::new();
+
 /// Bring up the xHCI controller and enumerate devices. Non-fatal: logs and
 /// returns if there is no controller or bring-up fails.
 pub fn init() {

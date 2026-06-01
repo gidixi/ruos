@@ -224,6 +224,10 @@ pub fn init() {
             let _kb = crate::usb::device::configure(&mut x, &mut dev);
             if let Some(kb) = _kb {
                 crate::usb::KBD.call_once(|| crate::sync::IrqMutex::new(Some(kb)));
+                // ── Task 8: Configure EP + boot protocol + queue first report ─
+                if let Some(st) = crate::usb::hid::configure_endpoint(&mut x, &mut dev, &kb) {
+                    crate::usb::HID.call_once(|| crate::sync::IrqMutex::new(Some(st)));
+                }
             }
             crate::usb::DEVICE.call_once(|| crate::sync::IrqMutex::new(Some(dev)));
         }

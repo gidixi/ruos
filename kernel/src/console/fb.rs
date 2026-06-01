@@ -49,8 +49,12 @@ pub(crate) static FB_PITCH:      AtomicU32     = AtomicU32::new(0);
 pub(crate) static FB_BPP:        AtomicU32     = AtomicU32::new(0);
 pub(crate) static CURSOR_POS:    AtomicU64     = AtomicU64::new(0);
 pub(crate) static BLINK_COUNTER: AtomicU64     = AtomicU64::new(0);
-// 100 Hz LAPIC timer / 25 = ~4 Hz blink.
-pub(crate) const  BLINK_DIVIDER: u64           = 25;
+// 100 Hz LAPIC timer / 50 = ~2 Hz blink (one blink per ~500 ms — calm,
+// terminal-like). Was /25 = 4 Hz; before the SMP AP-idle fix the busy-spinning
+// APs starved the BSP, so the timer ran below nominal and the cursor looked
+// slow. With APs now hlt-idle the BSP gets the full 100 Hz, exposing the
+// designed-but-fast 4 Hz; 2 Hz reads better.
+pub(crate) const  BLINK_DIVIDER: u64           = 50;
 
 impl FramebufferConsole {
     pub fn new(info: FbInfo, fg: Rgb, bg: Rgb) -> Self {

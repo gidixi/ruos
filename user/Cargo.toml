@@ -17,6 +17,7 @@ members = [
     "readdirtest",
     "spinloop",
     "smptest",
+    "rtop",
 ]
 
 [profile.release]

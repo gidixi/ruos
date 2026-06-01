@@ -41,5 +41,8 @@ pub fn init() -> Result<(), BootError> {
     x86_64::instructions::interrupts::enable();
     crate::binfo!("intr", "STI — interrupts enabled");
 
+    // Start the enumerated APs (Limine MpRequest) and park them idle.
+    crate::smp::bringup();
+
     Ok(())
 }

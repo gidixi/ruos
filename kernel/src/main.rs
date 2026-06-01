@@ -34,6 +34,7 @@ mod rtc;
 mod ssh;
 mod sync;
 mod cpu;
+mod smp;
 mod pipe;
 mod service;
 

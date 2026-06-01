@@ -110,8 +110,14 @@ pub fn ruos_cpuinfo(
         s.extend_from_slice(b"(no brand)");
     }
     s.push(0);
-    // n_cpus — kernel is currently single-CPU.
-    s.extend_from_slice(b"1");
+    // n_cpus = BSP (1) + online APs (Fase 1 SMP bring-up).
+    let n_cpus = 1 + crate::cpu::cpus_online();
+    let mut numbuf = alloc::string::String::new();
+    {
+        use core::fmt::Write as _;
+        let _ = write!(numbuf, "{}", n_cpus);
+    }
+    s.extend_from_slice(numbuf.as_bytes());
     write_bytes_and_len(caller, buf_ptr, buf_len, used_ptr, &s)
 }
 

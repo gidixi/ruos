@@ -1,0 +1,8 @@
+[package]
+name = "smptest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "smptest"
+path = "src/main.rs"

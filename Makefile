@@ -28,7 +28,7 @@ BIN_TOOLS  := shell ls cat echo \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
               service readdirtest \
-              spinloop
+              spinloop smptest
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

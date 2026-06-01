@@ -1,7 +1,9 @@
 //! Application Processor entry point. Limine hands each AP here already in
 //! 64-bit long mode on a Limine-owned stack; we load this core's GDT/TSS and
-//! the shared IDT, register online, then park in `hlt`. Fase 1: no IRQs, no
-//! work — the cooperative executor stays single-core on the BSP.
+//! the shared IDT, register online, then enter a compute WORKER loop (Fase 2).
+//! APs pull pure-CPU jobs from the shared pool and run them on their core;
+//! when the queue is empty they PAUSE-spin (no STI/IPI — APs take no
+//! interrupts in Fase 2, they busy-poll the job queue).
 
 use limine::mp::MpInfo;
 
@@ -18,8 +20,18 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();
-    // Park. No STI: APs receive no interrupts in Fase 1.
+    ap_worker_loop()
+}
+
+/// AP worker loop: take pure-CPU jobs from the pool and run them on this core.
+/// Spin-waits (PAUSE) when there's no work — no STI/IPI in Fase 2, so the AP
+/// polls the queue rather than sleeping on an interrupt.
+fn ap_worker_loop() -> ! {
+    let me = crate::cpu::cpu_id();
     loop {
-        x86_64::instructions::hlt();
+        match crate::smp::pool::take() {
+            Some(slot) => crate::smp::pool::run_slot(slot, me),
+            None => core::hint::spin_loop(),
+        }
     }
 }

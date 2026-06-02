@@ -19,7 +19,7 @@ pub struct GptPartition {
 impl GptPartition {
     pub fn is_esp(&self) -> bool { self.type_guid == TYPE_ESP }
     pub fn is_basic_data(&self) -> bool { self.type_guid == TYPE_MS_BASIC_DATA }
-    pub fn sectors(&self) -> u64 { self.last_lba.saturating_sub(self.first_lba) + 1 }
+    pub fn sectors(&self) -> u64 { self.last_lba.saturating_sub(self.first_lba).saturating_add(1) }
 }
 
 fn rd_u32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o],b[o+1],b[o+2],b[o+3]]) }
@@ -45,7 +45,8 @@ pub fn parse(dev: &mut dyn BlockDevice) -> Option<Vec<GptPartition>> {
     let mut sec = [0u8; 512];
     let sectors_needed = (num + per_sec - 1) / per_sec;
     for s in 0..sectors_needed {
-        if dev.read_blocks(entries_lba + s as u64, &mut sec).is_err() { break; }
+        let Some(lba) = entries_lba.checked_add(s as u64) else { break };
+        if dev.read_blocks(lba, &mut sec).is_err() { break; }
         for i in 0..per_sec {
             let idx = s * per_sec + i;
             if idx >= num { break; }

@@ -82,6 +82,13 @@ impl Bpb {
         let sec = u64::from(self.rsvd_sec_cnt) + off / SECTOR as u64;
         (sec, (off % SECTOR as u64) as usize)
     }
+    /// Highest valid cluster index + 1 (data-cluster count + 2). Saturating so a
+    /// corrupt BPB (data region past the volume) yields a small bound instead of
+    /// underflowing.
+    #[inline] fn max_cluster(&self) -> u32 {
+        ((self.tot_sec32 as u64).saturating_sub(self.data_start_sector())
+            / u64::from(self.sec_per_cluster)).saturating_add(2) as u32
+    }
 }
 
 /// One open file's mutable state.
@@ -104,7 +111,11 @@ impl Inner {
         let mut sec_buf = [0u8; SECTOR];
         let mut cur = start;
         let mut cached_sec: Option<u64> = None;
+        // A valid chain can't exceed the cluster count; a longer walk means a
+        // cyclic/corrupt FAT — bail instead of looping forever (heap-exhaust DoS).
+        let max_clusters = self.bpb.max_cluster() as usize;
         while cur >= 2 && (cur & 0x0FFF_FFFF) < EOC {
+            if out.len() >= max_clusters { return Err(VfsError::IoError); }
             out.push(cur);
             let (sec, off) = self.bpb.fat_entry_loc(cur);
             if cached_sec != Some(sec) {
@@ -148,9 +159,7 @@ impl Inner {
     /// Returns the cluster index. The entry is set to EOC.
     fn alloc_cluster(&mut self) -> Result<u32, VfsError> {
         let mut sec_buf = [0u8; SECTOR];
-        let max_cluster = (self.bpb.tot_sec32 as u64 - self.bpb.data_start_sector())
-            / u64::from(self.bpb.sec_per_cluster) + 2;
-        let max_cluster = max_cluster as u32;
+        let max_cluster = self.bpb.max_cluster();
         for n in 2..max_cluster {
             let (sec, off) = self.bpb.fat_entry_loc(n);
             self.read_sector(sec, &mut sec_buf)?;

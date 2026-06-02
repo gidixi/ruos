@@ -27,7 +27,13 @@ use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 
-const SLOTS: usize = 8;
+// One slot per concurrently-pending `Delay`. Background tasks (net poll, tick,
+// pty watchdog, ssh dispatcher) hold ~4-5 continuously; each interactive app
+// that races a read against a timer (rtop's auto-refresh, nano) holds one more.
+// 8 was too tight — two rtop sessions plus background tasks exhausted it and the
+// old code PANICKED (→ kernel halt → "system frozen"). 64 leaves wide headroom;
+// exhaustion is now non-fatal anyway (see `poll`).
+const SLOTS: usize = 64;
 
 struct Slot {
     target: u64,
@@ -37,9 +43,8 @@ struct Slot {
 
 // One global wake list; each `Delay` future occupies at most one slot
 // at a time (idx + gen is recorded in the future itself).
-static SLOTS_LIST: Mutex<[Option<Slot>; SLOTS]> = Mutex::new([
-    None, None, None, None, None, None, None, None,
-]);
+const NONE_SLOT: Option<Slot> = None; // `Slot` isn't Copy (holds a Waker)
+static SLOTS_LIST: Mutex<[Option<Slot>; SLOTS]> = Mutex::new([NONE_SLOT; SLOTS]);
 
 // Monotonic per-registration counter. u64 means we wrap after ~5.8 * 10^11
 // years at 1 GHz — non-issue.
@@ -122,7 +127,12 @@ impl Future for Delay {
                     return Poll::Pending;
                 }
             }
-            panic!("ruos: delay slots exhausted ({} in use)", SLOTS);
+            // All slots busy: degrade instead of panicking (a panic here halts
+            // the whole kernel — that was the "system frozen" bug). Resolve the
+            // delay immediately; the awaiting task proceeds a little early and
+            // re-arms on its next loop. With 64 slots this is essentially never
+            // reached, but it must never be fatal.
+            Poll::Ready(())
         })
     }
 }

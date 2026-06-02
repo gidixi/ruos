@@ -65,29 +65,25 @@ pub fn control_in(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) 
     });
 
     // ── Wait for Transfer Event (type 32) — up to 200 ms ──────────────────
-    let start = crate::boot::clock::elapsed_ms();
-    while crate::boot::clock::elapsed_ms() - start < 200 {
-        if let Some(ev) = crate::usb::xhci::ring::poll_event(x) {
-            let ty = crate::usb::xhci::ring::trb_type(&ev);
-            if ty == 32 {
-                let code = crate::usb::xhci::ring::completion_code(&ev);
-                // Code 1 = Success, code 13 = Short Packet (also OK for IN)
-                if code != 1 && code != 13 {
-                    crate::bwarn!("usb", "control_in xfer event code={}", code);
-                    return None;
-                }
-                // word2 bits 0..23 = residual transfer length
-                let residual = ev[2] & 0x00FF_FFFF;
-                let actual = s.length.saturating_sub(residual as u16);
-                return Some(actual);
-            }
-            // Ignore other events (e.g. port status change) and keep polling.
-        }
-        core::hint::spin_loop();
+    // Match THIS transfer's completion only: a Transfer Event whose slot id ==
+    // dev.slot_id AND endpoint (DCI) == 1 (EP0). A foreign transfer event (e.g.
+    // a keyboard interrupt report, also type 32) no longer matches → `wait_for`
+    // routes it through the central dispatcher instead of mis-delivering it here.
+    let sid = dev.slot_id;
+    let ev = crate::usb::xhci::event::wait_for(x, 200, |w| {
+        crate::usb::xhci::ring::trb_type(w) == 32
+            && ((w[3] >> 24) & 0xFF) as u8 == sid
+            && ((w[3] >> 16) & 0x1F) as u8 == 1
+    })?;
+    let code = crate::usb::xhci::ring::completion_code(&ev);
+    // Code 1 = Success, code 13 = Short Packet (also OK for IN)
+    if code != 1 && code != 13 {
+        crate::bwarn!("usb", "control_in xfer event code={}", code);
+        return None;
     }
-
-    crate::bwarn!("usb", "control_in timeout (no Transfer Event in 200 ms)");
-    None
+    // word2 bits 0..23 = residual transfer length
+    let residual = ev[2] & 0x00FF_FFFF;
+    Some(s.length.saturating_sub(residual as u16))
 }
 
 /// Control transfer with no Data stage (e.g. SET_CONFIGURATION, SET_PROTOCOL).
@@ -108,20 +104,79 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     x.regs.doorbell.update_volatile_at(dev.slot_id as usize, |d| {
         d.set_doorbell_target(1);
     });
-    let start = crate::boot::clock::elapsed_ms();
-    while crate::boot::clock::elapsed_ms() - start < 100 {
-        if let Some(ev) = crate::usb::xhci::ring::poll_event(x) {
-            if crate::usb::xhci::ring::trb_type(&ev) == 32 {
-                let code = crate::usb::xhci::ring::completion_code(&ev);
-                if code != 1 {
-                    crate::bwarn!("usb", "control_out code={}", code);
-                    return false;
-                }
-                return true;
-            }
+    // Match THIS transfer's completion only (slot == dev.slot_id, DCI == 1/EP0);
+    // foreign transfer events are dispatched by `wait_for`, not consumed here.
+    let sid = dev.slot_id;
+    let ev = match crate::usb::xhci::event::wait_for(x, 100, |w| {
+        crate::usb::xhci::ring::trb_type(w) == 32
+            && ((w[3] >> 24) & 0xFF) as u8 == sid
+            && ((w[3] >> 16) & 0x1F) as u8 == 1
+    }) {
+        Some(e) => e,
+        None => {
+            crate::bwarn!("usb", "control_out timeout");
+            return false;
         }
-        core::hint::spin_loop();
+    };
+    let code = crate::usb::xhci::ring::completion_code(&ev);
+    if code != 1 {
+        crate::bwarn!("usb", "control_out code={}", code);
+        return false;
     }
-    crate::bwarn!("usb", "control_out timeout");
-    false
+    true
+}
+
+// ── Hub class requests (USB 2.0 §11.24) ─────────────────────────────────────
+// These operate on the hub's own EP0 (`dev` = the hub's UsbDevice). The class
+// constants live here so the hub driver builds Setup packets symbolically.
+
+/// GET_DESCRIPTOR(Hub): bmRequestType=0xA0 (Dev→Host,Class,Device), wValue=0x2900
+/// (descriptor type 0x29, index 0). 71 = max hub-descriptor length (255-port DR).
+pub fn get_hub_descriptor(x: &mut Xhci, dev: &mut UsbDevice, buf: &DmaRegion) -> Option<u16> {
+    control_in(
+        x,
+        dev,
+        Setup { req_type: 0xA0, request: 6, value: 0x2900, index: 0, length: 71 },
+        buf,
+    )
+}
+
+/// GET_STATUS(port): bmRequestType=0xA3 (Dev→Host,Class,Other), 4 data bytes =
+/// wPortStatus (LE u16 @0) + wPortChange (LE u16 @2). Returns (status, change).
+pub fn get_port_status(
+    x: &mut Xhci,
+    dev: &mut UsbDevice,
+    port: u8,
+    buf: &DmaRegion,
+) -> Option<(u16, u16)> {
+    control_in(
+        x,
+        dev,
+        Setup { req_type: 0xA3, request: 0, value: 0, index: port as u16, length: 4 },
+        buf,
+    )?;
+    let p = buf.virt.as_ptr::<u8>();
+    // SAFETY: 4-byte read from a DMA page that just received >=4 bytes.
+    let st = unsafe { (*p as u16) | ((*p.add(1) as u16) << 8) };
+    let ch = unsafe { (*p.add(2) as u16) | ((*p.add(3) as u16) << 8) };
+    Some((st, ch))
+}
+
+/// SET_FEATURE(port, feature): bmRequestType=0x23 (Host→Dev,Class,Other),
+/// bRequest=3, wValue=feature, wIndex=port. No data stage.
+pub fn set_port_feature(x: &mut Xhci, dev: &mut UsbDevice, port: u8, feat: u16) -> bool {
+    control_out(
+        x,
+        dev,
+        Setup { req_type: 0x23, request: 3, value: feat, index: port as u16, length: 0 },
+    )
+}
+
+/// CLEAR_FEATURE(port, feature): like SET_FEATURE but bRequest=1.
+pub fn clear_port_feature(x: &mut Xhci, dev: &mut UsbDevice, port: u8, feat: u16) -> bool {
+    control_out(
+        x,
+        dev,
+        Setup { req_type: 0x23, request: 1, value: feat, index: port as u16, length: 0 },
+    )
 }

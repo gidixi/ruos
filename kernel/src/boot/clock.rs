@@ -31,33 +31,74 @@ pub fn read_tsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Calibrate TSC against PIT channel 2 by measuring TSC delta over 10 ms.
+/// TSC ticks per millisecond. Tries CPUID first (works without the PIT, which
+/// real UEFI machines often gate off — polling it then hangs forever), then a
+/// **bounded** PIT measurement, then a safe default. NEVER hangs.
 fn calibrate_tsc_per_ms() -> u64 {
+    if let Some(hz) = tsc_hz_from_cpuid() {
+        return hz / 1000;
+    }
+    if let Some(per_ms) = calibrate_pit_bounded() {
+        return per_ms;
+    }
+    // Last resort: assume 2 GHz. The boot clock is then approximate — only
+    // affects log timestamps + bounded-wait scaling, never correctness.
+    crate::kprintln!("ruos: TSC calibration fell back to 2GHz default");
+    2_000_000
+}
+
+/// TSC frequency (Hz) from CPUID, or None if the CPU doesn't report it.
+/// Leaf 0x15: TSC = crystal_hz * ratio_num / ratio_den. Leaf 0x16: base MHz.
+fn tsc_hz_from_cpuid() -> Option<u64> {
+    use core::arch::x86_64::__cpuid;
+    // SAFETY: CPUID is always available on x86-64; leaf 0 gives the max leaf.
+    let max_leaf = unsafe { __cpuid(0) }.eax;
+    if max_leaf >= 0x15 {
+        let r = unsafe { __cpuid(0x15) };
+        // eax = ratio denominator, ebx = numerator, ecx = core crystal Hz.
+        if r.eax != 0 && r.ebx != 0 && r.ecx != 0 {
+            return Some((r.ecx as u64) * (r.ebx as u64) / (r.eax as u64));
+        }
+    }
+    if max_leaf >= 0x16 {
+        let r = unsafe { __cpuid(0x16) };
+        // eax = base frequency in MHz (TSC runs at base freq on modern Intel).
+        if r.eax != 0 {
+            return Some((r.eax as u64) * 1_000_000);
+        }
+    }
+    None
+}
+
+/// Bounded PIT-channel-2 measurement of TSC ticks/ms. Returns None if the PIT
+/// one-shot never signals within a generous TSC-cycle cap (i.e. the PIT is
+/// dead/gated) instead of spinning forever.
+fn calibrate_pit_bounded() -> Option<u64> {
     use x86_64::instructions::port::Port;
-    // Enable PIT channel 2 (speaker gate, but we only read counter).
     let mut port_61: Port<u8> = Port::new(0x61);
     let mut pit_mode: Port<u8> = Port::new(0x43);
     let mut pit_ch2: Port<u8> = Port::new(0x42);
-
+    // Cap the spin: 10ms even at a 100 GHz TSC is 1e9 cycles; 8e9 is a huge
+    // margin that still bounds the loop on a dead PIT (~a couple seconds max).
+    const CYCLE_CAP: u64 = 8_000_000_000;
     unsafe {
-        // Disable speaker, enable gate (bit 0 = gate on for ch2).
         let v = port_61.read();
-        port_61.write((v & !0x02) | 0x01);
-
-        // Mode 0 (one-shot), binary, ch2.
-        pit_mode.write(0xB0);
-
-        // Load counter = 1193182 * 10 / 1000 = 11932 (10 ms at 1.193182 MHz).
-        let initial: u16 = 11932;
+        port_61.write((v & !0x02) | 0x01); // speaker off, ch2 gate on
+        pit_mode.write(0xB0);              // ch2, lobyte/hibyte, mode 0 (one-shot)
+        let initial: u16 = 11932;          // 10 ms at 1.193182 MHz
         pit_ch2.write((initial & 0xFF) as u8);
         pit_ch2.write((initial >> 8) as u8);
 
         let tsc_start = read_tsc();
-        // Wait until PIT bit 5 of port 0x61 is set (one-shot expired).
-        while (port_61.read() & 0x20) == 0 {}
+        loop {
+            if port_61.read() & 0x20 != 0 { break; } // one-shot expired (OUT high)
+            if read_tsc().wrapping_sub(tsc_start) > CYCLE_CAP {
+                return None; // PIT never fired — dead/gated; don't hang
+            }
+            core::hint::spin_loop();
+        }
         let tsc_end = read_tsc();
-
-        (tsc_end - tsc_start) / 10  // = TSC per 1 ms
+        Some((tsc_end - tsc_start) / 10)
     }
 }
 

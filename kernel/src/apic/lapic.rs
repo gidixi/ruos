@@ -10,7 +10,6 @@
 //!   TIMER_DIV   0x3E0 divide configuration
 
 use core::ptr::{read_volatile, write_volatile};
-use x86_64::instructions::port::Port;
 
 const REG_EOI:        u32 = 0xB0;
 const REG_SVR:        u32 = 0xF0;
@@ -85,37 +84,31 @@ pub fn send_ipi_all_but_self(vector: u8) {
     }
 }
 
-/// Calibrate by running the PIT for `pit_ms` ms (one-shot mode) and counting
-/// LAPIC timer ticks elapsed. Returns LAPIC ticks per `pit_ms` ms.
-pub fn calibrate(pit_ms: u32) -> u32 {
-    const PIT_FREQ_HZ: u32 = 1_193_182;
-    let pit_count: u16 = ((PIT_FREQ_HZ as u64 * pit_ms as u64) / 1000) as u16;
-
-    let mut pit_cmd:  Port<u8> = Port::new(0x43);
-    let mut pit_ch0:  Port<u8> = Port::new(0x40);
-
-    // SAFETY: ports 0x40/0x43 control the PIT.
+/// Calibrate the LAPIC timer: run it at max count for `ms` milliseconds measured
+/// via the **TSC-based boot clock** and return the LAPIC ticks elapsed.
+///
+/// Uses the TSC (calibrated from CPUID in `boot::clock::init`, which runs before
+/// the interrupts phase) instead of the PIT: real UEFI machines often gate the
+/// PIT off, and polling it then hangs the boot forever. The busy-wait is bounded
+/// by the monotonic boot clock.
+pub fn calibrate(ms: u32) -> u32 {
+    // TSC-cycle-precise window (elapsed_ms has 1ms granularity → ~10% error
+    // over a 10ms window). tsc_per_ms is set in boot::clock::init (CPUID or
+    // bounded-PIT fallback), always nonzero by the interrupts phase.
+    let target = crate::boot::clock::tsc_per_ms().saturating_mul(ms as u64);
+    // SAFETY: init ran; LAPIC timer registers are valid.
     unsafe {
-        // PIT channel 0, lobyte/hibyte, mode 0 (interrupt on terminal count).
-        pit_cmd.write(0b0011_0000);
-        pit_ch0.write((pit_count & 0xFF) as u8);
-        pit_ch0.write((pit_count >> 8) as u8);
-
-        // Start LAPIC timer with max count, one-shot (clear periodic bit).
-        write_volatile(reg(REG_LVT_TIMER), TIMER_MASKED); // masked one-shot
+        // Start LAPIC timer at max count, masked one-shot.
+        write_volatile(reg(REG_LVT_TIMER), TIMER_MASKED);
         write_volatile(reg(REG_TIMER_INIT), 0xFFFF_FFFF);
 
-        // Poll PIT until it reaches zero.
-        loop {
-            pit_cmd.write(0b1110_0010); // read-back channel 0 status
-            let status = pit_ch0.read();
-            if status & 0x80 != 0 { break; }
+        let t0 = crate::boot::clock::read_tsc();
+        while crate::boot::clock::read_tsc().wrapping_sub(t0) < target {
+            core::hint::spin_loop();
         }
 
         let remaining = read_volatile(reg(REG_TIMER_CUR));
-        // Stop LAPIC counter.
-        write_volatile(reg(REG_TIMER_INIT), 0);
-
+        write_volatile(reg(REG_TIMER_INIT), 0); // stop
         0xFFFF_FFFF - remaining
     }
 }

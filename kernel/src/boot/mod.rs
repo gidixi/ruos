@@ -16,9 +16,13 @@ pub fn run() -> Result<core::convert::Infallible, BootError> {
     phases::mem::init()?;
     phases::interrupts::init()?;
     phases::pci::init()?;
-    phases::usb::init()?;
     phases::devices::init()?;
     phases::fs::init()?;
     phases::storage::init()?;
+    // USB after the framebuffer console (devices) so its bring-up logs are
+    // VISIBLE on real hardware (no serial there). USB only needs PCI; it does
+    // not depend on devices/fs/storage. Must still precede userland (the
+    // executor that runs usb_poll_task).
+    phases::usb::init()?;
     phases::userland::init()
 }

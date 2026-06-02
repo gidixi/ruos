@@ -5,6 +5,7 @@
 //! program registers, run, issue No-Op command, verify Command Completion event.
 pub mod regs;
 pub mod ring;
+pub mod event;
 
 use crate::memory::dma::{self, DmaRegion};
 use crate::pci;
@@ -39,6 +40,50 @@ fn wait_ms<F: Fn() -> bool>(predicate: F, timeout_ms: u64) -> bool {
     }
 }
 
+/// Take xHCI ownership from the BIOS and silence its legacy SMIs (real hardware).
+///
+/// Walks the xHCI Extended Capability list (raw MMIO) for the USB Legacy Support
+/// capability (id 1). If the firmware owns the controller, set the OS-owned
+/// semaphore and wait (bounded) for the BIOS to release; then write USBLEGCTLSTS
+/// = 0xE000_0000 — all SMI enables cleared, all three RW1C SMI status bits
+/// written-1-to-clear — so the firmware can no longer raise legacy SMIs and stall
+/// the machine. `bar_virt` is the HHDM virtual address of xHCI BAR0. No-op on
+/// controllers without extended capabilities (e.g. QEMU's qemu-xhci).
+fn bios_handoff(bar_virt: u64) {
+    use core::ptr::{read_volatile, write_volatile};
+    // HCCPARAMS1 @ capability offset 0x10; xECP = bits 31:16, in dwords.
+    let hcc1 = unsafe { read_volatile((bar_virt + 0x10) as *const u32) };
+    let xecp = ((hcc1 >> 16) & 0xFFFF) as u64;
+    if xecp == 0 { return; }
+    let mut cap = bar_virt + xecp * 4;
+    // Bounded walk (guard against a malformed/looping list on bad hardware).
+    for _ in 0..64 {
+        let dw = unsafe { read_volatile(cap as *const u32) };
+        let id = dw & 0xFF;
+        let next = ((dw >> 8) & 0xFF) as u64; // dwords to next cap
+        if id == 1 {
+            // USBLEGSUP @ cap, USBLEGCTLSTS @ cap+4.
+            // Request OS ownership (bit 24).
+            unsafe { write_volatile(cap as *mut u32, dw | (1 << 24)); }
+            // Wait (bounded 100 ms) for the BIOS-owned semaphore (bit 16) to clear.
+            let deadline = crate::boot::clock::elapsed_ms() + 100;
+            while crate::boot::clock::elapsed_ms() < deadline {
+                if unsafe { read_volatile(cap as *const u32) } & (1 << 16) == 0 { break; }
+                core::hint::spin_loop();
+            }
+            // Force OS-owned + BIOS-not-owned regardless of timeout (best effort).
+            let v = unsafe { read_volatile(cap as *const u32) };
+            unsafe { write_volatile(cap as *mut u32, (v | (1 << 24)) & !(1 << 16)); }
+            // Disable ALL legacy SMIs + clear the RW1C SMI status bits (29..31).
+            unsafe { write_volatile((cap + 4) as *mut u32, 0xE000_0000); }
+            crate::binfo!("usb", "xhci BIOS->OS handoff done");
+            return;
+        }
+        if next == 0 { break; }
+        cap += next * 4;
+    }
+}
+
 /// Bring up the xHCI controller. Non-fatal: logs a warning and returns on any
 /// error so that a missing/broken controller does not hang the system.
 pub fn init() {
@@ -49,7 +94,7 @@ pub fn init() {
     };
     dev.enable_mmio();
     dev.enable_bus_master();
-    let (base, _size) = match dev.bar(0) {
+    let (base, size) = match dev.bar(0) {
         Some(pci::Bar::Memory64 { address, size, .. }) => (address, size as usize),
         Some(pci::Bar::Memory32 { address, size, .. }) => (address as u64, size as usize),
         other => { crate::bwarn!("usb", "xhci bar0 unexpected: {:?}", other); return; }
@@ -60,6 +105,18 @@ pub fn init() {
     let mut regs = unsafe {
         ::xhci::Registers::new(base as usize, HhdmMapper)
     };
+
+    // ── 1b. BIOS→OS handoff + disable legacy SMIs (real hardware) ─────────────
+    // On real HW the firmware owns the xHCI (USB legacy keyboard/boot support);
+    // resetting/running it while the BIOS still owns it — with its SMI handler
+    // active — makes SMM fight us for the controller and the machine FREEZES
+    // (SMM preempts the OS, so our bounded waits can't save us). QEMU exposes no
+    // extended capabilities / no SMM, so this is a no-op there. Map the whole
+    // BAR first so the extended-capability list (which can sit outside the
+    // register blocks the crate mapped) is reachable.
+    if let Ok(bar_virt) = crate::memory::mapper::map_io_range(x86_64::PhysAddr::new(base), size) {
+        bios_handoff(bar_virt.as_u64());
+    }
 
     let hcs1     = regs.capability.hcsparams1.read_volatile();
     let hcs2     = regs.capability.hcsparams2.read_volatile();
@@ -214,22 +271,17 @@ pub fn init() {
         crate::bwarn!("usb", "noop FAIL");
     }
 
-    // ── Root port scan + reset (Task 4) ──────────────────────────────────────
-    if let Some(port) = crate::usb::device::scan_ports(&mut x) {
-        // ── Enable Slot + Address Device (Task 5) ─────────────────────────
-        if let Some(mut dev) = crate::usb::device::address_device(&mut x, &port) {
-            // ── Task 6: Read Device Descriptor (EP0 control-IN) ──────────
-            crate::usb::device::read_device_descriptor(&mut x, &mut dev);
-            // ── Task 7: Config descriptor + HID detect + SET_CONFIGURATION ─
-            let _kb = crate::usb::device::configure(&mut x, &mut dev);
-            if let Some(kb) = _kb {
-                crate::usb::KBD.call_once(|| crate::sync::IrqMutex::new(Some(kb)));
-                // ── Task 8: Configure EP + boot protocol + queue first report ─
-                if let Some(st) = crate::usb::hid::configure_endpoint(&mut x, &mut dev, &kb) {
-                    crate::usb::HID.call_once(|| crate::sync::IrqMutex::new(Some(st)));
-                }
-            }
-            crate::usb::DEVICE.call_once(|| crate::sync::IrqMutex::new(Some(dev)));
+    // ── Seed the worklist: one RootPortChanged per connected root port ───────
+    // Enumeration itself runs on the first `poll()` after the executor starts —
+    // init must not block on per-device control transfers.
+    for port in 1..=x.max_ports {
+        let connected = x.regs.port_register_set
+            .read_volatile_at((port - 1) as usize)
+            .portsc.current_connect_status();
+        if connected {
+            crate::usb::registry::push_action(
+                crate::usb::registry::UsbAction::RootPortChanged(port),
+            );
         }
     }
 
@@ -238,22 +290,63 @@ pub fn init() {
 
 pub fn poll() {
     let ctrl_cell = match crate::usb::CTRL.get() { Some(c) => c, None => return };
-    let hid_cell  = match crate::usb::HID.get()  { Some(h) => h, None => return };
-    // Lock order: CTRL first, then HID — consistent with init(); no deadlock.
-    let mut ctrl_g = ctrl_cell.lock();
-    let x = match ctrl_g.as_mut() { Some(x) => x, None => return };
-    // Drain all pending events.
-    loop {
-        let ev = match ring::poll_event(x) { Some(e) => e, None => break };
-        if ring::trb_type(&ev) == 32 { // Transfer Event (xHCI spec type 32)
-            let slot = ((ev[3] >> 24) & 0xFF) as u8;
-            let epid = ((ev[3] >> 16) & 0x1F) as u8;
-            let mut hid_g = hid_cell.lock();
-            if let Some(st) = hid_g.as_mut() {
-                if st.slot_id == slot && st.dci == epid {
-                    crate::usb::hid::on_report(x, st);
+    let mut g = ctrl_cell.lock();
+    let x = match g.as_mut() { Some(x) => x, None => return };
+    // Drain every pending event through the central dispatcher (routes Transfer
+    // Events to slot handlers + Port Status Change to the worklist).
+    while let Some(ev) = ring::poll_event(x) {
+        event::dispatch(x, ev);
+    }
+    // Then drain the connect/disconnect worklist (port-change events queued above,
+    // plus the root ports seeded at init). Enumeration runs here, not at init.
+    while let Some(a) = crate::usb::registry::pop_action() {
+        handle_action(x, a);
+    }
+}
+
+/// Act on one worklist item: reset + enumerate newly-connected devices. Runs with
+/// the controller (`x`) locked but the SLOTS lock free — `enumerate` only locks
+/// SLOTS for its final `insert`, never across a command/event drain.
+fn handle_action(x: &mut Xhci, a: crate::usb::registry::UsbAction) {
+    use crate::usb::registry::UsbAction;
+    match a {
+        UsbAction::RootPortChanged(p) => {
+            let portsc = x.regs.port_register_set
+                .read_volatile_at((p - 1) as usize).portsc;
+            let connected = portsc.current_connect_status();
+            // Clear the connect-status-change (CSC) RW1C bit, preserving the other
+            // change bits (set_0_* keeps them 0 in the written value so a plain
+            // read-modify-write does not accidentally clear them).
+            x.regs.port_register_set.update_volatile_at((p - 1) as usize, |r| {
+                r.portsc.clear_connect_status_change();
+                r.portsc.set_0_port_enabled_disabled();
+                r.portsc.set_0_port_enabled_disabled_change();
+                r.portsc.set_0_warm_port_reset_change();
+                r.portsc.set_0_over_current_change();
+                r.portsc.set_0_port_reset_change();
+                r.portsc.set_0_port_link_state_change();
+                r.portsc.set_0_port_config_error_change();
+            });
+            let existing = crate::usb::registry::find_root(p);
+            match (connected, existing) {
+                // Newly connected, not yet enumerated → reset + enumerate.
+                (true, None) => {
+                    if let Some(speed) = crate::usb::device::reset_root_port(x, p) {
+                        let loc = crate::usb::device::Location {
+                            root_port: p, route: 0, tier: 0, speed,
+                            parent_slot: 0, parent_port: 0, tt: false,
+                        };
+                        let _ = crate::usb::device::enumerate(x, loc);
+                    }
                 }
+                // Disconnected with a live root slot → tear it down (+ children).
+                (false, Some(slot)) => { crate::usb::registry::teardown(x, slot); }
+                // Already-present connect, or empty disconnect: nothing to do.
+                _ => {}
             }
+        }
+        UsbAction::HubPortChanged { hub_slot, port } => {
+            crate::usb::hub::handle_port(x, hub_slot, port);
         }
     }
 }

@@ -66,24 +66,12 @@ pub fn init_link(virt: x86_64::VirtAddr, phys: u64, cycle: bool) {
 /// Poll for a Command Completion event TRB (type 33) up to `CMD_TIMEOUT_MS`.
 /// Returns Some(words) on success, None on timeout.
 ///
-/// ASSUMPTION (MVP): boot enumeration is strictly serial — one command in
-/// flight at a time and no concurrent transfers — so any non-CommandCompletion
-/// event seen here (a stray Port Status Change, etc.) is discarded and its slot
-/// consumed. Safe today because nothing else drives the rings during bring-up;
-/// a future concurrent design must route unexpected events instead of dropping.
+/// Routes every non-CommandCompletion event seen while waiting through the
+/// central dispatcher (`event::wait_for`) instead of dropping it, so concurrent
+/// transfers / port-status changes during enumeration are not lost. Kept here
+/// (name + signature) so existing callers compile unchanged.
 pub fn wait_cmd(x: &mut Xhci) -> Option<[u32; 4]> {
-    let deadline = crate::boot::clock::elapsed_ms() + CMD_TIMEOUT_MS;
-    loop {
-        if let Some(ev) = poll_event(x) {
-            if trb_type(&ev) == TRB_CMD_COMPLETION {
-                return Some(ev);
-            }
-        }
-        if crate::boot::clock::elapsed_ms() >= deadline {
-            return None;
-        }
-        core::hint::spin_loop();
-    }
+    super::event::wait_for(x, CMD_TIMEOUT_MS, |w| trb_type(w) == TRB_CMD_COMPLETION)
 }
 
 /// Install the Link TRB at LINK_IDX on the command ring (points to ring start,

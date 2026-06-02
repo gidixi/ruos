@@ -220,6 +220,18 @@ run-ssh-idle-test: iso ssh-key-on-disk
 run-usb-key-test: iso
 	bash tests/usb-key-test.sh
 
+# USB hub test: a keyboard behind a usb-hub at boot must enumerate (route string
+# + recursive enumeration) and type — proves the hub class driver.
+.PHONY: run-usb-hub-test
+run-usb-hub-test: iso
+	bash tests/usb-hub-test.sh
+
+# USB hot-plug test: QMP device_add/device_del a usb-kbd at runtime — it must
+# enumerate + type after add (Port Status Change Event) and tear down after del.
+.PHONY: run-usb-hotplug-test
+run-usb-hotplug-test: iso
+	bash tests/usb-hotplug-test.sh
+
 .PHONY: run-passwd-test
 run-passwd-test: iso passwd-on-disk
 	RUOS_PASSWORD='$(RUOS_PASSWORD)' bash tests/ssh-passwd-test.sh

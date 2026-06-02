@@ -115,3 +115,58 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     }
     true
 }
+
+// ── Hub class requests (USB 2.0 §11.24) ─────────────────────────────────────
+// These operate on the hub's own EP0 (`dev` = the hub's UsbDevice). The class
+// constants live here so the hub driver builds Setup packets symbolically.
+
+/// GET_DESCRIPTOR(Hub): bmRequestType=0xA0 (Dev→Host,Class,Device), wValue=0x2900
+/// (descriptor type 0x29, index 0). 71 = max hub-descriptor length (255-port DR).
+pub fn get_hub_descriptor(x: &mut Xhci, dev: &mut UsbDevice, buf: &DmaRegion) -> Option<u16> {
+    control_in(
+        x,
+        dev,
+        Setup { req_type: 0xA0, request: 6, value: 0x2900, index: 0, length: 71 },
+        buf,
+    )
+}
+
+/// GET_STATUS(port): bmRequestType=0xA3 (Dev→Host,Class,Other), 4 data bytes =
+/// wPortStatus (LE u16 @0) + wPortChange (LE u16 @2). Returns (status, change).
+pub fn get_port_status(
+    x: &mut Xhci,
+    dev: &mut UsbDevice,
+    port: u8,
+    buf: &DmaRegion,
+) -> Option<(u16, u16)> {
+    control_in(
+        x,
+        dev,
+        Setup { req_type: 0xA3, request: 0, value: 0, index: port as u16, length: 4 },
+        buf,
+    )?;
+    let p = buf.virt.as_ptr::<u8>();
+    // SAFETY: 4-byte read from a DMA page that just received >=4 bytes.
+    let st = unsafe { (*p as u16) | ((*p.add(1) as u16) << 8) };
+    let ch = unsafe { (*p.add(2) as u16) | ((*p.add(3) as u16) << 8) };
+    Some((st, ch))
+}
+
+/// SET_FEATURE(port, feature): bmRequestType=0x23 (Host→Dev,Class,Other),
+/// bRequest=3, wValue=feature, wIndex=port. No data stage.
+pub fn set_port_feature(x: &mut Xhci, dev: &mut UsbDevice, port: u8, feat: u16) -> bool {
+    control_out(
+        x,
+        dev,
+        Setup { req_type: 0x23, request: 3, value: feat, index: port as u16, length: 0 },
+    )
+}
+
+/// CLEAR_FEATURE(port, feature): like SET_FEATURE but bRequest=1.
+pub fn clear_port_feature(x: &mut Xhci, dev: &mut UsbDevice, port: u8, feat: u16) -> bool {
+    control_out(
+        x,
+        dev,
+        Setup { req_type: 0x23, request: 1, value: feat, index: port as u16, length: 0 },
+    )
+}

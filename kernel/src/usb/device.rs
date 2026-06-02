@@ -281,17 +281,20 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
     };
 
     // ── 8. Device descriptor (for bDeviceClass) + class dispatch ─────────────
+    // Hub class (0x09) is checked FIRST: a hub does its OWN config-descriptor
+    // walk + SET_CONFIGURATION in `hub::setup` (it must enable the hub's status
+    // endpoint, not look for a HID keyboard). Only non-hubs run the HID-only
+    // `configure` path (which would otherwise read config + log "no HID kbd").
     let dev_class = read_device_descriptor(x, &mut dev).unwrap_or(0);
-    let kb = configure(x, &mut dev);
 
-    let kind = if let Some(kb) = kb {
-        // HID boot keyboard: configure its interrupt-IN endpoint + queue a report.
-        let st = crate::usb::hid::configure_endpoint(x, &mut dev, &kb)?;
-        crate::usb::registry::SlotKind::Keyboard(st)
-    } else if dev_class == 0x09 {
+    let kind = if dev_class == 0x09 {
         // USB hub (QEMU usb-hub reports class 9 on the device descriptor).
         let hs = crate::usb::hub::setup(x, slot_id, &mut dev, &loc)?;
         crate::usb::registry::SlotKind::Hub(hs)
+    } else if let Some(kb) = configure(x, &mut dev) {
+        // HID boot keyboard: configure its interrupt-IN endpoint + queue a report.
+        let st = crate::usb::hid::configure_endpoint(x, &mut dev, &kb)?;
+        crate::usb::registry::SlotKind::Keyboard(st)
     } else {
         crate::usb::registry::SlotKind::Other
     };

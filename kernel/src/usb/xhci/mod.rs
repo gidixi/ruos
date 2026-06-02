@@ -269,8 +269,8 @@ fn handle_action(x: &mut Xhci, a: crate::usb::registry::UsbAction) {
             }
             // (disconnect handling added in Task 5)
         }
-        UsbAction::HubPortChanged { .. } => {
-            // (hub handling added in Task 4)
+        UsbAction::HubPortChanged { hub_slot, port } => {
+            crate::usb::hub::handle_port(x, hub_slot, port);
         }
     }
 }

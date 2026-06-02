@@ -109,19 +109,39 @@ pub fn teardown(x: &mut crate::usb::xhci::Xhci, slot: u8) {
     // Remove the entry under the lock, take ownership of its DMA to free after.
     let entry = SLOTS.lock()[slot as usize].take();
     let entry = match entry { Some(e) => e, None => return };
-    // Disable Slot (cmd type 10): slot id in word3 bits 24..31.
+    // Disable Slot (cmd type 10): slot id in word3 bits 24..31. We must know
+    // whether it SUCCEEDED before freeing the slot's DMA: if Disable Slot times
+    // out or returns a non-success code the controller may still hold these phys
+    // addresses (and have a pending interrupt-IN transfer), so freeing the frames
+    // would be a use-after-free (the frame gets reused + DMA-corrupted). Only free
+    // on success (completion code 1); on failure leak the DMA — leaking is safe,
+    // UAF is not. Either way the slot is gone from our tracking, so clear DCBAA
+    // and drop the entry (already taken above) in both cases.
     crate::usb::xhci::ring::enqueue_cmd(x, [0, 0, 0, (slot as u32) << 24], 10);
-    let _ = crate::usb::xhci::ring::wait_cmd(x); // best-effort; ignore code
-    // Clear DCBAA[slot].
+    let ok = matches!(
+        crate::usb::xhci::ring::wait_cmd(x),
+        Some(ev) if crate::usb::xhci::ring::completion_code(&ev) == 1
+    );
+    // Clear DCBAA[slot] regardless (the slot is gone from our tracking).
     unsafe { x.dcbaa.virt.as_mut_ptr::<u64>().add(slot as usize).write_volatile(0); }
-    // Free DMA: dev contexts/ring + kind-specific.
-    dma::dealloc(entry.dev.ep0_ring);
-    dma::dealloc(entry.dev.input_ctx);
-    dma::dealloc(entry.dev.dev_ctx);
-    match entry.kind {
-        SlotKind::Hub(h) => { dma::dealloc(h.int_ring); dma::dealloc(h.change_buf); }
-        SlotKind::Keyboard(k) => { dma::dealloc(k.int_ring); dma::dealloc(k.report); }
-        SlotKind::Other => {}
+    if ok {
+        // Free DMA: dev contexts/ring + kind-specific.
+        dma::dealloc(entry.dev.ep0_ring);
+        dma::dealloc(entry.dev.input_ctx);
+        dma::dealloc(entry.dev.dev_ctx);
+        match entry.kind {
+            SlotKind::Hub(h) => { dma::dealloc(h.int_ring); dma::dealloc(h.change_buf); }
+            SlotKind::Keyboard(k) => { dma::dealloc(k.int_ring); dma::dealloc(k.report); }
+            SlotKind::Other => {}
+        }
+        crate::binfo!("usb", "teardown slot={}", slot);
+    } else {
+        // Controller may still own these frames + have a pending IN transfer —
+        // leak the DMA to avoid a use-after-free. The entry is already removed.
+        crate::bwarn!(
+            "usb",
+            "teardown slot={} disable failed — leaking DMA to avoid UAF",
+            slot
+        );
     }
-    crate::binfo!("usb", "teardown slot={}", slot);
 }

@@ -154,6 +154,16 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
         None => { crate::bwarn!("usb", "input ctx alloc failed"); return None; }
     };
 
+    // Steps 4..9 run in an inner closure so that on ANY failure (it returns
+    // None) we can free the three regions allocated above, while on SUCCESS the
+    // closure has already moved them into the `UsbDevice` and `registry::insert`ed
+    // it — the registry/teardown now owns them, so we must NOT free them. The
+    // closure therefore returns `Some(slot_id)` ONLY after the insert: "Some
+    // returned" ⟺ "regions committed to the registry" (no-double-free invariant).
+    // (`ep0_ring`/`dev_ctx`/`input_ctx` are Copy, so the closure copies them into
+    //  the registered `UsbDevice`; the originals below remain valid to free on the
+    //  None path, and are simply dropped — never freed — on the Some path.)
+    let committed = (|| -> Option<u8> {
     // ── 4. EP0 transfer ring: install Link TRB at index 255, DCS=1 ──────────
     ring::init_link(ep0_ring.virt, ep0_ring.phys.as_u64(), true);
 
@@ -306,6 +316,9 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
     };
 
     // ── 9. Register the slot (lock held only for the insert) ─────────────────
+    // After this insert the registry owns ep0_ring/dev_ctx/input_ctx (and the
+    // kind-specific rings inside `kind`); returning Some(slot_id) signals the
+    // caller below NOT to free them.
     crate::usb::registry::insert(slot_id, crate::usb::registry::SlotEntry {
         kind,
         dev,
@@ -319,125 +332,144 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
 
     crate::binfo!("usb", "enumerated slot={} route=0x{:X}", slot_id, loc.route);
     Some(slot_id)
+    })();
+
+    match committed {
+        // Success: regions are owned by the registry — do NOT dealloc here.
+        Some(slot) => Some(slot),
+        // Failure before insert: free the three regions we allocated (step 3) so
+        // they don't leak. Nothing else references them (the UsbDevice that would
+        // have owned them was never inserted), so this frees each exactly once.
+        None => {
+            crate::memory::dma::dealloc(ep0_ring);
+            crate::memory::dma::dealloc(dev_ctx);
+            crate::memory::dma::dealloc(input_ctx);
+            None
+        }
+    }
 }
 
 /// Read the Configuration Descriptor, walk interface/endpoint descriptors to
 /// find the HID boot keyboard interrupt-IN endpoint, then issue SET_CONFIGURATION.
 /// Returns the HidKeyboard descriptor on success.
 pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::HidKeyboard> {
-    // NB: this scratch page is intentionally leaked (not dma::dealloc'd). It is a
-    // single one-shot page used only during boot enumeration; freeing across the
-    // `?` early-returns isn't worth the control-flow risk for one page.
+    // `buf` is a one-shot scratch page used only for this descriptor walk. It is
+    // freed on EVERY return path: DmaRegion has no Drop, so the body runs in an
+    // inner closure (which has the `?`/early returns), then we dealloc, then
+    // return the closure's result.
     let buf = crate::memory::dma::alloc(1)?;
-
-    // ── 1. Read 9-byte config header for wTotalLength + bConfigurationValue ──
-    let s9 = crate::usb::control::Setup {
-        req_type: 0x80,
-        request:  6,
-        value:    0x0200, // Config descriptor, index 0
-        index:    0,
-        length:   9,
-    };
-    if crate::usb::control::control_in(x, dev, s9, &buf)? < 9 {
-        crate::bwarn!("usb", "config header: short read");
-        return None;
-    }
-    let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
-    let total = (rd(2) as u16) | ((rd(3) as u16) << 8);
-    let cfg_val = rd(5);
-
-    // ── 2. Read the full config block (capped at 4096) ────────────────────────
-    let total = total.min(4096);
-    let s_all = crate::usb::control::Setup {
-        req_type: 0x80,
-        request:  6,
-        value:    0x0200,
-        index:    0,
-        length:   total,
-    };
-    let n = crate::usb::control::control_in(x, dev, s_all, &buf)?;
-    let n = (n.min(total)) as usize;
-
-    // ── 3. Walk descriptors ───────────────────────────────────────────────────
-    let mut pos: usize = 0;
-    // (iface_num, class, subclass, protocol)
-    let mut cur_iface: Option<(u8, u8, u8, u8)> = None;
-    let mut found: Option<crate::usb::hid::HidKeyboard> = None;
-
-    while pos + 2 <= n {
-        let blen = rd(pos) as usize;
-        if blen == 0 || pos + blen > n {
-            break;
+    let result = (|| {
+        // ── 1. Read 9-byte config header for wTotalLength + bConfigurationValue ──
+        let s9 = crate::usb::control::Setup {
+            req_type: 0x80,
+            request:  6,
+            value:    0x0200, // Config descriptor, index 0
+            index:    0,
+            length:   9,
+        };
+        if crate::usb::control::control_in(x, dev, s9, &buf)? < 9 {
+            crate::bwarn!("usb", "config header: short read");
+            return None;
         }
-        let dtype = rd(pos + 1);
-        match dtype {
-            4 => {
-                // Interface descriptor
-                if pos + 9 <= n {
-                    cur_iface = Some((rd(pos + 2), rd(pos + 5), rd(pos + 6), rd(pos + 7)));
-                }
+        let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
+        let total = (rd(2) as u16) | ((rd(3) as u16) << 8);
+        let cfg_val = rd(5);
+
+        // ── 2. Read the full config block (capped at 4096) ────────────────────────
+        let total = total.min(4096);
+        let s_all = crate::usb::control::Setup {
+            req_type: 0x80,
+            request:  6,
+            value:    0x0200,
+            index:    0,
+            length:   total,
+        };
+        let n = crate::usb::control::control_in(x, dev, s_all, &buf)?;
+        let n = (n.min(total)) as usize;
+
+        // ── 3. Walk descriptors ───────────────────────────────────────────────────
+        let mut pos: usize = 0;
+        // (iface_num, class, subclass, protocol)
+        let mut cur_iface: Option<(u8, u8, u8, u8)> = None;
+        let mut found: Option<crate::usb::hid::HidKeyboard> = None;
+
+        while pos + 2 <= n {
+            let blen = rd(pos) as usize;
+            if blen == 0 || pos + blen > n {
+                break;
             }
-            5 => {
-                // Endpoint descriptor
-                if pos + 7 <= n {
-                    if let Some((iface, cls, sub, proto)) = cur_iface {
-                        let addr = rd(pos + 2);
-                        let attr = rd(pos + 3);
-                        let is_in  = (addr & 0x80) != 0;
-                        let is_int = (attr & 0x03) == 3;
-                        if cls == 3 && sub == 1 && proto == 1 && is_in && is_int
-                            && found.is_none()
-                        {
-                            let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
-                            found = Some(crate::usb::hid::HidKeyboard {
-                                iface,
-                                ep_addr:    addr,
-                                max_packet: mps,
-                                interval:   rd(pos + 6),
-                            });
+            let dtype = rd(pos + 1);
+            match dtype {
+                4 => {
+                    // Interface descriptor
+                    if pos + 9 <= n {
+                        cur_iface = Some((rd(pos + 2), rd(pos + 5), rd(pos + 6), rd(pos + 7)));
+                    }
+                }
+                5 => {
+                    // Endpoint descriptor
+                    if pos + 7 <= n {
+                        if let Some((iface, cls, sub, proto)) = cur_iface {
+                            let addr = rd(pos + 2);
+                            let attr = rd(pos + 3);
+                            let is_in  = (addr & 0x80) != 0;
+                            let is_int = (attr & 0x03) == 3;
+                            if cls == 3 && sub == 1 && proto == 1 && is_in && is_int
+                                && found.is_none()
+                            {
+                                let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
+                                found = Some(crate::usb::hid::HidKeyboard {
+                                    iface,
+                                    ep_addr:    addr,
+                                    max_packet: mps,
+                                    interval:   rd(pos + 6),
+                                });
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+            pos += blen;
         }
-        pos += blen;
-    }
 
-    match found {
-        Some(kb) => {
-            crate::binfo!(
-                "usb",
-                "HID kbd iface={} ep=0x{:02x} mps={} interval={}",
-                kb.iface, kb.ep_addr, kb.max_packet, kb.interval
-            );
+        match found {
+            Some(kb) => {
+                crate::binfo!(
+                    "usb",
+                    "HID kbd iface={} ep=0x{:02x} mps={} interval={}",
+                    kb.iface, kb.ep_addr, kb.max_packet, kb.interval
+                );
+            }
+            None => {
+                crate::bwarn!("usb", "no HID boot keyboard found");
+                return None;
+            }
         }
-        None => {
-            crate::bwarn!("usb", "no HID boot keyboard found");
+
+        // ── 4. SET_CONFIGURATION ─────────────────────────────────────────────────
+        let ok = crate::usb::control::control_out(
+            x,
+            dev,
+            crate::usb::control::Setup {
+                req_type: 0x00,
+                request:  9,
+                value:    cfg_val as u16,
+                index:    0,
+                length:   0,
+            },
+        );
+        if ok {
+            crate::binfo!("usb", "slot {} configured", dev.slot_id);
+        } else {
+            crate::bwarn!("usb", "set_config failed");
             return None;
         }
-    }
 
-    // ── 4. SET_CONFIGURATION ─────────────────────────────────────────────────
-    let ok = crate::usb::control::control_out(
-        x,
-        dev,
-        crate::usb::control::Setup {
-            req_type: 0x00,
-            request:  9,
-            value:    cfg_val as u16,
-            index:    0,
-            length:   0,
-        },
-    );
-    if ok {
-        crate::binfo!("usb", "slot {} configured", dev.slot_id);
-    } else {
-        crate::bwarn!("usb", "set_config failed");
-        return None;
-    }
-
-    found
+        found
+    })();
+    crate::memory::dma::dealloc(buf);
+    result
 }
 
 /// Read the 18-byte USB Device Descriptor from the addressed device and log
@@ -460,31 +492,37 @@ pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) -> Option<u8> {
         length:   18,
     };
 
-    match crate::usb::control::control_in(x, dev, setup, &buf) {
-        Some(n) if n >= 18 => {
-            let d = buf.virt.as_ptr::<u8>();
-            // SAFETY: DMA buffer is mapped, readable, and at least 18 bytes long.
-            let rd   = |o: usize| unsafe { core::ptr::read_volatile(d.add(o)) };
-            let rd16 = |o: usize| (rd(o) as u16) | ((rd(o + 1) as u16) << 8);
-            let vid      = rd16(8);
-            let pid      = rd16(10);
-            let class    = rd(4);
-            let mps0     = rd(7);
-            let num_cfg  = rd(17);
-            crate::binfo!(
-                "usb",
-                "dev {:04x}:{:04x} class={} maxpkt0={} numcfg={}",
-                vid, pid, class, mps0, num_cfg
-            );
-            Some(class)
+    // `buf` is a local scratch page: free it on EVERY return path. DmaRegion has
+    // no Drop, so run the body in an inner closure, then dealloc, then return.
+    let result = (|| {
+        match crate::usb::control::control_in(x, dev, setup, &buf) {
+            Some(n) if n >= 18 => {
+                let d = buf.virt.as_ptr::<u8>();
+                // SAFETY: DMA buffer is mapped, readable, and at least 18 bytes long.
+                let rd   = |o: usize| unsafe { core::ptr::read_volatile(d.add(o)) };
+                let rd16 = |o: usize| (rd(o) as u16) | ((rd(o + 1) as u16) << 8);
+                let vid      = rd16(8);
+                let pid      = rd16(10);
+                let class    = rd(4);
+                let mps0     = rd(7);
+                let num_cfg  = rd(17);
+                crate::binfo!(
+                    "usb",
+                    "dev {:04x}:{:04x} class={} maxpkt0={} numcfg={}",
+                    vid, pid, class, mps0, num_cfg
+                );
+                Some(class)
+            }
+            Some(n) => {
+                crate::bwarn!("usb", "device descriptor short: got {} bytes", n);
+                None
+            }
+            None => {
+                crate::bwarn!("usb", "device descriptor read failed");
+                None
+            }
         }
-        Some(n) => {
-            crate::bwarn!("usb", "device descriptor short: got {} bytes", n);
-            None
-        }
-        None => {
-            crate::bwarn!("usb", "device descriptor read failed");
-            None
-        }
-    }
+    })();
+    crate::memory::dma::dealloc(buf);
+    result
 }

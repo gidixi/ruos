@@ -53,58 +53,65 @@ fn queue_status_trb(x: &mut Xhci, slot: u8, st: &mut HubState) {
 /// interface (bInterfaceClass==9) and its interrupt-IN endpoint. Returns
 /// (cfg_val, ep_addr, max_packet, interval) or None.
 fn read_hub_interface(x: &mut Xhci, dev: &mut UsbDevice) -> Option<(u8, u8, u16, u8)> {
+    // `buf` is a one-shot scratch page: free it on EVERY return path. DmaRegion
+    // has no Drop, so the body (with its `?`/early returns) runs in an inner
+    // closure; we dealloc afterward and return the closure's result.
     let buf = crate::memory::dma::alloc(1)?;
-    let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
+    let result = (|| {
+        let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
 
-    // 9-byte config header → wTotalLength + bConfigurationValue.
-    let s9 = control::Setup { req_type: 0x80, request: 6, value: 0x0200, index: 0, length: 9 };
-    if control::control_in(x, dev, s9, &buf)? < 9 {
-        crate::bwarn!("usb", "hub config header: short read");
-        return None;
-    }
-    let total = ((rd(2) as u16) | ((rd(3) as u16) << 8)).min(4096);
-    let cfg_val = rd(5);
-
-    // Full config block.
-    let s_all = control::Setup { req_type: 0x80, request: 6, value: 0x0200, index: 0, length: total };
-    let n = control::control_in(x, dev, s_all, &buf)?;
-    let n = (n.min(total)) as usize;
-
-    // Walk descriptors: interface(4) sets current class; endpoint(5) under a
-    // hub interface (class 9), IN + Interrupt, is the status-change endpoint.
-    let mut pos: usize = 0;
-    let mut in_hub_iface = false;
-    let mut found: Option<(u8, u16, u8)> = None; // (ep_addr, mps, interval)
-    while pos + 2 <= n {
-        let blen = rd(pos) as usize;
-        if blen == 0 || pos + blen > n {
-            break;
-        }
-        match rd(pos + 1) {
-            4 if pos + 9 <= n => {
-                in_hub_iface = rd(pos + 5) == 9; // bInterfaceClass == Hub
-            }
-            5 if pos + 7 <= n => {
-                let addr = rd(pos + 2);
-                let attr = rd(pos + 3);
-                if in_hub_iface && (addr & 0x80) != 0 && (attr & 0x03) == 3 && found.is_none() {
-                    let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
-                    found = Some((addr, mps, rd(pos + 6)));
-                }
-            }
-            _ => {}
-        }
-        pos += blen;
-    }
-
-    let (ep_addr, mps, interval) = match found {
-        Some(f) => f,
-        None => {
-            crate::bwarn!("usb", "hub: no interrupt-IN endpoint found");
+        // 9-byte config header → wTotalLength + bConfigurationValue.
+        let s9 = control::Setup { req_type: 0x80, request: 6, value: 0x0200, index: 0, length: 9 };
+        if control::control_in(x, dev, s9, &buf)? < 9 {
+            crate::bwarn!("usb", "hub config header: short read");
             return None;
         }
-    };
-    Some((cfg_val, ep_addr, mps, interval))
+        let total = ((rd(2) as u16) | ((rd(3) as u16) << 8)).min(4096);
+        let cfg_val = rd(5);
+
+        // Full config block.
+        let s_all = control::Setup { req_type: 0x80, request: 6, value: 0x0200, index: 0, length: total };
+        let n = control::control_in(x, dev, s_all, &buf)?;
+        let n = (n.min(total)) as usize;
+
+        // Walk descriptors: interface(4) sets current class; endpoint(5) under a
+        // hub interface (class 9), IN + Interrupt, is the status-change endpoint.
+        let mut pos: usize = 0;
+        let mut in_hub_iface = false;
+        let mut found: Option<(u8, u16, u8)> = None; // (ep_addr, mps, interval)
+        while pos + 2 <= n {
+            let blen = rd(pos) as usize;
+            if blen == 0 || pos + blen > n {
+                break;
+            }
+            match rd(pos + 1) {
+                4 if pos + 9 <= n => {
+                    in_hub_iface = rd(pos + 5) == 9; // bInterfaceClass == Hub
+                }
+                5 if pos + 7 <= n => {
+                    let addr = rd(pos + 2);
+                    let attr = rd(pos + 3);
+                    if in_hub_iface && (addr & 0x80) != 0 && (attr & 0x03) == 3 && found.is_none() {
+                        let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
+                        found = Some((addr, mps, rd(pos + 6)));
+                    }
+                }
+                _ => {}
+            }
+            pos += blen;
+        }
+
+        let (ep_addr, mps, interval) = match found {
+            Some(f) => f,
+            None => {
+                crate::bwarn!("usb", "hub: no interrupt-IN endpoint found");
+                return None;
+            }
+        };
+        Some((cfg_val, ep_addr, mps, interval))
+    })();
+    crate::memory::dma::dealloc(buf);
+    result
 }
 
 /// Build + issue the Configure Endpoint command (type 12) that adds the hub's
@@ -251,9 +258,17 @@ pub fn setup(x: &mut Xhci, slot: u8, dev: &mut UsbDevice, loc: &Location) -> Opt
         return None;
     }
 
-    // 3. Hub descriptor.
+    // 3. Hub descriptor. `hbuf` is a one-shot scratch page: free it on EVERY
+    //    return path (DmaRegion has no Drop), including the read-fail and
+    //    bad-descriptor early returns below.
     let hbuf = crate::memory::dma::alloc(1)?;
-    let got = control::get_hub_descriptor(x, dev, &hbuf)?;
+    let got = match control::get_hub_descriptor(x, dev, &hbuf) {
+        Some(g) => g,
+        None => {
+            crate::memory::dma::dealloc(hbuf);
+            return None;
+        }
+    };
     let d = {
         let n = (got as usize).min(71);
         let mut tmp = [0u8; 71];
@@ -267,6 +282,7 @@ pub fn setup(x: &mut Xhci, slot: u8, dev: &mut UsbDevice, loc: &Location) -> Opt
         Some(h) => h,
         None => {
             crate::bwarn!("usb", "hub: bad hub descriptor");
+            crate::memory::dma::dealloc(hbuf);
             return None;
         }
     };
@@ -305,7 +321,15 @@ pub fn setup(x: &mut Xhci, slot: u8, dev: &mut UsbDevice, loc: &Location) -> Opt
     }
 
     // 6. Allocate change buffer + queue the first status-change Normal TRB.
-    let change_buf = crate::memory::dma::alloc(1)?;
+    //    On alloc failure free int_ring (allocated above, not yet owned by any
+    //    HubState) before bailing so it doesn't leak.
+    let change_buf = match crate::memory::dma::alloc(1) {
+        Some(b) => b,
+        None => {
+            crate::memory::dma::dealloc(int_ring);
+            return None;
+        }
+    };
     let mut st = HubState {
         dci,
         nbr_ports,
@@ -318,7 +342,16 @@ pub fn setup(x: &mut Xhci, slot: u8, dev: &mut UsbDevice, loc: &Location) -> Opt
 
     // 7. Initial scan: a HubPortChanged per already-connected port so the
     //    worklist resets + enumerates anything plugged in at boot.
-    let pbuf = crate::memory::dma::alloc(1)?;
+    //    On scratch-alloc failure, free the int_ring + change_buf we now hold in
+    //    `st` (HubState has no Drop) before bailing so they don't leak.
+    let pbuf = match crate::memory::dma::alloc(1) {
+        Some(b) => b,
+        None => {
+            crate::memory::dma::dealloc(st.int_ring);
+            crate::memory::dma::dealloc(st.change_buf);
+            return None;
+        }
+    };
     for port in 1..=nbr_ports {
         if let Some((status, _change)) = control::get_port_status(x, dev, port, &pbuf) {
             if encoding::decode_port_status(status, 0).connected {

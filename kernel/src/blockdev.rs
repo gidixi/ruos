@@ -73,13 +73,19 @@ impl BlockDevice for PartitionDevice {
     fn block_count(&self) -> u64 { self.count }
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         let n = (buf.len() as u64) / self.inner.block_size() as u64;
-        if lba + n > self.count { return Err(BlockError::OutOfRange); }
-        self.inner.read_blocks(self.base + lba, buf)
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.read_blocks(phys, buf)
     }
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         let n = (buf.len() as u64) / self.inner.block_size() as u64;
-        if lba + n > self.count { return Err(BlockError::OutOfRange); }
-        self.inner.write_blocks(self.base + lba, buf)
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.write_blocks(phys, buf)
     }
 }
 

@@ -37,9 +37,10 @@ pub fn parse(dev: &mut dyn BlockDevice) -> Option<Vec<GptPartition>> {
     let entries_lba = rd_u64(&hdr, 72);
     let num = rd_u32(&hdr, 80).min(128) as usize;     // cap at 128 (sane GPT)
     let esize = rd_u32(&hdr, 84) as usize;
-    if !(128..=512).contains(&esize) || num == 0 { return None; }
+    // GPT entries are 128 bytes; reject any other size (a non-512-divisor esize
+    // would mis-parse entries that straddle a 512-byte sector boundary).
+    if esize != 128 || num == 0 { return None; }
     let per_sec = 512 / esize;
-    if per_sec == 0 { return None; }
     let mut out = Vec::new();
     let mut sec = [0u8; 512];
     let sectors_needed = (num + per_sec - 1) / per_sec;

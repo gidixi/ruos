@@ -2,6 +2,7 @@
 //! docs/superpowers/specs/2026-06-01-usb-xhci-hid-design.md.
 pub mod control;
 pub mod device;
+pub mod encoding;
 pub mod hid;
 pub mod usage;
 pub mod xhci;

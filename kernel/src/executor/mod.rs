@@ -61,6 +61,7 @@ pub fn run() -> ! {
     crate::binfo!("user", "executor: spawning tasks");
     spawner.spawn(tick_task()).unwrap();
     spawner.spawn(net_poll_task()).unwrap();
+    spawner.spawn(usb_poll_task()).unwrap();
     spawner.spawn(console_drain_task()).unwrap();
     // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
     // and server/client.wasm live under /root/ as runnable demo blobs
@@ -185,6 +186,14 @@ async fn ssh_serve_task() {
 async fn net_poll_task() {
     loop {
         crate::net::poll();
+        delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_poll_task() {
+    loop {
+        crate::usb::poll();
         delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
     }
 }

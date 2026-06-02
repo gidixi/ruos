@@ -32,6 +32,7 @@ sunset = { path = "../third_party/sunset", default-features = false }
 # to crate::rng via register_custom_getrandom! in ssh/rng_bridge.rs.
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 log = { version = "0.4", default-features = false }
+xhci = "0.9"
 
 [features]
 boot-checks = []

@@ -28,6 +28,7 @@ mod executor;
 mod boot;
 mod pty;
 mod pci;
+mod usb;
 mod blockdev;
 mod ahci;
 mod rtc;

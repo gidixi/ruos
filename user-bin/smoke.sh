@@ -31,6 +31,7 @@ rtop --once
 lspci
 ip
 cat /mnt/hello.txt
+cat /mnt/GPTHELLO.TXT 2>/dev/null
 echo --- FAT write test ---
 cp /etc/init.sh /mnt/init.bak
 cat /mnt/init.bak | head -n 3

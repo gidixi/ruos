@@ -30,9 +30,13 @@ pub fn init() -> Result<(), BootError> {
     crate::apic::ioapic::init(acpi.ioapic_base);
     crate::binfo!("intr", "IOAPIC up base=0x{:X}", acpi.ioapic_base);
 
-    crate::timer::init(100)
+    let pm_timer = acpi.pm_timer_io.map(|port| (port, acpi.pm_timer_32bit));
+    crate::timer::init(100, pm_timer)
         .map_err(|_| BootError::TimerInit("timer init failed"))?;
-    crate::binfo!("intr", "timer 100 Hz");
+    crate::binfo!(
+        "intr", "timer 100 Hz (ref={})",
+        if pm_timer.is_some() { "acpi-pm" } else { "tsc" }
+    );
 
     crate::keyboard::init(&acpi.overrides);
     crate::binfo!("intr", "keyboard IRQ1 wired overrides={}", acpi.overrides.len());

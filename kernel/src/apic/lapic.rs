@@ -85,30 +85,52 @@ pub fn send_ipi_all_but_self(vector: u8) {
 }
 
 /// Calibrate the LAPIC timer: run it at max count for `ms` milliseconds measured
-/// via the **TSC-based boot clock** and return the LAPIC ticks elapsed.
+/// LAPIC ticks elapsed, measuring the `ms` window against the best reference.
 ///
-/// Uses the TSC (calibrated from CPUID in `boot::clock::init`, which runs before
-/// the interrupts phase) instead of the PIT: real UEFI machines often gate the
-/// PIT off, and polling it then hangs the boot forever. The busy-wait is bounded
-/// by the monotonic boot clock.
-pub fn calibrate(ms: u32) -> u32 {
-    // TSC-cycle-precise window (elapsed_ms has 1ms granularity → ~10% error
-    // over a 10ms window). tsc_per_ms is set in boot::clock::init (CPUID or
-    // bounded-PIT fallback), always nonzero by the interrupts phase.
-    let target = crate::boot::clock::tsc_per_ms().saturating_mul(ms as u64);
+/// `pm_timer = Some((port, is_32bit))` → use the ACPI **PM timer** (fixed
+/// 3.579545 MHz, accurate even when the PIT is gated off — the real-UEFI case)
+/// and ALSO recalibrate the boot-clock TSC from the same window. `None` → fall
+/// back to the TSC (itself from CPUID), which on some real hardware over-reports
+/// and makes the 100 Hz timer run slow. Never uses the PIT (it hangs on UEFI).
+pub fn calibrate(ms: u32, pm_timer: Option<(u16, bool)>) -> u32 {
+    use x86_64::instructions::port::Port;
+    const PM_FREQ: u64 = 3_579_545; // ACPI PM timer, fixed
+
     // SAFETY: init ran; LAPIC timer registers are valid.
     unsafe {
         // Start LAPIC timer at max count, masked one-shot.
         write_volatile(reg(REG_LVT_TIMER), TIMER_MASKED);
         write_volatile(reg(REG_TIMER_INIT), 0xFFFF_FFFF);
-
         let t0 = crate::boot::clock::read_tsc();
-        while crate::boot::clock::read_tsc().wrapping_sub(t0) < target {
-            core::hint::spin_loop();
+
+        match pm_timer {
+            Some((port, is_32bit)) => {
+                let mask: u32 = if is_32bit { 0xFFFF_FFFF } else { 0x00FF_FFFF };
+                let pm_ticks = (PM_FREQ * ms as u64 / 1000) as u32; // ticks for `ms` ms
+                let mut p: Port<u32> = Port::new(port);
+                let start = p.read() & mask;
+                loop {
+                    let elapsed = p.read().wrapping_sub(start) & mask;
+                    if elapsed >= pm_ticks { break; }
+                    core::hint::spin_loop();
+                }
+            }
+            None => {
+                let target = crate::boot::clock::tsc_per_ms().saturating_mul(ms as u64);
+                while crate::boot::clock::read_tsc().wrapping_sub(t0) < target {
+                    core::hint::spin_loop();
+                }
+            }
         }
 
+        let t1 = crate::boot::clock::read_tsc();
         let remaining = read_volatile(reg(REG_TIMER_CUR));
         write_volatile(reg(REG_TIMER_INIT), 0); // stop
+
+        // If we used the accurate PM timer, correct the boot-clock TSC too.
+        if pm_timer.is_some() && ms > 0 {
+            crate::boot::clock::set_tsc_per_ms(t1.wrapping_sub(t0) / ms as u64);
+        }
         0xFFFF_FFFF - remaining
     }
 }

@@ -7,11 +7,22 @@ use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style, Modifier};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table, Cell as TCell};
+use ratatui::widgets::{Paragraph, Row, Table, Cell as TCell};
 use ansi_backend::AnsiBackend;
 
 const W: u16 = 80;
 const H: u16 = 24;
+
+/// ASCII progress bar `[####------]` — the ruos framebuffer font has no Unicode
+/// block/box glyphs (they render as '?'), so the TUI stays pure ASCII.
+fn ascii_bar(pct: u16, width: usize) -> String {
+    let fill = (pct as usize * width / 100).min(width);
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    for i in 0..width { s.push(if i < fill { '#' } else { '-' }); }
+    s.push(']');
+    s
+}
 
 // ---------------------------------------------------------------------------
 // sys_read: wasm32 delegates to sys::read_snapshot; host build returns None.
@@ -143,25 +154,24 @@ fn draw(term: &mut Terminal<AnsiBackend>, a: &Snapshot, b: &Snapshot) {
             .split(chunks[1]);
         for (i, pct) in cp.iter().enumerate() {
             f.render_widget(
-                Gauge::default()
-                    .label(format!("cpu{} {}%", i, pct))
-                    .gauge_style(Style::default().fg(Color::Green))
-                    .percent(*pct),
+                Paragraph::new(format!("cpu{:<2} {} {:>3}%", i, ascii_bar(*pct, 30), pct))
+                    .style(Style::default().fg(Color::Green)),
                 core_rows[i],
             );
         }
 
-        // Memory gauge
+        // Memory bar (ASCII)
         let mem_pct = if b.mem.frames_total == 0 {
             0
         } else {
             ((b.mem.frames_used * 100) / b.mem.frames_total) as u16
         };
         f.render_widget(
-            Gauge::default()
-                .label(format!("mem {}/{}", b.mem.frames_used, b.mem.frames_total))
-                .gauge_style(Style::default().fg(Color::Cyan))
-                .percent(mem_pct.min(100)),
+            Paragraph::new(format!(
+                "mem {} {}/{} pages",
+                ascii_bar(mem_pct.min(100), 30), b.mem.frames_used, b.mem.frames_total
+            ))
+            .style(Style::default().fg(Color::Cyan)),
             chunks[2],
         );
 
@@ -188,12 +198,13 @@ fn draw(term: &mut Terminal<AnsiBackend>, a: &Snapshot, b: &Snapshot) {
             Constraint::Length(9),
             Constraint::Min(10),
         ];
+        // No box border (the framebuffer font lacks '─'); a reverse-video header
+        // row (ANSI, ASCII-safe) separates it instead.
         let table = Table::new(trows, widths)
             .header(
                 Row::new(vec!["PID", "CPU%", "MEM", "TIME+", "CMD"])
                     .style(Style::default().add_modifier(Modifier::REVERSED)),
-            )
-            .block(Block::default().borders(Borders::TOP));
+            );
         f.render_widget(table, chunks[3]);
     });
 }

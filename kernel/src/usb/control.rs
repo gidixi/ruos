@@ -65,10 +65,15 @@ pub fn control_in(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) 
     });
 
     // ── Wait for Transfer Event (type 32) — up to 200 ms ──────────────────
-    // Foreign events (port status change, other slots' transfers) are routed
-    // through the central dispatcher by `wait_for`, not dropped.
+    // Match THIS transfer's completion only: a Transfer Event whose slot id ==
+    // dev.slot_id AND endpoint (DCI) == 1 (EP0). A foreign transfer event (e.g.
+    // a keyboard interrupt report, also type 32) no longer matches → `wait_for`
+    // routes it through the central dispatcher instead of mis-delivering it here.
+    let sid = dev.slot_id;
     let ev = crate::usb::xhci::event::wait_for(x, 200, |w| {
         crate::usb::xhci::ring::trb_type(w) == 32
+            && ((w[3] >> 24) & 0xFF) as u8 == sid
+            && ((w[3] >> 16) & 0x1F) as u8 == 1
     })?;
     let code = crate::usb::xhci::ring::completion_code(&ev);
     // Code 1 = Success, code 13 = Short Packet (also OK for IN)
@@ -99,8 +104,13 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     x.regs.doorbell.update_volatile_at(dev.slot_id as usize, |d| {
         d.set_doorbell_target(1);
     });
+    // Match THIS transfer's completion only (slot == dev.slot_id, DCI == 1/EP0);
+    // foreign transfer events are dispatched by `wait_for`, not consumed here.
+    let sid = dev.slot_id;
     let ev = match crate::usb::xhci::event::wait_for(x, 100, |w| {
         crate::usb::xhci::ring::trb_type(w) == 32
+            && ((w[3] >> 24) & 0xFF) as u8 == sid
+            && ((w[3] >> 16) & 0x1F) as u8 == 1
     }) {
         Some(e) => e,
         None => {

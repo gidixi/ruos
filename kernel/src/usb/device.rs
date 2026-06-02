@@ -93,6 +93,12 @@ pub fn reset_root_port(x: &mut Xhci, port: u8) -> Option<u8> {
 
 /// An addressed USB device: slot allocated, EP0 transfer ring set up, Device Context
 /// installed in DCBAA. Ready for descriptor fetch (Task 6+).
+///
+/// All fields are Copy (DmaRegion is Copy + scalars), so the whole struct is
+/// Copy. `handle_port` relies on this: it copies the hub's `dev` out of the
+/// SLOTS-locked registry, runs control transfers on the copy WITHOUT holding
+/// SLOTS, then writes the advanced EP0 cursor back.
+#[derive(Clone, Copy)]
 pub struct UsbDevice {
     pub slot_id:     u8,
     pub port:        u8,

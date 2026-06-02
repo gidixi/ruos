@@ -351,8 +351,8 @@ pub fn on_status(x: &mut Xhci, slot: u8, st: &mut HubState) {
     queue_status_trb(x, slot, st);
 }
 
-/// What to do after inspecting a hub port, decided while the hub entry is
-/// borrowed; acted on (enumerate/teardown) only after the borrow is released.
+/// What to do after inspecting a hub port, decided from a SLOTS-free copy of the
+/// hub; acted on (enumerate/teardown) afterwards, also SLOTS-free.
 enum Outcome {
     Connect { child: Location },
     Disconnect,
@@ -364,89 +364,105 @@ enum Outcome {
 ///
 /// # Lock / borrow structure
 /// We need the hub's `&mut UsbDevice` (for control transfers to the hub) but must
-/// NOT call `enumerate`/`teardown` while holding SLOTS (they lock SLOTS and would
-/// deadlock / re-enter). So:
-///   1. Inside a single `with_slot(hub_slot, ...)` closure — which borrows the
-///      hub `SlotEntry` and captures `x` — run ALL the hub's control transfers
-///      (get_port_status, set/clear feature, reset poll) and build the child
-///      `Location` from the hub's topology fields. These control transfers do
-///      not reach `dispatch_transfer` (every `event::wait_for` here matches on
-///      Transfer-Event type 32 and returns before dispatching one), so they
-///      never re-lock SLOTS — safe under the held lock. The closure returns an
-///      `Outcome` (Connect{child} / Disconnect / None) by value.
-///   2. AFTER `with_slot` returns (SLOTS released): act on the `Outcome` —
-///      `enumerate(child)` (connect) or `find_child` + `teardown` (disconnect),
-///      each of which locks SLOTS itself, never under a held lock.
+/// NOT hold the SLOTS lock across those control transfers. With the slot+EP0
+/// specific control wait predicate, a foreign transfer event arriving mid-wait
+/// is `dispatch`ed (→ `dispatch_transfer` → `with_slot` → `SLOTS.lock()`); if we
+/// held SLOTS that would deadlock. We also must not call `enumerate`/`teardown`
+/// under SLOTS (they lock it). So:
+///   1. Brief lock: copy out the hub's topology fields + a Copy of its `dev`.
+///   2. SLOTS released: run ALL the hub's control transfers (get_port_status,
+///      set/clear feature, reset poll) on the local `&mut hubdev` copy, which
+///      advances `hubdev.ep0_enqueue`/`ep0_cycle`. Build the `Outcome`.
+///   3. Brief lock: write the advanced EP0 cursor back so the hub's ring state
+///      stays consistent with the TRBs we enqueued.
+///   4. SLOTS released: act on the `Outcome` — `enumerate(child)` (connect) or
+///      `find_child` + `teardown` (disconnect).
 pub fn handle_port(x: &mut Xhci, hub_slot: u8, port: u8) {
     let pbuf = match crate::memory::dma::alloc(1) {
         Some(b) => b,
         None => return,
     };
 
-    // ── Phase 1: hub control transfers under the SLOTS lock (no enumerate). ──
-    let already = registry::find_child(hub_slot, port);
-    let outcome = registry::with_slot(hub_slot, |e| {
-        let (route, tier, speed, root_port) = (e.route, e.tier, e.speed, e.root_port);
-        let dev = &mut e.dev;
-
-        let (status, _change) = match control::get_port_status(x, dev, port, &pbuf) {
+    // ── Step 1: brief lock — copy hub topology + a Copy of its dev. ─────────
+    let (route, tier, speed, root_port, mut hubdev) =
+        match registry::with_slot(hub_slot, |e| {
+            (e.route, e.tier, e.speed, e.root_port, e.dev) // e.dev is Copy
+        }) {
             Some(v) => v,
-            None => return Outcome::None,
+            None => {
+                crate::memory::dma::dealloc(pbuf);
+                return; // hub entry gone
+            }
         };
-        let ps = encoding::decode_port_status(status, 0);
 
-        if ps.connected && already.is_none() {
-            // Reset the port, then poll until reset clears (bounded 100 ms).
-            control::set_port_feature(x, dev, port, PORT_RESET);
-            let start = crate::boot::clock::elapsed_ms();
-            let mut child_speed = ps.speed;
-            loop {
-                if crate::boot::clock::elapsed_ms() - start >= 100 {
-                    break;
-                }
-                if let Some((s2, c2)) = control::get_port_status(x, dev, port, &pbuf) {
-                    let p2 = encoding::decode_port_status(s2, c2);
-                    child_speed = p2.speed;
-                    // Reset done = PORT_RESET cleared, or C_PORT_RESET (bit4) set.
-                    if !p2.reset || (c2 & (1 << 4)) != 0 {
-                        break;
+    // ── Step 2: SLOTS free — hub control transfers on the local copy. ───────
+    let already = registry::find_child(hub_slot, port);
+    let outcome = {
+        let dev = &mut hubdev;
+        match control::get_port_status(x, dev, port, &pbuf) {
+            None => Outcome::None,
+            Some((status, _change)) => {
+                let ps = encoding::decode_port_status(status, 0);
+
+                if ps.connected && already.is_none() {
+                    // Reset the port, then poll until reset clears (bounded 100 ms).
+                    control::set_port_feature(x, dev, port, PORT_RESET);
+                    let start = crate::boot::clock::elapsed_ms();
+                    let mut child_speed = ps.speed;
+                    loop {
+                        if crate::boot::clock::elapsed_ms() - start >= 100 {
+                            break;
+                        }
+                        if let Some((s2, c2)) = control::get_port_status(x, dev, port, &pbuf) {
+                            let p2 = encoding::decode_port_status(s2, c2);
+                            child_speed = p2.speed;
+                            // Reset done = PORT_RESET cleared, or C_PORT_RESET (bit4) set.
+                            if !p2.reset || (c2 & (1 << 4)) != 0 {
+                                break;
+                            }
+                        }
+                        core::hint::spin_loop();
                     }
-                }
-                core::hint::spin_loop();
-            }
-            control::clear_port_feature(x, dev, port, C_PORT_RESET);
-            control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
+                    control::clear_port_feature(x, dev, port, C_PORT_RESET);
+                    control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
 
-            if tier + 1 >= encoding::MAX_TIER {
-                crate::bwarn!("usb", "hub: tier limit, skip port={} (tier={})", port, tier);
-                Outcome::None
-            } else {
-                Outcome::Connect {
-                    child: Location {
-                        root_port,
-                        route: encoding::child_route(route, port, tier),
-                        tier: tier + 1,
-                        speed: child_speed,
-                        parent_slot: hub_slot,
-                        parent_port: port,
-                        tt: encoding::needs_tt(child_speed, speed),
-                    },
+                    if tier + 1 >= encoding::MAX_TIER {
+                        crate::bwarn!("usb", "hub: tier limit, skip port={} (tier={})", port, tier);
+                        Outcome::None
+                    } else {
+                        Outcome::Connect {
+                            child: Location {
+                                root_port,
+                                route: encoding::child_route(route, port, tier),
+                                tier: tier + 1,
+                                speed: child_speed,
+                                parent_slot: hub_slot,
+                                parent_port: port,
+                                tt: encoding::needs_tt(child_speed, speed),
+                            },
+                        }
+                    }
+                } else if !ps.connected {
+                    // Disconnect: ack the connection change so the hub stops asserting it.
+                    control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
+                    Outcome::Disconnect
+                } else {
+                    // Connected but already enumerated (spurious/extra change bit): ack.
+                    control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
+                    Outcome::None
                 }
             }
-        } else if !ps.connected {
-            // Disconnect: ack the connection change so the hub stops asserting it.
-            control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
-            Outcome::Disconnect
-        } else {
-            // Connected but already enumerated (spurious/extra change bit): ack.
-            control::clear_port_feature(x, dev, port, C_PORT_CONNECTION);
-            Outcome::None
         }
-    })
-    .unwrap_or(Outcome::None); // hub entry gone
+    };
     crate::memory::dma::dealloc(pbuf);
 
-    // ── Phase 2: SLOTS free — enumerate / teardown the child. ───────────────
+    // ── Step 3: brief lock — write the advanced EP0 cursor back. ────────────
+    registry::with_slot(hub_slot, |e| {
+        e.dev.ep0_enqueue = hubdev.ep0_enqueue;
+        e.dev.ep0_cycle = hubdev.ep0_cycle;
+    });
+
+    // ── Step 4: SLOTS free — enumerate / teardown the child. ────────────────
     match outcome {
         Outcome::Connect { child } => {
             crate::binfo!(

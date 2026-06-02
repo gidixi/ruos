@@ -5,6 +5,7 @@
 //! program registers, run, issue No-Op command, verify Command Completion event.
 pub mod regs;
 pub mod ring;
+pub mod event;
 
 use crate::memory::dma::{self, DmaRegion};
 use crate::pci;
@@ -238,22 +239,11 @@ pub fn init() {
 
 pub fn poll() {
     let ctrl_cell = match crate::usb::CTRL.get() { Some(c) => c, None => return };
-    let hid_cell  = match crate::usb::HID.get()  { Some(h) => h, None => return };
-    // Lock order: CTRL first, then HID — consistent with init(); no deadlock.
-    let mut ctrl_g = ctrl_cell.lock();
-    let x = match ctrl_g.as_mut() { Some(x) => x, None => return };
-    // Drain all pending events.
-    loop {
-        let ev = match ring::poll_event(x) { Some(e) => e, None => break };
-        if ring::trb_type(&ev) == 32 { // Transfer Event (xHCI spec type 32)
-            let slot = ((ev[3] >> 24) & 0xFF) as u8;
-            let epid = ((ev[3] >> 16) & 0x1F) as u8;
-            let mut hid_g = hid_cell.lock();
-            if let Some(st) = hid_g.as_mut() {
-                if st.slot_id == slot && st.dci == epid {
-                    crate::usb::hid::on_report(x, st);
-                }
-            }
-        }
+    let mut g = ctrl_cell.lock();
+    let x = match g.as_mut() { Some(x) => x, None => return };
+    // Drain every pending event through the central dispatcher (routes Transfer
+    // Events to slot handlers + Port Status Change to the worklist).
+    while let Some(ev) = ring::poll_event(x) {
+        event::dispatch(x, ev);
     }
 }

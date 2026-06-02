@@ -53,6 +53,16 @@ pub fn with_slot<R>(slot: u8, f: impl FnOnce(&mut SlotEntry) -> R) -> Option<R> 
     g[slot as usize].as_mut().map(f)
 }
 
+/// Route a Transfer Event to the slot's class handler. Holds SLOTS only while
+/// the handler runs; handlers must not lock SLOTS or drain events (invariant).
+pub fn dispatch_transfer(x: &mut crate::usb::xhci::Xhci, slot: u8, dci: u8) {
+    with_slot(slot, |e| match &mut e.kind {
+        SlotKind::Keyboard(st) if st.dci == dci => crate::usb::hid::on_report(x, st),
+        SlotKind::Hub(hs) if hs.dci == dci => crate::usb::hub::on_status(x, slot, hs),
+        _ => {}
+    });
+}
+
 /// First child slot hanging off (parent_slot, port), if any.
 pub fn find_child(parent_slot: u8, port: u8) -> Option<u8> {
     let g = SLOTS.lock();

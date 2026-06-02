@@ -65,29 +65,20 @@ pub fn control_in(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) 
     });
 
     // ── Wait for Transfer Event (type 32) — up to 200 ms ──────────────────
-    let start = crate::boot::clock::elapsed_ms();
-    while crate::boot::clock::elapsed_ms() - start < 200 {
-        if let Some(ev) = crate::usb::xhci::ring::poll_event(x) {
-            let ty = crate::usb::xhci::ring::trb_type(&ev);
-            if ty == 32 {
-                let code = crate::usb::xhci::ring::completion_code(&ev);
-                // Code 1 = Success, code 13 = Short Packet (also OK for IN)
-                if code != 1 && code != 13 {
-                    crate::bwarn!("usb", "control_in xfer event code={}", code);
-                    return None;
-                }
-                // word2 bits 0..23 = residual transfer length
-                let residual = ev[2] & 0x00FF_FFFF;
-                let actual = s.length.saturating_sub(residual as u16);
-                return Some(actual);
-            }
-            // Ignore other events (e.g. port status change) and keep polling.
-        }
-        core::hint::spin_loop();
+    // Foreign events (port status change, other slots' transfers) are routed
+    // through the central dispatcher by `wait_for`, not dropped.
+    let ev = crate::usb::xhci::event::wait_for(x, 200, |w| {
+        crate::usb::xhci::ring::trb_type(w) == 32
+    })?;
+    let code = crate::usb::xhci::ring::completion_code(&ev);
+    // Code 1 = Success, code 13 = Short Packet (also OK for IN)
+    if code != 1 && code != 13 {
+        crate::bwarn!("usb", "control_in xfer event code={}", code);
+        return None;
     }
-
-    crate::bwarn!("usb", "control_in timeout (no Transfer Event in 200 ms)");
-    None
+    // word2 bits 0..23 = residual transfer length
+    let residual = ev[2] & 0x00FF_FFFF;
+    Some(s.length.saturating_sub(residual as u16))
 }
 
 /// Control transfer with no Data stage (e.g. SET_CONFIGURATION, SET_PROTOCOL).
@@ -108,20 +99,19 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     x.regs.doorbell.update_volatile_at(dev.slot_id as usize, |d| {
         d.set_doorbell_target(1);
     });
-    let start = crate::boot::clock::elapsed_ms();
-    while crate::boot::clock::elapsed_ms() - start < 100 {
-        if let Some(ev) = crate::usb::xhci::ring::poll_event(x) {
-            if crate::usb::xhci::ring::trb_type(&ev) == 32 {
-                let code = crate::usb::xhci::ring::completion_code(&ev);
-                if code != 1 {
-                    crate::bwarn!("usb", "control_out code={}", code);
-                    return false;
-                }
-                return true;
-            }
+    let ev = match crate::usb::xhci::event::wait_for(x, 100, |w| {
+        crate::usb::xhci::ring::trb_type(w) == 32
+    }) {
+        Some(e) => e,
+        None => {
+            crate::bwarn!("usb", "control_out timeout");
+            return false;
         }
-        core::hint::spin_loop();
+    };
+    let code = crate::usb::xhci::ring::completion_code(&ev);
+    if code != 1 {
+        crate::bwarn!("usb", "control_out code={}", code);
+        return false;
     }
-    crate::bwarn!("usb", "control_out timeout");
-    false
+    true
 }

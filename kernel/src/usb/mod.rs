@@ -4,6 +4,8 @@ pub mod control;
 pub mod device;
 pub mod encoding;
 pub mod hid;
+pub mod hub;
+pub mod registry;
 pub mod usage;
 pub mod xhci;
 

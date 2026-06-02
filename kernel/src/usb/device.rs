@@ -3,14 +3,24 @@ use crate::usb::xhci::Xhci;
 use crate::usb::xhci::ring;
 use crate::memory::dma::DmaRegion;
 
-/// A reset, connected root port ready for enumeration.
-pub struct PortInfo {
-    pub port:  u8,   // 1-based port number
-    pub speed: u8,   // PSI value (1=Full, 2=Low, 3=High, 4=Super)
+/// Where a device sits in the USB topology — everything `enumerate` needs to
+/// build the slot context (root device: route=0, tier=0, parent_slot=0, tt=false;
+/// devices behind a hub fill route/tier/parent_* and set tt for FS/LS-via-HS-hub).
+#[derive(Clone, Copy)]
+pub struct Location {
+    pub root_port: u8,   // root-hub port this device's branch hangs off (1-based)
+    pub route: u32,      // xHCI route string (0 for a root device)
+    pub tier: u8,        // hub depth (0 = root-attached)
+    pub speed: u8,       // PSI value (1=Full, 2=Low, 3=High, 4=Super)
+    pub parent_slot: u8, // slot id of the parent hub (0 = root)
+    pub parent_port: u8, // 1-based port on the parent hub (0 = root)
+    pub tt: bool,        // needs Transaction Translator (FS/LS device on an HS hub)
 }
 
-/// Scan all root ports; reset each connected one and read its speed. Returns the
-/// first connected+reset port (MVP enumerates one device). Logs each.
+/// Reset a single connected root port and read its operating speed. Returns
+/// `Some(speed)` (PSI value) once the port is reset+enabled, `None` if nothing is
+/// connected or the port never enabled. The worklist (`xhci::poll`) calls this
+/// per port before `enumerate`.
 ///
 /// # PORTSC RW1C note
 /// `update_volatile_at` does a plain read-modify-write. PORTSC contains several
@@ -18,78 +28,67 @@ pub struct PortInfo {
 /// clearing them during the set_port_reset() write, we call `set_0_*` on every
 /// RW1C change bit in the same closure so they stay 0 in the written value.
 /// Only when we deliberately clear PRC do we call `clear_port_reset_change()`.
-pub fn scan_ports(x: &mut Xhci) -> Option<PortInfo> {
-    let mut found = None;
+pub fn reset_root_port(x: &mut Xhci, port: u8) -> Option<u8> {
+    let idx = (port - 1) as usize;
 
-    for port in 1..=x.max_ports {
-        let idx = (port - 1) as usize;
-
-        // Check if a device is connected (CCS = Current Connect Status).
-        let p = x.regs.port_register_set.read_volatile_at(idx);
-        if !p.portsc.current_connect_status() {
-            continue;
-        }
-
-        // Assert port reset (PR bit, RW1S). Preserve all RW1C change bits by
-        // writing 0 to them so the read-modify-write does not accidentally clear
-        // them (writing 1 to a RW1C bit clears it in hardware).
-        x.regs.port_register_set.update_volatile_at(idx, |p| {
-            p.portsc.set_port_reset();
-            // Write 0 to all RW1C change bits to avoid clearing them.
-            p.portsc.set_0_port_enabled_disabled();
-            p.portsc.set_0_connect_status_change();
-            p.portsc.set_0_port_enabled_disabled_change();
-            p.portsc.set_0_warm_port_reset_change();
-            p.portsc.set_0_over_current_change();
-            p.portsc.set_0_port_reset_change();
-            p.portsc.set_0_port_link_state_change();
-            p.portsc.set_0_port_config_error_change();
-        });
-
-        // Wait (bounded 50 ms) for reset to complete — PRC (Port Reset Change) set.
-        let start = crate::boot::clock::elapsed_ms();
-        let mut reset_done = false;
-        while crate::boot::clock::elapsed_ms() - start < 50 {
-            let p = x.regs.port_register_set.read_volatile_at(idx);
-            if p.portsc.port_reset_change() {
-                reset_done = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // Clear PRC (RW1C) and preserve all other RW1C change bits.
-        x.regs.port_register_set.update_volatile_at(idx, |p| {
-            p.portsc.clear_port_reset_change();   // write 1 → hardware clears PRC
-            // Write 0 to all other RW1C change bits so we don't clear them.
-            p.portsc.set_0_port_enabled_disabled();
-            p.portsc.set_0_connect_status_change();
-            p.portsc.set_0_port_enabled_disabled_change();
-            p.portsc.set_0_warm_port_reset_change();
-            p.portsc.set_0_over_current_change();
-            p.portsc.set_0_port_link_state_change();
-            p.portsc.set_0_port_config_error_change();
-        });
-
-        let p = x.regs.port_register_set.read_volatile_at(idx);
-        let speed   = p.portsc.port_speed();
-        let enabled = p.portsc.port_enabled_disabled();
-
-        crate::binfo!(
-            "usb",
-            "port {} connected speed={} enabled={} reset_done={}",
-            port, speed, enabled, reset_done
-        );
-
-        if found.is_none() && enabled {
-            found = Some(PortInfo { port, speed });
-        }
+    // Check if a device is connected (CCS = Current Connect Status).
+    let p = x.regs.port_register_set.read_volatile_at(idx);
+    if !p.portsc.current_connect_status() {
+        return None;
     }
 
-    if found.is_none() {
-        crate::bwarn!("usb", "no usable port after scan");
+    // Assert port reset (PR bit, RW1S). Preserve all RW1C change bits by
+    // writing 0 to them so the read-modify-write does not accidentally clear
+    // them (writing 1 to a RW1C bit clears it in hardware).
+    x.regs.port_register_set.update_volatile_at(idx, |p| {
+        p.portsc.set_port_reset();
+        // Write 0 to all RW1C change bits to avoid clearing them.
+        p.portsc.set_0_port_enabled_disabled();
+        p.portsc.set_0_connect_status_change();
+        p.portsc.set_0_port_enabled_disabled_change();
+        p.portsc.set_0_warm_port_reset_change();
+        p.portsc.set_0_over_current_change();
+        p.portsc.set_0_port_reset_change();
+        p.portsc.set_0_port_link_state_change();
+        p.portsc.set_0_port_config_error_change();
+    });
+
+    // Wait (bounded 50 ms) for reset to complete — PRC (Port Reset Change) set.
+    let start = crate::boot::clock::elapsed_ms();
+    let mut reset_done = false;
+    while crate::boot::clock::elapsed_ms() - start < 50 {
+        let p = x.regs.port_register_set.read_volatile_at(idx);
+        if p.portsc.port_reset_change() {
+            reset_done = true;
+            break;
+        }
+        core::hint::spin_loop();
     }
-    found
+
+    // Clear PRC (RW1C) and preserve all other RW1C change bits.
+    x.regs.port_register_set.update_volatile_at(idx, |p| {
+        p.portsc.clear_port_reset_change();   // write 1 → hardware clears PRC
+        // Write 0 to all other RW1C change bits so we don't clear them.
+        p.portsc.set_0_port_enabled_disabled();
+        p.portsc.set_0_connect_status_change();
+        p.portsc.set_0_port_enabled_disabled_change();
+        p.portsc.set_0_warm_port_reset_change();
+        p.portsc.set_0_over_current_change();
+        p.portsc.set_0_port_link_state_change();
+        p.portsc.set_0_port_config_error_change();
+    });
+
+    let p = x.regs.port_register_set.read_volatile_at(idx);
+    let speed   = p.portsc.port_speed();
+    let enabled = p.portsc.port_enabled_disabled();
+
+    crate::binfo!(
+        "usb",
+        "port {} connected speed={} enabled={} reset_done={}",
+        port, speed, enabled, reset_done
+    );
+
+    if enabled { Some(speed) } else { None }
 }
 
 /// An addressed USB device: slot allocated, EP0 transfer ring set up, Device Context
@@ -106,14 +105,17 @@ pub struct UsbDevice {
     pub ep0_cycle:   bool,
 }
 
-/// Enable Slot → build Input Context → allocate EP0 ring + Device Context →
-/// write DCBAA entry → Address Device command. Returns `None` on any failure.
-pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
-    use ::xhci::context::{
-        Input32Byte, Input64Byte,
-        InputHandler, DeviceHandler, SlotHandler, EndpointHandler,
-        EndpointType,
-    };
+/// Enumerate the device at `loc`: Enable Slot → build Input Context (root-hub
+/// port + speed + route string + TT) → allocate EP0 ring + Device Context →
+/// write DCBAA → Address Device → read the device descriptor → `configure` →
+/// class-dispatch (keyboard / hub / other) → register the slot. Returns the
+/// allocated slot id, or `None` on any failure (DMA leaks on the error path are
+/// accepted for now — boot/hot-plug is rare; teardown frees registered slots).
+pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
+    // NB: only `InputHandler` is imported — `device_mut()`/`slot_mut()`/
+    // `endpoint_mut()` return `&mut dyn {Device,Slot,Endpoint}Handler`, so those
+    // traits' methods dispatch through the trait object without being in scope.
+    use ::xhci::context::{Input32Byte, Input64Byte, InputHandler, EndpointType};
 
     // ── 1. Enable Slot (command type 9) ─────────────────────────────────────
     ring::enqueue_cmd(x, [0, 0, 0, 0], 9);
@@ -130,11 +132,7 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
     crate::binfo!("usb", "slot {} enabled", slot_id);
 
     // ── 2. MaxPacketSize0 by speed ───────────────────────────────────────────
-    let max_packet0: u16 = match p.speed {
-        4 => 512,
-        3 => 64,
-        _ => 8,
-    };
+    let max_packet0: u16 = crate::usb::encoding::max_packet0(loc.speed);
 
     // ── 3. Allocate DMA regions ──────────────────────────────────────────────
     let ep0_ring = match crate::memory::dma::alloc(1) {
@@ -167,6 +165,23 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
     // set_dequeue_cycle_state(). Our DMA pages are 4KiB-aligned, so fine.
     let ep0_phys = ep0_ring.phys.as_u64();
 
+    // Slot-context builder shared by both context sizes: root-hub port + speed,
+    // route string (0 for a root device), and — for a FS/LS device behind an HS
+    // hub — the parent hub slot/port so the HC routes split transactions via TT.
+    macro_rules! build_slot {
+        ($slot:expr) => {{
+            let slot = $slot;
+            slot.set_context_entries(1);
+            slot.set_root_hub_port_number(loc.root_port);
+            slot.set_speed(loc.speed);
+            slot.set_route_string(loc.route);
+            if loc.tt {
+                slot.set_parent_hub_slot_id(loc.parent_slot);
+                slot.set_parent_port_number(loc.parent_port);
+            }
+        }};
+    }
+
     if csz {
         // 64-byte contexts
         let mut input = Input64Byte::new_64byte();
@@ -177,12 +192,7 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
         }
         {
             let dev = input.device_mut();
-            {
-                let slot = dev.slot_mut();
-                slot.set_context_entries(1);
-                slot.set_root_hub_port_number(p.port);
-                slot.set_speed(p.speed);
-            }
+            build_slot!(dev.slot_mut());
             {
                 let ep0 = dev.endpoint_mut(1); // DCI 1 = Control EP0
                 ep0.set_endpoint_type(EndpointType::Control);
@@ -210,12 +220,7 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
         }
         {
             let dev = input.device_mut();
-            {
-                let slot = dev.slot_mut();
-                slot.set_context_entries(1);
-                slot.set_root_hub_port_number(p.port);
-                slot.set_speed(p.speed);
-            }
+            build_slot!(dev.slot_mut());
             {
                 let ep0 = dev.endpoint_mut(1); // DCI 1 = Control EP0
                 ep0.set_endpoint_type(EndpointType::Control);
@@ -258,19 +263,53 @@ pub fn address_device(x: &mut Xhci, p: &PortInfo) -> Option<UsbDevice> {
         return None;
     }
 
-    crate::binfo!("usb", "slot {} addressed port={} speed={} mps0={}", slot_id, p.port, p.speed, max_packet0);
+    crate::binfo!(
+        "usb", "slot {} addressed port={} speed={} mps0={} route=0x{:X}",
+        slot_id, loc.root_port, loc.speed, max_packet0, loc.route
+    );
 
-    Some(UsbDevice {
+    let mut dev = UsbDevice {
         slot_id,
-        port: p.port,
-        speed: p.speed,
+        port: loc.root_port,
+        speed: loc.speed,
         max_packet0,
         ep0_ring,
         input_ctx,
         dev_ctx,
         ep0_enqueue: 0,
         ep0_cycle: true,
-    })
+    };
+
+    // ── 8. Device descriptor (for bDeviceClass) + class dispatch ─────────────
+    let dev_class = read_device_descriptor(x, &mut dev).unwrap_or(0);
+    let kb = configure(x, &mut dev);
+
+    let kind = if let Some(kb) = kb {
+        // HID boot keyboard: configure its interrupt-IN endpoint + queue a report.
+        let st = crate::usb::hid::configure_endpoint(x, &mut dev, &kb)?;
+        crate::usb::registry::SlotKind::Keyboard(st)
+    } else if dev_class == 0x09 {
+        // USB hub (QEMU usb-hub reports class 9 on the device descriptor).
+        let hs = crate::usb::hub::setup(x, slot_id, &mut dev, &loc)?;
+        crate::usb::registry::SlotKind::Hub(hs)
+    } else {
+        crate::usb::registry::SlotKind::Other
+    };
+
+    // ── 9. Register the slot (lock held only for the insert) ─────────────────
+    crate::usb::registry::insert(slot_id, crate::usb::registry::SlotEntry {
+        kind,
+        dev,
+        root_port:   loc.root_port,
+        parent_slot: loc.parent_slot,
+        parent_port: loc.parent_port,
+        route:       loc.route,
+        tier:        loc.tier,
+        speed:       loc.speed,
+    });
+
+    crate::binfo!("usb", "enumerated slot={} route=0x{:X}", slot_id, loc.route);
+    Some(slot_id)
 }
 
 /// Read the Configuration Descriptor, walk interface/endpoint descriptors to
@@ -393,13 +432,14 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
 }
 
 /// Read the 18-byte USB Device Descriptor from the addressed device and log
-/// VID, PID, class, max_packet_size0, and number of configurations.
-pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) {
+/// VID, PID, class, max_packet_size0, and number of configurations. Returns the
+/// bDeviceClass byte (offset 4) on success — used for hub vs. other dispatch.
+pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) -> Option<u8> {
     let buf = match crate::memory::dma::alloc(1) {
         Some(b) => b,
         None => {
             crate::bwarn!("usb", "device descriptor: DMA alloc failed");
-            return;
+            return None;
         }
     };
 
@@ -427,12 +467,15 @@ pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) {
                 "dev {:04x}:{:04x} class={} maxpkt0={} numcfg={}",
                 vid, pid, class, mps0, num_cfg
             );
+            Some(class)
         }
         Some(n) => {
             crate::bwarn!("usb", "device descriptor short: got {} bytes", n);
+            None
         }
         None => {
             crate::bwarn!("usb", "device descriptor read failed");
+            None
         }
     }
 }

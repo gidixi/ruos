@@ -63,6 +63,21 @@ pub fn dispatch_transfer(x: &mut crate::usb::xhci::Xhci, slot: u8, dci: u8) {
     });
 }
 
+/// Root device on root-hub port `port`, if one is already enumerated. A root
+/// device registers with `parent_slot == 0` (root-attached) and `root_port`
+/// set — distinct from `find_child(0, port)`, which keys on `parent_port`.
+pub fn find_root(port: u8) -> Option<u8> {
+    let g = SLOTS.lock();
+    for i in 1..MAX_SLOTS {
+        if let Some(e) = g[i].as_ref() {
+            if e.parent_slot == 0 && e.root_port == port {
+                return Some(i as u8);
+            }
+        }
+    }
+    None
+}
+
 /// First child slot hanging off (parent_slot, port), if any.
 pub fn find_child(parent_slot: u8, port: u8) -> Option<u8> {
     let g = SLOTS.lock();

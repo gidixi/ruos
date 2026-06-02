@@ -215,22 +215,17 @@ pub fn init() {
         crate::bwarn!("usb", "noop FAIL");
     }
 
-    // ── Root port scan + reset (Task 4) ──────────────────────────────────────
-    if let Some(port) = crate::usb::device::scan_ports(&mut x) {
-        // ── Enable Slot + Address Device (Task 5) ─────────────────────────
-        if let Some(mut dev) = crate::usb::device::address_device(&mut x, &port) {
-            // ── Task 6: Read Device Descriptor (EP0 control-IN) ──────────
-            crate::usb::device::read_device_descriptor(&mut x, &mut dev);
-            // ── Task 7: Config descriptor + HID detect + SET_CONFIGURATION ─
-            let _kb = crate::usb::device::configure(&mut x, &mut dev);
-            if let Some(kb) = _kb {
-                crate::usb::KBD.call_once(|| crate::sync::IrqMutex::new(Some(kb)));
-                // ── Task 8: Configure EP + boot protocol + queue first report ─
-                if let Some(st) = crate::usb::hid::configure_endpoint(&mut x, &mut dev, &kb) {
-                    crate::usb::HID.call_once(|| crate::sync::IrqMutex::new(Some(st)));
-                }
-            }
-            crate::usb::DEVICE.call_once(|| crate::sync::IrqMutex::new(Some(dev)));
+    // ── Seed the worklist: one RootPortChanged per connected root port ───────
+    // Enumeration itself runs on the first `poll()` after the executor starts —
+    // init must not block on per-device control transfers.
+    for port in 1..=x.max_ports {
+        let connected = x.regs.port_register_set
+            .read_volatile_at((port - 1) as usize)
+            .portsc.current_connect_status();
+        if connected {
+            crate::usb::registry::push_action(
+                crate::usb::registry::UsbAction::RootPortChanged(port),
+            );
         }
     }
 
@@ -245,5 +240,37 @@ pub fn poll() {
     // Events to slot handlers + Port Status Change to the worklist).
     while let Some(ev) = ring::poll_event(x) {
         event::dispatch(x, ev);
+    }
+    // Then drain the connect/disconnect worklist (port-change events queued above,
+    // plus the root ports seeded at init). Enumeration runs here, not at init.
+    while let Some(a) = crate::usb::registry::pop_action() {
+        handle_action(x, a);
+    }
+}
+
+/// Act on one worklist item: reset + enumerate newly-connected devices. Runs with
+/// the controller (`x`) locked but the SLOTS lock free — `enumerate` only locks
+/// SLOTS for its final `insert`, never across a command/event drain.
+fn handle_action(x: &mut Xhci, a: crate::usb::registry::UsbAction) {
+    use crate::usb::registry::UsbAction;
+    match a {
+        UsbAction::RootPortChanged(p) => {
+            // Connected + not yet enumerated → reset + enumerate a root device.
+            let connected = x.regs.port_register_set
+                .read_volatile_at((p - 1) as usize).portsc.current_connect_status();
+            if connected && crate::usb::registry::find_root(p).is_none() {
+                if let Some(speed) = crate::usb::device::reset_root_port(x, p) {
+                    let loc = crate::usb::device::Location {
+                        root_port: p, route: 0, tier: 0, speed,
+                        parent_slot: 0, parent_port: 0, tt: false,
+                    };
+                    let _ = crate::usb::device::enumerate(x, loc);
+                }
+            }
+            // (disconnect handling added in Task 5)
+        }
+        UsbAction::HubPortChanged { .. } => {
+            // (hub handling added in Task 4)
+        }
     }
 }

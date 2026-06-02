@@ -255,19 +255,39 @@ fn handle_action(x: &mut Xhci, a: crate::usb::registry::UsbAction) {
     use crate::usb::registry::UsbAction;
     match a {
         UsbAction::RootPortChanged(p) => {
-            // Connected + not yet enumerated → reset + enumerate a root device.
-            let connected = x.regs.port_register_set
-                .read_volatile_at((p - 1) as usize).portsc.current_connect_status();
-            if connected && crate::usb::registry::find_root(p).is_none() {
-                if let Some(speed) = crate::usb::device::reset_root_port(x, p) {
-                    let loc = crate::usb::device::Location {
-                        root_port: p, route: 0, tier: 0, speed,
-                        parent_slot: 0, parent_port: 0, tt: false,
-                    };
-                    let _ = crate::usb::device::enumerate(x, loc);
+            let portsc = x.regs.port_register_set
+                .read_volatile_at((p - 1) as usize).portsc;
+            let connected = portsc.current_connect_status();
+            // Clear the connect-status-change (CSC) RW1C bit, preserving the other
+            // change bits (set_0_* keeps them 0 in the written value so a plain
+            // read-modify-write does not accidentally clear them).
+            x.regs.port_register_set.update_volatile_at((p - 1) as usize, |r| {
+                r.portsc.clear_connect_status_change();
+                r.portsc.set_0_port_enabled_disabled();
+                r.portsc.set_0_port_enabled_disabled_change();
+                r.portsc.set_0_warm_port_reset_change();
+                r.portsc.set_0_over_current_change();
+                r.portsc.set_0_port_reset_change();
+                r.portsc.set_0_port_link_state_change();
+                r.portsc.set_0_port_config_error_change();
+            });
+            let existing = crate::usb::registry::find_root(p);
+            match (connected, existing) {
+                // Newly connected, not yet enumerated → reset + enumerate.
+                (true, None) => {
+                    if let Some(speed) = crate::usb::device::reset_root_port(x, p) {
+                        let loc = crate::usb::device::Location {
+                            root_port: p, route: 0, tier: 0, speed,
+                            parent_slot: 0, parent_port: 0, tt: false,
+                        };
+                        let _ = crate::usb::device::enumerate(x, loc);
+                    }
                 }
+                // Disconnected with a live root slot → tear it down (+ children).
+                (false, Some(slot)) => { crate::usb::registry::teardown(x, slot); }
+                // Already-present connect, or empty disconnect: nothing to do.
+                _ => {}
             }
-            // (disconnect handling added in Task 5)
         }
         UsbAction::HubPortChanged { hub_slot, port } => {
             crate::usb::hub::handle_port(x, hub_slot, port);

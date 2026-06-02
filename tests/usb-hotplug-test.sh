@@ -24,7 +24,11 @@ sleep 1
 rm -f "$SERIAL" "$QMP"
 
 # xHCI controller with an id (xhci.0 bus) but no usb-kbd at boot — we add it later.
-timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
+# i8042=off disables the emulated PS/2 keyboard: q35 always instantiates an i8042,
+# and QMP `send-key` routes to it too, so post-removal "zzz" would echo via PS/2
+# even though the USB keyboard is gone — masking USB teardown. Disabling PS/2
+# isolates the USB HID path so this test actually gates USB add/remove.
+timeout 60 qemu-system-x86_64 -machine q35,i8042=off -cpu max -boot d -cdrom "$ISO" \
   -serial stdio -display none -no-reboot -m 512 \
   -device qemu-xhci,id=xhci \
   -qmp unix:$QMP,server,nowait > "$SERIAL" 2>&1 &

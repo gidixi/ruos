@@ -125,10 +125,12 @@ Depth is bounded to 5 tiers (xHCI max); deeper attachments are logged + skipped.
 1. **Hub descriptor** GET_DESCRIPTOR(type 0x29) → `bNbrPorts`,
    `wHubCharacteristics` (TT think time bits, power-switching), `bPwrOn2PwrGood`.
 2. **One Configure Endpoint command** (type 12) that does both: with `A0` set it
-   carries an updated slot context (Hub bit + `number_of_ports` + `tt_think_time`,
-   + `multi_tt` if reported), and with `A(dci)` set it adds the hub's
-   **interrupt-IN status-change endpoint** (same endpoint-context build as the
-   keyboard's). Allocate that endpoint's interrupt ring here.
+   carries an updated slot context (Hub bit + `number_of_ports` + `tt_think_time`),
+   and with `A(dci)` set it adds the hub's **interrupt-IN status-change endpoint**
+   (same endpoint-context build as the keyboard's). Allocate that endpoint's
+   interrupt ring here. **All hubs are treated as single-TT**: we do not set the
+   Multi-TT bit and do not SET_INTERFACE to a multi-TT alt setting, so a multi-TT
+   hub falls back to its single shared TT (sufficient for HID interrupt traffic).
 3. **Power ports**: SET_FEATURE(PORT_POWER=8) per port; wait
    `bPwrOn2PwrGood * 2` ms.
 4. **Queue the status-change TRB**: a Normal TRB into a small change-bitmap
@@ -206,8 +208,11 @@ New boot-log markers gate the automated parts: `usb hub slot=S ports=N`,
 
 - Non-HID class drivers (storage, audio, …) — identified + logged, not driven.
 - Mouse (no consumer until a GUI exists).
-- Power management, suspend/resume, remote wakeup, USB3 streams.
-- Multi-TT beyond setting the slot-context bit; per-TT bandwidth scheduling.
+- Power management, suspend/resume, remote wakeup, USB3 streams. (ruos never
+  suspends the bus, so there is nothing to manage or wake from.)
+- Multi-TT: every hub is driven as single-TT (no MTT bit, no SET_INTERFACE
+  alt-1); multi-TT hubs fall back to their shared TT. Single-TT itself IS in
+  scope (required for full/low-speed devices behind a high-speed hub).
 - MSI/MSI-X (polling stays).
 
 ## Files touched

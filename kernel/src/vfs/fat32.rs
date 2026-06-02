@@ -281,10 +281,11 @@ pub struct Fat32Fs {
 }
 
 impl Fat32Fs {
-    /// Take the AHCI port from `PORT0`, parse the BPB, return a mounted FS.
-    pub fn from_ahci_port(mut port: AhciPort) -> Result<Self, VfsError> {
+    /// Parse the BPB off `dev` (sector 0) and return a mounted FS over any
+    /// block device (an AHCI port, a partition, …).
+    pub fn from_blockdev(mut dev: alloc::boxed::Box<dyn crate::blockdev::BlockDevice + Send>) -> Result<Self, VfsError> {
         let mut sec0 = [0u8; SECTOR];
-        port.read_blocks(0, &mut sec0).map_err(map_block_err)?;
+        dev.read_blocks(0, &mut sec0).map_err(map_block_err)?;
         let bpb = Bpb::parse(&sec0)?;
         crate::binfo!(
             "fat32",
@@ -293,9 +294,14 @@ impl Fat32Fs {
             bpb.root_clus, bpb.tot_sec32,
         );
         Ok(Self { inner: Arc::new(Mutex::new(Inner {
-            dev: Box::new(port) as Box<dyn BlockDevice + Send>,
+            dev,
             bpb,
         })) })
+    }
+
+    /// Take the AHCI port from `PORT0`, parse the BPB, return a mounted FS.
+    pub fn from_ahci_port(port: AhciPort) -> Result<Self, VfsError> {
+        Self::from_blockdev(alloc::boxed::Box::new(port))
     }
 
     /// Look up `path` (split components) walking from the root cluster.
@@ -602,6 +608,13 @@ fn update_entry_on_disk(fs: &Arc<Mutex<Inner>>, entry: &DirEntry) -> Result<(), 
 /// Convenience for the storage phase: take the ahci PORT0 and mount it.
 pub fn mount_from_ahci_port(port: AhciPort) -> Result<(), VfsError> {
     let fs = Fat32Fs::from_ahci_port(port)?;
+    crate::vfs::mount("/mnt", crate::vfs::fs::FsImpl::Fat32(fs))?;
+    Ok(())
+}
+
+/// Build + mount a FAT32 volume on any block device at /mnt.
+pub fn mount_from_blockdev(dev: alloc::boxed::Box<dyn crate::blockdev::BlockDevice + Send>) -> Result<(), VfsError> {
+    let fs = Fat32Fs::from_blockdev(dev)?;
     crate::vfs::mount("/mnt", crate::vfs::fs::FsImpl::Fat32(fs))?;
     Ok(())
 }

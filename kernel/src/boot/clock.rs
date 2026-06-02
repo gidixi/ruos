@@ -125,3 +125,10 @@ pub fn elapsed_ms() -> u64 {
 pub fn tsc_per_ms() -> u64 {
     TSC_PER_MS.load(Ordering::Acquire)
 }
+
+/// Overwrite the TSC/ms calibration. Called from the interrupts phase once the
+/// ACPI PM timer (an accurate fixed-frequency reference) is available, to correct
+/// the rough CPUID/PIT estimate made at `init()` time (before ACPI was parsed).
+pub fn set_tsc_per_ms(v: u64) {
+    if v != 0 { TSC_PER_MS.store(v, Ordering::Release); }
+}

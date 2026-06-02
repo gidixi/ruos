@@ -18,9 +18,10 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
 
 pub fn ticks() -> u64 { TICKS.load(Ordering::Relaxed) }
 
-pub fn init(hz: u32) -> Result<(), &'static str> {
-    // Calibrate over 10 ms (100 PIT samples per second).
-    let lapic_per_10ms = lapic::calibrate(10);
+pub fn init(hz: u32, pm_timer: Option<(u16, bool)>) -> Result<(), &'static str> {
+    // Calibrate the LAPIC over a 10 ms window. Prefer the ACPI PM timer (accurate
+    // even when the PIT is gated off); else fall back to the TSC.
+    let lapic_per_10ms = lapic::calibrate(10, pm_timer);
     if lapic_per_10ms == 0 { return Err("calibration"); }
     // u64 to avoid overflow on >4.29 GHz LAPIC buses.
     let lapic_per_sec = (lapic_per_10ms as u64) * 100;

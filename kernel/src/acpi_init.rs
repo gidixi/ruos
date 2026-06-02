@@ -73,6 +73,12 @@ pub struct AcpiInfo {
     /// CPUs listed in the MADT. Index 0 is always the BSP (if any); remaining
     /// entries are APs. May be empty if no MADT processor entries found.
     pub cpus:        Vec<CpuInfo>,
+    /// ACPI Power Management Timer I/O port (3.579545 MHz, fixed). Used to
+    /// calibrate the LAPIC timer + TSC accurately even when the PIT is gated
+    /// off (real UEFI machines). `None` if the FADT has no SystemIO PM timer.
+    pub pm_timer_io:    Option<u16>,
+    /// True if the PM timer is a 32-bit counter (else 24-bit).
+    pub pm_timer_32bit: bool,
 }
 
 #[derive(Debug)]
@@ -182,5 +188,17 @@ pub fn parse() -> Result<AcpiInfo, AcpiInitError> {
         }
     }
 
-    Ok(AcpiInfo { lapic_base, ioapic_base, overrides, ecam, hhdm_offset, cpus })
+    // ACPI PM timer port (SystemIO only; memory-mapped PM timers fall back to
+    // the TSC path in lapic::calibrate).
+    let (pm_timer_io, pm_timer_32bit) = match platform.pm_timer.as_ref() {
+        Some(pt) if matches!(pt.base.address_space, acpi::address::AddressSpace::SystemIo) => {
+            (Some(pt.base.address as u16), pt.supports_32bit)
+        }
+        _ => (None, false),
+    };
+
+    Ok(AcpiInfo {
+        lapic_base, ioapic_base, overrides, ecam, hhdm_offset, cpus,
+        pm_timer_io, pm_timer_32bit,
+    })
 }

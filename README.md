@@ -3,10 +3,12 @@
 `ruos` is a hobby operating system written in Rust (`no_std`), booted by
 [Limine](https://github.com/limine-bootloader/limine). It boots in QEMU
 (BIOS or UEFI), VirtualBox, and on real hardware via USB; runs `.wasm`
-userspace tools (coreutils, network tools, an editor); ships a TCP/IP
-stack with virtio-net and e1000 drivers; mounts an AHCI/SATA disk as FAT32
-at `/mnt`; and exposes an interactive shell over **SSH** (port 22, ed25519
-host key, password + pubkey auth).
+userspace tools (coreutils, network tools, an editor, an `htop`-style
+monitor); ships a TCP/IP stack with virtio-net and e1000 drivers; mounts an
+AHCI/SATA disk as FAT32 at `/mnt`; drives USB keyboards over xHCI (hubs +
+hot-plug); offloads pure-CPU work across cores (SMP); can **install itself
+onto an internal SATA SSD** and boot standalone; and exposes an interactive
+shell over **SSH** (port 22, ed25519 host key, password + pubkey auth).
 
 **North star** (pivot 2026-05-28): execute `.wasm` apps (WASI), GUI via
 `rlvgl`, remote access via SSH. Userland = WebAssembly (`wasm32-wasip1`);
@@ -32,6 +34,18 @@ scheduler — concurrency is async cooperative (timer-IRQ wake). See the
 | 16 | SSH server (`sunset`, ed25519 host key, pubkey **+ password** auth, PTY shell + exec, runs disklessly) | ✅ |
 | 17 | Mouse PS/2 + `rlvgl` GUI + graphics host functions | ⏳ next |
 
+### Built alongside (beyond the numbered roadmap)
+
+After Step 16 landed, several subsystems were built ahead of the Step 17 GUI
+work — all merged to `main` and verified in QEMU + VirtualBox:
+
+| Subsystem | What | Status |
+|---|---|---|
+| **SMP** | Multi-core bring-up (Limine MP, per-CPU GDT/TSS/IDT) + a cooperative compute-offload pool — APs run pure-CPU kernel jobs in parallel while the BSP async executor is untouched (`smptest` shows 2–3× speedup). Still no preemptive scheduler. | ✅ |
+| **USB** | xHCI host driver + HID boot keyboard, USB **hubs**, and runtime **hot-plug** — attach/detach a keyboard on a root port or behind hubs and it types into the shell. | ✅ |
+| **`rtop`** | `htop`-style full-screen monitor (per-core CPU%, memory, uptime, process table) — `ratatui` on `wasm32-wasip1`, timer-driven auto-refresh, Ctrl-C foreground kill. | ✅ |
+| **SSD self-install** | `install` authors a SATA SSD (GPT + FAT32), copies the whole boot tree onto the ESP, and the SSD then boots ruos standalone under UEFI and mounts its data partition. A `/mnt` guard refuses to wipe the running system. | ✅ |
+
 WASI compatibility is growing incrementally alongside the roadmap: as of
 the latest work, `fd_readdir` is exported, so `std::fs::read_dir` and
 `walkdir`-style crates work from a plain `wasm32-wasip1` `std` binary (no
@@ -43,6 +57,20 @@ Per-step design specs and implementation plans live under
 [`docs/superpowers/specs/`](docs/superpowers/specs/) and
 [`docs/superpowers/plans/`](docs/superpowers/plans/). A flat changelog of every
 change is in [`CHANGELOG/`](CHANGELOG/).
+
+## Userspace tools
+
+Every tool is a `wasm32-wasip1` binary in `user/`, mounted under `/bin`. Add a
+new one by appending its crate name to `BIN_TOOLS` in the `Makefile`.
+
+| Group | Tools |
+|---|---|
+| Files & text | `ls cat echo cp mv rm mkdir rmdir touch find du df wc head tail sort uniq cut tr tee grep diff which clear` |
+| Editor | `nano` |
+| System & process | `ps kill pkill uname whoami id uptime free dmesg lscpu service rtop` |
+| Network | `ip ifconfig ping nc wget lspci` |
+| Disk & install | `mkdisk mkboot install` |
+| SMP & misc | `smptest spinloop readdirtest date` |
 
 ## Prerequisites
 
@@ -86,23 +114,53 @@ The first `make iso` clones the Limine binary branch (`v11.4.1-binary`) into
 
 ## Test (automated, headless)
 
-The Makefile has separate targets for the boot smoke battery, SSH pubkey,
-SSH password (with `/mnt/passwd`), and SSH password from a diskless boot
-(compile-time default fallback):
+The Makefile has a target per subsystem. The core boot battery:
 
 ```bash
-make run-test                  # boot + DHCP + AHCI + FAT + shell + pipe
+make run-test                  # boot smoke: PCI + xHCI USB + DHCP + AHCI + FAT + readdir + rtop + shell pipe
+make run-test-e1000            # run-test on the Intel e1000 NIC path
+```
+
+SSH, PTY, and WASM-sandbox behaviour:
+
+```bash
 make run-ssh-test              # SSH client w/ ed25519 pubkey, exec + interactive
 make run-passwd-test           # SSH password from /mnt/passwd (sshpass)
-make run-passwd-diskless-test  # SSH password fallback, no -drive
+make run-passwd-diskless-test  # SSH password fallback, no -drive (diskless)
+make run-pipe-test             # shell pipeline `a | b` over a PTY
+make run-fuel-test             # WASM fuel metering kills a runaway compute loop
+make run-ctrlc-test            # Ctrl-C kills the foreground app, prompt returns
+make run-ssh-idle-test         # idle SSH session survives the PTY watchdog
+```
+
+SMP, the monitor, and USB:
+
+```bash
+make run-smp-test              # SMP bring-up: every AP comes online
+make run-smp2-test             # SMP compute pool: parallel speedup over APs
+make run-rtop-test             # rtop over SSH: auto-refresh + clean quit
+make run-usb-key-test          # USB keyboard (root port) types into the shell
+make run-usb-hub-test          # USB keyboard behind a hub enumerates + types
+make run-usb-hotplug-test      # USB keyboard added / removed at runtime
+```
+
+Disk authoring and boot-from-SSD (`run-m2b2-test` is the installer capstone —
+it boots the authored SSD standalone under OVMF/UEFI):
+
+```bash
+make run-gpt-test              # GPT-partitioned SATA disk parsed + /mnt mounted
+make run-m2a-test              # `mkdisk` authors a GPT+FAT32 disk (host-verified)
+make run-m2b1-test             # boot tree copied onto the ESP (LFN, byte-identity)
+make run-m2b2-test             # install to SSD, then boot standalone from it
 ```
 
 `run-test` swaps in `user-bin/smoke.sh` as `/etc/init.sh` so the boot
-exercises every `.wasm` tool, FAT R/W, ping, and a shell pipe. Each test
-captures the serial log under `build/`, greps for marker lines (e.g. `dhcp
-bound ip=10.0.2.15`, `mnt mounted FAT`, `auth ok user=root`) and prints
-`TEST_PASS_*` on success. The kernel halts after smoke; QEMU is killed by
-`timeout`, which is expected — the verdict is based on the captured serial.
+exercises every `.wasm` tool, FAT R/W, ping, a shell pipe, `rtop`, and the
+USB keyboard. Each test captures the serial log under `build/`, greps for
+marker lines (e.g. `dhcp bound ip=10.0.2.15`, `mnt mounted FAT`, `usb  xhci
+up`, `rtop: uptime=`, `auth ok user=root`) and prints `TEST_PASS_*` on
+success. The kernel halts after smoke; QEMU is killed by `timeout`, which is
+expected — the verdict is based on the captured serial.
 
 ## Run (interactive)
 
@@ -112,6 +170,29 @@ make run
 
 Launches QEMU with a display window; serial is mirrored to the host
 terminal.
+
+## Install to an internal disk (SSD)
+
+ruos can author a blank SATA disk and copy its own boot tree onto it, so the
+machine then boots ruos from the SSD with no USB stick attached. From a
+running ruos shell (serial, framebuffer, or SSH):
+
+```
+install            # auto-targets the first non-boot SATA disk
+install 1          # or name the AHCI port explicitly
+```
+
+`install` writes a GPT (protective MBR + primary/backup headers), formats an
+EFI System Partition (FAT32) plus a data partition, and copies the kernel,
+`BOOTX64.EFI`, `limine.conf`, and every `.wasm` tool onto the ESP with long
+filenames. On the next UEFI boot the firmware runs
+`/EFI/BOOT/BOOTX64.EFI` → Limine → the kernel, and the data partition mounts
+at `/mnt`. Proven end-to-end under OVMF (`make run-m2b2-test`).
+
+A safety guard refuses to run while `/mnt` is mounted, so it can neither wipe
+the disk it booted from nor re-install in a loop. The lower-level steps are
+also exposed as standalone tools: `mkdisk` (author GPT + FAT32 only) and
+`mkboot` (copy the boot tree onto an already-authored ESP).
 
 ## SSH
 
@@ -225,9 +306,12 @@ Replace `/dev/sdX` with your USB device (e.g. `/dev/sdb`).
 
 Boot from the USB on any x86-64 PC; both BIOS and UEFI firmware are
 supported. Output goes to both the **framebuffer console** (Step 8) and COM1
-serial, and the PS/2 keyboard drives a local shell — so a monitor + keyboard
-is enough; a serial console (USB-to-serial, BMC/IPMI redirect) still mirrors
-everything if you need it.
+serial, and either a **PS/2 or USB keyboard** drives the local shell — so a
+monitor + keyboard is enough; a serial console (USB-to-serial, BMC/IPMI
+redirect) still mirrors everything if you need it. The boot path is hardened
+for real firmware: the clock no longer polls the (often-gated) PIT, the LAPIC
+timer is calibrated against the ACPI PM timer, and xHCI takes ownership from
+the BIOS via the USB legacy-support handoff.
 
 ## Repository layout
 
@@ -238,16 +322,22 @@ kernel/                 # Rust no_std kernel crate
     boot/               # phased boot sequence (arch → mem → fs → user)
     apic/, gdt.rs,      # interrupt setup (LAPIC/IOAPIC, GDT/TSS, IDT)
       idt.rs, pic.rs
+    cpu/, smp/          # per-CPU GDT/TSS/IDT + AP trampoline; SMP bring-up + job pool
+    sched/              # TSC-based per-core CPU accounting (feeds rtop)
     serial.rs, klog.rs, # COM1 driver + ring-buffer log + kprintln!
       kprint.rs
     memory/             # frame allocator + paging (talc + map/unmap_page)
     acpi_init.rs        # ACPI MADT/ECAM parse
     pci/                # PCIe enumeration (ECAM)
     net/                # smoltcp stack + virtio-net + e1000 drivers
+    usb/                # xHCI driver + HID keyboard + hub + hot-plug
     ahci/, blockdev.rs  # SATA driver + block device trait
+    gpt.rs, disk.rs,    # GPT parse/author + FAT32 mkfs + boot-tree copy (install)
+      crc32.rs
     vfs/                # tmpfs + FAT32 + /dev/{console,null,zero,pts/N}
     pty/                # 4 master/slave pairs + line discipline
     pipe/               # in-RAM pipe for shell pipelines
+    service/, sync/     # minimal service manager; IrqMutex (IRQ-safe lock)
     console/            # framebuffer console (font, AA blend, vte ANSI)
     wasm/               # wasmi runtime, WASI shim, exec_queue, pipeline
     ssh/                # sunset bridge + hostkey + authkeys + password

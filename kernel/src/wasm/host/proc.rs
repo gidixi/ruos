@@ -543,33 +543,26 @@ pub fn ruos_tcp_dial(
 /// with /EFI/BOOT + FAT32 data partition) on the FIRST populated SATA port.
 /// **Destructive** — wipes the target disk.
 ///
-/// Synchronous: re-acquires the AHCI HBA + brings up the first PI port the same
-/// way `boot::phases::storage` does, then calls `disk::author`. Targets a single
-/// blank disk (the M2a test scenario), so there is no `/mnt` mount conflict.
+/// Synchronous: brings up the first PI port via the boot-time HBA
+/// (`ahci::acquire_port`) WITHOUT a second HBA reset, then calls `disk::author`.
+/// The reset-free path means a live `/mnt` on another port is not orphaned.
 ///
 /// Returns 0 on success; negative on failure: -1 no SATA port, -2 author error.
 /// `esp_mib <= 0` defaults to 64 MiB; values above 4096 are clamped down.
 pub fn ruos_mkdisk(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i32, Error> {
-    // Acquire the first populated SATA port (mirrors boot::phases::storage).
-    let hba = match crate::ahci::init() {
-        Some(h) => h,
+    // Acquire the first populated SATA port via the boot-time HBA — NO second
+    // HBA reset, so a live /mnt on another port is not orphaned.
+    let idx = match crate::ahci::sata_ports().first().copied() {
+        Some(i) => i,
         None => {
-            crate::bwarn!("mkdisk", "no SATA HBA found");
+            crate::bwarn!("mkdisk", "no populated SATA port");
             return Ok(-1);
         }
     };
-    let mut port = None;
-    for idx in 0..32 {
-        if (hba.pi & (1 << idx)) == 0 { continue; }
-        if let Some(p) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
-            port = Some(p);
-            break;
-        }
-    }
-    let mut port = match port {
+    let mut port = match crate::ahci::acquire_port(idx) {
         Some(p) => p,
         None => {
-            crate::bwarn!("mkdisk", "no populated SATA port");
+            crate::bwarn!("mkdisk", "port {} acquire failed", idx);
             return Ok(-1);
         }
     };
@@ -605,32 +598,26 @@ pub fn ruos_mkdisk(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
 /// onto the ESP so the SSD boots standalone (UEFI → BOOTX64.EFI → limine.conf →
 /// kernel + every module at its cmdline path). **Destructive** — wipes the disk.
 ///
-/// Synchronous: same AHCI bring-up as `ruos_mkdisk`, then `disk::author`
-/// followed by `disk::copy_boot_payload` over a `PartBorrow` of the ESP extent.
+/// Synchronous: same reset-free port acquisition as `ruos_mkdisk`
+/// (`ahci::acquire_port`), then `disk::author` followed by
+/// `disk::copy_boot_payload` over a `PartBorrow` of the ESP extent.
 ///
 /// Returns 0 on success; negative on failure: -1 no SATA port, -2 author/copy
 /// error. `esp_mib <= 0` defaults to 64 MiB; values above 4096 are clamped down.
 pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i32, Error> {
-    // Acquire the first populated SATA port (mirrors boot::phases::storage).
-    let hba = match crate::ahci::init() {
-        Some(h) => h,
+    // Acquire the first populated SATA port via the boot-time HBA — NO second
+    // HBA reset, so a live /mnt on another port is not orphaned.
+    let idx = match crate::ahci::sata_ports().first().copied() {
+        Some(i) => i,
         None => {
-            crate::bwarn!("mkboot", "no SATA HBA found");
+            crate::bwarn!("mkboot", "no populated SATA port");
             return Ok(-1);
         }
     };
-    let mut port = None;
-    for idx in 0..32 {
-        if (hba.pi & (1 << idx)) == 0 { continue; }
-        if let Some(p) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
-            port = Some(p);
-            break;
-        }
-    }
-    let mut port = match port {
+    let mut port = match crate::ahci::acquire_port(idx) {
         Some(p) => p,
         None => {
-            crate::bwarn!("mkboot", "no populated SATA port");
+            crate::bwarn!("mkboot", "port {} acquire failed", idx);
             return Ok(-1);
         }
     };

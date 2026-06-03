@@ -52,6 +52,10 @@ the latest work, `fd_readdir` is exported, so `std::fs::read_dir` and
 custom `ruos.*` bindings needed). The legacy `ruos.readdir` host fn stays
 for the existing tools.
 
+**How it all works:** a top-to-bottom walkthrough of the hardware, kernel,
+and userland — boot flow, drivers, the WASM runtime, and the host ABI — is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 Detailed roadmap: [`docs/superpowers/roadmap-rust-os.md`](docs/superpowers/roadmap-rust-os.md).
 Per-step design specs and implementation plans live under
 [`docs/superpowers/specs/`](docs/superpowers/specs/) and
@@ -363,16 +367,6 @@ Build artifacts live under `build/` and `kernel/target/` (gitignored).
 The Limine binary branch is cloned to `third_party/limine/` on first build
 (gitignored); the `sunset` SSH library is vendored to `third_party/sunset/`
 and checked in.
-
-## Reference / history
-
-The project started as a fork of an x86-64 hobby OS in C (Pure64 + a full C
-kernel: bitmap frame allocator from BIOS E820, 4 KiB paging, buddy heap,
-RTL8139 driver, simple shell). After completing the C memory manager, the
-project pivoted to a Rust + Limine rewrite. The legacy C tree was removed
-from `main` but survives in git history up to commit `c1d2a81`; see
-[`docs/superpowers/plans/2026-05-27-memory-manager.md`](docs/superpowers/plans/2026-05-27-memory-manager.md)
-for the C design and implementation history.
 
 ## License
 

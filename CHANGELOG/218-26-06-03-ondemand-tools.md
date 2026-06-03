@@ -26,14 +26,13 @@ dati (`ls.wasm` + `readdirtest.wasm`, byte-identici), fsck pulito su entrambe.
 Altri 3 gate verdi: run-m2a-test → TEST_PASS_M2A, run-gpt-test → TEST_PASS_GPT,
 run-test → TEST_PASS.
 
-NOTA (concern aperto): run-m2b2-test FALLISCE (TEST_FAIL_SSD_BOOT) — l'exec
-on-demand NON funziona in-guest. Sul SSD avviato `/mnt` monta FAT, ma la shell
-non risolve NESSUN tool da `/mnt/bin` (`echo: not found`, `uname: not found`).
-Causa = bug del driver FAT32 del kernel (`kernel/src/vfs/fat32.rs`): scrive le
-entry LFN ma NON le rilegge in lookup (`read_dir_entries` salta `ATTR_LFN`,
-`lookup` confronta solo il nome 8.3). I `*.wasm` hanno estensione a 4 char →
-nome corto lossy `UNAME~1.WAS` ≠ `uname.wasm` richiesto → NotFound. Il disco è
-corretto (host mtools, che supporta LFN, legge `uname.wasm` dalla partizione
-dati). Il fix è kernel-side (LFN read in fat32), fuori dallo scope di questo
-task (solo test + init + changelog). Test corretti: m2b1 verde lo prova, e
-m2b2 ora espone il bug invece di dare un falso PASS.
+NOTA (risolto): run-m2b2-test ora PASSA (TEST_PASS_M2B2) dopo il fix LFN-read nel
+driver FAT32 del kernel (`kernel/src/vfs/fat32.rs`, commit separato). In origine
+falliva perché il driver scriveva le entry LFN ma NON le rileggeva in lookup
+(`read_dir_entries` saltava `ATTR_LFN`, `lookup` confrontava solo il nome 8.3): i
+`*.wasm` (estensione a 4 char) finivano sul nome corto lossy `UNAME~1.WAS` ≠
+`uname.wasm` richiesto → NotFound → `uname: not found`. Ora `read_dir_entries`
+ricostruisce il nome lungo dalle run `ATTR_LFN` (per ordinale) e lo espone come
+`DirEntry.name`, così l'exec on-demand risolve `/mnt/bin/uname.wasm` e `uname -a`
+stampa `wasm-userland`. I file con solo nome corto (es. `/mnt/hello.txt`) restano
+invariati → run-test resta verde.

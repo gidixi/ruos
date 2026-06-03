@@ -118,4 +118,27 @@ impl Grid {
         self.cur_row = 0;
         for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
     }
+
+    pub fn move_up(&mut self, n: u16)    { self.cur_row = self.cur_row.saturating_sub(n); }
+    pub fn move_down(&mut self, n: u16)  { self.cur_row = (self.cur_row + n).min(self.rows - 1); }
+    pub fn move_left(&mut self, n: u16)  { self.cur_col = self.cur_col.saturating_sub(n); }
+    pub fn move_right(&mut self, n: u16) { self.cur_col = (self.cur_col + n).min(self.cols - 1); }
+
+    pub fn goto(&mut self, col: u16, row: u16) {
+        self.cur_col = col.min(self.cols - 1);
+        self.cur_row = row.min(self.rows - 1);
+    }
+
+    /// Cancella dalla colonna del cursore a fine riga (riempi di blank).
+    pub fn erase_to_eol(&mut self) {
+        let (col, row) = (self.cur_col, self.cur_row);
+        let blank = Cell::blank(self.fg, self.bg);
+        for c in col..self.cols {
+            let i = self.idx(c, row);
+            self.cells[i] = blank;
+        }
+        let hi = self.cols - 1;
+        let (lo, _) = self.dirty[row as usize];
+        self.dirty[row as usize] = (lo.min(col), hi);
+    }
 }

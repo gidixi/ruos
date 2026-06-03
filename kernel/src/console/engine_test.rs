@@ -122,6 +122,21 @@ fn run_inner() -> Result<(), u32> {
         check(22, g.dirty_span(0).is_none())?;
     }
 
+    // T23: FramebufferConsole su FbInfo finto (addr null) — write_str aggiorna
+    // la griglia e pubblica il cursore.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh*3,
+                            pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("ok");
+        check(23, con.cursor_for_test() == (2, 0))?;
+    }
+
     Ok(())
 }
 

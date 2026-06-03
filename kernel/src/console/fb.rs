@@ -1,12 +1,15 @@
 //! Framebuffer console: text rendering on Limine's framebuffer.
 //!
-//! Task 1: printable ASCII, '\n', '\r', '\b', '\t', scrolling, clear. No
-//! ANSI parsing, no cursor blink. Task 4 adds vte::Parser + cursor blink.
+//! Task 8: FramebufferConsole wired onto Grid + Surface + GlyphCache + render
+//! pipeline built in Tasks 2-7. tick_cursor stays untouched (reads atomics).
 
-use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use crate::console::ansi::{apply_sgr, Rgb};
-use crate::console::font::{glyph_height, glyph_width, raster_for};
+use crate::console::font::{glyph_height, glyph_width};
+use crate::console::grid::Grid;
+use crate::console::surface::Surface;
+use crate::console::glyphcache::GlyphCache;
+use crate::console::render;
 
 #[derive(Debug, Copy, Clone)]
 pub enum PixelLayout { Rgb, Bgr }
@@ -22,27 +25,14 @@ pub struct FbInfo {
 }
 
 pub struct FramebufferConsole {
-    info:    FbInfo,
-    cols:    u32,
-    rows:    u32,
-    cur_col: u32,
-    cur_row: u32,
-    fg:      Rgb,
-    bg:      Rgb,
-    parser:  vte::Parser,
+    info:   FbInfo,
+    grid:   Grid,
+    surf:   Surface,
+    cache:  GlyphCache,
+    parser: vte::Parser,
 }
 
 unsafe impl Send for FramebufferConsole {}
-
-/// Per-channel linear blend `fg*α + bg*(1-α)` where α = intensity/255.
-/// Preserves Noto's grayscale anti-aliasing instead of hard-thresholding to 1-bit.
-#[inline]
-fn blend(fg: Rgb, bg: Rgb, intensity: u8) -> Rgb {
-    let a   = intensity as u32;
-    let ia  = 255 - a;
-    let mix = |f: u8, b: u8| (((f as u32) * a + (b as u32) * ia) / 255) as u8;
-    Rgb { r: mix(fg.r, bg.r), g: mix(fg.g, bg.g), b: mix(fg.b, bg.b) }
-}
 
 pub(crate) static FB_VIRT:       AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub(crate) static FB_PITCH:      AtomicU32     = AtomicU32::new(0);
@@ -58,13 +48,16 @@ pub(crate) const  BLINK_DIVIDER: u64           = 50;
 
 impl FramebufferConsole {
     pub fn new(info: FbInfo, fg: Rgb, bg: Rgb) -> Self {
-        let cols = (info.width  / glyph_width()  as u32).max(1);
-        let rows = (info.height / glyph_height() as u32).max(1);
+        let cols = (info.width  / glyph_width()  as u32).max(1) as u16;
+        let rows = (info.height / glyph_height() as u32).max(1) as u16;
         FB_VIRT.store(info.addr, Ordering::Release);
         FB_PITCH.store(info.pitch, Ordering::Release);
         FB_BPP.store(info.bpp, Ordering::Release);
         let mut me = Self {
-            info, cols, rows, cur_col: 0, cur_row: 0, fg, bg,
+            info,
+            grid:  Grid::new(cols, rows, fg, bg),
+            surf:  Surface::new(info),
+            cache: GlyphCache::new(),
             parser: vte::Parser::new(),
         };
         me.clear();
@@ -73,7 +66,8 @@ impl FramebufferConsole {
     }
 
     fn publish_cursor(&self) {
-        let packed = ((self.cur_col as u64) << 32) | (self.cur_row as u64);
+        let (c, r) = self.grid.cursor();
+        let packed = ((c as u64) << 32) | (r as u64);
         CURSOR_POS.store(packed, Ordering::Release);
     }
 
@@ -83,216 +77,77 @@ impl FramebufferConsole {
 
     pub fn info(&self) -> FbInfo { self.info }
 
+    #[cfg(feature = "boot-checks")]
+    pub fn cursor_for_test(&self) -> (u16, u16) { self.grid.cursor() }
+
     pub fn write_str(&mut self, s: &str) {
+        let mut parser = core::mem::replace(&mut self.parser, vte::Parser::new());
         for b in s.bytes() {
-            self.parser_advance_byte(b);
+            parser.advance(self, b);
         }
+        self.parser = parser;
+        render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
         self.publish_cursor();
     }
 
-    /// Drive one byte through the vte parser. `mem::replace` is the standard
-    /// workaround for vte's `Parser::advance` requiring `&mut self` while
-    /// the Perform target is also `&mut Self`: temporarily move the parser
-    /// out, run the byte, put it back. Single-threaded boot, no reentrancy.
-    fn parser_advance_byte(&mut self, b: u8) {
-        let mut parser = core::mem::replace(&mut self.parser, vte::Parser::new());
-        parser.advance(self, b);
-        self.parser = parser;
-    }
-
-    pub fn put_char(&mut self, ch: char) {
-        match ch {
-            '\n' => self.newline(),
-            '\r' => { self.cur_col = 0; }
-            '\x08' => { if self.cur_col > 0 { self.cur_col -= 1; } }
-            '\t' => { self.cur_col = (self.cur_col + 8) & !7; if self.cur_col >= self.cols { self.newline(); } }
-            _ => {
-                if self.cur_col >= self.cols { self.newline(); }
-                self.draw_glyph(self.cur_col, self.cur_row, ch, self.fg, self.bg);
-                self.cur_col += 1;
-            }
-        }
-    }
-
     pub fn clear(&mut self) {
-        for y in 0..self.info.height {
-            for x in 0..self.info.width {
-                self.pixel_write(x, y, self.bg);
-            }
-        }
-        self.cur_col = 0;
-        self.cur_row = 0;
-    }
-
-    fn newline(&mut self) {
-        self.cur_col = 0;
-        self.cur_row += 1;
-        if self.cur_row >= self.rows {
-            self.scroll_up();
-            self.cur_row = self.rows - 1;
-        }
-    }
-
-    fn scroll_up(&mut self) {
-        let gh   = glyph_height() as u32;
-        let pitch = self.info.pitch as usize;
-        let src_row = gh as usize;
-        let dst_rows = (self.info.height - gh) as usize;
-        // SAFETY: src and dst lie within the framebuffer mapping, sizes within bounds.
-        unsafe {
-            let base = self.info.addr;
-            for y in 0..dst_rows {
-                let src = base.add((y + src_row) * pitch);
-                let dst = base.add(y * pitch);
-                core::ptr::copy(src, dst, pitch);
-            }
-        }
-        // Clear the bottom band.
-        for y in (self.info.height - gh)..self.info.height {
-            for x in 0..self.info.width {
-                self.pixel_write(x, y, self.bg);
-            }
-        }
-    }
-
-    pub fn draw_glyph(&self, col: u32, row: u32, ch: char, fg: Rgb, bg: Rgb) {
-        let raster = raster_for(ch);
-        let gw = glyph_width() as u32;
-        let gh = glyph_height() as u32;
-        let ox = col * gw;
-        let oy = row * gh;
-        for (ry, line) in raster.raster().iter().enumerate() {
-            for (rx, intensity) in line.iter().enumerate() {
-                let color = blend(fg, bg, *intensity);
-                self.pixel_write(ox + rx as u32, oy + ry as u32, color);
-            }
-        }
-    }
-
-    fn pixel_write(&self, x: u32, y: u32, c: Rgb) {
-        if x >= self.info.width || y >= self.info.height { return; }
-        let off = (y as usize) * (self.info.pitch as usize)
-                + (x as usize) * (self.info.bpp as usize / 8);
-        // SAFETY: off is within the framebuffer; bpp is 24 or 32 (checked at init).
-        unsafe {
-            let p = self.info.addr.add(off);
-            let (b0, b1, b2) = match self.info.pixel {
-                PixelLayout::Bgr => (c.b, c.g, c.r),
-                PixelLayout::Rgb => (c.r, c.g, c.b),
-            };
-            if self.info.bpp == 32 {
-                // Pack as one 32-bit store: byte0=b0, byte1=b1, byte2=b2, byte3=0.
-                // x86_64 LE → matches the per-byte store layout. Pitch and x*4 are
-                // 4-byte aligned with bpp=32, so the u32 write is aligned.
-                let packed = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16);
-                write_volatile(p as *mut u32, packed);
-            } else {
-                write_volatile(p.add(0), b0);
-                write_volatile(p.add(1), b1);
-                write_volatile(p.add(2), b2);
-            }
-        }
+        self.grid.clear();
+        render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
+        self.publish_cursor();
     }
 }
 
-/// Boot-time self-test: render 'X' at (0,0), read back the glyph rectangle,
-/// compare each pixel to the expected color according to the Noto raster
-/// (intensity >= 128 → fg, else bg). Returns true on full match.
+/// Boot-time self-test: scrive 'X', flush, e verifica che un pixel acceso
+/// della maschera sia il colore fg nel back-buffer.
 pub fn self_test(fb: &mut FramebufferConsole) -> bool {
-    let fg = fb.fg;
-    let bg = fb.bg;
-    fb.draw_glyph(0, 0, 'X', fg, bg);
-
-    let raster = raster_for('X');
-    let bpp_bytes = (fb.info.bpp as usize) / 8;
-    let pitch = fb.info.pitch as usize;
-
-    for (ry, line) in raster.raster().iter().enumerate() {
-        for (rx, intensity) in line.iter().enumerate() {
-            let expect = blend(fg, bg, *intensity);
-            let off = ry * pitch + rx * bpp_bytes;
-            // SAFETY: bounds checked by draw_glyph above.
-            let (b0, b1, b2) = unsafe {
-                let p = fb.info.addr.add(off);
-                (
-                    core::ptr::read_volatile(p.add(0)),
-                    core::ptr::read_volatile(p.add(1)),
-                    core::ptr::read_volatile(p.add(2)),
-                )
-            };
-            let (eb0, eb1, eb2) = match fb.info.pixel {
-                PixelLayout::Bgr => (expect.b, expect.g, expect.r),
-                PixelLayout::Rgb => (expect.r, expect.g, expect.b),
-            };
-            if (b0, b1, b2) != (eb0, eb1, eb2) {
-                return false;
-            }
+    let fg = fb.grid.current_colors().0;
+    fb.write_str("X");
+    let m = fb.cache.mask('X', false);
+    let gw = glyph_width(); let gh = glyph_height();
+    for y in 0..gh { for x in 0..gw {
+        if m.alpha[y * gw + x] == 255 {
+            return fb.surf.read_px(x as u32, y as u32) == fg;
         }
-    }
-    true
+    }}
+    false
 }
 
 impl vte::Perform for FramebufferConsole {
-    fn print(&mut self, ch: char) {
-        if self.cur_col >= self.cols { self.newline(); }
-        self.draw_glyph(self.cur_col, self.cur_row, ch, self.fg, self.bg);
-        self.cur_col += 1;
-    }
+    fn print(&mut self, ch: char) { self.grid.put(ch); }
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => self.newline(),
-            b'\r' => { self.cur_col = 0; }
-            b'\x08' => { if self.cur_col > 0 { self.cur_col -= 1; } }
-            b'\t' => {
-                self.cur_col = (self.cur_col + 8) & !7;
-                if self.cur_col >= self.cols { self.newline(); }
-            }
+            b'\n' => self.grid.newline(),
+            b'\r' => self.grid.cr(),
+            b'\x08' => self.grid.bs(),
+            b'\t' => self.grid.tab(),
             _ => {}
         }
     }
     fn csi_dispatch(&mut self, params: &vte::Params, _i: &[u8], _ignore: bool, c: char) {
         let p1 = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(1);
         match c {
-            'A' => self.cur_row = self.cur_row.saturating_sub(p1.max(1) as u32),
-            'B' => {
-                self.cur_row = (self.cur_row + p1.max(1) as u32).min(self.rows.saturating_sub(1));
+            'm' => {
+                let it = params.iter().flat_map(|p| p.iter().copied());
+                let (fg, bg) = apply_sgr(it, self.grid.current_colors().0, self.grid.current_colors().1);
+                self.grid.set_fg(fg);
+                self.grid.set_bg(bg);
             }
-            'C' => {
-                self.cur_col = (self.cur_col + p1.max(1) as u32).min(self.cols.saturating_sub(1));
+            'J' => {
+                let arg = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                if arg == 2 { self.grid.clear(); }
             }
-            'D' => self.cur_col = self.cur_col.saturating_sub(p1.max(1) as u32),
+            'A' => self.grid.move_up(p1.max(1)),
+            'B' => self.grid.move_down(p1.max(1)),
+            'C' => self.grid.move_right(p1.max(1)),
+            'D' => self.grid.move_left(p1.max(1)),
             'H' => {
                 let mut it = params.iter();
                 let row = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
                 let col = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-                self.cur_row = (row.saturating_sub(1) as u32).min(self.rows.saturating_sub(1));
-                self.cur_col = (col.saturating_sub(1) as u32).min(self.cols.saturating_sub(1));
+                self.grid.goto(col.saturating_sub(1), row.saturating_sub(1));
             }
-            'J' => {
-                let arg = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
-                if arg == 2 { self.clear(); }
-            }
-            'K' => {
-                let gw = glyph_width() as u32;
-                let gh = glyph_height() as u32;
-                let oy = self.cur_row * gh;
-                for col in self.cur_col..self.cols {
-                    let ox = col * gw;
-                    for y in oy..(oy + gh) {
-                        for x in ox..(ox + gw) {
-                            self.pixel_write(x, y, self.bg);
-                        }
-                    }
-                }
-            }
-            'm' => {
-                // Avoid the Vec roundtrip: apply_sgr only needs an iterator.
-                let it = params.iter().flat_map(|p| p.iter().copied());
-                let (fg, bg) = apply_sgr(it, self.fg, self.bg);
-                self.fg = fg;
-                self.bg = bg;
-            }
-            _ => { /* drop silently */ }
+            'K' => self.grid.erase_to_eol(),
+            _ => {}
         }
     }
     fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {}

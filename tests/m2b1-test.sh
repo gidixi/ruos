@@ -15,7 +15,17 @@ IMG=build/m2b1-disk.img
 S=build/serial.log
 KERNEL=kernel/target/x86_64-unknown-none/release/kernel   # ISO source for /boot/kernel
 LS_SRC=user-bin/ls.wasm                                    # ISO source for /bin/ls.wasm
+# Stage the ESP + the mtools/fsck outputs on ext4 /tmp, NOT the build/ dir: in
+# the WSL host the repo lives on a 9p /mnt/e mount where mtools' many small
+# random reads of the ~20 MB kernel are pathologically slow (can hang for
+# minutes). /tmp is on the native ext4 root, so the read-only verification runs
+# at disk speed. We still never touch the QEMU-written raw image.
+ESP=/tmp/m2b1-esp.img
+KERNEL_OUT=/tmp/m2b1-kernel.out
+LS_OUT=/tmp/m2b1-ls.out
 killq(){ ps -eo pid,comm | awk '/qemu-system/{print $1}' | while read p; do kill -9 "$p" 2>/dev/null||true; done; }
+cleanup(){ rm -f "$ESP" "$KERNEL_OUT" "$LS_OUT" 2>/dev/null||true; }
+trap cleanup EXIT
 
 killq; sleep 1
 dd if=/dev/zero of="$IMG" bs=1M count=512 status=none      # blank target (≥ kernel + payload)
@@ -44,39 +54,39 @@ grep -qF "mkboot: ok" "$S" || { echo TEST_FAIL_MKBOOT; tail -40 "$S"; exit 1; }
 ELBA=$(sgdisk -i 1 "$IMG" | awk -F': ' '/First sector/{print $2}' | awk '{print $1}')
 ESEC=$(sgdisk -i 1 "$IMG" | awk '/Partition size/{print $3}')
 [ -n "$ELBA" ] && [ -n "$ESEC" ] || { echo TEST_FAIL_SGDISK; sgdisk -i 1 "$IMG"; exit 1; }
-dd if="$IMG" of=build/m2b1-esp.img bs=512 skip="$ELBA" count="$ESEC" status=none
+dd if="$IMG" of="$ESP" bs=512 skip="$ELBA" count="$ESEC" status=none
 
 # --- fsck the extracted ESP (read-only). `fsck.fat -n` prints a benign
 #     "Free cluster summary uninitialized" (we don't write FSInfo free counts)
 #     and a "<n> files, <a>/<b> clusters" summary. Corruption prints hard errors.
 #     Gate: summary present AND no hard error. ---
-fsck.fat -n build/m2b1-esp.img > build/m2b1-fsck.log 2>&1
+fsck.fat -n "$ESP" > build/m2b1-fsck.log 2>&1
 HARD='Dirty bit|orphan|Checksum|cross-link|free cluster chain|Reclaim|corrupt|invalid|bad cluster|Got [0-9]'
 grep -qiE 'files, .*clusters' build/m2b1-fsck.log || { echo TEST_FAIL_FSCK; cat build/m2b1-fsck.log; exit 1; }
 grep -qiE "$HARD"             build/m2b1-fsck.log && { echo TEST_FAIL_FSCK; cat build/m2b1-fsck.log; exit 1; }
 
 # --- structure: the three boot files at their UEFI/Limine ESP locations ---
-mdir -i build/m2b1-esp.img ::/EFI/BOOT 2>&1 | grep -qi "BOOTX64" \
-  || { echo TEST_FAIL_BOOTX64; mdir -i build/m2b1-esp.img ::/EFI/BOOT; exit 1; }
-mdir -i build/m2b1-esp.img ::/boot 2>&1 | grep -qi "kernel" \
-  || { echo TEST_FAIL_KERNEL; mdir -i build/m2b1-esp.img ::/boot; exit 1; }
-mdir -i build/m2b1-esp.img ::/boot/limine 2>&1 | grep -qi "limine" \
-  || { echo TEST_FAIL_CONF; mdir -i build/m2b1-esp.img ::/boot/limine; exit 1; }
+mdir -i "$ESP" ::/EFI/BOOT 2>&1 | grep -qi "BOOTX64" \
+  || { echo TEST_FAIL_BOOTX64; mdir -i "$ESP" ::/EFI/BOOT; exit 1; }
+mdir -i "$ESP" ::/boot 2>&1 | grep -qi "kernel" \
+  || { echo TEST_FAIL_KERNEL; mdir -i "$ESP" ::/boot; exit 1; }
+mdir -i "$ESP" ::/boot/limine 2>&1 | grep -qi "limine" \
+  || { echo TEST_FAIL_CONF; mdir -i "$ESP" ::/boot/limine; exit 1; }
 
 # --- LFN proof: readdirtest.wasm is a 14-char name (not 8.3), so its presence
 #     in the mdir listing proves the long-name directory entries were written. ---
-mdir -i build/m2b1-esp.img ::/bin 2>&1 | grep -qi "readdirtest.wasm" \
-  || { echo TEST_FAIL_LFN; mdir -i build/m2b1-esp.img ::/bin; exit 1; }
+mdir -i "$ESP" ::/bin 2>&1 | grep -qi "readdirtest.wasm" \
+  || { echo TEST_FAIL_LFN; mdir -i "$ESP" ::/bin; exit 1; }
 
 # --- byte-identity proof: the copied bytes must equal the ISO sources. The
 #     kernel is ~20 MB — the copy (FAT cluster-chain write) must be exact. ---
-mcopy -i build/m2b1-esp.img ::/boot/kernel build/m2b1-kernel.out 2>/dev/null \
+mcopy -i "$ESP" ::/boot/kernel "$KERNEL_OUT" 2>/dev/null \
   || { echo TEST_FAIL_KERNEL_READ; exit 1; }
-cmp "$KERNEL" build/m2b1-kernel.out \
-  || { echo TEST_FAIL_KERNEL_BYTES; ls -l "$KERNEL" build/m2b1-kernel.out; exit 1; }
-mcopy -i build/m2b1-esp.img ::/bin/ls.wasm build/m2b1-ls.out 2>/dev/null \
+cmp "$KERNEL" "$KERNEL_OUT" \
+  || { echo TEST_FAIL_KERNEL_BYTES; ls -l "$KERNEL" "$KERNEL_OUT"; exit 1; }
+mcopy -i "$ESP" ::/bin/ls.wasm "$LS_OUT" 2>/dev/null \
   || { echo TEST_FAIL_LS_READ; exit 1; }
-cmp "$LS_SRC" build/m2b1-ls.out \
-  || { echo TEST_FAIL_LS_BYTES; ls -l "$LS_SRC" build/m2b1-ls.out; exit 1; }
+cmp "$LS_SRC" "$LS_OUT" \
+  || { echo TEST_FAIL_LS_BYTES; ls -l "$LS_SRC" "$LS_OUT"; exit 1; }
 
 echo TEST_PASS_M2B1

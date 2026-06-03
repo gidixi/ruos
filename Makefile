@@ -30,7 +30,7 @@ BIN_TOOLS  := shell ls cat echo \
               service readdirtest \
               spinloop smptest \
               rtop \
-              mkdisk mkboot
+              mkdisk mkboot install
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
@@ -172,6 +172,16 @@ run-m2a-test:
 .PHONY: run-m2b1-test
 run-m2b1-test:
 	bash tests/m2b1-test.sh
+
+# M2b-2 boot-from-SSD end-to-end (the SSD-installer CAPSTONE). Two phases on ONE
+# disk image, boot-marker-only (no mtools): phase 1 boots the ISO + a BLANK SATA
+# disk + an init running `install` (guard passes ⇒ authors disk + copies boot
+# tree to the ESP, asserts `install: ok`); phase 2 boots FROM that SSD under
+# UEFI/OVMF with NO cdrom (OVMF → /EFI/BOOT/BOOTX64.EFI → Limine → /boot/kernel →
+# ruos → M1 mounts /mnt), asserting "ruos boot OK" + "mnt mounted FAT".
+.PHONY: run-m2b2-test
+run-m2b2-test:
+	bash tests/m2b2-test.sh
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.

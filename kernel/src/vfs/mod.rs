@@ -32,6 +32,11 @@ pub fn mount(prefix: &str, fs: FsImpl) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// True if a filesystem is mounted at exactly `prefix` (e.g. "/mnt").
+pub fn is_mounted(prefix: &str) -> bool {
+    MOUNTS.lock().iter().any(|(p, _)| p == prefix)
+}
+
 /// Build the in-RAM root tmpfs, mount it at `/`, populate /dev + /tmp.
 /// Returns `AlreadyExists` if called twice (single init by design).
 pub fn init() -> Result<usize, VfsError> {

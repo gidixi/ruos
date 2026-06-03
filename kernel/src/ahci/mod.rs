@@ -16,10 +16,16 @@ pub use hba::{Hba, AhciError};
 pub use port::AhciPort;
 
 use spin::Mutex;
+use x86_64::VirtAddr;
 
 /// Global slot for the first usable SATA port. Populated by
 /// `boot::phases::storage`; consumed by the FAT mount step (Task 7).
 static PORT0: Mutex<Option<AhciPort>> = Mutex::new(None);
+
+/// Boot-time HBA snapshot — `(abar, pi)` cached by [`init`] after the one-shot
+/// HBA reset. Lets `mkdisk`/`mkboot` bring up a SATA port via the already-reset
+/// HBA WITHOUT a second `GHC_HR`, which on real HW would orphan a live `/mnt`.
+static BOOT_HBA: Mutex<Option<(VirtAddr, u32)>> = Mutex::new(None); // (abar, pi)
 
 pub fn set_port0(p: AhciPort) {
     *PORT0.lock() = Some(p);
@@ -37,7 +43,12 @@ pub fn take_port0() -> Option<AhciPort> {
 /// without SATA — boot continues, FAT mount is skipped).
 pub fn init() -> Option<Hba> {
     match hba::Hba::find_and_init() {
-        Ok(hba) => Some(hba),
+        Ok(hba) => {
+            // Cache the post-reset HBA so mkdisk/mkboot can grab a port without
+            // re-issuing the HBA reset (which would orphan a live /mnt's DMA).
+            *BOOT_HBA.lock() = Some((hba.abar, hba.pi));
+            Some(hba)
+        }
         Err(AhciError::NotFound) => {
             crate::bwarn!("ahci", "no SATA HBA found — /mnt will be empty");
             None
@@ -47,4 +58,22 @@ pub fn init() -> Option<Hba> {
             None
         }
     }
+}
+
+/// Bring up SATA port `idx` using the boot-time HBA — NO HBA reset, so a live
+/// /mnt on another port is not orphaned. None if no HBA recorded or no device.
+pub fn acquire_port(idx: usize) -> Option<AhciPort> {
+    let (abar, _pi) = (*BOOT_HBA.lock())?;
+    AhciPort::bringup(abar, idx)
+}
+
+/// Populated SATA port indices from the boot HBA's Ports-Implemented bitmap.
+pub fn sata_ports() -> alloc::vec::Vec<usize> {
+    let mut v = alloc::vec::Vec::new();
+    if let Some((_abar, pi)) = *BOOT_HBA.lock() {
+        for idx in 0..32 {
+            if pi & (1 << idx) != 0 { v.push(idx); }
+        }
+    }
+    v
 }

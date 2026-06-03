@@ -657,6 +657,41 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
     Ok(0)
 }
 
+/// ruos_install(esp_mib) -> status. The user-facing "install ruos to the SSD"
+/// command: author a fresh ruos disk (GPT + FAT32 ESP + FAT32 data) on the FIRST
+/// populated SATA port AND write the full boot tree onto the ESP — i.e. the same
+/// work as `ruos_mkboot`, but GUARDED so it can never wipe the running system's
+/// own data disk.
+///
+/// GUARD: refuses (returns -3, non-destructive) when a filesystem is mounted at
+/// `/mnt`. A live `/mnt` means we booted off an installed/data SATA disk, and
+/// authoring would orphan it; the operator must boot the installer medium (which
+/// leaves `/mnt` unmounted) to install onto a target disk.
+///
+/// Returns 0 on success; negative on failure: -3 /mnt mounted (guard tripped),
+/// -1 no SATA port, -2 author/copy error. `esp_mib <= 0` defaults to 64 MiB;
+/// values above 4096 are clamped down.
+fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i32, Error> {
+    // GUARD: never wipe the running system's data disk.
+    if crate::vfs::is_mounted("/mnt") {
+        crate::bwarn!("install", "refusing: /mnt is mounted — boot the installer medium to install");
+        return Ok(-3);
+    }
+    let esp = if esp_mib <= 0 { 64 } else if esp_mib > 4096 { 4096 } else { esp_mib } as u32;
+    let idx = match crate::ahci::sata_ports().first().copied() {
+        Some(i) => i,
+        None => { crate::bwarn!("install", "no SATA disk found"); return Ok(-1); }
+    };
+    let mut port = match crate::ahci::acquire_port(idx) { Some(p) => p, None => return Ok(-1) };
+    crate::binfo!("install", "target: port {} model={:?} sectors={} ({} MiB) — WIPING",
+        idx, port.model, port.sectors, port.sectors / 2048);
+    let layout = match crate::disk::author(&mut port, esp) { Ok(l) => l, Err(_) => return Ok(-2) };
+    let mut e = crate::blockdev::PartBorrow::new(&mut port, layout.esp.first_lba, layout.esp.sectors);
+    if crate::disk::copy_boot_payload(&mut e).is_err() { return Ok(-2); }
+    crate::binfo!("install", "ok — ruos installed to port {}, reboot from the SSD", idx);
+    Ok(0)
+}
+
 /// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
 pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
     use smoltcp::socket::dhcpv4;
@@ -686,6 +721,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "ping", ruos_ping)?
         .func_wrap("ruos", "mkdisk", ruos_mkdisk)?
         .func_wrap("ruos", "mkboot", ruos_mkboot)?
+        .func_wrap("ruos", "install", ruos_install)?
         .func_wrap("ruos", "exec_pipeline", ruos_exec_pipeline)?;
     Ok(())
 }

@@ -614,6 +614,171 @@ fn update_entry_on_disk(fs: &Arc<Mutex<Inner>>, entry: &DirEntry) -> Result<(), 
     Ok(())
 }
 
+/// Format `dev` as a fresh FAT32 volume (`mkfs.fat32`).
+///
+/// Operates purely through `dev.write_blocks`; no mount-table involvement.
+/// Geometry follows the canonical fatgen103 / Microsoft `DskTableFAT32` math
+/// (same as `mkfs.fat`) so the result passes `fsck.fat` and is mountable by
+/// `mtools` and our own reader. Layout written:
+///   LBA 0      boot sector (BPB)
+///   LBA 1      FSInfo
+///   LBA 6      backup boot sector (+ LBA 7 backup FSInfo)
+///   reserved.. FAT #0 then FAT #1, each `fat_sz32` sectors
+///   data_start root directory cluster (cluster 2), zeroed
+///
+/// All multi-byte fields are little-endian. Any write error maps to
+/// [`VfsError::IoError`].
+pub fn format(dev: &mut dyn BlockDevice) -> Result<(), VfsError> {
+    if dev.block_size() != SECTOR as u32 {
+        return Err(VfsError::IoError);
+    }
+
+    // Total sectors, clamped to u32 (our partitions are < 2 TiB so this is
+    // exact; cap defensively rather than truncate-wrap on a hypothetical
+    // monster device).
+    let tot_sec: u32 = core::cmp::min(dev.block_count(), u32::MAX as u64) as u32;
+
+    const RESERVED_SEC_CNT: u32 = 32;
+    const NUM_FATS: u32 = 2;
+    const ROOT_CLUS: u32 = 2;
+
+    // sec_per_clus from the Microsoft DskTableFAT32 (units = 512-byte sectors).
+    let sec_per_clus: u32 = if tot_sec <= 66_600 {
+        // Too small to be valid FAT32 — our partitions are large.
+        return Err(VfsError::IoError);
+    } else if tot_sec <= 532_480 {
+        1
+    } else if tot_sec <= 16_777_216 {
+        8
+    } else if tot_sec <= 33_554_432 {
+        16
+    } else if tot_sec <= 67_108_864 {
+        32
+    } else {
+        64
+    };
+
+    // fatgen103 FATSz (FAT32, RootDirSectors = 0). Ceil-divide; a slight
+    // over-allocation of the FAT is correct and what mkfs.fat does too.
+    // tmp2 = (256 * sec_per_clus + num_fats) / 2  fits comfortably in u32.
+    let tmp1: u32 = tot_sec.saturating_sub(RESERVED_SEC_CNT);
+    let tmp2: u32 = (256 * sec_per_clus + NUM_FATS) / 2;
+    let fat_sz32: u32 = (tmp1 + (tmp2 - 1)) / tmp2;
+
+    // Data region geometry + the FAT32 minimum-cluster sanity check.
+    let data_start: u32 = RESERVED_SEC_CNT + NUM_FATS * fat_sz32;
+    if tot_sec <= data_start {
+        return Err(VfsError::IoError);
+    }
+    let clusters: u32 = (tot_sec - data_start) / sec_per_clus;
+    if clusters < 65_525 {
+        // Below the FAT32 cluster minimum — not a valid FAT32 volume.
+        return Err(VfsError::IoError);
+    }
+
+    // --- Boot sector (LBA 0) ---------------------------------------------
+    let mut boot = [0u8; SECTOR];
+    boot[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);     // jmp short + nop
+    boot[3..11].copy_from_slice(b"MSWIN4.1");            // OEM name
+    boot[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes()); // bytes/sec
+    boot[13] = sec_per_clus as u8;
+    boot[14..16].copy_from_slice(&(RESERVED_SEC_CNT as u16).to_le_bytes());
+    boot[16] = NUM_FATS as u8;
+    boot[17..19].copy_from_slice(&0u16.to_le_bytes());   // root_ent_cnt = 0
+    boot[19..21].copy_from_slice(&0u16.to_le_bytes());   // tot_sec16 = 0
+    boot[21] = 0xF8;                                      // media (fixed disk)
+    boot[22..24].copy_from_slice(&0u16.to_le_bytes());   // fat_sz16 = 0
+    boot[24..26].copy_from_slice(&0x3Fu16.to_le_bytes()); // sec/track (cosmetic)
+    boot[26..28].copy_from_slice(&0xFFu16.to_le_bytes()); // num_heads (cosmetic)
+    boot[28..32].copy_from_slice(&0u32.to_le_bytes());   // hidden_sec = 0
+    boot[32..36].copy_from_slice(&tot_sec.to_le_bytes());
+    boot[36..40].copy_from_slice(&fat_sz32.to_le_bytes());
+    boot[40..42].copy_from_slice(&0u16.to_le_bytes());   // ext_flags (mirrored)
+    boot[42..44].copy_from_slice(&0u16.to_le_bytes());   // fs_ver = 0.0
+    boot[44..48].copy_from_slice(&ROOT_CLUS.to_le_bytes());
+    boot[48..50].copy_from_slice(&1u16.to_le_bytes());   // fsinfo sector
+    boot[50..52].copy_from_slice(&6u16.to_le_bytes());   // backup boot sector
+    // boot[52..64] reserved = 0
+    boot[64] = 0x80;                                     // drive number
+    boot[65] = 0;                                        // reserved
+    boot[66] = 0x29;                                     // ext boot signature
+    let mut vol_id = [0u8; 4];
+    crate::rng::fill(&mut vol_id);
+    boot[67..71].copy_from_slice(&vol_id);               // volume serial
+    boot[71..82].copy_from_slice(b"RUOS       ");        // volume label (11)
+    boot[82..90].copy_from_slice(b"FAT32   ");           // fs type (8)
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+
+    // --- FSInfo (LBA 1) ---------------------------------------------------
+    let mut fsinfo = [0u8; SECTOR];
+    fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());   // lead sig "RRaA"
+    // [4..484] reserved = 0
+    fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes()); // struct sig "rrAa"
+    // Free count = data clusters minus cluster 2 (root, in use).
+    let free_count: u32 = clusters - 1;
+    fsinfo[488..492].copy_from_slice(&free_count.to_le_bytes());
+    fsinfo[492..496].copy_from_slice(&3u32.to_le_bytes());          // next free hint
+    // [496..508] reserved = 0
+    fsinfo[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes()); // trail sig
+
+    // Helper: map a write error to VfsError::IoError.
+    let one = |dev: &mut dyn BlockDevice, lba: u64, buf: &[u8]| -> Result<(), VfsError> {
+        dev.write_blocks(lba, buf).map_err(map_block_err)
+    };
+
+    one(dev, 0, &boot)?;
+    one(dev, 1, &fsinfo)?;
+    // Backup boot region at sector 6 (+ backup FSInfo at 7 for completeness).
+    one(dev, 6, &boot)?;
+    one(dev, 7, &fsinfo)?;
+
+    // --- Zero both FATs ---------------------------------------------------
+    let zero = [0u8; SECTOR];
+    for fat_idx in 0..NUM_FATS {
+        let fat_start = u64::from(RESERVED_SEC_CNT) + u64::from(fat_idx) * u64::from(fat_sz32);
+        for s in 0..u64::from(fat_sz32) {
+            one(dev, fat_start + s, &zero)?;
+        }
+    }
+
+    // Seed the first 3 entries in each FAT:
+    //   FAT[0] = 0x0FFFFFF8 (media byte in low 8 bits | EOC bits)
+    //   FAT[1] = 0x0FFFFFFF (clean/no-error flags)
+    //   FAT[2] = 0x0FFFFFFF (root cluster = end of chain)
+    let mut fat0 = [0u8; SECTOR];
+    fat0[0..4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+    fat0[4..8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+    fat0[8..12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+    for fat_idx in 0..NUM_FATS {
+        let fat_start = u64::from(RESERVED_SEC_CNT) + u64::from(fat_idx) * u64::from(fat_sz32);
+        one(dev, fat_start, &fat0)?;
+    }
+
+    // --- Root directory cluster (cluster 2) -------------------------------
+    // Zero every sector, then drop a volume-label entry as the first record so
+    // the boot-sector label is mirrored in the root dir (what mkfs.fat does;
+    // without it fsck.fat warns + "auto-removes" the label). The label entry
+    // is an ATTR_VOLUME_ID record whose 11 name bytes hold the space-padded
+    // label; our reader skips it (ATTR_VOLUME_ID) so it stays invisible.
+    let root_sec = u64::from(data_start); // (2 - 2) * sec_per_clus == 0
+    let mut root0 = [0u8; SECTOR];
+    root0[0..11].copy_from_slice(b"RUOS       "); // 8.3 name field = label
+    root0[11] = ATTR_VOLUME_ID;                   // attr
+    // remaining fields (times, clusters, size) stay zero
+    one(dev, root_sec, &root0)?;
+    for s in 1..u64::from(sec_per_clus) {
+        one(dev, root_sec + s, &zero)?;
+    }
+
+    crate::binfo!(
+        "fat32",
+        "format ok tot_sec={} spc={} fat_sz32={} clusters={} data_start={}",
+        tot_sec, sec_per_clus, fat_sz32, clusters, data_start,
+    );
+    Ok(())
+}
+
 /// Convenience for the storage phase: take the ahci PORT0 and mount it.
 pub fn mount_from_ahci_port(port: AhciPort) -> Result<(), VfsError> {
     let fs = Fat32Fs::from_ahci_port(port)?;

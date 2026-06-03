@@ -184,6 +184,16 @@ run-m2b1-test:
 run-m2b2-test:
 	bash tests/m2b2-test.sh
 
+# Disk-management end-to-end: prove `disks` lists the SATA disks AND that
+# `umount /mnt` unblocks `install`. Builds a GPT disk with a FAT32 data partition
+# (so M1 auto-mounts /mnt at boot, like run-gpt-test), boots with
+# INIT_SCRIPT=user-bin/dm-init.sh (disks → umount /mnt → install 0), and asserts
+# the disk was listed, `/mnt` unmounted, and install PROCEEDED (did not refuse).
+# The script does its own `make iso INIT_SCRIPT=...`.
+.PHONY: run-dm-test
+run-dm-test:
+	bash tests/disk-mgmt-test.sh
+
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
 .PHONY: run-ssh-test

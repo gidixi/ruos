@@ -80,6 +80,31 @@ pub fn ruos_chdir(
     Ok(0)
 }
 
+/// ruos_umount(path_ptr, path_len) -> status.
+///
+/// Unmount the filesystem mounted at exactly `path` (e.g. "/mnt"). Dropping the
+/// FsImpl releases its backing device (the SATA port) once no open file still
+/// holds a ref to it — which is what lets `install` proceed onto a disk that
+/// M1 auto-mounted (the install /mnt guard otherwise refuses). Refuses "/".
+///
+/// Returns 0 on success, -2 when the path cannot be unmounted (e.g. "/"),
+/// -1 when nothing is mounted there (NotFound) or the path is unreadable.
+fn ruos_umount(caller: Caller<'_, RuntimeState>, path_ptr: i32, path_len: i32) -> Result<i32, Error> {
+    let buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
+        Ok(b) => b,
+        Err(_) => return Ok(-1),
+    };
+    let path = match core::str::from_utf8(&buf) {
+        Ok(s) => s,
+        Err(_) => return Ok(-1),
+    };
+    match crate::vfs::unmount(path) {
+        Ok(())                                 => Ok(0),
+        Err(crate::vfs::VfsError::InvalidPath) => Ok(-2),  // refused (e.g. "/")
+        Err(_)                                 => Ok(-1),  // NotFound / not mounted
+    }
+}
+
 /// Resolve a `path` against `base` (current CWD). Handles `.`, `..`,
 /// absolute path override, and trailing-slash normalization.
 pub fn resolve_cwd(base: &str, path: &str) -> alloc::string::String {
@@ -733,6 +758,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "exec", ruos_exec)?
         .func_wrap("ruos", "readdir", ruos_readdir)?
         .func_wrap("ruos", "chdir", ruos_chdir)?
+        .func_wrap("ruos", "umount", ruos_umount)?
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?

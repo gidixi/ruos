@@ -21,6 +21,7 @@ members = [
     "mkdisk",
     "mkboot",
     "install",
+    "umount",
 ]
 
 [profile.release]

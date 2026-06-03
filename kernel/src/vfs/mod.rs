@@ -37,6 +37,17 @@ pub fn is_mounted(prefix: &str) -> bool {
     MOUNTS.lock().iter().any(|(p, _)| p == prefix)
 }
 
+/// Unmount the filesystem at exactly `prefix` (e.g. "/mnt"). Dropping the FsImpl
+/// releases its backing device (the SATA port) once no open file still holds a
+/// ref to it. Refuses "/" (the root tmpfs).
+pub fn unmount(prefix: &str) -> Result<(), VfsError> {
+    if prefix == "/" { return Err(VfsError::InvalidPath); }
+    let mut m = MOUNTS.lock();
+    let before = m.len();
+    m.retain(|(p, _)| p != prefix);
+    if m.len() == before { Err(VfsError::NotFound) } else { Ok(()) }
+}
+
 /// Build the in-RAM root tmpfs, mount it at `/`, populate /dev + /tmp.
 /// Returns `AlreadyExists` if called twice (single init by design).
 pub fn init() -> Result<usize, VfsError> {

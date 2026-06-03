@@ -789,9 +789,12 @@ pub fn format(dev: &mut dyn BlockDevice) -> Result<(), VfsError> {
     fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());   // lead sig "RRaA"
     // [4..484] reserved = 0
     fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes()); // struct sig "rrAa"
-    // Free count = data clusters minus cluster 2 (root, in use).
-    let free_count: u32 = clusters - 1;
-    fsinfo[488..492].copy_from_slice(&free_count.to_le_bytes());
+    // Free count = 0xFFFFFFFF ("unknown"). The volume is mutated after format
+    // (mkdir during author, file copies later) and the shared alloc_cluster does
+    // not maintain FSInfo, so a fixed count goes stale and fsck flags "Free
+    // cluster summary wrong". The spec sentinel tells the OS to recompute; fsck
+    // then skips the check. next_free stays a (harmless) search hint.
+    fsinfo[488..492].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     fsinfo[492..496].copy_from_slice(&3u32.to_le_bytes());          // next free hint
     // [496..508] reserved = 0
     fsinfo[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes()); // trail sig

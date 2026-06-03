@@ -58,3 +58,23 @@ pub fn author(dev: &mut dyn BlockDevice, esp_mib: u32) -> Result<Layout, DiskErr
 
     Ok(Layout { esp, data })
 }
+
+/// Write the full boot tree onto a freshly-authored ESP (must already contain
+/// /EFI/BOOT from `author`). Reads the boot files from Limine modules. The SSD
+/// then boots standalone (UEFI → /EFI/BOOT/BOOTX64.EFI → limine.conf → kernel).
+pub fn copy_boot_payload(esp: &mut dyn crate::blockdev::BlockDevice) -> Result<(), DiskError> {
+    let mut w = crate::vfs::fat32::FatWriter::open(esp).map_err(|_| DiskError::Io)?;
+    // 3 payload files at their UEFI/Limine ESP locations:
+    let k = crate::modules::payload("kernel").ok_or(DiskError::Io)?;
+    w.write_file("/boot/kernel", k).map_err(|_| DiskError::Io)?;
+    let b = crate::modules::payload("BOOTX64.EFI").ok_or(DiskError::Io)?;
+    w.write_file("/EFI/BOOT/BOOTX64.EFI", b).map_err(|_| DiskError::Io)?;
+    let c = crate::modules::payload("limine.conf").ok_or(DiskError::Io)?;
+    w.write_file("/boot/limine/limine.conf", c).map_err(|_| DiskError::Io)?;
+    // every non-payload module → its declared cmdline path on the ESP:
+    for (cmdline, data) in crate::modules::all() {
+        if cmdline.starts_with("/payload/") { continue; }
+        w.write_file(cmdline, data).map_err(|_| DiskError::Io)?;
+    }
+    Ok(())
+}

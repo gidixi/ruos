@@ -19,6 +19,7 @@ members = [
     "smptest",
     "rtop",
     "mkdisk",
+    "mkboot",
 ]
 
 [profile.release]

@@ -47,6 +47,36 @@ pub fn xterm_256(idx: u8) -> Rgb {
     Rgb { r: v, g: v, b: v }
 }
 
+use bitflags::bitflags;
+
+bitflags! {
+    /// Attributi testo per cella. Bold/dim/underline/reverse sono definiti ora
+    /// per stabilizzare il tipo; il rendering degli attributi arriva nel Plan 2.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub struct CellAttr: u8 {
+        const BOLD      = 0b0001;
+        const DIM       = 0b0010;
+        const UNDERLINE = 0b0100;
+        const REVERSE   = 0b1000;
+    }
+}
+
+/// Una cella della griglia terminale.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub ch:   char,
+    pub fg:   Rgb,
+    pub bg:   Rgb,
+    pub attr: CellAttr,
+}
+
+impl Cell {
+    /// Cella vuota (spazio) con i colori dati e nessun attributo.
+    pub fn blank(fg: Rgb, bg: Rgb) -> Self {
+        Cell { ch: ' ', fg, bg, attr: CellAttr::empty() }
+    }
+}
+
 /// Apply a CSI SGR parameter sequence to fg/bg. Unknown params are ignored.
 /// Supports:
 ///   0      reset

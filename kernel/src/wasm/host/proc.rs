@@ -657,31 +657,56 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
     Ok(0)
 }
 
-/// ruos_install(esp_mib) -> status. The user-facing "install ruos to the SSD"
-/// command: author a fresh ruos disk (GPT + FAT32 ESP + FAT32 data) on the FIRST
-/// populated SATA port AND write the full boot tree onto the ESP — i.e. the same
-/// work as `ruos_mkboot`, but GUARDED so it can never wipe the running system's
-/// own data disk.
+/// ruos_install(esp_mib, target) -> status. The user-facing "install ruos to the
+/// SSD" command. Two modes selected by `target`:
+///
+/// LIST mode (`target < 0`): enumerate the populated SATA ports and log each as
+/// `[idx] model (N MiB)`. Read-only — never authors, never needs the /mnt guard.
+/// Returns -10 (sentinel: "list shown"). This is what bare `install` does so the
+/// operator can pick a disk on a multi-disk machine without wiping anything.
+///
+/// INSTALL mode (`target >= 0`): author a fresh ruos disk (GPT + FAT32 ESP +
+/// FAT32 data) on SATA port `target` AND write the full boot tree onto its ESP —
+/// the same work as `ruos_mkboot`, but GUARDED so it can never wipe the running
+/// system's own data disk.
 ///
 /// GUARD: refuses (returns -3, non-destructive) when a filesystem is mounted at
 /// `/mnt`. A live `/mnt` means we booted off an installed/data SATA disk, and
 /// authoring would orphan it; the operator must boot the installer medium (which
 /// leaves `/mnt` unmounted) to install onto a target disk.
 ///
-/// Returns 0 on success; negative on failure: -3 /mnt mounted (guard tripped),
-/// -1 no SATA port, -2 author/copy error. `esp_mib <= 0` defaults to 64 MiB;
+/// Returns 0 on success; negative otherwise: -10 list shown (target<0),
+/// -3 /mnt mounted (guard tripped), -11 no SATA disk at `target`,
+/// -1 port not ready, -2 author/copy error. `esp_mib <= 0` defaults to 64 MiB;
 /// values above 4096 are clamped down.
-fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i32, Error> {
+fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Result<i32, Error> {
+    let ports = crate::ahci::sata_ports();
+    // --- LIST mode (target < 0): print disks, wipe nothing ---
+    if target < 0 {
+        if ports.is_empty() {
+            crate::binfo!("install", "no SATA disks found");
+        } else {
+            for &idx in &ports {
+                match crate::ahci::acquire_port(idx) {
+                    Some(p) => crate::binfo!("install", "[{}] {:?} ({} MiB)", idx, p.model, p.sectors / 2048),
+                    None    => crate::binfo!("install", "[{}] (not ready)", idx),
+                }
+            }
+        }
+        return Ok(-10); // sentinel: "list shown"
+    }
+    // --- INSTALL mode (target >= 0) ---
     // GUARD: never wipe the running system's data disk.
     if crate::vfs::is_mounted("/mnt") {
         crate::bwarn!("install", "refusing: /mnt is mounted — boot the installer medium to install");
         return Ok(-3);
     }
+    let idx = target as usize;
+    if !ports.contains(&idx) {
+        crate::bwarn!("install", "no SATA disk at index {} (run `install` with no argument to list)", target);
+        return Ok(-11);
+    }
     let esp = if esp_mib <= 0 { 64 } else if esp_mib > 4096 { 4096 } else { esp_mib } as u32;
-    let idx = match crate::ahci::sata_ports().first().copied() {
-        Some(i) => i,
-        None => { crate::bwarn!("install", "no SATA disk found"); return Ok(-1); }
-    };
     let mut port = match crate::ahci::acquire_port(idx) { Some(p) => p, None => return Ok(-1) };
     crate::binfo!("install", "target: port {} model={:?} sectors={} ({} MiB) — WIPING",
         idx, port.model, port.sectors, port.sectors / 2048);

@@ -33,7 +33,12 @@ timeout 150 qemu-system-x86_64 -machine q35 -cpu max \
   -drive if=pflash,format=raw,file=build/ovmf_vars.fd \
   -drive file="$IMG",format=raw,if=none,id=d0 -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0 \
   -serial stdio -display none -no-reboot -m 1024 -device qemu-xhci > "$S" 2>&1 & QP=$!
-for _ in $(seq 1 70); do grep -qF "mnt mounted FAT" "$S" && break; kill -0 $QP 2>/dev/null||break; sleep 2; done
+# Wait for the init script's LAST marker (`m2b2-installed`), not the kernel-level
+# `mnt mounted FAT`: the kernel mounts /mnt (~T+1.0s) well before the executor
+# spawns the shell that runs init (~T+1.5s), so keying on `mnt mounted FAT` would
+# kill QEMU before init emits `ruos boot OK`. `m2b2-installed` is the final init
+# line, so by the time it appears both asserted markers are guaranteed present.
+for _ in $(seq 1 70); do grep -qF "m2b2-installed" "$S" && break; kill -0 $QP 2>/dev/null||break; sleep 2; done
 killq; cp "$S" build/serial.m2b2p2.log
 grep -qF "ruos boot OK" build/serial.m2b2p2.log || { echo TEST_FAIL_SSD_BOOT; tail -50 build/serial.m2b2p2.log; exit 1; }
 grep -qF "mnt mounted FAT" build/serial.m2b2p2.log || { echo TEST_FAIL_SSD_MNT; tail -50 build/serial.m2b2p2.log; exit 1; }

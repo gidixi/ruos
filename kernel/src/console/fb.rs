@@ -60,6 +60,8 @@ impl FramebufferConsole {
             cache: GlyphCache::new(),
             parser: vte::Parser::new(),
         };
+        // pre-scalda la cache ASCII: render path (incl. panic handler) alloc-free.
+        me.cache.prewarm_ascii();
         me.clear();
         me.publish_cursor();
         me

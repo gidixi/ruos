@@ -29,6 +29,16 @@ impl GlyphCache {
     pub fn mask(&mut self, ch: char, bold: bool) -> &GlyphMask {
         self.map.entry((ch, bold)).or_insert_with(|| rasterize(ch))
     }
+
+    /// Pre-rasterizza tutto l'ASCII stampabile (0x20..=0x7E) nel peso Regular,
+    /// così il render path (incluso quello del panic handler) è alloc-free per
+    /// il testo ASCII: nessun cache-miss → nessuna alloc. Chiamato a init quando
+    /// l'heap è sano.
+    pub fn prewarm_ascii(&mut self) {
+        for c in 0x20u8..=0x7E {
+            let _ = self.mask(c as char, false);
+        }
+    }
 }
 
 fn rasterize(ch: char) -> GlyphMask {

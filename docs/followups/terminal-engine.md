@@ -54,6 +54,38 @@ confermare WC su baremetal. Se mai si osservano performance di blit scarse su
 hardware reale, aggiungere un check PAT e/o un remap esplicito con
 `_PAGE_PAT | _PAGE_WRITE_COMBINING`.
 
+## F3 — Panic path alloca su cache-miss di glyph non-ASCII ✅ MITIGATED
+
+**File:** `kernel/src/console/glyphcache.rs`, `kernel/src/console/fb.rs`
+**Severity:** 🟢 mitigated (residual: non-ASCII panic messages)
+
+### Problema (rilevato nella review finale del branch)
+
+Dopo la refactoring terminal-engine la `GlyphCache` era lazy: il primo
+accesso a ogni `(char, bold)` eseguiva `BTreeMap::insert + vec![0u8; w*h]`
+(allocazione heap). Il panic handler stampa il messaggio via
+`write_str` → `render::flush` → `GlyphCache::mask`, quindi un panic su OOM
+o con heap lock held poteva allocare nel panic path e sopprimere il
+messaggio on-screen. Il serial path era e resta allocation-free.
+
+### Mitigazione (CHANGELOG 236, commit su feature/terminal-engine)
+
+`FramebufferConsole::new` chiama `me.cache.prewarm_ascii()` che rasterizza
+tutti i codepoint U+0020..=U+007E (ASCII stampabile) nel peso Regular. I
+messaggi di panic del kernel usano esclusivamente ASCII, quindi il render
+path è ora **alloc-free per tutti i panic ASCII tipici**.
+
+### Residuo
+
+Un messaggio di panic contenente caratteri non-ASCII (es. Rust format
+strings con U+2019 right-quote, caratteri Unicode in variabili di debug)
+causerebbe ancora una cache-miss → alloc. Accettabile: i panic message
+del kernel Rust sono in pratica sempre ASCII. Per eliminare il residuo
+completamente si dovrebbe o (a) usare un font baked-in come array statico
+senza alloc (richiede redesign del font loader) o (b) fare fallback a
+un glyph di sostituzione se il cache è già "congelato" (flag `in_panic`).
+Entrambe le opzioni sono deferred post-Plan-2.
+
 ---
 
 ## ✅ CLOSED

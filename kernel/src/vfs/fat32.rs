@@ -1065,15 +1065,26 @@ impl<'a> FatWriter<'a> {
 
 /// Create directory paths on a freshly [`format`]ted FAT32 volume (borrow-based,
 /// synchronous — for the disk authoring path, NOT the mounted VFS). `paths` are
-/// absolute, created parents-first, e.g. `&["/EFI", "/EFI/BOOT"]`. A component
-/// that already exists (created by an earlier path) is reused, so listing both a
-/// parent and its child is fine. Each path component must be a valid 8.3 name.
+/// absolute, created parents-first, e.g. `&["/EFI", "/EFI/BOOT"]`. An existing
+/// *directory* component is reused (so listing both a parent and its child is
+/// fine); a name collision with a file is an error. Each component must be a
+/// simple 8.3 name (1..=8 ASCII alphanumerics) — anything `encode_short_name`
+/// would silently mangle is rejected with `IoError` instead, so a bad path can't
+/// create a wrong-named directory.
 pub fn create_dirs(dev: &mut dyn BlockDevice, paths: &[&str]) -> Result<(), VfsError> {
     let mut w = FatWriter::open(dev)?;
     for path in paths {
         // Walk components from the root, creating any that are missing.
         let mut cur = w.bpb.root_clus;
         for comp in path.split('/').filter(|c| !c.is_empty()) {
+            // Reject anything that isn't a plain ≤8-char ASCII-alphanumeric name:
+            // short-name encoding would otherwise mangle it and the lookup key
+            // (lower-cased here) would diverge from what was written.
+            if comp.is_empty() || comp.len() > 8
+                || !comp.bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                return Err(VfsError::IoError);
+            }
             let want = comp.to_ascii_lowercase();
             cur = match w.find_subdir(cur, &want)? {
                 Some(c) => c,                       // already there → descend

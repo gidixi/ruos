@@ -44,7 +44,7 @@ work — all merged to `main` and verified in QEMU + VirtualBox:
 | **SMP** | Multi-core bring-up (Limine MP, per-CPU GDT/TSS/IDT) + a cooperative compute-offload pool — APs run pure-CPU kernel jobs in parallel while the BSP async executor is untouched (`smptest` shows 2–3× speedup). Still no preemptive scheduler. | ✅ |
 | **USB** | xHCI host driver + HID boot keyboard, USB **hubs**, and runtime **hot-plug** — attach/detach a keyboard on a root port or behind hubs and it types into the shell. | ✅ |
 | **`rtop`** | `htop`-style full-screen monitor (per-core CPU%, memory, uptime, process table) — `ratatui` on `wasm32-wasip1`, timer-driven auto-refresh, Ctrl-C foreground kill. | ✅ |
-| **SSD self-install** | `install` authors a SATA SSD (GPT + FAT32), copies the whole boot tree onto the ESP, and the SSD then boots ruos standalone under UEFI and mounts its data partition. A `/mnt` guard refuses to wipe the running system. | ✅ |
+| **SSD self-install** | `install` lists the SATA disks (`install <n>` picks one), authors it (GPT + FAT32), and writes a bootable system: a **slim ESP** (kernel + shell + init + network/SSH) plus the command tools on the **data partition**. The SSD boots ruos standalone under UEFI, mounts its data partition, and the shell loads tools **on-demand** from `/mnt/bin`. A `/mnt` guard refuses to wipe the running system. | ✅ |
 
 WASI compatibility is growing incrementally alongside the roadmap: as of
 the latest work, `fd_readdir` is exported, so `std::fs::read_dir` and
@@ -64,7 +64,10 @@ change is in [`CHANGELOG/`](CHANGELOG/).
 
 ## Userspace tools
 
-Every tool is a `wasm32-wasip1` binary in `user/`, mounted under `/bin`. Add a
+Every tool is a `wasm32-wasip1` binary in `user/`. On the live ISO/USB they are
+Limine modules mounted under `/bin`; on an **installed SSD** only the bootstrap
+(kernel, shell, init, network/SSH) sits on the slim ESP, and the command tools
+live on the data partition (`/mnt/bin`) — the shell loads them on-demand. Add a
 new one by appending its crate name to `BIN_TOOLS` in the `Makefile`.
 
 | Group | Tools |

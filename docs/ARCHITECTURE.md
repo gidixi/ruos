@@ -186,11 +186,15 @@ SSH channel to a fresh shell on a PTY.
 ## Userland / OS layer
 
 - **Shell** — `user/shell`: line editing (←/→/⌫, tab path completion), PATH
-  lookup in `/bin`, `cmd1 | cmd2` pipelines, builtins (`cd`, `pwd`, `source`,
-  power commands), and `exec` of any `/bin/*.wasm`.
-- **Tools** — ~54 `wasm32-wasip1` crates under `user/`, built to `user-bin/` and
-  mounted at `/bin` (coreutils, `nano`, network tools, `rtop`, disk tools — see
-  the README's tool table).
+  lookup in `/bin` then `/mnt/bin`, `cmd1 | cmd2` pipelines, builtins (`cd`,
+  `pwd`, `source`, power commands), and `exec` of any `/bin/*.wasm` (or
+  `/mnt/bin/*.wasm` on an installed disk, loaded on-demand from the FAT).
+- **Tools** — ~54 `wasm32-wasip1` crates under `user/`, built to `user-bin/`.
+  On the live ISO they are Limine modules at `/bin`; on an installed SSD the
+  command tools live on the data partition (`/mnt/bin`) and load on-demand,
+  while only the bootstrap (shell, init, network/SSH service) stays on the slim
+  ESP. (The live medium has no readable filesystem after boot — no USB
+  mass-storage driver — so it must carry every tool as a module.)
 - **init** — `/etc/init.sh` (a tiny greeter by default; the test build swaps in
   `smoke.sh`, the full assertion battery).
 - **SSH** — `ssh/` is the `sunset` library bridged to the kernel: ed25519 host
@@ -198,10 +202,15 @@ SSH channel to a fresh shell on a PTY.
   non-interactive exec. It starts at boot and runs even disklessly (ephemeral
   RAM host key). The SSH server itself runs in ring 0; the app it spawns is the
   sandboxed part.
-- **Self-install** — from a running shell, `install` authors a SATA SSD
-  (GPT + FAT32), copies the whole boot tree onto the ESP, and the disk then
-  boots ruos standalone under UEFI. A `/mnt` guard refuses to wipe the running
-  system.
+- **Self-install** — from a running shell, `install` (no arg) lists the SATA
+  disks; `install <n>` authors that disk (GPT + FAT32) and writes a bootable
+  system — a **slim ESP** (kernel + shell + init + network/SSH, via a reduced
+  `limine-ssd.conf`) plus the command tools on the **data partition**
+  (`/mnt/bin`, loaded on-demand). The disk boots ruos standalone under UEFI. A
+  `/mnt` guard refuses to wipe the running system (and prevents a re-install
+  loop on the SSD's own reboot, where `/mnt` is already mounted). The FAT writer
+  authors long filenames (LFN) and the mounted driver reads them back, so the
+  tools keep their real names on disk.
 
 ## Concurrency model (and what SMP does)
 
@@ -222,7 +231,7 @@ all I/O stay on the BSP — APs never touch the VFS, runtime, or device locks.
 ```
 keypress (PS/2 or USB HID)            firmware/driver IRQ
   → input queue → PTY line discipline (cooked, echo, ^C)
-  → shell fiber reads a line, resolves /bin/<cmd>.wasm via VFS
+  → shell fiber reads a line, resolves /bin/<cmd>.wasm (then /mnt/bin) via VFS
   → exec_queue loads the module into a wasmi instance
        linker installs wasi_snapshot_preview1 + ruos host fns
        ResourceLimiter + fuel armed

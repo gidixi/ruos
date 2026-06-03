@@ -9,6 +9,14 @@
 #     (`install: /mnt is mounted`) and boot continues — no re-install loop.
 # The host-side test greps serial for "ruos boot OK" + "mnt mounted FAT" (phase 2)
 # and "install: ok" (phase 1).
+#
+# `uname -a` proves ON-DEMAND tool exec on the installed SSD: with the slim ESP,
+# /bin/uname.wasm is absent there, so the shell's resolve_path falls through to
+# /mnt/bin/uname.wasm on the data partition and loads it from the FAT at first
+# use. It prints "ruos ruos 0.1.0 wasm-userland x86_64" — phase 2 asserts the
+# uname-only token "wasm-userland" (the banner never emits it). Same init runs
+# in both phases: phase 1 (live ISO) resolves uname from the /bin tmpfs instead.
 echo ruos boot OK
 install 0
+uname -a
 echo m2b2-installed

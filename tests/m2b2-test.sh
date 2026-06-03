@@ -11,7 +11,11 @@
 #     → ruos boots → M1 mounts /mnt from the SSD's data partition. The init copied
 #     onto the SSD is the same one that ran `install`, but now /mnt is mounted, so
 #     that `install` hits the guard (prevents a re-install loop) and boot continues.
-#     Assert ruos booted from the SSD ("ruos boot OK" + "mnt mounted FAT").
+#     Assert ruos booted from the SSD ("ruos boot OK" + "mnt mounted FAT") AND that
+#     a tool runs ON-DEMAND off /mnt/bin: the init's `uname -a` is NOT on the slim
+#     ESP, so resolve_path loads /mnt/bin/uname.wasm from the data partition. It
+#     prints "ruos ruos 0.1.0 wasm-userland x86_64"; assert the uname-only token
+#     "wasm-userland" (the boot banner never emits it).
 set -u
 cd "$(dirname "$0")/.."
 IMG=build/m2b2-disk.img; S=build/serial.log
@@ -42,4 +46,9 @@ for _ in $(seq 1 70); do grep -qF "m2b2-installed" "$S" && break; kill -0 $QP 2>
 killq; cp "$S" build/serial.m2b2p2.log
 grep -qF "ruos boot OK" build/serial.m2b2p2.log || { echo TEST_FAIL_SSD_BOOT; tail -50 build/serial.m2b2p2.log; exit 1; }
 grep -qF "mnt mounted FAT" build/serial.m2b2p2.log || { echo TEST_FAIL_SSD_MNT; tail -50 build/serial.m2b2p2.log; exit 1; }
+# On-demand exec: the init's `uname -a` is absent from the slim ESP, so the shell
+# resolved /mnt/bin/uname.wasm from the data partition and ran it. "wasm-userland"
+# is the uname version string — emitted ONLY by uname, never by the boot banner —
+# so finding it after the SSD booted proves the tool loaded on-demand off /mnt/bin.
+grep -qF "wasm-userland" build/serial.m2b2p2.log || { echo TEST_FAIL_ONDEMAND; tail -50 build/serial.m2b2p2.log; exit 1; }
 echo TEST_PASS_M2B2

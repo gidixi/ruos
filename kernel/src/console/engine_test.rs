@@ -77,6 +77,20 @@ fn run_inner() -> Result<(), u32> {
         check(17, g.dirty_span(0).is_some())?;
     }
 
+    // T18: put_px nel back-buffer + read-back combaciano (BGR, 32bpp).
+    {
+        use crate::console::surface::Surface;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::ansi::Rgb;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: 4, height: 2,
+                            pitch: 16, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut s = Surface::new(info);
+        let red = Rgb { r: 0xFF, g: 0x00, b: 0x00 };
+        s.put_px(1, 1, red);
+        check(18, s.read_px(1, 1) == red)?;
+        check(19, s.read_px(0, 0) == Rgb { r: 0, g: 0, b: 0 })?;
+    }
+
     Ok(())
 }
 

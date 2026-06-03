@@ -118,7 +118,12 @@ fn readdir_entries(path: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// Command completion: builtins + /bin/*.wasm (stripped suffix).
+/// Command completion: builtins + /bin/*.wasm + /mnt/bin/*.wasm (stripped
+/// suffix). `/bin` is the live tmpfs; `/mnt/bin` is where the command tools
+/// live on the installed SSD's data partition, so installed-SSD tools also
+/// tab-complete. The `/mnt/bin` listing is best-effort: `readdir_entries`
+/// returns an empty list when it is absent (the live ISO has no `/mnt/bin`),
+/// so completion never breaks. Names present in both dirs are de-duplicated.
 fn complete_command(prefix: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = vec![
         "cd".into(),
@@ -129,9 +134,14 @@ fn complete_command(prefix: &[u8]) -> Vec<String> {
         "reboot".into(),
         "source".into(),
     ];
-    for (name, _) in readdir_entries("/bin") {
-        if name.ends_with(".wasm") {
-            out.push(name.trim_end_matches(".wasm").to_string());
+    for dir in ["/bin", "/mnt/bin"] {
+        for (name, _) in readdir_entries(dir) {
+            if name.ends_with(".wasm") {
+                let cmd = name.trim_end_matches(".wasm").to_string();
+                if !out.contains(&cmd) {
+                    out.push(cmd);
+                }
+            }
         }
     }
     let pref = std::str::from_utf8(prefix).unwrap_or("");
@@ -468,16 +478,28 @@ fn builtin_help() {
 }
 
 /// Resolve a command name to an absolute path (e.g. `ls` → `/bin/ls.wasm`).
-/// Returns `Some(path)` if the resolved path exists (best-effort), or
-/// `Some(path)` unconditionally when the command already contains a `/`
-/// (let the kernel report the error). Returns `None` when resolution yields
-/// no candidate.
+///
+/// When the command already contains a `/` it is taken verbatim (let the
+/// kernel report the error). Otherwise the bare command is looked up as a
+/// `.wasm` in `/bin` first, then `/mnt/bin` — returning the FIRST path that
+/// actually exists. On the installed SSD the command tools live on the data
+/// partition (`/mnt/bin`), not the slim ESP, so this lets them load on-demand
+/// from the FAT. The live ISO (all tools in `/bin` tmpfs) is unaffected since
+/// `/bin` is tried first. Returns `None` when neither candidate exists, so the
+/// caller prints "command not found".
 fn resolve_path(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
-        Some(cmd.to_string())
-    } else {
-        Some(format!("/bin/{}.wasm", cmd))
+        return Some(cmd.to_string());
     }
+    let p = format!("/bin/{}.wasm", cmd);
+    if std::fs::metadata(&p).is_ok() {
+        return Some(p);
+    }
+    let q = format!("/mnt/bin/{}.wasm", cmd);
+    if std::fs::metadata(&q).is_ok() {
+        return Some(q);
+    }
+    None
 }
 
 fn exec_external(cmd: &str, argv: &[&str]) -> i32 {

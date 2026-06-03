@@ -86,6 +86,13 @@ impl FramebufferConsole {
             parser.advance(self, b);
         }
         self.parser = parser;
+        // render::flush blits only dirty spans to the back-buffer (and from
+        // there to the framebuffer via Surface::present). If tick_cursor has
+        // XOR'd the cursor cell since the last flush, this blit will transiently
+        // overwrite that XOR. The next blink tick (tick_cursor) restores it.
+        // This is intentional and safe on single-core: flush runs under
+        // x86_64::instructions::interrupts::without_interrupts, so tick_cursor
+        // cannot interleave with it on the BSP.
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
         self.publish_cursor();
     }
@@ -159,6 +166,20 @@ impl vte::Perform for FramebufferConsole {
 
 /// Called from the LAPIC timer IRQ. NO locks acquired here. Toggles the
 /// cursor cell directly via the published FB pointer + cursor pos atomics.
+///
+/// The XOR underline is applied directly to the framebuffer pixels. When
+/// write_str/render::flush subsequently blits a dirty span that overlaps the
+/// cursor cell, the XOR is erased; the next blink tick restores it. This
+/// transient erasure is intentional and safe on single-core (the BSP is the
+/// only writer; flush runs under without_interrupts).
+///
+/// KNOWN FOLLOW-UP (deferred to Plan 3 / DECSCUSR work): when the cursor
+/// moves off a cell that does not otherwise become dirty (e.g. bare cursor-left
+/// `\x1b[D`, or `\n` on a non-final line), a stale XOR underline can linger on
+/// the old cell until that cell is next written. Proper fix: force-mark the
+/// previously-published cursor cell dirty on move, or composite the cursor into
+/// the back-buffer rather than XOR-ing the live framebuffer. Deferred —
+/// does not affect correctness of text output.
 pub fn tick_cursor() {
     let n = BLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
     if n % BLINK_DIVIDER != 0 { return; }

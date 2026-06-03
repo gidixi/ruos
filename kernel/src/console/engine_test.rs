@@ -137,6 +137,27 @@ fn run_inner() -> Result<(), u32> {
         check(23, con.cursor_for_test() == (2, 0))?;
     }
 
+    // T24: full-redraw 80x25 sotto soglia. Misura puramente RAM (addr null),
+    // quindi misura il costo compose; il costo blit MMIO si valuta a schermo.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*80, height: gh*25,
+                            pitch: gw*80*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        let t0 = crate::boot::clock::read_tsc();
+        for _ in 0..25 { con.write_str("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\n"); }
+        let dt = crate::boot::clock::read_tsc().wrapping_sub(t0);
+        crate::kprintln!("CONSOLE_PERF: full_redraw_tsc={}", dt);
+        // Threshold calibrated on QEMU (measured ~820M cycles, 11×24 font,
+        // cold GlyphCache, 2000 cells). 2B gives headroom on slow virt hosts
+        // while still catching gross regressions (e.g. O(n²) recompose).
+        check(24, dt < 2_000_000_000)?;
+    }
+
     Ok(())
 }
 

@@ -29,7 +29,8 @@ BIN_TOOLS  := shell ls cat echo \
               ifconfig nc date wget ping \
               service readdirtest \
               spinloop smptest \
-              rtop
+              rtop \
+              mkdisk
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

@@ -91,6 +91,37 @@ fn run_inner() -> Result<(), u32> {
         check(19, s.read_px(0, 0) == Rgb { r: 0, g: 0, b: 0 })?;
     }
 
+    // T20: render compone 'X' nel back-buffer; un pixel acceso della maschera
+    // diventa fg, una cella vuota resta bg.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::surface::Surface;
+        use crate::console::glyphcache::GlyphCache;
+        use crate::console::render;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::font::{glyph_width, glyph_height};
+        use crate::console::ansi::Rgb;
+        let fg = Rgb { r: 0xEE, g: 0xEE, b: 0xEE };
+        let bg = Rgb { r: 0, g: 0, b: 0 };
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw * 2, height: gh,
+                            pitch: (gw * 2 * 4), bpp: 32, pixel: PixelLayout::Bgr };
+        let mut g = Grid::new(2, 1, fg, bg);
+        let mut s = Surface::new(info);
+        let mut gc = GlyphCache::new();
+        g.put('X');
+        render::flush(&mut g, &mut gc, &mut s);
+        let m = gc.mask('X', false);
+        let mut found = false;
+        for y in 0..gh { for x in 0..gw {
+            if m.alpha[(y as usize)*(gw as usize)+(x as usize)] == 255 {
+                check(20, s.read_px(x, y) == fg)?; found = true; break;
+            }
+        } if found { break; } }
+        check(21, found)?;
+        check(22, g.dirty_span(0).is_none())?;
+    }
+
     Ok(())
 }
 

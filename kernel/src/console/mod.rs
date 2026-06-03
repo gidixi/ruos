@@ -8,6 +8,7 @@ pub mod fb;
 pub mod fb_init;
 pub mod serial_con;
 pub mod surface;
+pub mod render;
 pub mod engine_test;
 
 use core::fmt;

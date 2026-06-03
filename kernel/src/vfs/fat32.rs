@@ -442,6 +442,16 @@ impl Fat32Fs {
         Self::from_blockdev(alloc::boxed::Box::new(port))
     }
 
+    /// True while an open file still holds a clone of the backing `Inner`.
+    /// The mount itself holds one `Arc` ref; each open `Fat32File` holds one
+    /// more (`Arc::clone(&self.inner)` in `open`). So `strong_count > 1` means
+    /// the device is physically live behind an open fd — unmounting now would
+    /// let a later `acquire_port`/`bringup` reprogram this port's PxCLB/PxFB
+    /// out from under that live file (DMA corruption). `unmount` consults this.
+    pub fn is_busy(&self) -> bool {
+        alloc::sync::Arc::strong_count(&self.inner) > 1
+    }
+
     /// Look up `path` (split components) walking from the root cluster.
     /// Returns the DirEntry of the leaf. Path is interpreted case-insensitive.
     fn lookup(&self, parts: &[&str]) -> Result<DirEntry, VfsError> {

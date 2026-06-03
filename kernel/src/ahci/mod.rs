@@ -27,6 +27,29 @@ static PORT0: Mutex<Option<AhciPort>> = Mutex::new(None);
 /// HBA WITHOUT a second `GHC_HR`, which on real HW would orphan a live `/mnt`.
 static BOOT_HBA: Mutex<Option<(VirtAddr, u32)>> = Mutex::new(None); // (abar, pi)
 
+/// Per-port cache of `(model, sectors)` learned from IDENTIFY the first (and,
+/// for a mounted port, ONLY) time the port is brought up. `AhciPort::bringup`
+/// populates this on every success — including the boot-time bringup of the
+/// port that gets mounted at `/mnt`. `disk_info` then lets `disks`
+/// (`ruos_sata_list`) report a mounted disk WITHOUT a second `bringup` that
+/// would reprogram the live port's PxCLB/PxFB and corrupt its in-flight DMA.
+use alloc::string::String;
+const NONE_DI: Option<(String, u64)> = None;
+static DISK_INFO: Mutex<[Option<(String, u64)>; 32]> = Mutex::new([NONE_DI; 32]);
+
+/// Record port `idx`'s IDENTIFY model + sector count. Called by every
+/// successful `AhciPort::bringup` so the info survives the port being moved
+/// into a mount (where it can no longer be safely re-queried).
+pub fn cache_disk_info(idx: usize, model: String, sectors: u64) {
+    if idx < 32 { DISK_INFO.lock()[idx] = Some((model, sectors)); }
+}
+
+/// Cached `(model, sectors)` for port `idx`, if it has ever been brought up.
+/// `None` means never-seen → safe to `acquire_port` (the port is not mounted).
+pub fn disk_info(idx: usize) -> Option<(String, u64)> {
+    if idx < 32 { DISK_INFO.lock()[idx].clone() } else { None }
+}
+
 pub fn set_port0(p: AhciPort) {
     *PORT0.lock() = Some(p);
 }

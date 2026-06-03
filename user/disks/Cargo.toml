@@ -1,0 +1,8 @@
+[package]
+name = "disks"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "disks"
+path = "src/main.rs"

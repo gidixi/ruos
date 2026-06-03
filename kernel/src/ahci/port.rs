@@ -56,9 +56,10 @@ const STOP_TIMEOUT:  u64 = 100;  // ~1 s for engine stop
 const CMD_TIMEOUT:   u64 = 500;  // ~5 s per command
 
 // ATA commands.
-const ATA_IDENTIFY:       u8 = 0xEC;
-const ATA_READ_DMA_EXT:   u8 = 0x25;
-const ATA_WRITE_DMA_EXT:  u8 = 0x35;
+const ATA_IDENTIFY:        u8 = 0xEC;
+const ATA_READ_DMA_EXT:    u8 = 0x25;
+const ATA_WRITE_DMA_EXT:   u8 = 0x35;
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 /// 32-byte AHCI Command Header.
 #[repr(C)]
@@ -272,6 +273,11 @@ impl AhciPort {
             rsv: [0; 4],
         };
 
+        // No-data commands (e.g. FLUSH CACHE EXT) carry no PRDT: PRDTL=0 and the
+        // HBA never touches the PRDT region. A non-zero PRDTL with no DMA would
+        // hang the engine, and `buf_bytes - 1` would underflow for buf_bytes==0.
+        let has_data = buf_bytes > 0;
+
         // Build CT0: copy CFIS bytes, fill PRDT[0]. Write through the raw
         // pointer with `addr_of_mut!` + `write` to avoid implicit autoref to
         // unaligned/HHDM-backed memory.
@@ -287,17 +293,23 @@ impl AhciPort {
             );
             core::ptr::copy_nonoverlapping(fis_bytes.as_ptr(), cfis_ptr, fis_bytes.len());
             let prdt0_ptr = core::ptr::addr_of_mut!((*ct).prdt0);
-            core::ptr::write(prdt0_ptr, PrdtEntry {
-                dba:  buf_phys as u32,
-                dbau: (buf_phys >> 32) as u32,
-                rsv:  0,
-                // dbc bits 0..21 = byte count - 1, must be even
-                dbc:  (buf_bytes - 1) & 0x3F_FFFF,
+            // Only program a PRDT for data-bearing commands; for no-data commands
+            // zero it (PRDTL=0 below means the HBA ignores it anyway).
+            core::ptr::write(prdt0_ptr, if has_data {
+                PrdtEntry {
+                    dba:  buf_phys as u32,
+                    dbau: (buf_phys >> 32) as u32,
+                    rsv:  0,
+                    // dbc bits 0..21 = byte count - 1, must be even
+                    dbc:  (buf_bytes - 1) & 0x3F_FFFF,
+                }
+            } else {
+                PrdtEntry { dba: 0, dbau: 0, rsv: 0, dbc: 0 }
             });
         }
 
         // Build Command Header[0]: CFL=5 dwords (one register FIS = 5*4 = 20 B),
-        // W=1 for writes, PRDTL=1, CTBA=CT0 phys.
+        // W=1 for writes, PRDTL=1 for data commands / 0 for no-data, CTBA=CT0 phys.
         let ct0_phys = self.ct0_phys();
         let cfl_dwords = (core::mem::size_of::<FisH2D>() as u16 / 4) & 0x1F;
         let mut flags: u16 = cfl_dwords;
@@ -306,7 +318,7 @@ impl AhciPort {
             let ch = self.ch0_virt();
             write_volatile(ch, CmdHeader {
                 flags,
-                prdtl: 1,
+                prdtl: if has_data { 1 } else { 0 },
                 prdbc: 0,
                 ctba:  ct0_phys as u32,
                 ctbau: (ct0_phys >> 32) as u32,
@@ -378,6 +390,13 @@ impl AhciPort {
         self.model = String::from_utf8_lossy(&buf).into_owned();
 
         Ok(())
+    }
+
+    /// Issue FLUSH CACHE EXT — commit the disk's write cache so prior writes are
+    /// durable across power-off / VM reset (the install path calls this before
+    /// reporting success). No-data command: PRDTL=0, count/lba 0. Cheap; one cmd.
+    pub fn flush(&mut self) -> Result<(), BlockError> {
+        self.issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, 0, false)
     }
 }
 

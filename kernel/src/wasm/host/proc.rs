@@ -649,6 +649,12 @@ pub fn ruos_mkdisk(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
 
     match crate::disk::author(&mut port, esp_mib) {
         Ok(layout) => {
+            // Commit the disk's write-back cache so the GPT + FAT32 partitions are
+            // durable across a VM reset / power-off (WRITE DMA EXT alone leaves
+            // them in cache on VBox/real HW).
+            if port.flush().is_err() {
+                crate::bwarn!("mkdisk", "cache flush failed (writes may not be durable)");
+            }
             crate::binfo!(
                 "mkdisk",
                 "ok esp_lba={} esp_sec={} data_lba={} data_sec={}",
@@ -720,6 +726,12 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
         return Ok(-2);
     }
 
+    // Commit the disk's write-back cache so the boot tree (ESP + data partition)
+    // is durable across a VM reset / power-off before we report success.
+    if port.flush().is_err() {
+        crate::bwarn!("mkboot", "cache flush failed (writes may not be durable)");
+    }
+
     crate::binfo!(
         "mkboot", "ok esp_lba={} data_lba={}",
         layout.esp.first_lba, layout.data.first_lba,
@@ -774,6 +786,12 @@ fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Resu
         idx, port.model, port.sectors, port.sectors / 2048);
     let layout = match crate::disk::author(&mut port, esp) { Ok(l) => l, Err(_) => return Ok(-2) };
     if crate::disk::copy_boot_payload(&mut port, &layout).is_err() { return Ok(-2); }
+    // Commit the disk's write-back cache so the full install (GPT + ESP + data
+    // partition, ~22 MB) is durable across a VM reset / power-off. WRITE DMA EXT
+    // alone leaves it in cache on VBox/real HW -> "install ok" but disk reverts.
+    if port.flush().is_err() {
+        crate::bwarn!("install", "cache flush failed (writes may not be durable)");
+    }
     crate::binfo!("install", "ok -- ruos installed to port {}, reboot from the SSD", idx);
     Ok(0)
 }

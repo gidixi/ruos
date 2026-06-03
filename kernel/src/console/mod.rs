@@ -3,6 +3,7 @@
 pub mod ansi;
 pub mod font;
 pub mod glyphcache;
+pub mod grid;
 pub mod fb;
 pub mod fb_init;
 pub mod serial_con;

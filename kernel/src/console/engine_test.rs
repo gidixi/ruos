@@ -40,6 +40,21 @@ fn run_inner() -> Result<(), u32> {
         check(6, s.alpha.iter().all(|&a| a == 0))?;
     }
 
+    // T7: put avanza il cursore, scrive la cella, marca la riga dirty.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::ansi::{WHITE, BLACK};
+        let mut g = Grid::new(10, 4, WHITE, BLACK);
+        g.put('H'); g.put('i');
+        check(7, g.cell(0, 0).ch == 'H' && g.cell(1, 0).ch == 'i')?;
+        check(8, g.cursor() == (2, 0))?;
+        let d = g.dirty_span(0);
+        check(9, d == Some((0, 1)))?;
+        g.cr(); check(10, g.cursor() == (0, 0))?;
+        g.newline(); check(11, g.cursor() == (0, 1))?;
+        g.bs(); check(12, g.cursor().0 == 0)?;
+    }
+
     Ok(())
 }
 

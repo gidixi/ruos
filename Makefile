@@ -60,9 +60,15 @@ $(DISK_IMG):
 
 disk: $(DISK_IMG)
 
+# Optional Cargo feature flags forwarded to the kernel build.
+# Pass on the command line to enable extra features, e.g.:
+#   make iso CARGO_FEATURES=boot-checks
+CARGO_FEATURES ?=
+
 build:
 	source $$HOME/.cargo/env && cd kernel && \
-		RUOS_DEFAULT_PASSWORD='$(RUOS_PASSWORD)' cargo build --release
+		RUOS_DEFAULT_PASSWORD='$(RUOS_PASSWORD)' cargo build --release \
+		$(if $(CARGO_FEATURES),--features $(CARGO_FEATURES),)
 
 limine:
 	@if [ ! -d $(LIMINE) ]; then \
@@ -295,7 +301,7 @@ run-passwd-diskless-test: iso
 # in the devices boot phase, then init powers off.
 .PHONY: run-console-test
 run-console-test: iso
-	@$(MAKE) iso INIT_SCRIPT=user-bin/console-test-init.sh > build/console-iso.log 2>&1 || { echo TEST_FAIL_ISO; tail -20 build/console-iso.log; exit 1; }
+	@$(MAKE) iso INIT_SCRIPT=user-bin/console-test-init.sh CARGO_FEATURES=boot-checks > build/console-iso.log 2>&1 || { echo TEST_FAIL_ISO; tail -20 build/console-iso.log; exit 1; }
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 

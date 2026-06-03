@@ -26,6 +26,8 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    #[cfg(feature = "boot-checks")]
     crate::console::engine_test::run();
+
     Ok(())
 }

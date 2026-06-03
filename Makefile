@@ -156,6 +156,14 @@ run-gpt-test:
 	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
 	bash tests/gpt-test.sh
 
+# M2a disk-authoring end-to-end: proves ruos AUTHORS a real disk (GPT + FAT32 +
+# /EFI/BOOT via `mkdisk`) AND that M1 boots + auto-mounts it. The script runs two
+# phases on the same image with its own `make iso INIT_SCRIPT=...` builds (author,
+# then round-trip), host-verifying the authored image with sgdisk/fsck.fat/mtools.
+.PHONY: run-m2a-test
+run-m2a-test:
+	bash tests/m2a-test.sh
+
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
 .PHONY: run-ssh-test

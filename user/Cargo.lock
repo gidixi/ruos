@@ -283,6 +283,10 @@ name = "lspci"
 version = "0.1.0"
 
 [[package]]
+name = "mkboot"
+version = "0.1.0"
+
+[[package]]
 name = "mkdir"
 version = "0.1.0"
 

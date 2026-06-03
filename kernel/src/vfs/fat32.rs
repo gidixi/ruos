@@ -865,18 +865,57 @@ pub fn format(dev: &mut dyn BlockDevice) -> Result<(), VfsError> {
 /// `create_dirs` needs. The cluster/dir logic mirrors [`Inner`]'s
 /// (`alloc_cluster`, `add_dir_record`, FAT-entry mirroring) so a volume it
 /// authors is identical to what the mounted driver would produce.
-struct FatWriter<'a> {
+pub struct FatWriter<'a> {
     dev: &'a mut dyn BlockDevice,
     bpb: Bpb,
+    /// Lowest cluster index that *might* be free — the next-free-cluster search
+    /// hint (FSInfo `Nxt_Free` in spirit, kept in RAM). All allocator paths
+    /// (`alloc_cluster`, `alloc_chain`) start their scan here and bump it past
+    /// what they hand out, so allocation is O(1) amortised instead of an O(n)
+    /// rescan from cluster 2 each call. Seeded by one cached scan in `open`.
+    next_free: u32,
 }
 
 impl<'a> FatWriter<'a> {
     /// Parse the BPB off sector 0 of a freshly-`format`ted volume.
-    fn open(dev: &'a mut dyn BlockDevice) -> Result<Self, VfsError> {
+    pub fn open(dev: &'a mut dyn BlockDevice) -> Result<Self, VfsError> {
         let mut sec0 = [0u8; SECTOR];
         dev.read_blocks(0, &mut sec0).map_err(map_block_err)?;
         let bpb = Bpb::parse(&sec0)?;
-        Ok(Self { dev, bpb })
+        let mut w = Self { dev, bpb, next_free: 2 };
+        w.next_free = w.scan_first_free()?;
+        Ok(w)
+    }
+
+    /// Scan the whole FAT **once** for the first free (`0`) cluster, reading each
+    /// FAT sector a single time and walking the 128 u32 entries it holds in
+    /// memory (never re-reading per entry — that is what made the old
+    /// `alloc_cluster` O(n^2)). Returns the cluster index, or `max_cluster` if
+    /// the volume is full (callers turn that into `NoSpace`). On a
+    /// fresh-formatted ESP with a handful of dirs this lands within the first
+    /// FAT sector.
+    fn scan_first_free(&mut self) -> Result<u32, VfsError> {
+        let max_cluster = self.bpb.max_cluster();
+        if max_cluster <= 2 { return Ok(max_cluster); }
+        let mut sec_buf = [0u8; SECTOR];
+        let mut n = 2u32;
+        let fat_base = u64::from(self.bpb.rsvd_sec_cnt);
+        while n < max_cluster {
+            let sec = fat_base + (n as u64 * 4) / SECTOR as u64;
+            self.read_sector(sec, &mut sec_buf)?;
+            // Entries from `n` up to the end of this sector.
+            let first_off = ((n as u64 * 4) % SECTOR as u64) as usize;
+            let mut off = first_off;
+            while off + 4 <= SECTOR && n < max_cluster {
+                let entry = u32::from_le_bytes([
+                    sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+                ]) & 0x0FFF_FFFF;
+                if entry == 0 { return Ok(n); }
+                n += 1;
+                off += 4;
+            }
+        }
+        Ok(max_cluster)
     }
 
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), VfsError> {
@@ -949,25 +988,235 @@ impl<'a> FatWriter<'a> {
         Ok(())
     }
 
-    /// Allocate one free cluster (linear scan from 2), set it to EOC, and zero
-    /// its data so no stale bytes leak. Mirrors `Inner::alloc_cluster`.
+    /// Allocate one free cluster, set it to EOC, and zero its data so no stale
+    /// bytes leak. Starts the scan at the `next_free` hint (caching each FAT
+    /// sector across its 128 entries) and advances the hint past the cluster it
+    /// returns, so repeated allocs are O(1) amortised rather than rescanning from
+    /// cluster 2. Shared by every authoring path (`mkdir`, `add_dir_run`,
+    /// `create_dirs`) so two allocations can never collide on the same cluster.
     fn alloc_cluster(&mut self) -> Result<u32, VfsError> {
-        let mut sec_buf = [0u8; SECTOR];
+        let n = self.take_free_cluster()?;
+        self.write_fat_entry(n, 0x0FFF_FFFF)?;
+        let zero = alloc::vec![0u8; self.bpb.cluster_bytes()];
+        self.write_cluster(n, &zero)?;
+        Ok(n)
+    }
+
+    /// Find the next free cluster at/after `next_free`, advance the hint past it,
+    /// and return it. Does NOT touch the FAT entry or the data (callers do that).
+    /// Reads each FAT sector once and walks its 128 entries in memory.
+    fn take_free_cluster(&mut self) -> Result<u32, VfsError> {
         let max_cluster = self.bpb.max_cluster();
-        for n in 2..max_cluster {
-            let (sec, off) = self.bpb.fat_entry_loc(n);
-            self.read_sector(sec, &mut sec_buf)?;
+        let mut sec_buf = [0u8; SECTOR];
+        let mut cached_sec: Option<u64> = None;
+        let fat_base = u64::from(self.bpb.rsvd_sec_cnt);
+        let mut n = self.next_free.max(2);
+        while n < max_cluster {
+            let sec = fat_base + (n as u64 * 4) / SECTOR as u64;
+            if cached_sec != Some(sec) {
+                self.read_sector(sec, &mut sec_buf)?;
+                cached_sec = Some(sec);
+            }
+            let off = ((n as u64 * 4) % SECTOR as u64) as usize;
             let entry = u32::from_le_bytes([
                 sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
             ]) & 0x0FFF_FFFF;
             if entry == 0 {
-                self.write_fat_entry(n, 0x0FFF_FFFF)?;
-                let zero = alloc::vec![0u8; self.bpb.cluster_bytes()];
-                self.write_cluster(n, &zero)?;
+                self.next_free = n + 1;
                 return Ok(n);
             }
+            n += 1;
         }
         Err(VfsError::NoSpace)
+    }
+
+    /// Allocate a chain of `n` clusters for a file and link them on disk
+    /// (`first -> first+1 -> ... -> EOC`), returning the first cluster.
+    ///
+    /// Fast path (the append-only authoring case): the `n` clusters starting at
+    /// the `next_free` hint are all free and contiguous, so the chain is
+    /// `first..first+n`. Each cluster is still verified free as we go; if a
+    /// non-free cluster is hit we fall back to scanning forward for free clusters
+    /// (the resulting chain may then be non-contiguous, which `write_file`
+    /// handles). The FAT links are written by building **whole FAT sectors in
+    /// memory** (128 entries per 512-byte sector) and writing each affected
+    /// sector ONCE per FAT copy — turning ~`n` individual read-modify-writes per
+    /// FAT into ~`n/128`. Advances `next_free`. Data clusters are NOT pre-zeroed
+    /// (the caller overwrites every byte and zero-pads the final cluster tail).
+    fn alloc_chain(&mut self, n: u32) -> Result<u32, VfsError> {
+        if n == 0 { return Err(VfsError::IoError); }
+        let clusters = self.collect_free_clusters(n)?;
+        self.write_chain_fat(&clusters)?;
+        Ok(clusters[0])
+    }
+
+    /// Reserve `n` free clusters starting from the `next_free` hint, returning
+    /// them in order. Verifies each candidate is free; the common case is the
+    /// contiguous run `next_free..next_free+n`. Advances `next_free` past the
+    /// highest reserved cluster. Does not write the FAT (see `write_chain_fat`).
+    fn collect_free_clusters(&mut self, n: u32) -> Result<Vec<u32>, VfsError> {
+        let max_cluster = self.bpb.max_cluster();
+        let mut out: Vec<u32> = Vec::with_capacity(n as usize);
+        let mut sec_buf = [0u8; SECTOR];
+        let mut cached_sec: Option<u64> = None;
+        let fat_base = u64::from(self.bpb.rsvd_sec_cnt);
+        let mut cur = self.next_free.max(2);
+        while (out.len() as u32) < n {
+            if cur >= max_cluster { return Err(VfsError::NoSpace); }
+            let sec = fat_base + (cur as u64 * 4) / SECTOR as u64;
+            if cached_sec != Some(sec) {
+                self.read_sector(sec, &mut sec_buf)?;
+                cached_sec = Some(sec);
+            }
+            let off = ((cur as u64 * 4) % SECTOR as u64) as usize;
+            let entry = u32::from_le_bytes([
+                sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+            ]) & 0x0FFF_FFFF;
+            if entry == 0 {
+                out.push(cur);
+            }
+            cur += 1;
+        }
+        // Advance the hint past every cluster we examined. In the contiguous fast
+        // path this equals `out.last()+1`; after a scattered fallback it also
+        // skips the interleaved non-free clusters we already rejected.
+        self.next_free = cur;
+        Ok(out)
+    }
+
+    /// Write the FAT chain for an ordered cluster list: `clusters[i]` points to
+    /// `clusters[i+1]`, and the last points to EOC. Mirrors to every FAT copy.
+    /// Builds whole FAT sectors in memory and writes each affected sector once
+    /// per FAT, so a long chain costs ~`ceil(span/128) * num_fats` sector writes
+    /// instead of one read-modify-write per cluster.
+    fn write_chain_fat(&mut self, clusters: &[u32]) -> Result<(), VfsError> {
+        if clusters.is_empty() { return Ok(()); }
+        let fat_sz = u64::from(self.bpb.fat_sz32);
+        let fat_base = u64::from(self.bpb.rsvd_sec_cnt);
+
+        // Walk the list in index order, keeping one FAT sector resident in
+        // `sec_buf`. Up to 128 consecutive entries share a sector (the
+        // contiguous fast path), so we only reload — and flush, mirrored to
+        // every FAT copy — when an entry crosses into a different FAT sector.
+        // The list is ascending in the fast path but may have gaps after a
+        // scattered fallback; this handles both.
+        let mut sec_buf = [0u8; SECTOR];
+        let mut loaded_sec: Option<u64> = None; // which logical FAT sector is in sec_buf
+        let mut dirty = false;
+
+        let mut i = 0usize;
+        while i < clusters.len() {
+            let c = clusters[i];
+            let logical_sec = (c as u64 * 4) / SECTOR as u64; // relative to FAT start
+            if loaded_sec != Some(logical_sec) {
+                // Flush the previously loaded sector before loading a new one.
+                // `dirty` is only false on the very first iteration (nothing
+                // loaded yet); every reload after that follows entry writes into
+                // the resident buffer, so it is always dirty here.
+                if dirty {
+                    let prev = loaded_sec.unwrap();
+                    for fat_idx in 0..u64::from(self.bpb.num_fats) {
+                        let lba = fat_base + fat_idx * fat_sz + prev;
+                        self.write_sector(lba, &sec_buf)?;
+                    }
+                }
+                // Load the new sector from FAT #0 (so we preserve the top 4 bits
+                // and any neighbouring entries we are not changing).
+                let lba0 = fat_base + logical_sec;
+                self.read_sector(lba0, &mut sec_buf)?;
+                loaded_sec = Some(logical_sec);
+            }
+            // Set this cluster's entry to point at the next (or EOC at the tail).
+            let off = ((c as u64 * 4) % SECTOR as u64) as usize;
+            let value: u32 = if i + 1 < clusters.len() {
+                clusters[i + 1] & 0x0FFF_FFFF
+            } else {
+                0x0FFF_FFFF
+            };
+            let mut e = u32::from_le_bytes([
+                sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+            ]);
+            e = (e & 0xF000_0000) | value;
+            sec_buf[off..off+4].copy_from_slice(&e.to_le_bytes());
+            dirty = true;
+            i += 1;
+        }
+        // Final flush.
+        if dirty {
+            let last = loaded_sec.unwrap();
+            for fat_idx in 0..u64::from(self.bpb.num_fats) {
+                let lba = fat_base + fat_idx * fat_sz + last;
+                self.write_sector(lba, &sec_buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream `bytes` into the data region of the file's `clusters` chain.
+    ///
+    /// Splits the chain into maximal **physically-contiguous** sub-runs and
+    /// writes each as a few large `write_blocks` calls (capped at
+    /// `MAX_WRITE_SECTORS = 8192` sectors / 4 MiB per call — the AHCI PRDT-entry
+    /// limit) straight from a slice of `bytes`, with no per-cluster copy. The
+    /// fully-present, sector-aligned prefix of a sub-run is written directly; any
+    /// trailing partial sector and the zero tail of the file's LAST cluster are
+    /// written from one small zeroed scratch buffer (so stale bytes never leak
+    /// past EOF). A scattered fallback chain degrades to length-1 sub-runs (i.e.
+    /// per-cluster), staying correct.
+    fn write_data_run(&mut self, clusters: &[u32], bytes: &[u8]) -> Result<(), VfsError> {
+        const MAX_WRITE_SECTORS: u64 = 8192;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let spc = u64::from(self.bpb.sec_per_cluster);
+
+        let mut idx = 0usize; // chain index of the current sub-run start
+        while idx < clusters.len() {
+            // Extend a contiguous sub-run [idx, end).
+            let mut end = idx + 1;
+            while end < clusters.len() && clusters[end] == clusters[end - 1] + 1 {
+                end += 1;
+            }
+            let run_len = end - idx;
+            let start_lba = self.bpb.cluster_sector(clusters[idx]);
+            let run_sectors = run_len as u64 * spc;
+
+            // Byte window this sub-run covers.
+            let byte_base = idx * cluster_bytes;
+            let avail = bytes.len().saturating_sub(byte_base).min(run_len * cluster_bytes);
+            let full_sectors = (avail / SECTOR) as u64; // sectors fully covered by `bytes`
+
+            // 1. Write the fully-present sectors directly from `bytes`, chunked.
+            let mut written: u64 = 0;
+            while written < full_sectors {
+                let chunk = (full_sectors - written).min(MAX_WRITE_SECTORS);
+                let bstart = byte_base + (written as usize) * SECTOR;
+                let blen = (chunk as usize) * SECTOR;
+                self.write_sector_run(start_lba + written, &bytes[bstart..bstart + blen])?;
+                written += chunk;
+            }
+
+            // 2. Tail: the partial final sector (residual bytes) plus any whole
+            //    zero sectors left in this sub-run (only the file's last cluster
+            //    can have these). One zeroed scratch covers both → no stale leak.
+            let tail_sectors = run_sectors - full_sectors;
+            if tail_sectors > 0 {
+                let mut scratch = alloc::vec![0u8; (tail_sectors as usize) * SECTOR];
+                let residual = avail - (full_sectors as usize) * SECTOR; // 0..512
+                if residual > 0 {
+                    let bstart = byte_base + (full_sectors as usize) * SECTOR;
+                    scratch[..residual].copy_from_slice(&bytes[bstart..bstart + residual]);
+                }
+                self.write_sector_run(start_lba + full_sectors, &scratch)?;
+            }
+
+            idx = end;
+        }
+        Ok(())
+    }
+
+    /// Write a multi-sector buffer (already a multiple of `SECTOR`) at `lba`.
+    /// Thin wrapper over the block device for the batched data path.
+    fn write_sector_run(&mut self, lba: u64, buf: &[u8]) -> Result<(), VfsError> {
+        self.dev.write_blocks(lba, buf).map_err(map_block_err)
     }
 
     /// Find a free slot in directory `dir_cluster`'s chain and write `rec`,
@@ -1060,6 +1309,330 @@ impl<'a> FatWriter<'a> {
         rec[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
         self.add_dir_record(parent_cluster, &rec)?;
         Ok(new_cluster)
+    }
+
+    /// Generate a unique 8.3 short name for `long` inside `dir_cluster`.
+    ///
+    /// We only ever author lossy long names here (4-char `.wasm` ext,
+    /// `limine.conf`, or a >8-char stem), so we always emit the numeric-tail
+    /// (`BASIS~n`) form rather than a 1:1 8.3 copy. Steps:
+    ///   1. Build the upper-cased "OEM-ish" stem/ext: keep `A-Z 0-9` and the
+    ///      handful of punctuation chars the FAT spec allows in a short name,
+    ///      map everything else to `_`, drop spaces, drop leading dots.
+    ///   2. Split on the LAST `.` → stem + ext (3-char ext field).
+    ///   3. For `n = 1, 2, 3, …`, form `<basis>~<n>` where `basis` is the first
+    ///      `6 - extra` chars of the stem so the whole `~n` fits 8 bytes, pad to
+    ///      the 11-byte field, and scan `dir_cluster`'s chain for a colliding
+    ///      8.3 record (skipping free `0x00`/`0xE5` and LFN `0x0F` entries). The
+    ///      first `n` with no collision wins.
+    ///
+    /// Returns the raw 11-byte short name (name[0..8] + ext[8..11], NO dot,
+    /// space-padded).
+    fn short_name(&mut self, long: &str, dir_cluster: u32) -> Result<[u8; 11], VfsError> {
+        // --- 1. sanitise to an upper-cased OEM stem/ext --------------------
+        // Allowed short-name chars besides A-Z / 0-9 (FAT spec long set).
+        fn allowed(c: u8) -> bool {
+            c.is_ascii_uppercase() || c.is_ascii_digit()
+                || matches!(c, b'_' | b'~' | b'!' | b'@' | b'#' | b'$'
+                    | b'%' | b'^' | b'&' | b'(' | b')' | b'-' | b'{' | b'}')
+        }
+        // Drop leading dots, then map each byte: space → skip, allowed → keep,
+        // else → '_'. Dots are kept (they delimit the extension split below).
+        let mut cleaned: Vec<u8> = Vec::with_capacity(long.len());
+        let mut seen_non_dot = false;
+        for &b in long.as_bytes() {
+            let c = b.to_ascii_uppercase();
+            if c == b' ' { continue; }
+            if c == b'.' {
+                if !seen_non_dot { continue; } // leading dot
+                cleaned.push(b'.');
+                continue;
+            }
+            seen_non_dot = true;
+            cleaned.push(if allowed(c) { c } else { b'_' });
+        }
+
+        // --- 2. split stem / ext on the LAST '.' ---------------------------
+        let (stem, ext): (&[u8], &[u8]) = match cleaned.iter().rposition(|&b| b == b'.') {
+            Some(p) => (&cleaned[..p], &cleaned[p + 1..]),
+            None => (&cleaned[..], &[][..]),
+        };
+        // The ext field holds the first 3 non-dot chars of the ext.
+        let mut ext_field = [b' '; 3];
+        for (i, &b) in ext.iter().filter(|&&b| b != b'.').take(3).enumerate() {
+            ext_field[i] = b;
+        }
+        // The stem may still contain interior dots (e.g. "a.b.c" → stem "a.b");
+        // strip them for the basis (short-name field is dot-free).
+        let stem_nodot: Vec<u8> = stem.iter().copied().filter(|&b| b != b'.').collect();
+
+        // --- 3. numeric-tail loop ------------------------------------------
+        // `~n` costs `1 + digits(n)` bytes; basis takes the remaining 8.
+        for n in 1u32..=999_999 {
+            let tail = {
+                let mut t = Vec::new();
+                t.push(b'~');
+                // decimal digits of n, no alloc::format (keep it OEM bytes).
+                let mut buf = [0u8; 9];
+                let mut len = 0;
+                let mut v = n;
+                if v == 0 { buf[len] = b'0'; len += 1; }
+                while v > 0 { buf[len] = b'0' + (v % 10) as u8; v /= 10; len += 1; }
+                for i in (0..len).rev() { t.push(buf[i]); }
+                t
+            };
+            let basis_len = 8usize.saturating_sub(tail.len());
+            let mut name_field = [b' '; 8];
+            let take = stem_nodot.len().min(basis_len);
+            name_field[..take].copy_from_slice(&stem_nodot[..take]);
+            for (i, &b) in tail.iter().enumerate() {
+                name_field[take + i] = b;
+            }
+            let mut short = [b' '; 11];
+            short[0..8].copy_from_slice(&name_field);
+            short[8..11].copy_from_slice(&ext_field);
+
+            if !self.short_name_exists(dir_cluster, &short)? {
+                return Ok(short);
+            }
+        }
+        Err(VfsError::NoSpace)
+    }
+
+    /// Scan `dir_cluster`'s chain for a non-free, non-LFN record whose 11-byte
+    /// 8.3 name equals `short`. Used by `short_name` for `~n` collision search.
+    fn short_name_exists(&mut self, dir_cluster: u32, short: &[u8; 11])
+        -> Result<bool, VfsError>
+    {
+        let chain = self.chain(dir_cluster)?;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+        for c in chain {
+            self.read_cluster(c, &mut buf)?;
+            for i in 0..entries_per_cluster {
+                let rec = &buf[i * DIR_ENTRY_SIZE..(i + 1) * DIR_ENTRY_SIZE];
+                let first = rec[0];
+                if first == 0x00 { return Ok(false); } // end of directory
+                if first == 0xE5 { continue; }          // deleted
+                if rec[11] == ATTR_LFN { continue; }    // LFN sub-entry
+                if &rec[0..11] == &short[..] { return Ok(true); }
+            }
+        }
+        Ok(false)
+    }
+
+    /// LFN checksum of an 11-byte short name (FAT spec `ChkSum`).
+    fn lfn_checksum(short: &[u8; 11]) -> u8 {
+        let mut sum: u8 = 0;
+        for &c in short {
+            sum = ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(c);
+        }
+        sum
+    }
+
+    /// Build the LFN entry run for `long` (the on-disk records that precede the
+    /// short entry). Returns them in **physical order** (highest sequence first,
+    /// sequence 1 last — i.e. reverse of logical chunk order), so the caller can
+    /// write `run ++ [short_record]` consecutively.
+    ///
+    /// Each LFN entry carries 13 UTF-16LE name units at byte offsets
+    /// `1..11` (units 0..5), `14..26` (units 5..11), `28..32` (units 11..13).
+    /// Past the name end we write a single `0x0000` terminator then pad with
+    /// `0xFFFF`. Byte 11 = `0x0F` (LFN attr), 12 = 0 (type), 13 = checksum,
+    /// 26..28 = 0 (first-cluster, always 0 for LFN).
+    fn build_lfn_run(long: &str, short: &[u8; 11]) -> Vec<[u8; 32]> {
+        let checksum = Self::lfn_checksum(short);
+        // ASCII → one u16 unit each (our inputs are ASCII; non-ASCII would still
+        // round-trip via char::encode_utf16 but we never author such names).
+        let units: Vec<u16> = long.encode_utf16().collect();
+        let n_entries = (units.len() + 12) / 13; // ceil(len / 13), >=1 here
+
+        // Offsets within a 32-byte entry where the 13 name units live.
+        const SLOTS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+
+        let mut logical: Vec<[u8; 32]> = Vec::with_capacity(n_entries);
+        for k in 0..n_entries {
+            let mut e = [0u8; 32];
+            let mut seq = (k as u8) + 1;
+            if k == n_entries - 1 { seq |= 0x40; }
+            e[0] = seq;
+            e[11] = ATTR_LFN;
+            e[12] = 0x00;
+            e[13] = checksum;
+            e[26] = 0x00;
+            e[27] = 0x00;
+
+            // Fill the 13 unit slots for this chunk.
+            let mut terminated = false;
+            for j in 0..13 {
+                let off = SLOTS[j];
+                let idx = k * 13 + j;
+                let val: u16 = if idx < units.len() {
+                    units[idx]
+                } else if !terminated {
+                    terminated = true; // first padding slot = NUL terminator
+                    0x0000
+                } else {
+                    0xFFFF
+                };
+                e[off..off + 2].copy_from_slice(&val.to_le_bytes());
+            }
+            logical.push(e);
+        }
+
+        // Physical order = reverse of logical.
+        logical.reverse();
+        logical
+    }
+
+    /// Insert a contiguous run of directory entries (`K` LFN + 1 short) into
+    /// `dir_cluster`'s chain. The whole run MUST be physically consecutive and
+    /// MUST NOT straddle a cluster boundary, so we search each cluster for
+    /// `run.len()` consecutive free slots (first byte `0x00`/`0xE5`). If no
+    /// cluster has a long-enough free run, allocate + link a fresh cluster and
+    /// place the run at slot 0. Generalises `add_dir_record` (the K=1 case).
+    fn add_dir_run(&mut self, dir_cluster: u32, run: &[[u8; 32]]) -> Result<(), VfsError> {
+        if run.is_empty() { return Ok(()); }
+        let need = run.len();
+        let chain = self.chain(dir_cluster)?;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
+        // A run longer than a whole cluster can never be placed contiguously.
+        if need > entries_per_cluster { return Err(VfsError::NoSpace); }
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+
+        for &c in &chain {
+            self.read_cluster(c, &mut buf)?;
+            // Scan for a window of `need` consecutive free slots.
+            let mut run_start: Option<usize> = None;
+            let mut free_count = 0usize;
+            for i in 0..entries_per_cluster {
+                let first = buf[i * DIR_ENTRY_SIZE];
+                if first == 0x00 || first == 0xE5 {
+                    if free_count == 0 { run_start = Some(i); }
+                    free_count += 1;
+                    if free_count == need {
+                        let start = run_start.unwrap();
+                        for (j, ent) in run.iter().enumerate() {
+                            let off = (start + j) * DIR_ENTRY_SIZE;
+                            buf[off..off + DIR_ENTRY_SIZE].copy_from_slice(ent);
+                        }
+                        self.write_cluster(c, &buf)?;
+                        return Ok(());
+                    }
+                } else {
+                    free_count = 0;
+                    run_start = None;
+                }
+            }
+        }
+
+        // No cluster had a long-enough consecutive free run — extend the chain.
+        // The fresh cluster is zeroed (all slots free), so the run fits at 0.
+        //
+        // First, neutralise the old tail cluster's trailing `0x00` free slots.
+        // A FAT directory may have at most ONE `0x00` "end" region, and it must
+        // sit in the very last cluster. Once we link a new cluster after `last`,
+        // any `0x00` slot still in `last` would make every reader
+        // (`read_dir_entries` / `find_subdir` / `short_name_exists`) treat that
+        // slot as end-of-directory and stop *before* the new cluster, silently
+        // dropping its entries and blinding the collision scan. Rewrite those
+        // free slots as `0xE5` (deleted) so readers skip them and traverse the
+        // chain link. (`last` is the only cluster that can hold a `0x00` here:
+        // the copy path is append-only, so every earlier extend already did the
+        // same to its then-last cluster — last-cluster-only is sufficient.)
+        let last = *chain.last().ok_or(VfsError::IoError)?;
+        self.read_cluster(last, &mut buf)?;
+        let mut dirty = false;
+        for i in 0..entries_per_cluster {
+            let off = i * DIR_ENTRY_SIZE;
+            if buf[off] == 0x00 {
+                buf[off] = 0xE5;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.write_cluster(last, &buf)?;
+        }
+
+        let new_cluster = self.alloc_cluster()?;
+        self.write_fat_entry(last, new_cluster)?;
+        buf.iter_mut().for_each(|b| *b = 0);
+        for (j, ent) in run.iter().enumerate() {
+            buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE].copy_from_slice(ent);
+        }
+        self.write_cluster(new_cluster, &buf)?;
+        Ok(())
+    }
+
+    /// Write a file with a (possibly long) name at `path` on the authored
+    /// volume. Creates any missing parent directories (each a valid 8.3 short
+    /// name, like `create_dirs`). The leaf gets a real LFN run so tools and
+    /// Limine read its full long name.
+    ///
+    /// `bytes` empty → a zero-length file (first cluster 0, no allocation).
+    /// Otherwise the whole cluster chain is bulk-allocated at once
+    /// (`alloc_chain`, one batched FAT write) and the data streamed in large
+    /// multi-sector writes over the contiguous run (`write_data_run`), with the
+    /// final cluster's tail zero-padded so no stale bytes leak past EOF.
+    pub fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), VfsError> {
+        // --- split parent components + final name --------------------------
+        let mut comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let name = comps.pop().ok_or(VfsError::InvalidPath)?;
+        if name.is_empty() { return Err(VfsError::InvalidPath); }
+
+        // --- walk/create the parent dirs (same rules as create_dirs) -------
+        let mut parent = self.bpb.root_clus;
+        for comp in comps {
+            if comp.is_empty() || comp.len() > 8
+                || !comp.bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                return Err(VfsError::IoError);
+            }
+            let want = comp.to_ascii_lowercase();
+            parent = match self.find_subdir(parent, &want)? {
+                Some(c) => c,
+                None => self.mkdir(parent, comp)?,
+            };
+        }
+
+        // --- build the file data cluster chain -----------------------------
+        // Empty file → no allocation, first cluster 0. Otherwise bulk-allocate
+        // the whole chain at once (one batched FAT write, O(n)) and stream the
+        // data in large multi-sector writes over the contiguous run, instead of
+        // the old per-cluster alloc_cluster + write_cluster (O(n^2) for a 20 MB
+        // payload).
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let first_cluster: u32 = if bytes.is_empty() {
+            0
+        } else {
+            let num_clusters =
+                ((bytes.len() + cluster_bytes - 1) / cluster_bytes) as u32;
+            let first = self.alloc_chain(num_clusters)?;
+            // Re-walk the chain we just linked to get the actual cluster list
+            // (cheap: ~ceil(span/128) cached FAT-sector reads). This is correct
+            // whether the run is contiguous (fast path) or fell back to a
+            // scattered allocation, and lets the data writer batch contiguous
+            // spans.
+            let clusters = self.chain(first)?;
+            self.write_data_run(&clusters, bytes)?;
+            first
+        };
+
+        // --- 8.3 short record + LFN run ------------------------------------
+        let short = self.short_name(name, parent)?;
+        let mut run = Self::build_lfn_run(name, &short);
+
+        let mut rec = [0u8; DIR_ENTRY_SIZE];
+        rec[0..11].copy_from_slice(&short);
+        rec[11] = ATTR_ARCHIVE;
+        rec[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+        rec[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+        rec[28..32].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        run.push(rec);
+
+        self.add_dir_run(parent, &run)
     }
 }
 

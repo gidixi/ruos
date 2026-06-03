@@ -600,6 +600,76 @@ pub fn ruos_mkdisk(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
     }
 }
 
+/// ruos_mkboot(esp_mib) -> status. Author a fresh ruos disk (GPT + FAT32 ESP +
+/// FAT32 data) on the FIRST populated SATA port, THEN write the full boot tree
+/// onto the ESP so the SSD boots standalone (UEFI → BOOTX64.EFI → limine.conf →
+/// kernel + every module at its cmdline path). **Destructive** — wipes the disk.
+///
+/// Synchronous: same AHCI bring-up as `ruos_mkdisk`, then `disk::author`
+/// followed by `disk::copy_boot_payload` over a `PartBorrow` of the ESP extent.
+///
+/// Returns 0 on success; negative on failure: -1 no SATA port, -2 author/copy
+/// error. `esp_mib <= 0` defaults to 64 MiB; values above 4096 are clamped down.
+pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i32, Error> {
+    // Acquire the first populated SATA port (mirrors boot::phases::storage).
+    let hba = match crate::ahci::init() {
+        Some(h) => h,
+        None => {
+            crate::bwarn!("mkboot", "no SATA HBA found");
+            return Ok(-1);
+        }
+    };
+    let mut port = None;
+    for idx in 0..32 {
+        if (hba.pi & (1 << idx)) == 0 { continue; }
+        if let Some(p) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
+            port = Some(p);
+            break;
+        }
+    }
+    let mut port = match port {
+        Some(p) => p,
+        None => {
+            crate::bwarn!("mkboot", "no populated SATA port");
+            return Ok(-1);
+        }
+    };
+
+    // Clamp/validate the ESP size: default 64 MiB, cap at 4096 MiB.
+    let esp_mib: u32 = if esp_mib <= 0 {
+        64
+    } else if esp_mib > 4096 {
+        4096
+    } else {
+        esp_mib as u32
+    };
+
+    // Lay down the GPT + both FAT32 partitions + /EFI/BOOT.
+    let layout = match crate::disk::author(&mut port, esp_mib) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::bwarn!("mkboot", "author failed: {:?}", e);
+            return Ok(-2);
+        }
+    };
+
+    // Write the full boot tree onto the ESP through a borrow of its extent.
+    {
+        let mut e = crate::blockdev::PartBorrow::new(
+            &mut port, layout.esp.first_lba, layout.esp.sectors);
+        if crate::disk::copy_boot_payload(&mut e).is_err() {
+            crate::bwarn!("mkboot", "copy_boot_payload failed");
+            return Ok(-2);
+        }
+    }
+
+    crate::binfo!(
+        "mkboot", "ok esp_lba={} data_lba={}",
+        layout.esp.first_lba, layout.data.first_lba,
+    );
+    Ok(0)
+}
+
 /// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
 pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
     use smoltcp::socket::dhcpv4;
@@ -628,6 +698,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "time_get", ruos_time_get)?
         .func_wrap("ruos", "ping", ruos_ping)?
         .func_wrap("ruos", "mkdisk", ruos_mkdisk)?
+        .func_wrap("ruos", "mkboot", ruos_mkboot)?
         .func_wrap("ruos", "exec_pipeline", ruos_exec_pipeline)?;
     Ok(())
 }

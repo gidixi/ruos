@@ -30,7 +30,7 @@ BIN_TOOLS  := shell ls cat echo \
               service readdirtest \
               spinloop smptest \
               rtop \
-              mkdisk
+              mkdisk mkboot
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
@@ -163,6 +163,15 @@ run-gpt-test:
 .PHONY: run-m2a-test
 run-m2a-test:
 	bash tests/m2a-test.sh
+
+# M2b-1 boot-payload-copy end-to-end: proves ruos AUTHORS a disk (M2a) AND COPIES
+# its full boot tree onto the ESP so the SSD boots standalone. Boots M1 with a
+# BLANK disk + INIT_SCRIPT=user-bin/m2b1-init.sh (runs `mkboot 64`); the script
+# then extracts the ESP and host-verifies it with sgdisk/fsck.fat/mtools,
+# including LFN listing and ~20 MB kernel byte-identity vs the ISO sources.
+.PHONY: run-m2b1-test
+run-m2b1-test:
+	bash tests/m2b1-test.sh
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.

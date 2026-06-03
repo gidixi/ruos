@@ -71,12 +71,14 @@ fn log_payload_sizes() {
     let k = payload("kernel").map_or(0, <[u8]>::len);
     let b = payload("BOOTX64.EFI").map_or(0, <[u8]>::len);
     let c = payload("limine.conf").map_or(0, <[u8]>::len);
+    let s = payload("limine-ssd.conf").map_or(0, <[u8]>::len);
     crate::binfo!(
         "mod",
-        "payload: kernel={}B bootx64={}B conf={}B",
+        "payload: kernel={}B bootx64={}B conf={}B ssdconf={}B",
         k,
         b,
-        c
+        c,
+        s
     );
 }
 

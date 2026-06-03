@@ -594,13 +594,15 @@ pub fn ruos_mkdisk(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
 }
 
 /// ruos_mkboot(esp_mib) -> status. Author a fresh ruos disk (GPT + FAT32 ESP +
-/// FAT32 data) on the FIRST populated SATA port, THEN write the full boot tree
-/// onto the ESP so the SSD boots standalone (UEFI → BOOTX64.EFI → limine.conf →
-/// kernel + every module at its cmdline path). **Destructive** — wipes the disk.
+/// FAT32 data) on the FIRST populated SATA port, THEN write the boot tree:
+/// bootstrap (kernel + init chain + shell + network/SSH service + the slim
+/// limine.conf) onto the ESP so the SSD boots standalone (UEFI → BOOTX64.EFI →
+/// limine.conf → kernel), and the command-line tools onto the data partition
+/// (mount at /mnt/bin). **Destructive** — wipes the disk.
 ///
 /// Synchronous: same reset-free port acquisition as `ruos_mkdisk`
 /// (`ahci::acquire_port`), then `disk::author` followed by
-/// `disk::copy_boot_payload` over a `PartBorrow` of the ESP extent.
+/// `disk::copy_boot_payload`, which makes both partition borrows internally.
 ///
 /// Returns 0 on success; negative on failure: -1 no SATA port, -2 author/copy
 /// error. `esp_mib <= 0` defaults to 64 MiB; values above 4096 are clamped down.
@@ -640,14 +642,11 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
         }
     };
 
-    // Write the full boot tree onto the ESP through a borrow of its extent.
-    {
-        let mut e = crate::blockdev::PartBorrow::new(
-            &mut port, layout.esp.first_lba, layout.esp.sectors);
-        if crate::disk::copy_boot_payload(&mut e).is_err() {
-            crate::bwarn!("mkboot", "copy_boot_payload failed");
-            return Ok(-2);
-        }
+    // Write the boot tree: bootstrap to the ESP, tools to the data partition.
+    // copy_boot_payload makes both partition borrows internally (sequentially).
+    if crate::disk::copy_boot_payload(&mut port, &layout).is_err() {
+        crate::bwarn!("mkboot", "copy_boot_payload failed");
+        return Ok(-2);
     }
 
     crate::binfo!(
@@ -711,8 +710,7 @@ fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Resu
     crate::binfo!("install", "target: port {} model={:?} sectors={} ({} MiB) — WIPING",
         idx, port.model, port.sectors, port.sectors / 2048);
     let layout = match crate::disk::author(&mut port, esp) { Ok(l) => l, Err(_) => return Ok(-2) };
-    let mut e = crate::blockdev::PartBorrow::new(&mut port, layout.esp.first_lba, layout.esp.sectors);
-    if crate::disk::copy_boot_payload(&mut e).is_err() { return Ok(-2); }
+    if crate::disk::copy_boot_payload(&mut port, &layout).is_err() { return Ok(-2); }
     crate::binfo!("install", "ok — ruos installed to port {}, reboot from the SSD", idx);
     Ok(0)
 }

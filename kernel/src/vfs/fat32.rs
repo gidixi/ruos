@@ -1,7 +1,10 @@
 //! Minimal in-tree FAT32 filesystem.
 //!
-//! Read + write. Short-name only (no LFN handling — files are looked up by
-//! their 8.3 form, lowercase normalised). Single FAT mirror updated.
+//! Read + write. Long file names (LFN) are reconstructed on read (so tools with
+//! long names on `/mnt/bin`, e.g. `uname.wasm`, are looked up by their full
+//! name); short-name-only records still resolve by their 8.3 form. All lookup
+//! keys are lowercase-normalised. The authoring path ([`FatWriter`]) writes LFN
+//! runs. Single FAT mirror updated.
 //!
 //! Backed by any [`BlockDevice`]; we currently mount only on an `AhciPort`
 //! taken from the global `PORT0` slot. The full FS state lives behind one
@@ -244,7 +247,10 @@ fn map_block_err(_: BlockError) -> VfsError { VfsError::IoError }
 /// Decoded directory entry on disk.
 #[derive(Debug, Clone)]
 struct DirEntry {
-    name:      String,       // normalised 8.3 lowercase ("hello.txt")
+    /// Lowercased lookup key. The reconstructed LFN long name when the on-disk
+    /// record is preceded by an LFN run (e.g. "uname.wasm"); otherwise the
+    /// normalised 8.3 short name ("hello.txt").
+    name:      String,
     is_dir:    bool,
     cluster:   u32,
     size:      u32,
@@ -254,12 +260,33 @@ struct DirEntry {
     rec_off:   usize,
 }
 
-/// Read every short-name entry inside the directory starting at `start_cluster`.
+/// Read every file/dir entry inside the directory starting at `start_cluster`,
+/// reconstructing **long file names** (LFN) where present.
+///
+/// Each real 8.3 record may be preceded by a run of `ATTR_LFN` sub-entries (the
+/// mirror of [`FatWriter::build_lfn_run`]) that, decoded, spell the file's long
+/// name. We accumulate those sub-entries into `lfn` indexed by their 1-based
+/// ordinal (so the run is reconstructed correctly regardless of physical order,
+/// though on disk it is stored highest-ordinal-first) and, on reaching the
+/// following short entry, expose the reconstructed long name as `DirEntry.name`
+/// (lowercased, matching the lookup convention). A short-name-only record (no
+/// preceding LFN run, e.g. `HELLO.TXT`) keeps the 8.3 decode unchanged.
+///
+/// The LFN checksum (byte 13 of every sub-entry) is verified against the short
+/// name's `ChkSum`; on any mismatch the run is discarded and we fall back to the
+/// 8.3 name, so a torn/garbage LFN run can never surface a wrong name.
 fn read_dir_entries(inner: &mut Inner, start_cluster: u32) -> Result<Vec<DirEntry>, VfsError> {
     let chain = inner.chain(start_cluster)?;
     let cluster_bytes = inner.bpb.cluster_bytes();
     let mut out = Vec::new();
     let mut buf = alloc::vec![0u8; cluster_bytes];
+    // LFN reconstruction buffer: up to 20 sub-entries × 13 UTF-16 units. `lfn_max`
+    // is the high-water mark (ordinal*13) of units written for the current run;
+    // 0 means "no pending LFN run" → use the 8.3 short name. `lfn_csum` is the
+    // checksum carried by the run's sub-entries (must match the short name's).
+    let mut lfn: [u16; 260] = [0; 260];
+    let mut lfn_max: usize = 0;
+    let mut lfn_csum: u8 = 0;
     for c in chain {
         inner.read_cluster(c, &mut buf)?;
         let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
@@ -267,16 +294,48 @@ fn read_dir_entries(inner: &mut Inner, start_cluster: u32) -> Result<Vec<DirEntr
             let rec = &buf[i * DIR_ENTRY_SIZE..(i+1) * DIR_ENTRY_SIZE];
             let first = rec[0];
             if first == 0x00 { return Ok(out); }            // end of directory
-            if first == 0xE5 { continue; }                  // deleted
+            if first == 0xE5 { lfn_max = 0; continue; }     // deleted → drop run
             let attr = rec[11];
-            if attr == ATTR_LFN { continue; }               // LFN sub-entry
-            if attr & ATTR_VOLUME_ID != 0 { continue; }     // volume label
-            let name = decode_short_name(&rec[0..11]);
-            if name.is_empty() { continue; }
+            if attr == ATTR_LFN {
+                // LFN sub-entry: stash its 13 UTF-16LE units by ordinal.
+                let ord = (rec[0] & 0x1F) as usize;        // 1-based, ignore 0x40
+                if ord >= 1 && ord <= 20 {
+                    // Fresh run (no pending units) → clear the buffer first, so a
+                    // torn run with a missing middle ordinal truncates at the gap
+                    // (decode stops at the 0x0000) instead of reading stale units
+                    // left from a prior file's run.
+                    if lfn_max == 0 { lfn = [0; 260]; }
+                    let base = (ord - 1) * 13;
+                    // Units live at offsets 1..11 (5), 14..26 (6), 28..32 (2).
+                    const SLOTS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                    for (j, &off) in SLOTS.iter().enumerate() {
+                        lfn[base + j] = u16::from_le_bytes([rec[off], rec[off + 1]]);
+                    }
+                    // Every sub-entry of a run carries the same short-name
+                    // checksum; the guard at the short entry rejects a mismatch.
+                    lfn_csum = rec[13];
+                    lfn_max = lfn_max.max(ord * 13);
+                } else {
+                    lfn_max = 0;                            // bogus ordinal → drop
+                }
+                continue;                                   // never a DirEntry
+            }
+            if attr & ATTR_VOLUME_ID != 0 { lfn_max = 0; continue; } // volume label
             let cluster_hi = u16::from_le_bytes([rec[20], rec[21]]) as u32;
             let cluster_lo = u16::from_le_bytes([rec[26], rec[27]]) as u32;
             let cluster = (cluster_hi << 16) | cluster_lo;
             let size = u32::from_le_bytes([rec[28], rec[29], rec[30], rec[31]]);
+            // Reconstruct the long name if a valid LFN run preceded this record
+            // (checksum must match the short name); else use the 8.3 decode.
+            let mut short11 = [0u8; 11];
+            short11.copy_from_slice(&rec[0..11]);
+            let name = if lfn_max > 0 && lfn_checksum_short(&short11) == lfn_csum {
+                decode_long_name(&lfn[..lfn_max])
+            } else {
+                decode_short_name(&rec[0..11])
+            };
+            lfn_max = 0;                                    // consume the run
+            if name.is_empty() { continue; }
             // Compute the disk location of this record for write-back.
             let rec_sec  = inner.bpb.cluster_sector(c) + (i * DIR_ENTRY_SIZE / SECTOR) as u64;
             let rec_off  = (i * DIR_ENTRY_SIZE) % SECTOR;
@@ -287,6 +346,35 @@ fn read_dir_entries(inner: &mut Inner, start_cluster: u32) -> Result<Vec<DirEntr
         }
     }
     Ok(out)
+}
+
+/// Decode a reconstructed LFN unit buffer (`lfn[0..lfn_max]`) into a lowercase
+/// `String`. Stops at the first `0x0000` terminator (the rest is `0xFFFF`
+/// padding). ASCII units map straight to a `char`; any non-ASCII unit is decoded
+/// via `char::from_u32` (replacement char on failure — our authored names are
+/// ASCII, this is just robustness). Lowercased to match the lookup key.
+fn decode_long_name(units: &[u16]) -> String {
+    let mut out = String::new();
+    for &u in units {
+        if u == 0x0000 { break; }
+        let ch = if u < 0x80 {
+            (u as u8 as char)
+        } else {
+            char::from_u32(u as u32).unwrap_or('\u{FFFD}')
+        };
+        for lc in ch.to_lowercase() { out.push(lc); }
+    }
+    out
+}
+
+/// LFN checksum of an 11-byte 8.3 short name (FAT spec `ChkSum`). Mirrors
+/// [`FatWriter::lfn_checksum`] for the read/validate path.
+fn lfn_checksum_short(short: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &c in short {
+        sum = ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(c);
+    }
+    sum
 }
 
 /// Convert a raw 8.3 entry name (11 bytes) into "name.ext" lowercase.

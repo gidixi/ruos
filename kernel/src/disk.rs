@@ -59,22 +59,53 @@ pub fn author(dev: &mut dyn BlockDevice, esp_mib: u32) -> Result<Layout, DiskErr
     Ok(Layout { esp, data })
 }
 
-/// Write the full boot tree onto a freshly-authored ESP (must already contain
-/// /EFI/BOOT from `author`). Reads the boot files from Limine modules. The SSD
-/// then boots standalone (UEFI → /EFI/BOOT/BOOTX64.EFI → limine.conf → kernel).
-pub fn copy_boot_payload(esp: &mut dyn crate::blockdev::BlockDevice) -> Result<(), DiskError> {
-    let mut w = crate::vfs::fat32::FatWriter::open(esp).map_err(|_| DiskError::Io)?;
-    // 3 payload files at their UEFI/Limine ESP locations:
-    let k = crate::modules::payload("kernel").ok_or(DiskError::Io)?;
-    w.write_file("/boot/kernel", k).map_err(|_| DiskError::Io)?;
-    let b = crate::modules::payload("BOOTX64.EFI").ok_or(DiskError::Io)?;
-    w.write_file("/EFI/BOOT/BOOTX64.EFI", b).map_err(|_| DiskError::Io)?;
-    let c = crate::modules::payload("limine.conf").ok_or(DiskError::Io)?;
-    w.write_file("/boot/limine/limine.conf", c).map_err(|_| DiskError::Io)?;
-    // every non-payload module → its declared cmdline path on the ESP:
-    for (cmdline, data) in crate::modules::all() {
-        if cmdline.starts_with("/payload/") { continue; }
-        w.write_file(cmdline, data).map_err(|_| DiskError::Io)?;
+/// Modules that stay on the ESP as Limine bootstrap (init chain + shell + the
+/// network/SSH service). Everything else goes to the data partition (/mnt/bin).
+const BOOTSTRAP: &[&str] = &["/init.wasm", "/etc/init.sh", "/bin/shell.wasm",
+                             "/root/server.wasm", "/root/client.wasm"];
+
+/// Write the boot tree onto a freshly-authored disk: the bootstrap (+ the slim
+/// limine.conf) to the ESP, the command-line tools to the data partition.
+///
+/// The ESP gets BOOTX64.EFI + kernel + the SLIM limine.conf (which becomes the
+/// SSD's `/boot/limine/limine.conf`) + the bootstrap modules, so the SSD boots
+/// standalone (UEFI → /EFI/BOOT/BOOTX64.EFI → limine.conf → kernel + init chain).
+/// The ~50 `/bin/*.wasm` tools go to the data partition, where they mount at
+/// `/mnt/bin` and load on-demand. `author` has already FAT32-formatted BOTH
+/// partitions and created /EFI/BOOT on the ESP; `write_file` makes `/bin` (and
+/// any other intermediate dirs) on demand.
+pub fn copy_boot_payload(dev: &mut dyn crate::blockdev::BlockDevice,
+                         layout: &Layout) -> Result<(), DiskError> {
+    use crate::vfs::fat32::FatWriter;
+    use crate::blockdev::PartBorrow;
+    // --- ESP: BOOTX64.EFI + kernel + slim limine.conf + bootstrap modules ---
+    {
+        let mut esp = PartBorrow::new(dev, layout.esp.first_lba, layout.esp.sectors);
+        let mut w = FatWriter::open(&mut esp).map_err(|_| DiskError::Io)?;
+        w.write_file("/EFI/BOOT/BOOTX64.EFI",
+            crate::modules::payload("BOOTX64.EFI").ok_or(DiskError::Io)?)
+            .map_err(|_| DiskError::Io)?;
+        w.write_file("/boot/kernel",
+            crate::modules::payload("kernel").ok_or(DiskError::Io)?)
+            .map_err(|_| DiskError::Io)?;
+        // the SLIM config becomes the SSD's limine.conf:
+        w.write_file("/boot/limine/limine.conf",
+            crate::modules::payload("limine-ssd.conf").ok_or(DiskError::Io)?)
+            .map_err(|_| DiskError::Io)?;
+        for (cmdline, data) in crate::modules::all() {
+            if BOOTSTRAP.contains(&cmdline) {
+                w.write_file(cmdline, data).map_err(|_| DiskError::Io)?;
+            }
+        }
+    } // esp PartBorrow dropped — releases the &mut dev borrow
+    // --- DATA partition: the /bin/*.wasm tools (mount at /mnt/bin) ---
+    {
+        let mut d = PartBorrow::new(dev, layout.data.first_lba, layout.data.sectors);
+        let mut w = FatWriter::open(&mut d).map_err(|_| DiskError::Io)?;
+        for (cmdline, data) in crate::modules::all() {
+            if cmdline.starts_with("/payload/") || BOOTSTRAP.contains(&cmdline) { continue; }
+            w.write_file(cmdline, data).map_err(|_| DiskError::Io)?; // /bin/ls.wasm → data:/bin/ls.wasm
+        }
     }
     Ok(())
 }

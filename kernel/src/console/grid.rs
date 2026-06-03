@@ -97,8 +97,25 @@ impl Grid {
         }
     }
 
-    // TEMPORARY stub — Task 5 replaces with the real scroll.
     pub fn scroll_up(&mut self) {
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        // Sposta le righe 1..rows in 0..rows-1.
+        self.cells.copy_within(cols..rows * cols, 0);
+        // Svuota l'ultima riga con i colori correnti.
+        let blank = Cell::blank(self.fg, self.bg);
+        let last = (rows - 1) * cols;
+        for c in self.cells[last..].iter_mut() { *c = blank; }
         self.cur_row = self.rows - 1;
+        // Tutto lo schermo è cambiato.
+        for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
+    }
+
+    pub fn clear(&mut self) {
+        let blank = Cell::blank(self.fg, self.bg);
+        for c in self.cells.iter_mut() { *c = blank; }
+        self.cur_col = 0;
+        self.cur_row = 0;
+        for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
     }
 }

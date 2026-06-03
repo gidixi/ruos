@@ -55,6 +55,28 @@ fn run_inner() -> Result<(), u32> {
         g.bs(); check(12, g.cursor().0 == 0)?;
     }
 
+    // T13: scroll fa salire le righe, l'ultima resta vuota, tutto dirty.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::ansi::{WHITE, BLACK};
+        let mut g = Grid::new(4, 2, WHITE, BLACK);
+        g.put('A'); g.newline(); // riga 0 = 'A', cursore a riga 1
+        g.put('B'); g.newline(); // riga 1 = 'B', newline su ultima → scroll
+        check(13, g.cell(0, 0).ch == 'B')?;
+        check(14, g.cell(0, 1).ch == ' ')?;
+        check(15, g.dirty_span(0).is_some() && g.dirty_span(1).is_some())?;
+    }
+    // T16: clear svuota tutto e azzera il cursore, marca dirty.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::ansi::{WHITE, BLACK};
+        let mut g = Grid::new(4, 2, WHITE, BLACK);
+        g.put('Z');
+        g.clear();
+        check(16, g.cell(0, 0).ch == ' ' && g.cursor() == (0, 0))?;
+        check(17, g.dirty_span(0).is_some())?;
+    }
+
     Ok(())
 }
 

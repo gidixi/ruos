@@ -88,6 +88,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
+	cp limine-ssd.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
@@ -292,6 +293,7 @@ test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
+	cp limine-ssd.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done

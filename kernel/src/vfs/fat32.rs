@@ -663,7 +663,10 @@ pub fn format(dev: &mut dyn BlockDevice) -> Result<(), VfsError> {
     // tmp2 = (256 * sec_per_clus + num_fats) / 2  fits comfortably in u32.
     let tmp1: u32 = tot_sec.saturating_sub(RESERVED_SEC_CNT);
     let tmp2: u32 = (256 * sec_per_clus + NUM_FATS) / 2;
-    let fat_sz32: u32 = (tmp1 + (tmp2 - 1)) / tmp2;
+    // Ceil-divide in u64: at the u32 clamp (≈2 TiB, spc=64) `tmp1 + (tmp2-1)`
+    // would overflow u32 and wrap fat_sz32 to 0 → a corrupt, self-unmountable
+    // FAT. The quotient still fits u32 (fat_sz32 ≤ tot_sec).
+    let fat_sz32: u32 = ((tmp1 as u64 + (tmp2 as u64 - 1)) / tmp2 as u64) as u32;
 
     // Data region geometry + the FAT32 minimum-cluster sanity check.
     let data_start: u32 = RESERVED_SEC_CNT + NUM_FATS * fat_sz32;

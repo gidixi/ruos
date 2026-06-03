@@ -1281,7 +1281,32 @@ impl<'a> FatWriter<'a> {
 
         // No cluster had a long-enough consecutive free run — extend the chain.
         // The fresh cluster is zeroed (all slots free), so the run fits at 0.
+        //
+        // First, neutralise the old tail cluster's trailing `0x00` free slots.
+        // A FAT directory may have at most ONE `0x00` "end" region, and it must
+        // sit in the very last cluster. Once we link a new cluster after `last`,
+        // any `0x00` slot still in `last` would make every reader
+        // (`read_dir_entries` / `find_subdir` / `short_name_exists`) treat that
+        // slot as end-of-directory and stop *before* the new cluster, silently
+        // dropping its entries and blinding the collision scan. Rewrite those
+        // free slots as `0xE5` (deleted) so readers skip them and traverse the
+        // chain link. (`last` is the only cluster that can hold a `0x00` here:
+        // the copy path is append-only, so every earlier extend already did the
+        // same to its then-last cluster — last-cluster-only is sufficient.)
         let last = *chain.last().ok_or(VfsError::IoError)?;
+        self.read_cluster(last, &mut buf)?;
+        let mut dirty = false;
+        for i in 0..entries_per_cluster {
+            let off = i * DIR_ENTRY_SIZE;
+            if buf[off] == 0x00 {
+                buf[off] = 0xE5;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.write_cluster(last, &buf)?;
+        }
+
         let new_cluster = self.alloc_cluster()?;
         self.write_fat_entry(last, new_cluster)?;
         buf.iter_mut().for_each(|b| *b = 0);

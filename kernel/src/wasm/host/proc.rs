@@ -313,6 +313,40 @@ fn pci_class_name(class: u8, sub: u8, prog_if: u8) -> &'static str {
     }
 }
 
+/// ruos_sata_list(buf_ptr, buf_cap) -> i32.
+/// Writes pre-formatted text (one SATA disk per line) into the caller buffer:
+///   "<idx>\t<model>\t<N> MiB\n"
+/// where `model` is the debug-formatted (`{:?}`, quoted) IDENTIFY string. The
+/// `disks` tool strips the quotes when rendering its table.
+///
+/// Returns the number of bytes written, 0 if there are no SATA disks, or -1 if
+/// the text does not fit in `buf_cap`. Mirrors `ruos_pci_list`'s guest-write
+/// (same `crate::wasm::host::mem` boundary) but returns the length directly
+/// rather than an errno + used-ptr.
+fn ruos_sata_list(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_cap: i32,
+) -> Result<i32, Error> {
+    let mut s = String::new();
+    for idx in crate::ahci::sata_ports() {
+        if let Some(p) = crate::ahci::acquire_port(idx) {
+            let _ = write!(s, "{}\t{:?}\t{} MiB\n", idx, p.model, p.sectors / 2048);
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return Ok(0); // no SATA disks
+    }
+    if buf_cap < 0 || bytes.len() > buf_cap as usize {
+        return Ok(-1); // listing too large for the caller buffer
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
+    Ok(bytes.len() as i32)
+}
+
 /// ruos_net_iface(buf_ptr, buf_len, used_ptr) -> errno.
 /// Pre-formatted output:
 ///   "lo    127.0.0.1/8\n"
@@ -684,10 +718,10 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
 /// ruos_install(esp_mib, target) -> status. The user-facing "install ruos to the
 /// SSD" command. Two modes selected by `target`:
 ///
-/// LIST mode (`target < 0`): enumerate the populated SATA ports and log each as
-/// `[idx] model (N MiB)`. Read-only — never authors, never needs the /mnt guard.
-/// Returns -10 (sentinel: "list shown"). This is what bare `install` does so the
-/// operator can pick a disk on a multi-disk machine without wiping anything.
+/// LIST mode (`target < 0`): no-op sentinel kept for compatibility. Read-only —
+/// never authors, never needs the /mnt guard. Returns -10 ("list shown"). Disk
+/// enumeration now lives in the `disks` tool (host fn `ruos_sata_list`); bare
+/// `install` just points the operator at `disks` instead of logging here.
 ///
 /// INSTALL mode (`target >= 0`): author a fresh ruos disk (GPT + FAT32 ESP +
 /// FAT32 data) on SATA port `target` AND write the full boot tree onto its ESP —
@@ -705,18 +739,10 @@ pub fn ruos_mkboot(_caller: Caller<'_, RuntimeState>, esp_mib: i32) -> Result<i3
 /// values above 4096 are clamped down.
 fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Result<i32, Error> {
     let ports = crate::ahci::sata_ports();
-    // --- LIST mode (target < 0): print disks, wipe nothing ---
+    // --- LIST mode (target < 0): no-op sentinel, wipe nothing ---
+    // Disk enumeration now lives in the `disks` tool (via ruos_sata_list); this
+    // path no longer logs the per-disk lines `install` used to emit.
     if target < 0 {
-        if ports.is_empty() {
-            crate::binfo!("install", "no SATA disks found");
-        } else {
-            for &idx in &ports {
-                match crate::ahci::acquire_port(idx) {
-                    Some(p) => crate::binfo!("install", "[{}] {:?} ({} MiB)", idx, p.model, p.sectors / 2048),
-                    None    => crate::binfo!("install", "[{}] (not ready)", idx),
-                }
-            }
-        }
         return Ok(-10); // sentinel: "list shown"
     }
     // --- INSTALL mode (target >= 0) ---
@@ -762,6 +788,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
+        .func_wrap("ruos", "sata_list", ruos_sata_list)?
         .func_wrap("ruos", "net_iface", ruos_net_iface)?
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
         .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?

@@ -116,6 +116,10 @@ name = "diff"
 version = "0.1.0"
 
 [[package]]
+name = "disks"
+version = "0.1.0"
+
+[[package]]
 name = "dmesg"
 version = "0.1.0"
 

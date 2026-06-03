@@ -1,7 +1,7 @@
 //! install -- install ruos onto a chosen SATA disk (author + copy boot tree).
 //!
-//! `install` with no argument LISTS the SATA disks (`[idx] model (N MiB)`) and
-//! wipes nothing -- pick a disk on a multi-disk machine without risk.
+//! `install` with no argument prints a hint pointing at the `disks` tool (which
+//! lists the SATA disks as a clean table) and wipes nothing.
 //!
 //! `install <idx> [esp_mib]` is DESTRUCTIVE: it lays down a GPT + FAT32 ESP
 //! (with /EFI/BOOT) + FAT32 data partition on SATA disk `idx`, wiping whatever
@@ -13,7 +13,7 @@
 //! installer medium to install.
 //!
 //! Usage:
-//!   install                  list the SATA disks (wipes nothing)
+//!   install                  hint to run `disks` (wipes nothing)
 //!   install <idx> [esp_mib]  install onto SATA disk <idx>; esp_mib defaults to 64
 
 #[link(wasm_import_module = "ruos")]
@@ -24,11 +24,9 @@ extern "C" {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // No disk argument → LIST mode. The kernel prints the `[idx] model` lines.
+    // No disk argument → point the operator at `disks` to pick a target.
     if args.len() < 2 {
-        eprintln!("install: SATA disks (run `install <n>` to install -- WIPES that disk):");
-        let _ = unsafe { install(64, -1) };
-        eprintln!("install: run `install <n>` to install onto disk <n>");
+        eprintln!("install: run `disks` to list the SATA disks, then `install <n>` to install onto disk <n>");
         return;
     }
 

@@ -30,7 +30,7 @@ BIN_TOOLS  := shell ls cat echo \
               service readdirtest \
               spinloop smptest \
               rtop \
-              mkdisk mkboot install umount
+              mkdisk mkboot install umount disks
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 

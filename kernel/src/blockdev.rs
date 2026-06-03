@@ -89,6 +89,46 @@ impl BlockDevice for PartitionDevice {
     }
 }
 
+/// A borrowing partition view: like [`PartitionDevice`] but holds a `&mut dyn
+/// BlockDevice` instead of owning a `Box`. Every LBA is offset by `base`, and
+/// the device length is clamped to `count` sectors. Used by the disk-authoring
+/// path (`disk::author`), which only has a borrow of the raw disk yet must
+/// format + create dirs on individual partition regions of it. The range/offset
+/// checks are identical to `PartitionDevice` — the partition-isolation boundary
+/// holds the same way.
+pub struct PartBorrow<'a> {
+    inner: &'a mut dyn BlockDevice,
+    base: u64,
+    count: u64,
+}
+
+impl<'a> PartBorrow<'a> {
+    pub fn new(inner: &'a mut dyn BlockDevice, base: u64, count: u64) -> Self {
+        Self { inner, base, count }
+    }
+}
+
+impl<'a> BlockDevice for PartBorrow<'a> {
+    fn block_size(&self) -> u32 { self.inner.block_size() }
+    fn block_count(&self) -> u64 { self.count }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        let n = (buf.len() as u64) / self.inner.block_size() as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.read_blocks(phys, buf)
+    }
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let n = (buf.len() as u64) / self.inner.block_size() as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.write_blocks(phys, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; extern crate std; use std::vec; use std::vec::Vec;

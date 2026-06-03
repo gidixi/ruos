@@ -32,6 +32,7 @@ mod usb;
 mod blockdev;
 mod crc32;
 mod gpt;
+mod disk;
 mod ahci;
 mod rtc;
 mod ssh;

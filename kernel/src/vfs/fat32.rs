@@ -856,6 +856,234 @@ pub fn format(dev: &mut dyn BlockDevice) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// A synchronous, borrow-based FAT32 writer for the disk-authoring path.
+///
+/// Unlike [`Fat32Fs`] (async, behind `Arc<Mutex<Inner>>`, tied to the global
+/// `/mnt` mount table), this operates directly on a borrowed `&mut dyn
+/// BlockDevice` with no allocation of a long-lived FS object and no async. It
+/// reads the BPB once (sector 0) and exposes exactly the cluster/dir primitives
+/// `create_dirs` needs. The cluster/dir logic mirrors [`Inner`]'s
+/// (`alloc_cluster`, `add_dir_record`, FAT-entry mirroring) so a volume it
+/// authors is identical to what the mounted driver would produce.
+struct FatWriter<'a> {
+    dev: &'a mut dyn BlockDevice,
+    bpb: Bpb,
+}
+
+impl<'a> FatWriter<'a> {
+    /// Parse the BPB off sector 0 of a freshly-`format`ted volume.
+    fn open(dev: &'a mut dyn BlockDevice) -> Result<Self, VfsError> {
+        let mut sec0 = [0u8; SECTOR];
+        dev.read_blocks(0, &mut sec0).map_err(map_block_err)?;
+        let bpb = Bpb::parse(&sec0)?;
+        Ok(Self { dev, bpb })
+    }
+
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), VfsError> {
+        self.dev.read_blocks(lba, buf).map_err(map_block_err)
+    }
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), VfsError> {
+        self.dev.write_blocks(lba, buf).map_err(map_block_err)
+    }
+
+    fn read_cluster(&mut self, n: u32, out: &mut [u8]) -> Result<(), VfsError> {
+        let sectors = u64::from(self.bpb.sec_per_cluster);
+        let sec = self.bpb.cluster_sector(n);
+        if out.len() < self.bpb.cluster_bytes() { return Err(VfsError::IoError); }
+        for s in 0..sectors {
+            let sub = &mut out[(s as usize) * SECTOR..((s+1) as usize) * SECTOR];
+            self.read_sector(sec + s, sub)?;
+        }
+        Ok(())
+    }
+
+    fn write_cluster(&mut self, n: u32, data: &[u8]) -> Result<(), VfsError> {
+        let sectors = u64::from(self.bpb.sec_per_cluster);
+        let sec = self.bpb.cluster_sector(n);
+        for s in 0..sectors {
+            let sub = &data[(s as usize) * SECTOR..((s+1) as usize) * SECTOR];
+            self.write_sector(sec + s, sub)?;
+        }
+        Ok(())
+    }
+
+    /// Follow the FAT chain starting at `start`, returning every cluster index.
+    /// Bounded by the cluster count so a corrupt/cyclic FAT can't loop forever.
+    fn chain(&mut self, start: u32) -> Result<Vec<u32>, VfsError> {
+        let mut out = Vec::new();
+        let mut sec_buf = [0u8; SECTOR];
+        let mut cur = start;
+        let mut cached_sec: Option<u64> = None;
+        let max_clusters = self.bpb.max_cluster() as usize;
+        while cur >= 2 && (cur & 0x0FFF_FFFF) < EOC {
+            if out.len() >= max_clusters { return Err(VfsError::IoError); }
+            out.push(cur);
+            let (sec, off) = self.bpb.fat_entry_loc(cur);
+            if cached_sec != Some(sec) {
+                self.read_sector(sec, &mut sec_buf)?;
+                cached_sec = Some(sec);
+            }
+            let entry = u32::from_le_bytes([
+                sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+            ]) & 0x0FFF_FFFF;
+            if entry == 0 { return Err(VfsError::IoError); }
+            cur = entry;
+        }
+        Ok(out)
+    }
+
+    /// Write a single FAT entry (lower 28 bits), mirrored to every FAT copy.
+    fn write_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), VfsError> {
+        let (sec0, off) = self.bpb.fat_entry_loc(cluster);
+        let mut sec_buf = [0u8; SECTOR];
+        for fat_idx in 0..u64::from(self.bpb.num_fats) {
+            let sec = sec0 + fat_idx * u64::from(self.bpb.fat_sz32);
+            self.read_sector(sec, &mut sec_buf)?;
+            let mut e = u32::from_le_bytes([
+                sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+            ]);
+            e = (e & 0xF000_0000) | (value & 0x0FFF_FFFF);
+            sec_buf[off..off+4].copy_from_slice(&e.to_le_bytes());
+            self.write_sector(sec, &sec_buf)?;
+        }
+        Ok(())
+    }
+
+    /// Allocate one free cluster (linear scan from 2), set it to EOC, and zero
+    /// its data so no stale bytes leak. Mirrors `Inner::alloc_cluster`.
+    fn alloc_cluster(&mut self) -> Result<u32, VfsError> {
+        let mut sec_buf = [0u8; SECTOR];
+        let max_cluster = self.bpb.max_cluster();
+        for n in 2..max_cluster {
+            let (sec, off) = self.bpb.fat_entry_loc(n);
+            self.read_sector(sec, &mut sec_buf)?;
+            let entry = u32::from_le_bytes([
+                sec_buf[off], sec_buf[off+1], sec_buf[off+2], sec_buf[off+3]
+            ]) & 0x0FFF_FFFF;
+            if entry == 0 {
+                self.write_fat_entry(n, 0x0FFF_FFFF)?;
+                let zero = alloc::vec![0u8; self.bpb.cluster_bytes()];
+                self.write_cluster(n, &zero)?;
+                return Ok(n);
+            }
+        }
+        Err(VfsError::NoSpace)
+    }
+
+    /// Find a free slot in directory `dir_cluster`'s chain and write `rec`,
+    /// extending the chain with a fresh cluster if every slot is taken. Mirrors
+    /// `Inner::add_dir_record`.
+    fn add_dir_record(&mut self, dir_cluster: u32, rec: &[u8; DIR_ENTRY_SIZE])
+        -> Result<(), VfsError>
+    {
+        let chain = self.chain(dir_cluster)?;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+        for &c in &chain {
+            self.read_cluster(c, &mut buf)?;
+            for i in 0..entries_per_cluster {
+                let first = buf[i * DIR_ENTRY_SIZE];
+                if first == 0x00 || first == 0xE5 {
+                    buf[i * DIR_ENTRY_SIZE..(i+1) * DIR_ENTRY_SIZE].copy_from_slice(rec);
+                    self.write_cluster(c, &buf)?;
+                    return Ok(());
+                }
+            }
+        }
+        // Every cluster full — link a fresh (zeroed + EOC) cluster and use slot 0.
+        let last = *chain.last().ok_or(VfsError::IoError)?;
+        let new_cluster = self.alloc_cluster()?;
+        self.write_fat_entry(last, new_cluster)?;
+        buf.iter_mut().for_each(|b| *b = 0);
+        buf[0..DIR_ENTRY_SIZE].copy_from_slice(rec);
+        self.write_cluster(new_cluster, &buf)?;
+        Ok(())
+    }
+
+    /// Look for short-name `want` (lowercase) directly inside `dir_cluster`.
+    /// Returns its first cluster if it is a directory. Mirrors the relevant bits
+    /// of `read_dir_entries` without the heavy `DirEntry` decode.
+    fn find_subdir(&mut self, dir_cluster: u32, want: &str) -> Result<Option<u32>, VfsError> {
+        let chain = self.chain(dir_cluster)?;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+        for c in chain {
+            self.read_cluster(c, &mut buf)?;
+            for i in 0..entries_per_cluster {
+                let rec = &buf[i * DIR_ENTRY_SIZE..(i+1) * DIR_ENTRY_SIZE];
+                let first = rec[0];
+                if first == 0x00 { return Ok(None); }     // end of directory
+                if first == 0xE5 { continue; }            // deleted
+                let attr = rec[11];
+                if attr == ATTR_LFN { continue; }
+                if attr & ATTR_VOLUME_ID != 0 { continue; }
+                let name = decode_short_name(&rec[0..11]);
+                if name == want {
+                    if attr & ATTR_DIRECTORY == 0 { return Err(VfsError::NotDirectory); }
+                    let hi = u16::from_le_bytes([rec[20], rec[21]]) as u32;
+                    let lo = u16::from_le_bytes([rec[26], rec[27]]) as u32;
+                    return Ok(Some((hi << 16) | lo));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Create a child directory `name` under `parent_cluster`: allocate its
+    /// cluster, write its `.`/`..` records (`..` cluster is 0 when the parent is
+    /// the root, per the FAT spec), and add the parent's directory record.
+    /// Returns the new cluster. Mirrors `Fat32Fs::mkdir` (Task 4).
+    fn mkdir(&mut self, parent_cluster: u32, name: &str) -> Result<u32, VfsError> {
+        let new_cluster = self.alloc_cluster()?;
+        let dotdot_cluster = if parent_cluster == self.bpb.root_clus { 0 } else { parent_cluster };
+
+        let mut cbuf = alloc::vec![0u8; self.bpb.cluster_bytes()];
+        // "."  -> self
+        cbuf[0..11].copy_from_slice(b".          ");
+        cbuf[11] = ATTR_DIRECTORY;
+        cbuf[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
+        cbuf[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+        // ".." -> parent (0 at root)
+        cbuf[32..43].copy_from_slice(b"..         ");
+        cbuf[43] = ATTR_DIRECTORY;
+        cbuf[52..54].copy_from_slice(&((dotdot_cluster >> 16) as u16).to_le_bytes());
+        cbuf[58..60].copy_from_slice(&(dotdot_cluster as u16).to_le_bytes());
+        self.write_cluster(new_cluster, &cbuf)?;
+
+        let raw = encode_short_name(name);
+        let mut rec = [0u8; DIR_ENTRY_SIZE];
+        rec[0..11].copy_from_slice(&raw);
+        rec[11] = ATTR_DIRECTORY;
+        rec[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
+        rec[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+        self.add_dir_record(parent_cluster, &rec)?;
+        Ok(new_cluster)
+    }
+}
+
+/// Create directory paths on a freshly [`format`]ted FAT32 volume (borrow-based,
+/// synchronous — for the disk authoring path, NOT the mounted VFS). `paths` are
+/// absolute, created parents-first, e.g. `&["/EFI", "/EFI/BOOT"]`. A component
+/// that already exists (created by an earlier path) is reused, so listing both a
+/// parent and its child is fine. Each path component must be a valid 8.3 name.
+pub fn create_dirs(dev: &mut dyn BlockDevice, paths: &[&str]) -> Result<(), VfsError> {
+    let mut w = FatWriter::open(dev)?;
+    for path in paths {
+        // Walk components from the root, creating any that are missing.
+        let mut cur = w.bpb.root_clus;
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            let want = comp.to_ascii_lowercase();
+            cur = match w.find_subdir(cur, &want)? {
+                Some(c) => c,                       // already there → descend
+                None    => w.mkdir(cur, comp)?,     // create + descend
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Convenience for the storage phase: take the ahci PORT0 and mount it.
 pub fn mount_from_ahci_port(port: AhciPort) -> Result<(), VfsError> {
     let fs = Fat32Fs::from_ahci_port(port)?;

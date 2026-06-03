@@ -27,6 +27,10 @@ fn main() {
             eprintln!("umount: cannot unmount {p}");
             std::process::exit(1);
         }
+        -3 => {
+            eprintln!("umount: {p} busy (close open files first)");
+            std::process::exit(1);
+        }
         _ => {
             eprintln!("umount: {p} not mounted");
             std::process::exit(1);

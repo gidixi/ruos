@@ -74,6 +74,21 @@ grep -qE "IDX +MODEL +SIZE" build/serial.dm.log \
   || { echo TEST_FAIL_DISKS_HDR; tail -30 build/serial.dm.log; exit 1; }
 grep -qiE "QEMU HARDDISK +[0-9]+ MiB" build/serial.dm.log \
   || { echo TEST_FAIL_DISKS; tail -30 build/serial.dm.log; exit 1; }
+# NO-CORRUPTION proof: dm-init runs `cat /mnt/HI.TXT` AFTER `disks` (while /mnt is
+# still mounted). If `disks` had re-brought-up the mounted port (the bug), it would
+# have reprogrammed that port's PxCLB/PxFB and the subsequent /mnt read would read
+# garbage / fail. So assert the file's content `hi` appears in the serial AND that
+# it comes AFTER the `disks` table header — i.e. reading /mnt still works once
+# `disks` has run against the mounted disk. (HI.TXT == "hi"; written by mcopy above.)
+# Strip the PTY's trailing CR (serial goes through a PTY → lines end "\r\n") so
+# the FAT content "hi" matches as a whole line regardless of the carriage return.
+awk '
+  { sub(/\r$/, "") }
+  /IDX +MODEL +SIZE/ { seen_disks=1 }
+  seen_disks && $0 == "hi" { found=1 }
+  END { exit(found ? 0 : 1) }
+' build/serial.dm.log \
+  || { echo TEST_FAIL_MNT_CORRUPTED_AFTER_DISKS; tail -30 build/serial.dm.log; exit 1; }
 # `umount /mnt` succeeded and released the port.
 grep -qF "umount: /mnt unmounted" build/serial.dm.log \
   || { echo TEST_FAIL_UMOUNT; tail -30 build/serial.dm.log; exit 1; }

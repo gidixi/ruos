@@ -40,12 +40,22 @@ pub fn is_mounted(prefix: &str) -> bool {
 /// Unmount the filesystem at exactly `prefix` (e.g. "/mnt"). Dropping the FsImpl
 /// releases its backing device (the SATA port) once no open file still holds a
 /// ref to it. Refuses "/" (the root tmpfs).
+///
+/// Refuses with [`VfsError::Busy`] when a FAT32 file is still open on the mount
+/// (the backing `Inner` has more than the mount's single `Arc` ref). Tearing
+/// down a still-live device would let a later `acquire_port`/`bringup` (e.g.
+/// `install`) reprogram that port's command-list base out from under the open
+/// file → DMA corruption. The busy check happens BEFORE the mount entry is
+/// removed, so a refused unmount leaves the mount table untouched.
 pub fn unmount(prefix: &str) -> Result<(), VfsError> {
     if prefix == "/" { return Err(VfsError::InvalidPath); }
     let mut m = MOUNTS.lock();
-    let before = m.len();
-    m.retain(|(p, _)| p != prefix);
-    if m.len() == before { Err(VfsError::NotFound) } else { Ok(()) }
+    let idx = m.iter().position(|(p, _)| p == prefix).ok_or(VfsError::NotFound)?;
+    if let crate::vfs::fs::FsImpl::Fat32(fs) = &m[idx].1 {
+        if fs.is_busy() { return Err(VfsError::Busy); }
+    }
+    m.remove(idx);
+    Ok(())
 }
 
 /// Build the in-RAM root tmpfs, mount it at `/`, populate /dev + /tmp.

@@ -88,6 +88,7 @@ pub fn ruos_chdir(
 /// M1 auto-mounted (the install /mnt guard otherwise refuses). Refuses "/".
 ///
 /// Returns 0 on success, -2 when the path cannot be unmounted (e.g. "/"),
+/// -3 when a file is still open on the mount (busy — close it first),
 /// -1 when nothing is mounted there (NotFound) or the path is unreadable.
 fn ruos_umount(caller: Caller<'_, RuntimeState>, path_ptr: i32, path_len: i32) -> Result<i32, Error> {
     let buf = match crate::wasm::host::mem::guest_read(&caller, path_ptr, path_len) {
@@ -101,6 +102,7 @@ fn ruos_umount(caller: Caller<'_, RuntimeState>, path_ptr: i32, path_len: i32) -
     match crate::vfs::unmount(path) {
         Ok(())                                 => Ok(0),
         Err(crate::vfs::VfsError::InvalidPath) => Ok(-2),  // refused (e.g. "/")
+        Err(crate::vfs::VfsError::Busy)        => Ok(-3),  // open file still holds the port
         Err(_)                                 => Ok(-1),  // NotFound / not mounted
     }
 }
@@ -330,9 +332,19 @@ fn ruos_sata_list(
 ) -> Result<i32, Error> {
     let mut s = String::new();
     for idx in crate::ahci::sata_ports() {
-        if let Some(p) = crate::ahci::acquire_port(idx) {
-            let _ = write!(s, "{}\t{:?}\t{} MiB\n", idx, p.model, p.sectors / 2048);
-        }
+        // Prefer the cache: a port brought up at boot (e.g. the one mounted at
+        // /mnt) already has its (model, sectors) recorded. Only a NEVER-SEEN
+        // port — which therefore can't be mounted — is brought up here, and that
+        // first bringup caches it too. This guarantees `disks` never re-brings-
+        // up (and so never corrupts) a live /mnt port.
+        let info = match crate::ahci::disk_info(idx) {
+            Some(i) => i,                                      // cached → NO bringup
+            None => match crate::ahci::acquire_port(idx) {     // never seen → safe to bring up
+                Some(p) => (p.model.clone(), p.sectors),
+                None => continue,
+            },
+        };
+        let _ = write!(s, "{}\t{:?}\t{} MiB\n", idx, info.0, info.1 / 2048);
     }
     let bytes = s.as_bytes();
     if bytes.is_empty() {

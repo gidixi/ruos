@@ -222,6 +222,12 @@ impl AhciPort {
             "port {} sata sectors={} model=\"{}\"",
             port_idx, p.sectors, p.model.trim()
         );
+        // Cache this port's IDENTIFY info so `disks` can report it later WITHOUT
+        // re-bringing-up the port — critical for a port that is about to be moved
+        // into the `/mnt` mount, where a second bringup would reprogram its live
+        // PxCLB/PxFB and corrupt in-flight DMA. Every bringup caches (incl. the
+        // boot-time bringup of the mounted port in storage.rs).
+        crate::ahci::cache_disk_info(port_idx, p.model.clone(), p.sectors);
         Some(p)
     }
 

@@ -196,6 +196,47 @@ impl Inner {
         }
         Ok(())
     }
+
+    /// Find a free slot in directory `dir_cluster`'s chain and write `rec` (a
+    /// 32-byte short record). If every cluster is full, allocate + link a new
+    /// cluster to the dir's chain and use its first slot. Returns the on-disk
+    /// `(rec_sec, rec_off)` of the written record.
+    fn add_dir_record(&mut self, dir_cluster: u32, rec: &[u8; DIR_ENTRY_SIZE])
+        -> Result<(u64, usize), VfsError>
+    {
+        let chain = self.chain(dir_cluster)?;
+        let cluster_bytes = self.bpb.cluster_bytes();
+        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+        // Look for a free slot (0x00 = never used, 0xE5 = deleted) in an
+        // existing cluster of the chain.
+        for &c in &chain {
+            self.read_cluster(c, &mut buf)?;
+            for i in 0..entries_per_cluster {
+                let first = buf[i * DIR_ENTRY_SIZE];
+                if first == 0x00 || first == 0xE5 {
+                    buf[i * DIR_ENTRY_SIZE..(i+1) * DIR_ENTRY_SIZE].copy_from_slice(rec);
+                    self.write_cluster(c, &buf)?;
+                    let rec_sec = self.bpb.cluster_sector(c) + (i * DIR_ENTRY_SIZE / SECTOR) as u64;
+                    let rec_off = (i * DIR_ENTRY_SIZE) % SECTOR;
+                    return Ok((rec_sec, rec_off));
+                }
+            }
+        }
+        // Every cluster is full — extend the chain. Allocate a fresh cluster
+        // (already zeroed + set EOC by `alloc_cluster`), link the old tail to it,
+        // and write the record at slot 0 of the new cluster. A zeroed cluster's
+        // slot 0 has first byte 0x00 (free); leaving the rest zero terminates the
+        // directory scan correctly.
+        let last = *chain.last().ok_or(VfsError::IoError)?;
+        let new_cluster = self.alloc_cluster()?;
+        self.write_fat_entry(last, new_cluster)?;
+        buf.iter_mut().for_each(|b| *b = 0);
+        buf[0..DIR_ENTRY_SIZE].copy_from_slice(rec);
+        self.write_cluster(new_cluster, &buf)?;
+        let rec_sec = self.bpb.cluster_sector(new_cluster); // slot 0 → offset 0
+        Ok((rec_sec, 0))
+    }
 }
 
 fn map_block_err(_: BlockError) -> VfsError { VfsError::IoError }
@@ -377,31 +418,13 @@ impl Fat32Fs {
         rec[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
         // size = 0 initially (rec[28..32] left zero).
 
-        // Find a free slot in the parent directory (first 0x00 or 0xE5 entry).
-        let chain = inner.chain(parent_cluster)?;
-        let cluster_bytes = inner.bpb.cluster_bytes();
-        let mut buf = alloc::vec![0u8; cluster_bytes];
-        let entries_per_cluster = cluster_bytes / DIR_ENTRY_SIZE;
-        for c in chain {
-            inner.read_cluster(c, &mut buf)?;
-            for i in 0..entries_per_cluster {
-                let first = buf[i * DIR_ENTRY_SIZE];
-                if first == 0x00 || first == 0xE5 {
-                    buf[i * DIR_ENTRY_SIZE..(i+1) * DIR_ENTRY_SIZE].copy_from_slice(&rec);
-                    inner.write_cluster(c, &buf)?;
-                    let rec_sec = inner.bpb.cluster_sector(c) + (i * DIR_ENTRY_SIZE / SECTOR) as u64;
-                    let rec_off = (i * DIR_ENTRY_SIZE) % SECTOR;
-                    return Ok(DirEntry {
-                        name: want, is_dir: false, cluster: first_cluster,
-                        size: 0, rec_sec, rec_off,
-                    });
-                }
-            }
-        }
-        // Parent dir cluster chain exhausted — would need to extend it. The
-        // /mnt root has 32+ clusters of empty slots after a fresh mkfs so we
-        // never hit this in practice on the QEMU test image; punt for now.
-        Err(VfsError::NoSpace)
+        // Find a free slot in the parent directory, extending its cluster chain
+        // if every existing cluster is full.
+        let (rec_sec, rec_off) = inner.add_dir_record(parent_cluster, &rec)?;
+        Ok(DirEntry {
+            name: want, is_dir: false, cluster: first_cluster,
+            size: 0, rec_sec, rec_off,
+        })
     }
 
     /// Update the on-disk size + first-cluster fields of an entry.
@@ -445,7 +468,55 @@ impl FileSystem for Fat32Fs {
     }
 
     async fn unlink(&self, _path: &[&str]) -> Result<(), VfsError> { Err(VfsError::Unsupported) }
-    async fn mkdir(&self, _path: &[&str]) -> Result<(), VfsError>  { Err(VfsError::Unsupported) }
+
+    async fn mkdir(&self, path: &[&str]) -> Result<(), VfsError> {
+        // Resolve the parent cluster first; `lookup_parent_and_name` takes the
+        // inner lock and releases it, so we can re-lock below without deadlock
+        // (same ordering as `create` → `create_file`).
+        let (parent_cluster, name) = self.lookup_parent_and_name(path)?;
+        let mut inner = self.inner.lock();
+
+        // Reject a duplicate name in the parent.
+        let existing = read_dir_entries(&mut inner, parent_cluster)?;
+        let want = name.to_ascii_lowercase();
+        if existing.iter().any(|e| e.name == want) {
+            return Err(VfsError::AlreadyExists);
+        }
+
+        // Allocate the new directory's first cluster (zeroed + EOC).
+        let new_cluster = inner.alloc_cluster()?;
+
+        // The ".." cluster is 0 when the parent is the root directory (FAT spec).
+        let dotdot_cluster = if parent_cluster == inner.bpb.root_clus { 0 } else { parent_cluster };
+
+        // Build the "." and ".." records as the first two slots of the new dir.
+        let mut cbuf = alloc::vec![0u8; inner.bpb.cluster_bytes()];
+        // "."  -> self
+        cbuf[0..11].copy_from_slice(b".          ");
+        cbuf[11] = ATTR_DIRECTORY;
+        cbuf[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
+        cbuf[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+        // ".." -> parent (0 at root)
+        cbuf[32..43].copy_from_slice(b"..         ");
+        cbuf[43] = ATTR_DIRECTORY;
+        cbuf[52..54].copy_from_slice(&((dotdot_cluster >> 16) as u16).to_le_bytes());
+        cbuf[58..60].copy_from_slice(&(dotdot_cluster as u16).to_le_bytes());
+        // remaining slots stay zero (0x00 terminates the dir scan).
+        inner.write_cluster(new_cluster, &cbuf)?;
+
+        // Add the directory record for `name` to the parent (extends the parent
+        // chain if it is full).
+        let raw = encode_short_name(name);
+        let mut rec = [0u8; DIR_ENTRY_SIZE];
+        rec[0..11].copy_from_slice(&raw);
+        rec[11] = ATTR_DIRECTORY;
+        rec[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
+        rec[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+        // size = 0 for a directory (rec[28..32] left zero).
+        inner.add_dir_record(parent_cluster, &rec)?;
+        Ok(())
+    }
+
     async fn rmdir(&self, _path: &[&str]) -> Result<(), VfsError>  { Err(VfsError::Unsupported) }
     async fn rename(&self, _src: &[&str], _dst: &[&str]) -> Result<(), VfsError> { Err(VfsError::Unsupported) }
 

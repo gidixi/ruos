@@ -30,6 +30,7 @@ mod pty;
 mod pci;
 mod usb;
 mod blockdev;
+mod gpt;
 mod ahci;
 mod rtc;
 mod ssh;

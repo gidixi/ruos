@@ -49,3 +49,68 @@ pub trait BlockDevice {
     /// `buf.len()` must be a multiple of `block_size()`.
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
 }
+
+extern crate alloc;
+use alloc::boxed::Box;
+
+/// A `BlockDevice` view of one partition: every LBA is offset by `base`, and
+/// the device length is clamped to `count` sectors. Lets the FAT32 driver mount
+/// a partition unchanged (it reads "LBA 0" = the partition's first sector).
+pub struct PartitionDevice {
+    inner: Box<dyn BlockDevice + Send>,
+    base: u64,
+    count: u64,
+}
+
+impl PartitionDevice {
+    pub fn new(inner: Box<dyn BlockDevice + Send>, base: u64, count: u64) -> Self {
+        Self { inner, base, count }
+    }
+}
+
+impl BlockDevice for PartitionDevice {
+    fn block_size(&self) -> u32 { self.inner.block_size() }
+    fn block_count(&self) -> u64 { self.count }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        let n = (buf.len() as u64) / self.inner.block_size() as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.read_blocks(phys, buf)
+    }
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let n = (buf.len() as u64) / self.inner.block_size() as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.count) {
+            return Err(BlockError::OutOfRange);
+        }
+        let phys = self.base.checked_add(lba).ok_or(BlockError::OutOfRange)?;
+        self.inner.write_blocks(phys, buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*; extern crate std; use std::vec; use std::vec::Vec;
+    struct Mem(Vec<u8>);
+    impl BlockDevice for Mem {
+        fn block_size(&self)->u32{512}
+        fn block_count(&self)->u64{(self.0.len()/512) as u64}
+        fn read_blocks(&mut self,lba:u64,buf:&mut[u8])->Result<(),BlockError>{
+            let o=(lba as usize)*512; buf.copy_from_slice(&self.0[o..o+buf.len()]); Ok(())
+        }
+        fn write_blocks(&mut self,lba:u64,buf:&[u8])->Result<(),BlockError>{
+            let o=(lba as usize)*512; self.0[o..o+buf.len()].copy_from_slice(buf); Ok(())
+        }
+    }
+    #[test] fn offsets_and_clamps() {
+        let mut backing = vec![0u8; 512*10];
+        backing[5*512] = 0xAB;
+        let mut pd = PartitionDevice::new(Box::new(Mem(backing)), 5, 3);
+        let mut buf = [0u8;512];
+        pd.read_blocks(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAB);
+        assert!(pd.read_blocks(3, &mut buf).is_err());
+        assert_eq!(pd.block_count(), 3);
+    }
+}

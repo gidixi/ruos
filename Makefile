@@ -145,6 +145,16 @@ run-test-e1000: iso
 	@grep -qE "net .* e1000 mac=" build/serial.log || { echo TEST_FAIL_E1000_MAC; exit 1; }
 	@echo TEST_PASS_E1000
 
+# GPT mount test: builds a GPT-partitioned SATA disk (ESP + Microsoft-Basic-Data
+# holding a marker), boots ruos with it as the only AHCI disk, asserts the GPT
+# data partition is parsed + mounted as /mnt and the marker file is read.
+# Builds the iso with the smoke battery as init (like run-test) so the boot
+# shell `cat`s /mnt/GPTHELLO.TXT to serial — the minimal default init.sh does not.
+.PHONY: run-gpt-test
+run-gpt-test:
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	bash tests/gpt-test.sh
+
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
 .PHONY: run-ssh-test

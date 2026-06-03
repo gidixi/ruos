@@ -37,9 +37,25 @@ pub fn init() -> Result<(), BootError> {
             }
             // Mount the FAT32 volume at /mnt. Failures log and continue —
             // boot still completes with tmpfs at /.
-            match crate::vfs::fat32::mount_from_ahci_port(port) {
-                Ok(()) => crate::binfo!("fat32", "mnt mounted FAT"),
-                Err(e) => crate::bwarn!("fat32", "mount /mnt failed: {}", e),
+            //
+            // Parse the GPT first: if present, mount the data partition; else
+            // fall back to a raw FAT at LBA 0. We copy out (base,count) from the
+            // owned GptPartition before moving `port`, so the mutable borrow
+            // taken by `parse` has ended by the time we box the port.
+            let data_part: Option<(u64, u64)> = crate::gpt::parse(&mut port)
+                .and_then(|parts| crate::gpt::find_data(&parts).map(|d| (d.first_lba, d.sectors())));
+            let mounted = match data_part {
+                Some((base, count)) => {
+                    crate::binfo!("storage", "gpt: data part lba={} sectors={} -> /mnt", base, count);
+                    let pd = crate::blockdev::PartitionDevice::new(
+                        alloc::boxed::Box::new(port), base, count);
+                    crate::vfs::fat32::mount_from_blockdev(alloc::boxed::Box::new(pd))
+                }
+                None => crate::vfs::fat32::mount_from_blockdev(alloc::boxed::Box::new(port)),
+            };
+            match mounted {
+                Ok(())  => crate::binfo!("fat32", "mnt mounted FAT"),
+                Err(e)  => crate::bwarn!("fat32", "mount /mnt failed: {}", e),
             }
             break;
         }

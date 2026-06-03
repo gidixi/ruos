@@ -81,7 +81,18 @@ pub fn parse(dev: &mut dyn BlockDevice) -> Option<Vec<GptPartition>> {
     let sectors_needed = (num + per_sec - 1) / per_sec;
     for s in 0..sectors_needed {
         let Some(lba) = entries_lba.checked_add(s as u64) else { return None };
-        if dev.read_blocks(lba, &mut sec).is_err() { return None; }
+        // Retry a marginal sector a couple of times before giving up: a single
+        // transient read error on the 32-sector array would otherwise drop the
+        // whole mount for this boot (real-hardware robustness). A valid disk
+        // succeeds on the first try, so the happy path is unchanged.
+        let mut tries = 0u8;
+        loop {
+            match dev.read_blocks(lba, &mut sec) {
+                Ok(())               => break,
+                Err(_) if tries < 2  => tries += 1,
+                Err(_)               => return None,
+            }
+        }
         for i in 0..per_sec {
             let idx = s * per_sec + i;
             if idx >= num { break; }
@@ -137,7 +148,10 @@ fn write_name_utf16le(dst: &mut [u8], name: &str) {
 ///
 /// Returns the placement of the (ESP, data) partitions. All layout arithmetic is
 /// checked/saturating: an odd or too-small device yields `Err(TooSmall)` rather
-/// than a panic (untrusted-disk-safe, like the M1 read path).
+/// than a panic (untrusted-disk-safe, like the M1 read path). Requires the
+/// CSPRNG (`crate::rng`) to be seeded for the partition GUIDs — guaranteed at the
+/// runtime call site (rng is seeded in the userland boot phase, before the shell
+/// from which `mkdisk` runs).
 pub fn write_layout(
     dev: &mut dyn BlockDevice,
     esp_sectors: u64,

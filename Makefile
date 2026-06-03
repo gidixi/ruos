@@ -291,6 +291,14 @@ run-passwd-test: iso passwd-on-disk
 run-passwd-diskless-test: iso
 	bash tests/ssh-passwd-diskless-test.sh
 
+# Console engine self-test: engine_test::run() emits CONSOLE_TEST: OK on serial
+# in the devices boot phase, then init powers off.
+.PHONY: run-console-test
+run-console-test: iso
+	@$(MAKE) iso INIT_SCRIPT=user-bin/console-test-init.sh > build/console-iso.log 2>&1 || { echo TEST_FAIL_ISO; tail -20 build/console-iso.log; exit 1; }
+	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
+
 test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build \

@@ -26,5 +26,6 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    crate::console::engine_test::run();
     Ok(())
 }

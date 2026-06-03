@@ -5,6 +5,7 @@ pub mod font;
 pub mod fb;
 pub mod fb_init;
 pub mod serial_con;
+pub mod engine_test;
 
 use core::fmt;
 use spin::Mutex;

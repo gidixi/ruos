@@ -10,5 +10,5 @@
 # The host-side test greps serial for "ruos boot OK" + "mnt mounted FAT" (phase 2)
 # and "install: ok" (phase 1).
 echo ruos boot OK
-install
+install 0
 echo m2b2-installed

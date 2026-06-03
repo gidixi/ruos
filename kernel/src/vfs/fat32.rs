@@ -300,14 +300,19 @@ fn read_dir_entries(inner: &mut Inner, start_cluster: u32) -> Result<Vec<DirEntr
                 // LFN sub-entry: stash its 13 UTF-16LE units by ordinal.
                 let ord = (rec[0] & 0x1F) as usize;        // 1-based, ignore 0x40
                 if ord >= 1 && ord <= 20 {
+                    // Fresh run (no pending units) → clear the buffer first, so a
+                    // torn run with a missing middle ordinal truncates at the gap
+                    // (decode stops at the 0x0000) instead of reading stale units
+                    // left from a prior file's run.
+                    if lfn_max == 0 { lfn = [0; 260]; }
                     let base = (ord - 1) * 13;
                     // Units live at offsets 1..11 (5), 14..26 (6), 28..32 (2).
                     const SLOTS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
                     for (j, &off) in SLOTS.iter().enumerate() {
                         lfn[base + j] = u16::from_le_bytes([rec[off], rec[off + 1]]);
                     }
-                    // First (highest-ordinal) sub-entry seen sets the run's
-                    // checksum; the run is the longest ordinal observed.
+                    // Every sub-entry of a run carries the same short-name
+                    // checksum; the guard at the short entry rejects a mismatch.
                     lfn_csum = rec[13];
                     lfn_max = lfn_max.max(ord * 13);
                 } else {

@@ -1,7 +1,7 @@
-//! install — install ruos onto a chosen SATA disk (author + copy boot tree).
+//! install -- install ruos onto a chosen SATA disk (author + copy boot tree).
 //!
 //! `install` with no argument LISTS the SATA disks (`[idx] model (N MiB)`) and
-//! wipes nothing — pick a disk on a multi-disk machine without risk.
+//! wipes nothing -- pick a disk on a multi-disk machine without risk.
 //!
 //! `install <idx> [esp_mib]` is DESTRUCTIVE: it lays down a GPT + FAT32 ESP
 //! (with /EFI/BOOT) + FAT32 data partition on SATA disk `idx`, wiping whatever
@@ -9,7 +9,7 @@
 //! limine.conf + every module) so the SSD boots standalone (UEFI →
 //! /EFI/BOOT/BOOTX64.EFI → limine.conf → kernel). The kernel host fn
 //! `ruos::install` does all the work AND guards it: it refuses when /mnt is
-//! mounted, so you cannot wipe the data disk you booted from — boot the
+//! mounted, so you cannot wipe the data disk you booted from -- boot the
 //! installer medium to install.
 //!
 //! Usage:
@@ -26,7 +26,7 @@ fn main() {
 
     // No disk argument → LIST mode. The kernel prints the `[idx] model` lines.
     if args.len() < 2 {
-        eprintln!("install: SATA disks (run `install <n>` to install — WIPES that disk):");
+        eprintln!("install: SATA disks (run `install <n>` to install -- WIPES that disk):");
         let _ = unsafe { install(64, -1) };
         eprintln!("install: run `install <n>` to install onto disk <n>");
         return;
@@ -61,7 +61,7 @@ fn main() {
 
     let rc = unsafe { install(esp_mib, target) };
     match rc {
-        0 => println!("install: ok — remove the installer medium and reboot"),
+        0 => println!("install: ok -- remove the installer medium and reboot"),
         -3 => {
             eprintln!("install: /mnt is mounted, refusing (boot the installer medium)");
             std::process::exit(1);
@@ -75,7 +75,7 @@ fn main() {
             std::process::exit(1);
         }
         -2 => {
-            eprintln!("install: failed (write error — disk left partially written)");
+            eprintln!("install: failed (write error -- disk left partially written)");
             std::process::exit(1);
         }
         _ => {

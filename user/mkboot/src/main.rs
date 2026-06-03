@@ -1,4 +1,4 @@
-//! mkboot — author a fresh ruos disk AND write the full boot tree onto it.
+//! mkboot -- author a fresh ruos disk AND write the full boot tree onto it.
 //!
 //! DESTRUCTIVE: lays down a GPT + FAT32 ESP (with /EFI/BOOT) + FAT32 data
 //! partition on the first populated SATA disk, wiping whatever was there, then
@@ -29,7 +29,7 @@ fn main() {
     };
 
     eprintln!(
-        "mkboot: authoring first SATA disk (ESP {} MiB) + writing boot tree — wipes it",
+        "mkboot: authoring first SATA disk (ESP {} MiB) + writing boot tree -- wipes it",
         esp_mib
     );
 

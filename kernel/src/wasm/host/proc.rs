@@ -697,7 +697,7 @@ fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Resu
     // --- INSTALL mode (target >= 0) ---
     // GUARD: never wipe the running system's data disk.
     if crate::vfs::is_mounted("/mnt") {
-        crate::bwarn!("install", "refusing: /mnt is mounted — boot the installer medium to install");
+        crate::bwarn!("install", "refusing: /mnt is mounted -- boot the installer medium to install");
         return Ok(-3);
     }
     let idx = target as usize;
@@ -707,11 +707,11 @@ fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Resu
     }
     let esp = if esp_mib <= 0 { 64 } else if esp_mib > 4096 { 4096 } else { esp_mib } as u32;
     let mut port = match crate::ahci::acquire_port(idx) { Some(p) => p, None => return Ok(-1) };
-    crate::binfo!("install", "target: port {} model={:?} sectors={} ({} MiB) — WIPING",
+    crate::binfo!("install", "target: port {} model={:?} sectors={} ({} MiB) -- WIPING",
         idx, port.model, port.sectors, port.sectors / 2048);
     let layout = match crate::disk::author(&mut port, esp) { Ok(l) => l, Err(_) => return Ok(-2) };
     if crate::disk::copy_boot_payload(&mut port, &layout).is_err() { return Ok(-2); }
-    crate::binfo!("install", "ok — ruos installed to port {}, reboot from the SSD", idx);
+    crate::binfo!("install", "ok -- ruos installed to port {}, reboot from the SSD", idx);
     Ok(0)
 }
 

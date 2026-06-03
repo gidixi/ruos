@@ -1,4 +1,4 @@
-//! mkdisk — author a fresh ruos disk on the first SATA port.
+//! mkdisk -- author a fresh ruos disk on the first SATA port.
 //!
 //! DESTRUCTIVE: lays down a GPT + FAT32 ESP (with /EFI/BOOT) + FAT32 data
 //! partition on the first populated SATA disk, wiping whatever was there.
@@ -27,7 +27,7 @@ fn main() {
     };
 
     eprintln!(
-        "mkdisk: authoring first SATA disk (ESP {} MiB) — wipes it",
+        "mkdisk: authoring first SATA disk (ESP {} MiB) -- wipes it",
         esp_mib
     );
 

@@ -25,12 +25,13 @@ pub struct FbInfo {
 }
 
 pub struct FramebufferConsole {
-    info:   FbInfo,
-    grid:   Grid,
-    surf:   Surface,
-    cache:  GlyphCache,
-    parser: vte::Parser,
-    saved:  Option<Grid>,
+    info:     FbInfo,
+    grid:     Grid,
+    surf:     Surface,
+    cache:    GlyphCache,
+    parser:   vte::Parser,
+    saved:    Option<Grid>,
+    last_cur: (u16, u16),
 }
 
 unsafe impl Send for FramebufferConsole {}
@@ -59,11 +60,12 @@ impl FramebufferConsole {
         FB_BPP.store(info.bpp, Ordering::Release);
         let mut me = Self {
             info,
-            grid:  Grid::new(cols, rows, fg, bg),
-            surf:  Surface::new(info),
-            cache: GlyphCache::new(),
-            parser: vte::Parser::new(),
-            saved:  None,
+            grid:     Grid::new(cols, rows, fg, bg),
+            surf:     Surface::new(info),
+            cache:    GlyphCache::new(),
+            parser:   vte::Parser::new(),
+            saved:    None,
+            last_cur: (0, 0),
         };
         // pre-scalda la cache ASCII: render path (incl. panic handler) alloc-free.
         me.cache.prewarm_ascii();
@@ -87,12 +89,19 @@ impl FramebufferConsole {
     #[cfg(feature = "boot-checks")]
     pub fn cursor_for_test(&self) -> (u16, u16) { self.grid.cursor() }
 
+    #[cfg(feature = "boot-checks")]
+    pub fn last_cur_for_test(&self) -> (u16, u16) { self.last_cur }
+
     pub fn write_str(&mut self, s: &str) {
         let mut parser = core::mem::replace(&mut self.parser, vte::Parser::new());
         for b in s.bytes() {
             parser.advance(self, b);
         }
         self.parser = parser;
+        // ghost-fix: repaint the cell the cursor occupied last (the IRQ blink may
+        // have XOR'd it); the blit restores it from the back-buffer.
+        let (oc, or) = self.last_cur;
+        self.grid.mark_cell(oc, or);
         // render::flush blits only dirty spans to the back-buffer (and from
         // there to the framebuffer via Surface::present). If tick_cursor has
         // XOR'd the cursor cell since the last flush, this blit will transiently
@@ -101,12 +110,14 @@ impl FramebufferConsole {
         // x86_64::instructions::interrupts::without_interrupts, so tick_cursor
         // cannot interleave with it on the BSP.
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
+        self.last_cur = self.grid.cursor();
         self.publish_cursor();
     }
 
     pub fn clear(&mut self) {
         self.grid.clear();
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
+        self.last_cur = self.grid.cursor();
         self.publish_cursor();
     }
 
@@ -222,13 +233,11 @@ impl vte::Perform for FramebufferConsole {
 /// transient erasure is intentional and safe on single-core (the BSP is the
 /// only writer; flush runs under without_interrupts).
 ///
-/// KNOWN FOLLOW-UP (deferred to Plan 3 / DECSCUSR work): when the cursor
-/// moves off a cell that does not otherwise become dirty (e.g. bare cursor-left
-/// `\x1b[D`, or `\n` on a non-final line), a stale XOR underline can linger on
-/// the old cell until that cell is next written. Proper fix: force-mark the
-/// previously-published cursor cell dirty on move, or composite the cursor into
-/// the back-buffer rather than XOR-ing the live framebuffer. Deferred —
-/// does not affect correctness of text output.
+/// Ghost-fix (Plan 3 / Task 3, CHANGELOG 247): when the cursor moves off a cell
+/// that does not otherwise become dirty (e.g. bare cursor-left `\x1b[D`, or
+/// `\n` on a non-final line), write_str now force-marks the previously-published
+/// cursor cell dirty before calling render::flush, so the blit repaints it from
+/// the back-buffer and erases any stale XOR underline.
 pub fn tick_cursor() {
     let n = BLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
     if n % BLINK_DIVIDER != 0 { return; }

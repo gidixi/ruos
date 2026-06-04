@@ -289,6 +289,21 @@ fn run_inner() -> Result<(), u32> {
         check(40, cursor_style_for_test() == 0)?;
     }
 
+    // T41: dopo aver mosso il cursore, last_cur segue la nuova posizione
+    // (e la vecchia cella viene forzata dirty per ripulire il ghost XOR).
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*5, height: gh, pitch: gw*5*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("AB");        // cursor → (2,0)
+        con.write_str("\x1b[D");    // cursor-left → (1,0)
+        check(41, con.last_cur_for_test() == (1, 0))?;
+    }
+
     Ok(())
 }
 

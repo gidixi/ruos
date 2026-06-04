@@ -62,6 +62,13 @@ impl Grid {
         self.dirty[row as usize] = (lo.min(col), hi.max(col));
     }
 
+    /// Forza dirty la singola cella (col, row). Clampa silenziosamente i
+    /// valori fuori range — usato dal ghost-fix per l'ultima posizione del
+    /// cursore, che potrebbe eccedere il grid dopo un alt-screen swap.
+    pub fn mark_cell(&mut self, col: u16, row: u16) {
+        if row < self.rows && col < self.cols { self.mark(col, row); }
+    }
+
     /// Resetta tutte le righe a pulite. Chiamato dal render dopo il blit.
     pub fn clear_dirty(&mut self) {
         for d in self.dirty.iter_mut() { *d = CLEAN; }

@@ -5,7 +5,6 @@
 //! angoli light netti (arco vero = follow-up minore).
 
 use alloc::vec;
-use alloc::vec::Vec;
 use crate::console::font::{glyph_height, glyph_width};
 use crate::console::glyphcache::GlyphMask;
 

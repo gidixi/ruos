@@ -17,13 +17,7 @@ pub const fn glyph_height() -> usize {
 
 const FALLBACK: char = '?';
 
-pub fn raster_for(ch: char) -> RasterizedChar {
-    get_raster(ch, FONT_WEIGHT, FONT_HEIGHT)
-        .unwrap_or_else(|| get_raster(FALLBACK, FONT_WEIGHT, FONT_HEIGHT)
-            .expect("noto fallback '?' missing"))
-}
-
-/// Like `raster_for` but picks the weight (Bold if `bold`). Falls back to '?'
+/// Picks the weight (Bold if `bold`). Falls back to '?'
 /// in the same weight, then '?' Regular.
 pub fn raster_for_weight(ch: char, bold: bool) -> RasterizedChar {
     let w = if bold { FontWeight::Bold } else { FontWeight::Regular };

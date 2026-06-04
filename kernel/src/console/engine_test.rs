@@ -241,6 +241,20 @@ fn run_inner() -> Result<(), u32> {
         check(34, vlit >= gh / 2)?;
     }
 
+    // T35: SGR truecolor+bold+underline applicati via il path vte completo.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        // ESC[1;4;38;2;200;100;50m  → bold+underline+fg truecolor, poi reset
+        con.write_str("\x1b[1;4;38;2;200;100;50mA\x1b[0mB");
+        check(35, con.cursor_for_test() == (2, 0))?;
+    }
+
     Ok(())
 }
 

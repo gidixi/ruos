@@ -1,6 +1,6 @@
 //! Cache di maschere di copertura alpha, indicizzate per (char, bold).
 //! Una maschera è un buffer flat `w*h` di intensità 0..255 (row-major),
-//! ricavato una volta da `font::raster_for` e poi riusato. Comporre/colorare
+//! ricavato una volta da `font::raster_for_weight` e poi riusato. Comporre/colorare
 //! avviene altrove (render), così il truecolor non moltiplica le entry.
 
 use alloc::collections::BTreeMap;

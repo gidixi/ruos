@@ -102,6 +102,14 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
     let sh = GFX_H.load(Ordering::Acquire);
     if w == 0 || h == 0 { return; }
 
+    // Lift the software cursor BEFORE mutating the framebuffer: this restores the
+    // true background it was covering, so the post-blit cursor_repaint() saves
+    // real pixels, never the sprite. Critical with dirty-rect partial blits that
+    // usually do NOT overlap the cursor — otherwise the saved "background" would
+    // be the sprite itself and the next cursor move would leave a trail of arrows
+    // (denser the slower you move). No-op when no cursor is currently drawn.
+    cursor_erase();
+
     if buf.len() >= 4 {
         LAST_PIXEL.store(
             u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
@@ -111,7 +119,7 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
     BLIT_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // Clip the source rect to the screen ONCE (instead of per pixel).
-    if x >= sw || y >= sh { cursor_after_blit(); return; }
+    if x >= sw || y >= sh { cursor_repaint(); return; }
     let vis_w = core::cmp::min(w, sw - x) as usize;
     let vis_h = core::cmp::min(h, sh - y) as usize;
     let src_stride = (w as usize) * 4; // guest is always RGBA8888
@@ -146,7 +154,7 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
                 }
             }
         }
-        cursor_after_blit();
+        cursor_repaint();
         return;
     }
 
@@ -156,7 +164,7 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
         for col in 0..vis_w {
             let dx = x as usize + col;
             let si = (row * w as usize + col) * 4;
-            if si + 3 >= buf.len() { cursor_after_blit(); return; }
+            if si + 3 >= buf.len() { cursor_repaint(); return; }
             let (r, g, b) = (buf[si], buf[si + 1], buf[si + 2]);
             let off = dy * pitch + dx * bpp;
             // SAFETY: (dx,dy) is within the framebuffer (clipped above).
@@ -168,7 +176,7 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
         }
     }
     // The full-frame blit overwrote the cursor — repaint it on top.
-    cursor_after_blit();
+    cursor_repaint();
 }
 
 // --- Input ---------------------------------------------------------------
@@ -355,12 +363,14 @@ pub fn cursor_move(x: i32, y: i32) {
     cursor_paint(x, y);
 }
 
-/// Repaint the cursor after a full-frame blit overwrote it. The blit replaced
-/// the cursor area with fresh frame pixels, so the old save buffer is stale —
-/// invalidate it, then save the new background and draw.
-fn cursor_after_blit() {
+/// Repaint the cursor at its current position after a blit. `blit()` calls
+/// `cursor_erase()` BEFORE it writes, so the framebuffer under the cursor is the
+/// true background (sprite already lifted) when `cursor_paint` saves it here —
+/// never the sprite. Without that pre-erase, a partial (dirty-rect) blit that
+/// does not cover the cursor would save the sprite as background, and the next
+/// cursor move would restore it → a trail of arrows (worse the slower you move).
+fn cursor_repaint() {
     if !gui_mode() { return; }
-    CUR_VALID.store(false, Ordering::Release);
     cursor_paint(CUR_X.load(Ordering::Relaxed), CUR_Y.load(Ordering::Relaxed));
 }
 

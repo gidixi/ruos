@@ -1,0 +1,20 @@
+package ruos:gui;
+
+interface gfx {
+  record gfx-info { width: u32, height: u32, stride: u32, format: u32 }
+  record gfx-event { kind: u32, p0: u32, p1: u32, p2: u32 }
+  get-info: func() -> gfx-info;
+  blit: func(pixels: list<u8>, x: u32, y: u32, w: u32, h: u32);
+  poll-event: func() -> option<gfx-event>;
+  pending: func() -> u32;
+  wall-seconds: func() -> f64;
+  debug-log: func(msg: string);
+}
+interface power {
+  poweroff: func();
+  reboot: func();
+}
+world ruos-gui {
+  import gfx;
+  import power;
+}

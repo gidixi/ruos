@@ -200,6 +200,21 @@ fn run_inner() -> Result<(), u32> {
         } }
     }
 
+    // T31: underline disegna una riga fg sul fondo della cella.
+    {
+        use crate::console::grid::Grid; use crate::console::render;
+        use crate::console::surface::Surface; use crate::console::glyphcache::GlyphCache;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK, CellAttr};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw, height: gh, pitch: gw*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut g = Grid::new(1,1,WHITE,BLACK); let mut s = Surface::new(info); let mut gc = GlyphCache::new();
+        g.set_attr(CellAttr::UNDERLINE); g.put(' '); // spazio: niente glifo, solo underline
+        render::flush(&mut g, &mut gc, &mut s);
+        check(31, s.read_px(0, gh - 2) == WHITE && s.read_px(gw/2, gh - 2) == WHITE)?;
+    }
+
     Ok(())
 }
 

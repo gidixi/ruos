@@ -58,4 +58,8 @@ fn compose_cell(cell: Cell, col: u32, row: u32, gw: u32, gh: u32,
             surf.put_px(ox + rx, oy + ry, color);
         }
     }
+    if cell.attr.contains(CellAttr::UNDERLINE) {
+        let uy = oy + gh - 2;
+        for rx in 0..gw { surf.put_px(ox + rx, uy, fg); }
+    }
 }

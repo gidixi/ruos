@@ -55,6 +55,7 @@ impl Grid {
     pub fn set_bg(&mut self, bg: Rgb) { self.bg = bg; }
     pub fn set_attr(&mut self, attr: CellAttr) { self.attr = attr; }
     pub fn current_colors(&self) -> (Rgb, Rgb) { (self.fg, self.bg) }
+    pub fn current_attr(&self) -> CellAttr { self.attr }
 
     fn mark(&mut self, col: u16, row: u16) {
         let (lo, hi) = self.dirty[row as usize];

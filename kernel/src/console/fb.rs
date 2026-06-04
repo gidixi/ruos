@@ -137,9 +137,15 @@ impl vte::Perform for FramebufferConsole {
         match c {
             'm' => {
                 let it = params.iter().flat_map(|p| p.iter().copied());
-                let (fg, bg) = apply_sgr(it, self.grid.current_colors().0, self.grid.current_colors().1);
+                let (fg, bg, attr) = apply_sgr(
+                    it,
+                    self.grid.current_colors().0,
+                    self.grid.current_colors().1,
+                    self.grid.current_attr(),
+                );
                 self.grid.set_fg(fg);
                 self.grid.set_bg(bg);
+                self.grid.set_attr(attr);
             }
             'J' => {
                 let arg = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);

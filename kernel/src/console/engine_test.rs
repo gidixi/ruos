@@ -158,6 +158,19 @@ fn run_inner() -> Result<(), u32> {
         check(24, dt < 2_000_000_000)?;
     }
 
+    // T25-28: SGR truecolor + attributi + reset.
+    {
+        use crate::console::ansi::{apply_sgr, CellAttr, Rgb, WHITE, BLACK};
+        let (fg, _b, _a) = apply_sgr([38u16,2,10,20,30].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(25, fg == Rgb { r:10, g:20, b:30 })?;
+        let (_f, bg, _a) = apply_sgr([48u16,2,7,8,9].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(26, bg == Rgb { r:7, g:8, b:9 })?;
+        let (_f,_b, a) = apply_sgr([1u16,4,7].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(27, a.contains(CellAttr::BOLD) && a.contains(CellAttr::UNDERLINE) && a.contains(CellAttr::REVERSE))?;
+        let (f2, b2, a2) = apply_sgr([0u16].into_iter(), Rgb{r:1,g:2,b:3}, Rgb{r:4,g:5,b:6}, CellAttr::BOLD);
+        check(28, f2 == WHITE && b2 == BLACK && a2.is_empty())?;
+    }
+
     Ok(())
 }
 

@@ -77,39 +77,52 @@ impl Cell {
     }
 }
 
-/// Apply a CSI SGR parameter sequence to fg/bg. Unknown params are ignored.
-/// Supports:
-///   0      reset
-///   30..37 fg from VGA_16[0..7]
-///   40..47 bg from VGA_16[0..7]
-///   90..97 fg from VGA_16[8..15]
-///   100..107 bg from VGA_16[8..15]
-///   38;5;N fg from xterm_256(N)
-///   48;5;N bg from xterm_256(N)
-pub fn apply_sgr(mut params: impl Iterator<Item = u16>, mut fg: Rgb, mut bg: Rgb) -> (Rgb, Rgb) {
+/// Apply a CSI SGR parameter sequence to fg/bg/attr. Unknown params ignored.
+/// 0 reset-all; 1/2/4/7 bold/dim/underline/reverse; 22/24/27 reset those;
+/// 30-37/90-97 fg, 40-47/100-107 bg (16-color); 39/49 default fg/bg;
+/// 38;5;N / 48;5;N indexed; 38;2;r;g;b / 48;2;r;g;b truecolor.
+pub fn apply_sgr(
+    mut params: impl Iterator<Item = u16>,
+    mut fg: Rgb, mut bg: Rgb, mut attr: CellAttr,
+) -> (Rgb, Rgb, CellAttr) {
     while let Some(p) = params.next() {
         match p {
-            0 => { fg = WHITE; bg = BLACK; }
+            0 => { fg = WHITE; bg = BLACK; attr = CellAttr::empty(); }
+            1 => attr.insert(CellAttr::BOLD),
+            2 => attr.insert(CellAttr::DIM),
+            4 => attr.insert(CellAttr::UNDERLINE),
+            7 => attr.insert(CellAttr::REVERSE),
+            22 => attr.remove(CellAttr::BOLD | CellAttr::DIM),
+            24 => attr.remove(CellAttr::UNDERLINE),
+            27 => attr.remove(CellAttr::REVERSE),
             30..=37   => fg = VGA_16[(p - 30) as usize],
+            39        => fg = WHITE,
             40..=47   => bg = VGA_16[(p - 40) as usize],
+            49        => bg = BLACK,
             90..=97   => fg = VGA_16[((p - 90) + 8) as usize],
             100..=107 => bg = VGA_16[((p - 100) + 8) as usize],
-            38 => {
-                if params.next() == Some(5) {
-                    if let Some(idx) = params.next() {
-                        fg = xterm_256(idx as u8);
-                    }
+            38 => match params.next() {
+                Some(5) => { if let Some(i) = params.next() { fg = xterm_256(i as u8); } }
+                Some(2) => {
+                    let r = params.next().unwrap_or(0) as u8;
+                    let g = params.next().unwrap_or(0) as u8;
+                    let b = params.next().unwrap_or(0) as u8;
+                    fg = Rgb { r, g, b };
                 }
-            }
-            48 => {
-                if params.next() == Some(5) {
-                    if let Some(idx) = params.next() {
-                        bg = xterm_256(idx as u8);
-                    }
+                _ => {}
+            },
+            48 => match params.next() {
+                Some(5) => { if let Some(i) = params.next() { bg = xterm_256(i as u8); } }
+                Some(2) => {
+                    let r = params.next().unwrap_or(0) as u8;
+                    let g = params.next().unwrap_or(0) as u8;
+                    let b = params.next().unwrap_or(0) as u8;
+                    bg = Rgb { r, g, b };
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
     }
-    (fg, bg)
+    (fg, bg, attr)
 }

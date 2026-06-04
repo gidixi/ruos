@@ -135,6 +135,16 @@ build/gui.cwasm: $(WT_PRECOMPILE) $(RUOS_DESKTOP_SRCS)
 		cargo build -p ruos-backend --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/gui.wasm build/gui.cwasm
 
+# Bring-up component (Step-0 gate): guest -> component -> AOT cwasm embedded in kernel.
+kernel/src/wasm/wt/bringup.cwasm: wit/ruos-bringup.wit tools/wt-bringup/src/lib.rs tools/wt-bringup/Cargo.toml $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/wt-bringup && \
+		cargo build --release --target wasm32-wasip1
+	source $$HOME/.cargo/env && wasm-tools component new \
+		tools/wt-bringup/target/wasm32-wasip1/release/wt_bringup.wasm \
+		-o build/wt-bringup.component.wasm
+	$(WT_PRECOMPILE) --component build/wt-bringup.component.wasm kernel/src/wasm/wt/bringup.cwasm
+
 iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
@@ -354,7 +364,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \

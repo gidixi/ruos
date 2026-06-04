@@ -69,6 +69,9 @@ pub fn init() -> Result<(), BootError> {
         // (cat demo needs the VFS → runs in the fs phase, not here.)
         let ec = crate::wasm::wt::run_echo_demo();
         crate::binfo!("wt", "wasmtime WASI echo exit={}", ec);
+        // Component Model bring-up: prove the no_std AOT component path runs.
+        let cc = crate::wasm::wt::run_bringup_demo();
+        crate::binfo!("wt", "component bringup run={}", cc);
     }
 
     Ok(())

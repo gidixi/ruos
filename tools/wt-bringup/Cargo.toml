@@ -1,0 +1,16 @@
+[package]
+name = "wt-bringup"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# no_std guest: drop wit-bindgen default features (which enable `std` and would
+# duplicate our `panic_impl` lang item). Keep only what generate! needs.
+[dependencies]
+wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "realloc", "bitflags"] }
+
+[profile.release]
+panic = "abort"
+lto = true

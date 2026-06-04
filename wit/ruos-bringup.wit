@@ -1,0 +1,15 @@
+package ruos:bringup;
+
+interface system {
+  // Append a UTF-8 line to the kernel serial log (host side).
+  log: func(msg: string);
+  // Power the machine off. Never returns. (The bring-up guest does NOT call this;
+  // it exists to exercise a zero-arg, no-return import shape for later reuse.)
+  poweroff: func();
+}
+
+world bringup {
+  import system;
+  // Host calls this after instantiation; returns a status code.
+  export run: func() -> s32;
+}

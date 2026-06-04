@@ -19,7 +19,7 @@ use crate::wasm::wt::mem;
 /// tick-vs-RTC drift over a session is sub-second, irrelevant for minute display.
 static WALL_OFFSET_CS: AtomicI64 = AtomicI64::new(i64::MIN); // centiseconds; MIN = uninit
 
-fn wall_secs() -> f64 {
+pub fn wall_secs() -> f64 {
     let up_cs = crate::timer::ticks() as i64; // 100 Hz tick = 1 centisecond of uptime
     let mut off = WALL_OFFSET_CS.load(Ordering::Relaxed);
     if off == i64::MIN {

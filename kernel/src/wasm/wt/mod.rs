@@ -7,6 +7,7 @@ pub mod state;
 pub mod mem;
 pub mod wasi;
 pub mod gfx;
+pub mod gui;
 pub mod component;
 
 use crate::kprintln;
@@ -117,6 +118,10 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
     }
     if let Err(e) = gfx::add_to_linker(&mut linker) {
         kprintln!("ruos: wt gfx link err: {}", e);
+        return 126;
+    }
+    if let Err(e) = gui::add_to_linker(&mut linker) {
+        kprintln!("ruos: wt gui link err: {}", e);
         return 126;
     }
     let instance = match linker.instantiate(&mut store, &module) {

@@ -13,13 +13,15 @@ const CLEAN: (u16, u16) = (u16::MAX, 0);
 pub struct Grid {
     pub cols: u16,
     pub rows: u16,
-    cells:    Vec<Cell>,       // len == cols*rows, row-major
-    cur_col:  u16,
-    cur_row:  u16,
-    fg:       Rgb,
-    bg:       Rgb,
-    attr:     CellAttr,
-    dirty:    Vec<(u16, u16)>, // len == rows
+    cells:      Vec<Cell>,       // len == cols*rows, row-major
+    cur_col:    u16,
+    cur_row:    u16,
+    fg:         Rgb,
+    bg:         Rgb,
+    attr:       CellAttr,
+    dirty:      Vec<(u16, u16)>, // len == rows
+    scroll_top: u16,
+    scroll_bot: u16,
 }
 
 impl Grid {
@@ -31,6 +33,8 @@ impl Grid {
             cur_col: 0, cur_row: 0,
             fg, bg, attr: CellAttr::empty(),
             dirty: vec![CLEAN; rows as usize],
+            scroll_top: 0,
+            scroll_bot: rows - 1,
         }
     }
 
@@ -62,9 +66,21 @@ impl Grid {
         self.dirty[row as usize] = (lo.min(col), hi.max(col));
     }
 
+    /// Forza dirty la singola cella (col, row). Clampa silenziosamente i
+    /// valori fuori range — usato dal ghost-fix per l'ultima posizione del
+    /// cursore, che potrebbe eccedere il grid dopo un alt-screen swap.
+    pub fn mark_cell(&mut self, col: u16, row: u16) {
+        if row < self.rows && col < self.cols { self.mark(col, row); }
+    }
+
     /// Resetta tutte le righe a pulite. Chiamato dal render dopo il blit.
     pub fn clear_dirty(&mut self) {
         for d in self.dirty.iter_mut() { *d = CLEAN; }
+    }
+
+    /// Marca tutte le righe come dirty (full span). Usato al cambio di buffer.
+    pub fn mark_all_dirty(&mut self) {
+        for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
     }
 
     /// Scrive il carattere visibile alla posizione cursore (colori/attr correnti)
@@ -91,25 +107,38 @@ impl Grid {
 
     pub fn newline(&mut self) {
         self.cur_col = 0;
-        if self.cur_row + 1 >= self.rows {
+        if self.cur_row == self.scroll_bot {
             self.scroll_up();
-        } else {
+        } else if self.cur_row + 1 < self.rows {
             self.cur_row += 1;
         }
     }
 
     pub fn scroll_up(&mut self) {
         let cols = self.cols as usize;
-        let rows = self.rows as usize;
-        // Sposta le righe 1..rows in 0..rows-1.
-        self.cells.copy_within(cols..rows * cols, 0);
-        // Svuota l'ultima riga con i colori correnti.
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bot as usize;
+        let src = (top + 1) * cols;
+        let end = (bot + 1) * cols;
+        let dst = top * cols;
+        self.cells.copy_within(src..end, dst);
         let blank = Cell::blank(self.fg, self.bg);
-        let last = (rows - 1) * cols;
-        for c in self.cells[last..].iter_mut() { *c = blank; }
-        self.cur_row = self.rows - 1;
-        // Tutto lo schermo è cambiato.
-        for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
+        let last = bot * cols;
+        for c in self.cells[last..last + cols].iter_mut() { *c = blank; }
+        self.cur_row = self.scroll_bot;
+        for r in top..=bot { self.dirty[r] = (0, self.cols - 1); }
+    }
+
+    pub fn set_scroll_region(&mut self, top: u16, bot: u16) {
+        if top < bot && bot < self.rows {
+            self.scroll_top = top;
+            self.scroll_bot = bot;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bot = self.rows - 1;
+        }
+        self.cur_col = 0;
+        self.cur_row = self.scroll_top;
     }
 
     pub fn clear(&mut self) {
@@ -117,6 +146,8 @@ impl Grid {
         for c in self.cells.iter_mut() { *c = blank; }
         self.cur_col = 0;
         self.cur_row = 0;
+        self.scroll_top = 0;
+        self.scroll_bot = self.rows - 1;
         for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
     }
 

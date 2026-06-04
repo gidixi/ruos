@@ -3,7 +3,7 @@
 //! Task 8: FramebufferConsole wired onto Grid + Surface + GlyphCache + render
 //! pipeline built in Tasks 2-7. tick_cursor stays untouched (reads atomics).
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use crate::console::ansi::{apply_sgr, Rgb};
 use crate::console::font::{glyph_height, glyph_width};
 use crate::console::grid::Grid;
@@ -25,11 +25,13 @@ pub struct FbInfo {
 }
 
 pub struct FramebufferConsole {
-    info:   FbInfo,
-    grid:   Grid,
-    surf:   Surface,
-    cache:  GlyphCache,
-    parser: vte::Parser,
+    info:     FbInfo,
+    grid:     Grid,
+    surf:     Surface,
+    cache:    GlyphCache,
+    parser:   vte::Parser,
+    saved:    Option<Grid>,
+    last_cur: (u16, u16),
 }
 
 unsafe impl Send for FramebufferConsole {}
@@ -45,6 +47,9 @@ pub(crate) static BLINK_COUNTER: AtomicU64     = AtomicU64::new(0);
 // slow. With APs now hlt-idle the BSP gets the full 100 Hz, exposing the
 // designed-but-fast 4 Hz; 2 Hz reads better.
 pub(crate) const  BLINK_DIVIDER: u64           = 50;
+pub(crate) static CURSOR_VISIBLE: AtomicBool   = AtomicBool::new(true);
+// 0=block, 1=underline, 2=bar. Default underline (Plan 1/2 behavior).
+pub(crate) static CURSOR_STYLE:   AtomicU32    = AtomicU32::new(1);
 
 impl FramebufferConsole {
     pub fn new(info: FbInfo, fg: Rgb, bg: Rgb) -> Self {
@@ -55,10 +60,12 @@ impl FramebufferConsole {
         FB_BPP.store(info.bpp, Ordering::Release);
         let mut me = Self {
             info,
-            grid:  Grid::new(cols, rows, fg, bg),
-            surf:  Surface::new(info),
-            cache: GlyphCache::new(),
-            parser: vte::Parser::new(),
+            grid:     Grid::new(cols, rows, fg, bg),
+            surf:     Surface::new(info),
+            cache:    GlyphCache::new(),
+            parser:   vte::Parser::new(),
+            saved:    None,
+            last_cur: (0, 0),
         };
         // pre-scalda la cache ASCII: render path (incl. panic handler) alloc-free.
         me.cache.prewarm_ascii();
@@ -82,12 +89,19 @@ impl FramebufferConsole {
     #[cfg(feature = "boot-checks")]
     pub fn cursor_for_test(&self) -> (u16, u16) { self.grid.cursor() }
 
+    #[cfg(feature = "boot-checks")]
+    pub fn last_cur_for_test(&self) -> (u16, u16) { self.last_cur }
+
     pub fn write_str(&mut self, s: &str) {
         let mut parser = core::mem::replace(&mut self.parser, vte::Parser::new());
         for b in s.bytes() {
             parser.advance(self, b);
         }
         self.parser = parser;
+        // ghost-fix: repaint the cell the cursor occupied last (the IRQ blink may
+        // have XOR'd it); the blit restores it from the back-buffer.
+        let (oc, or) = self.last_cur;
+        self.grid.mark_cell(oc, or);
         // render::flush blits only dirty spans to the back-buffer (and from
         // there to the framebuffer via Surface::present). If tick_cursor has
         // XOR'd the cursor cell since the last flush, this blit will transiently
@@ -96,15 +110,40 @@ impl FramebufferConsole {
         // x86_64::instructions::interrupts::without_interrupts, so tick_cursor
         // cannot interleave with it on the BSP.
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
+        self.last_cur = self.grid.cursor();
         self.publish_cursor();
     }
 
     pub fn clear(&mut self) {
         self.grid.clear();
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
+        self.last_cur = self.grid.cursor();
         self.publish_cursor();
     }
+
+    fn enter_alt(&mut self) {
+        if self.saved.is_none() {
+            let (fg, bg) = self.grid.current_colors();
+            let mut alt = Grid::new(self.grid.cols, self.grid.rows, fg, bg);
+            alt.mark_all_dirty();
+            self.saved = Some(core::mem::replace(&mut self.grid, alt));
+        }
+        self.last_cur = self.grid.cursor();
+    }
+
+    fn leave_alt(&mut self) {
+        if let Some(mut primary) = self.saved.take() {
+            primary.mark_all_dirty();
+            self.grid = primary;
+        }
+        self.last_cur = self.grid.cursor();
+    }
 }
+
+#[cfg(feature = "boot-checks")]
+pub fn cursor_visible_for_test() -> bool { CURSOR_VISIBLE.load(Ordering::Acquire) }
+#[cfg(feature = "boot-checks")]
+pub fn cursor_style_for_test() -> u32 { CURSOR_STYLE.load(Ordering::Acquire) }
 
 /// Boot-time self-test: scrive 'X', flush, e verifica che un pixel acceso
 /// della maschera sia il colore fg nel back-buffer.
@@ -132,7 +171,7 @@ impl vte::Perform for FramebufferConsole {
             _ => {}
         }
     }
-    fn csi_dispatch(&mut self, params: &vte::Params, _i: &[u8], _ignore: bool, c: char) {
+    fn csi_dispatch(&mut self, params: &vte::Params, i: &[u8], _ignore: bool, c: char) {
         let p1 = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(1);
         match c {
             'm' => {
@@ -162,6 +201,27 @@ impl vte::Perform for FramebufferConsole {
                 self.grid.goto(col.saturating_sub(1), row.saturating_sub(1));
             }
             'K' => self.grid.erase_to_eol(),
+            'h' | 'l' if i.contains(&b'?') => {
+                let set = c == 'h';
+                for p in params.iter().flat_map(|p| p.iter().copied()) {
+                    match p {
+                        1049 | 1047 | 47 => if set { self.enter_alt() } else { self.leave_alt() },
+                        25 => CURSOR_VISIBLE.store(set, Ordering::Release),
+                        _ => {}
+                    }
+                }
+            }
+            'q' if i.contains(&b' ') => {
+                let n = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(1);
+                let style = match n { 0 | 1 | 2 => 0u32, 3 | 4 => 1, 5 | 6 => 2, _ => 1 };
+                CURSOR_STYLE.store(style, Ordering::Release);
+            }
+            'r' => {
+                let mut it = params.iter();
+                let top = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
+                let bot = it.next().and_then(|p| p.first().copied()).unwrap_or(self.grid.rows);
+                self.grid.set_scroll_region(top.saturating_sub(1), bot.saturating_sub(1));
+            }
             _ => {}
         }
     }
@@ -181,18 +241,18 @@ impl vte::Perform for FramebufferConsole {
 /// transient erasure is intentional and safe on single-core (the BSP is the
 /// only writer; flush runs under without_interrupts).
 ///
-/// KNOWN FOLLOW-UP (deferred to Plan 3 / DECSCUSR work): when the cursor
-/// moves off a cell that does not otherwise become dirty (e.g. bare cursor-left
-/// `\x1b[D`, or `\n` on a non-final line), a stale XOR underline can linger on
-/// the old cell until that cell is next written. Proper fix: force-mark the
-/// previously-published cursor cell dirty on move, or composite the cursor into
-/// the back-buffer rather than XOR-ing the live framebuffer. Deferred —
-/// does not affect correctness of text output.
+/// Ghost-fix (Plan 3 / Task 3, CHANGELOG 247): when the cursor moves off a cell
+/// that does not otherwise become dirty (e.g. bare cursor-left `\x1b[D`, or
+/// `\n` on a non-final line), write_str now force-marks the previously-published
+/// cursor cell dirty before calling render::flush, so the blit repaints it from
+/// the back-buffer and erases any stale XOR underline.
 pub fn tick_cursor() {
     let n = BLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
     if n % BLINK_DIVIDER != 0 { return; }
     let base = FB_VIRT.load(Ordering::Acquire);
     if base.is_null() { return; }
+    if !CURSOR_VISIBLE.load(Ordering::Acquire) { return; }
+    let style = CURSOR_STYLE.load(Ordering::Acquire);
     let pitch = FB_PITCH.load(Ordering::Acquire) as usize;
     let bpp_bytes = (FB_BPP.load(Ordering::Acquire) as usize) / 8;
     let pos = CURSOR_POS.load(Ordering::Acquire);
@@ -202,9 +262,13 @@ pub fn tick_cursor() {
     let gh = glyph_height();
     let ox = col * gw;
     let oy = row * gh;
-    // XOR the bottom 2 scanlines of the cell as a thin underline cursor.
-    for y in (oy + gh - 2)..(oy + gh) {
-        for x in ox..(ox + gw) {
+    let (y0, y1, x0, x1) = match style {
+        0 => (oy, oy + gh, ox, ox + gw),          // block
+        2 => (oy, oy + gh, ox, ox + 2),           // bar (2 cols)
+        _ => (oy + gh - 2, oy + gh, ox, ox + gw), // underline
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
             let off = y * pitch + x * bpp_bytes;
             // SAFETY: off lies within the framebuffer; bpp_bytes is 3 or 4.
             unsafe {

@@ -255,6 +255,83 @@ fn run_inner() -> Result<(), u32> {
         check(35, con.cursor_for_test() == (2, 0))?;
     }
 
+    // T36-37: ?1049h entra in alt-screen (pulito), ?1049l ripristina il primario.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh*3, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("PRIMARY");
+        con.write_str("\x1b[?1049h");
+        check(36, con.cursor_for_test() == (0, 0))?;
+        con.write_str("ALT");
+        con.write_str("\x1b[?1049l");
+        check(37, con.cursor_for_test() == (7, 0))?;
+    }
+
+    // T38-40: ?25l/h toggle visibility; DECSCUSR sets style.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout, cursor_visible_for_test, cursor_style_for_test};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*4, height: gh, pitch: gw*4*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("\x1b[?25l");
+        check(38, cursor_visible_for_test() == false)?;
+        con.write_str("\x1b[?25h");
+        check(39, cursor_visible_for_test() == true)?;
+        con.write_str("\x1b[2 q"); // DECSCUSR 2 = steady block → style block(0)
+        check(40, cursor_style_for_test() == 0)?;
+    }
+
+    // T41: dopo aver mosso il cursore, last_cur segue la nuova posizione
+    // (e la vecchia cella viene forzata dirty per ripulire il ghost XOR).
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*5, height: gh, pitch: gw*5*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("AB");        // cursor → (2,0)
+        con.write_str("\x1b[D");    // cursor-left → (1,0)
+        check(41, con.last_cur_for_test() == (1, 0))?;
+    }
+
+    // T42-43: regione [0,1] su griglia 4 righe; newline a fondo regione scrolla
+    // SOLO la banda 0..=1; le righe 2,3 restano intatte.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::ansi::{WHITE, BLACK};
+        let mut g = Grid::new(4, 4, WHITE, BLACK);
+        g.goto(0,3); g.put('Z');     // riga 3 = "Z..."
+        g.set_scroll_region(0, 1);
+        g.goto(0,1); g.newline();    // a fondo regione → scroll banda [0,1]
+        check(42, g.cell(0,3).ch == 'Z')?;  // riga fuori regione intatta
+        check(43, g.cursor() == (0,1))?;    // resta sul fondo regione
+    }
+
+    // T44: alt-screen non corrompe il primario; cursore coerente dopo il ritorno.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh*3, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("\x1b[2;1HKEEP");                       // riga 2 (0-based 1): "KEEP", cursore → (4,1)
+        con.write_str("\x1b[?1049h\x1b[2JALTDATA\x1b[?1049l"); // entra alt, scrive, esce
+        con.write_str("\x1b[3;1Hx");                         // scrive sul primario ripristinato → cursore (1,2)
+        check(44, con.cursor_for_test() == (1, 2))?;
+    }
+
     Ok(())
 }
 

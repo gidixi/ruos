@@ -4,43 +4,28 @@ Followup emersi durante Tasks 1-8 (console back-buffer refactor) e dal
 code review di Task 8. Aperti al merge di `feature/terminal-engine` → `main`.
 Nessuno blocca merge; F1 è il più visibile.
 
-## F1 — Stale XOR cursor on non-dirty cell move
+## ✅ F1 — Stale XOR cursor on non-dirty cell move — RISOLTO (CHANGELOG 247)
 
 **File:** `kernel/src/console/fb.rs` (`tick_cursor`, `write_str`)
-**Severity:** 🟡 cosmetic / visible on real HW
+**Severity:** 🟡 cosmetic / visible on real HW → FIXED
 
 ### Problema
 
 `tick_cursor` XOR-a i pixel del cursore direttamente sul framebuffer (non nel
 back-buffer). Quando il cursore si sposta su una cella che non diventa altrimenti
 dirty (es. bare cursor-left `\x1b[D`, `\n` su riga non-finale, `\r`), la vecchia
-cella non viene riscritto dal prossimo `render::flush`. Il XOR rimane visibile
+cella non veniva riscritta dal prossimo `render::flush`. Il XOR rimaneva visibile
 fino alla prossima scrittura su quella cella.
 
-### Impatto
+### Fix applicato (Plan 3 / Task 3, 2026-06-04)
 
-Puramente cosmetic: nessun dato di testo viene perso. Lieve ghosting del cursore
-in scenari di movement-only (cursor navigation nella shell, editing con ← →).
-
-### Fix (deferred)
-
-Due opzioni, da scegliere in Plan 3 / DECSCUSR work:
-1. **Force-mark dirty on move**: in `Grid::move_left`, `move_right`, `move_up`,
-   `move_down`, `goto` — marcare dirty la cella al cursore *prima* dello
-   spostamento (la "vecchia" posizione). Semplice, costo: flush blit extra per
-   quella cella ad ogni move.
-2. **Composite cursor nel back-buffer**: non XOR sul framebuffer live; invece
-   `tick_cursor` scrive nel back-buffer e poi presenta (come una mini-flush di 1
-   cella). Richiede che `tick_cursor` acquisisca il lock della console — o che la
-   Surface esponga un'API "blit cursor cell". Più clean, più invasivo.
-
-### Contesto architetturale
-
-Oggi `tick_cursor` opera **senza lock**, leggendo soli atomics (FB_VIRT,
-FB_PITCH, CURSOR_POS). Questo è deliberato (ISR path). Aggiungere un lock
-in `tick_cursor` richiede attenzione: il lock della console non può essere
-held dall'ISR a meno che non sia un raw spinlock senza possibilità di
-preemption (ok su single-core + `without_interrupts`).
+Opzione 1 implementata nella variante `per-write_str` (più semplice e YAGNI):
+`FramebufferConsole` traccia `last_cur: (u16, u16)` — la posizione del cursore
+all'ultimo `write_str`. All'inizio di ogni `write_str`, prima di `render::flush`,
+viene chiamato `self.grid.mark_cell(last_cur.0, last_cur.1)`, forzando dirty la
+cella precedente. Il blit la ridisegna dal back-buffer, eliminando il XOR residuo.
+`Grid::mark_cell` clampa silenziosamente i valori fuori range (safe dopo alt-screen
+swap). Test T41 verifica il comportamento in `engine_test.rs`.
 
 ## F2 — WC mapping non esplicitamente verificata su real HW
 
@@ -90,4 +75,4 @@ Entrambe le opzioni sono deferred post-Plan-2.
 
 ## ✅ CLOSED
 
-*(nessuno ancora)*
+- **F1** — Stale XOR cursor ghost: risolto in Plan 3 / Task 3 (CHANGELOG 247, 2026-06-04).

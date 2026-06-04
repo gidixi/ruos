@@ -1,0 +1,10 @@
+{
+  "name": "ruos-wasm-app",
+  "version": "0.1.0",
+  "description": "Scaffold and build userspace wasm apps/tools for the ruos OS (wasm32-wasip1 crates under user/). Bundles a scaffolding skill + the ruos host-fn reference, a /ruos-app slash command, and a builder agent — so you never re-read the codebase to make a new tool.",
+  "author": {
+    "name": "g.desolda",
+    "url": "https://github.com/gidixi/ruos"
+  },
+  "keywords": ["ruos", "wasm", "wasm32-wasip1", "scaffold", "osdev"]
+}

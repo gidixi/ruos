@@ -1,0 +1,17 @@
+{
+  "name": "ruos-tools",
+  "interface": {
+    "displayName": "ruos tools"
+  },
+  "plugins": [
+    {
+      "name": "ruos-wasm-app",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ruos-wasm-app"
+      },
+      "description": "Scaffold + build ruos userspace wasm apps (skill + reference + /ruos-app command + builder agent).",
+      "category": "Development"
+    }
+  ]
+}

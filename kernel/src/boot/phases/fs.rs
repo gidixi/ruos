@@ -47,5 +47,12 @@ pub fn init() -> Result<(), BootError> {
     crate::modules::mount_all();
     crate::binfo!("fs", "modules mounted");
 
+    #[cfg(feature = "boot-checks")]
+    {
+        // Real `cat` over the WASI file path (needs the VFS, hence this phase).
+        let cc = crate::wasm::wt::run_cat_demo();
+        crate::binfo!("wt", "wasmtime WASI cat exit={}", cc);
+    }
+
     Ok(())
 }

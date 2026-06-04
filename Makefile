@@ -307,7 +307,7 @@ run-console-test: iso
 
 test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	@echo "--- build with boot-checks feature ---"
-	source $$HOME/.cargo/env && cd kernel && cargo build \
+	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
 		-Zbuild-std-features=compiler-builtins-mem \
 		--target x86_64-unknown-none \
@@ -332,8 +332,8 @@ test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 		$(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 	@echo "--- test-boot (boot-checks feature) ---"
-	@timeout 60 qemu-system-x86_64 -m 512 -no-reboot -display none -serial stdio \
-		-cdrom $(ISO) > build/test-boot.log 2>&1 || true
+	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -m 512 -no-reboot -display none -serial stdio \
+		-device qemu-xhci -cdrom $(ISO) > build/test-boot.log 2>&1 || true
 	@grep -qF "smoke" build/test-boot.log || \
 		{ echo "FAIL: no smoke lines in boot log"; cat build/test-boot.log | head -60; exit 1; }
 	@grep -qF "$(HELLO)" build/test-boot.log || \

@@ -41,12 +41,31 @@ pub fn init() -> Result<(), BootError> {
     crate::keyboard::init(&acpi.overrides);
     crate::binfo!("intr", "keyboard IRQ1 wired overrides={}", acpi.overrides.len());
 
+    crate::mouse::init(&acpi.overrides);
+    crate::binfo!("intr", "mouse IRQ12 wired overrides={}", acpi.overrides.len());
+
     // Enable hardware interrupts.
     x86_64::instructions::interrupts::enable();
     crate::binfo!("intr", "STI — interrupts enabled");
 
     // Start the enumerated APs (Limine MpRequest) and park them idle.
     crate::smp::bringup();
+
+    #[cfg(feature = "boot-checks")]
+    {
+        let ok = crate::memory::exec::self_test();
+        crate::binfo!("mem", "exec W^X self-test {}", if ok { "ok" } else { "FAIL" });
+        let mok = crate::mouse::self_test();
+        crate::binfo!("mouse", "decode self-test {}", if mok { "ok" } else { "FAIL" });
+        // Wasmtime no_std AOT runtime self-test (spike gate): run the embedded
+        // hello.cwasm; its `run` export calls ruos.print(42).
+        let wt = crate::wasm::wt::run_hello_demo();
+        crate::binfo!("wt", "wasmtime AOT hello {}", if wt { "ok" } else { "FAIL" });
+        // Real wasm32-wasip1 std binary via the WASI Linker (argv + fd_write).
+        // (cat demo needs the VFS → runs in the fs phase, not here.)
+        let ec = crate::wasm::wt::run_echo_demo();
+        crate::binfo!("wt", "wasmtime WASI echo exit={}", ec);
+    }
 
     Ok(())
 }

@@ -8,7 +8,7 @@ use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Mapper, Size4KiB,
 };
-use x86_64::structures::paging::mapper::{MapToError, UnmapError as XUnmapError};
+use x86_64::structures::paging::mapper::{MapToError, UnmapError as XUnmapError, FlagUpdateError};
 
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 static HHDM_OFFSET: spin::Once<u64> = spin::Once::new();
@@ -109,6 +109,26 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     })?;
     flush.flush();
     Ok(frame)
+}
+
+/// Change the flags of an already-mapped 4 KiB page (and flush its TLB entry).
+/// Used to flip executable-memory pages from W (writable, NX) to X (read-only,
+/// executable) — the W^X protection step.
+pub fn set_flags(virt: VirtAddr, flags: PageTableFlags) -> Result<(), UnmapError> {
+    let mut g_map = MAPPER.lock();
+    let mapper = g_map.as_mut().ok_or(UnmapError::NotInitialized)?;
+    let page: Page<Size4KiB> = Page::containing_address(virt);
+    // SAFETY: caller guarantees `flags` is a valid combination for an existing
+    // mapping; update_flags does not change the frame, only its permissions.
+    unsafe {
+        mapper.update_flags(page, flags)
+            .map_err(|e| match e {
+                FlagUpdateError::PageNotMapped       => UnmapError::NotMapped,
+                FlagUpdateError::ParentEntryHugePage => UnmapError::ParentHugePage,
+            })?
+            .flush();
+    }
+    Ok(())
 }
 
 /// Virtual (HHDM) alias of a physical address. Valid for any RAM/MMIO phys

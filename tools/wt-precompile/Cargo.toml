@@ -1,0 +1,16 @@
+# Host tool: precompile a .wasm to a .cwasm whose compilation settings match the
+# kernel's no_std Wasmtime runtime EXACTLY. The trick is linking wasmtime with
+# the SAME feature set as the kernel (default-features = false, no signals), so
+# Config::default() bakes identical tunables and the precompile compatibility
+# hash matches. Adds `cranelift` so this host tool can actually compile.
+[package]
+name = "wt-precompile"
+version = "0.0.0"
+edition = "2021"
+
+# Isolate from any parent workspace (the kernel/user workspaces target other triples).
+[workspace]
+
+[dependencies]
+wasmtime = { version = "=45.0.0", default-features = false, features = ["runtime", "cranelift"] }
+raw-cpuid = "11.5.0"

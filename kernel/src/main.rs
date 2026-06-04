@@ -18,6 +18,7 @@ mod acpi_init;
 mod apic;
 mod timer;
 mod keyboard;
+mod mouse;
 mod vfs;
 mod modules;
 mod console;

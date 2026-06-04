@@ -1,6 +1,7 @@
 //! Console subsystem: framebuffer rendering, ANSI parsing, fan-out logging.
 
 pub mod ansi;
+pub mod boxdraw;
 pub mod font;
 pub mod glyphcache;
 pub mod grid;

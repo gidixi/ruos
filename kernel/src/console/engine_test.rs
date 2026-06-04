@@ -158,6 +158,103 @@ fn run_inner() -> Result<(), u32> {
         check(24, dt < 2_000_000_000)?;
     }
 
+    // T25-28: SGR truecolor + attributi + reset.
+    {
+        use crate::console::ansi::{apply_sgr, CellAttr, Rgb, WHITE, BLACK};
+        let (fg, _b, _a) = apply_sgr([38u16,2,10,20,30].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(25, fg == Rgb { r:10, g:20, b:30 })?;
+        let (_f, bg, _a) = apply_sgr([48u16,2,7,8,9].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(26, bg == Rgb { r:7, g:8, b:9 })?;
+        let (_f,_b, a) = apply_sgr([1u16,4,7].into_iter(), WHITE, BLACK, CellAttr::empty());
+        check(27, a.contains(CellAttr::BOLD) && a.contains(CellAttr::UNDERLINE) && a.contains(CellAttr::REVERSE))?;
+        let (f2, b2, a2) = apply_sgr([0u16].into_iter(), Rgb{r:1,g:2,b:3}, Rgb{r:4,g:5,b:6}, CellAttr::BOLD);
+        check(28, f2 == WHITE && b2 == BLACK && a2.is_empty())?;
+    }
+
+    // T29-30: reverse scambia fg/bg; dim scurisce fg.
+    {
+        use crate::console::grid::Grid; use crate::console::render;
+        use crate::console::surface::Surface; use crate::console::glyphcache::GlyphCache;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK, CellAttr};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw, height: gh, pitch: gw*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut g = Grid::new(1, 1, WHITE, BLACK); let mut s = Surface::new(info); let mut gc = GlyphCache::new();
+        g.set_attr(CellAttr::REVERSE); g.put('X');
+        render::flush(&mut g, &mut gc, &mut s);
+        let m = gc.mask('X', false);
+        let mut hit = false;
+        for y in 0..gh { for x in 0..gw {
+            if m.alpha[(y as usize)*(gw as usize)+(x as usize)] == 255 { check(29, s.read_px(x,y) == BLACK)?; hit = true; break; }
+        } if hit { break; } }
+        let mut g2 = Grid::new(1,1,WHITE,BLACK); let mut s2 = Surface::new(info); let mut gc2 = GlyphCache::new();
+        g2.set_attr(CellAttr::DIM); g2.put('X');
+        render::flush(&mut g2, &mut gc2, &mut s2);
+        let m2 = gc2.mask('X', false);
+        for y in 0..gh { for x in 0..gw {
+            if m2.alpha[(y as usize)*(gw as usize)+(x as usize)] == 255 {
+                let px = s2.read_px(x,y);
+                check(30, px != WHITE && px.r > 0)?; break;
+            }
+        } }
+    }
+
+    // T31: underline disegna una riga fg sul fondo della cella.
+    {
+        use crate::console::grid::Grid; use crate::console::render;
+        use crate::console::surface::Surface; use crate::console::glyphcache::GlyphCache;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK, CellAttr};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw, height: gh, pitch: gw*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut g = Grid::new(1,1,WHITE,BLACK); let mut s = Surface::new(info); let mut gc = GlyphCache::new();
+        g.set_attr(CellAttr::UNDERLINE); g.put(' '); // spazio: niente glifo, solo underline
+        render::flush(&mut g, &mut gc, &mut s);
+        check(31, s.read_px(0, gh - 2) == WHITE && s.read_px(gw/2, gh - 2) == WHITE)?;
+    }
+
+    // T32: la maschera bold differisce da quella regular per lo stesso char.
+    {
+        use crate::console::glyphcache::GlyphCache;
+        use alloc::vec::Vec;
+        let mut gc = GlyphCache::new();
+        let b: Vec<u8> = gc.mask('M', true).alpha.clone();
+        let r: Vec<u8> = gc.mask('M', false).alpha.clone();
+        check(32, b != r)?;
+    }
+
+    // T33-34: ─ (U+2500) ha una riga orizzontale al centro; │ (U+2502) verticale.
+    {
+        use crate::console::glyphcache::GlyphCache;
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width(); let gh = glyph_height();
+        let mut gc = GlyphCache::new();
+        let hm = gc.mask('\u{2500}', false);
+        let cy = gh / 2;
+        let hlit = (0..gw).filter(|&x| hm.alpha[cy*gw + x] == 255).count();
+        check(33, hlit >= gw / 2)?;
+        let vm = gc.mask('\u{2502}', false);
+        let cx = gw / 2;
+        let vlit = (0..gh).filter(|&y| vm.alpha[y*gw + cx] == 255).count();
+        check(34, vlit >= gh / 2)?;
+    }
+
+    // T35: SGR truecolor+bold+underline applicati via il path vte completo.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        // ESC[1;4;38;2;200;100;50m  → bold+underline+fg truecolor, poi reset
+        con.write_str("\x1b[1;4;38;2;200;100;50mA\x1b[0mB");
+        check(35, con.cursor_for_test() == (2, 0))?;
+    }
+
     Ok(())
 }
 

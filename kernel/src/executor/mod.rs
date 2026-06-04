@@ -128,10 +128,10 @@ async fn exec_worker_task() {
                     let pid = crate::proc::register(
                         alloc::string::String::from(slot.path.trim_start_matches('/')),
                     );
-                    // NB: stdout currently fans out to CONSOLE (serial+fb), like a
-                    // non-rebound wasmi tool. PTY-bound stdio for Wasmtime is a
-                    // follow-up (needs WtState fd 1/2 → pts slave).
-                    let c = crate::wasm::wt::run_cwasm(&bytes, slot.argv);
+                    // stdout/stderr bound to the caller's PTY slave (reaches the
+                    // terminal / SSH channel, like a rebound wasmi tool). stdin
+                    // is EOF for now (blocking PTY reads need epoch/async — TODO).
+                    let c = crate::wasm::wt::run_cwasm(&bytes, slot.argv, Some(slot.term_pts));
                     crate::proc::unregister(pid);
                     c
                 }

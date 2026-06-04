@@ -17,6 +17,9 @@ pub struct WtState {
     /// fd table. 0/1/2 = Console; 3 = virtual preopen "/" (handled in the WASI
     /// fns, kept as Closed here); 4.. = files opened via path_open.
     pub fds: Vec<WtFd>,
+    /// If set, stdout/stderr (fd 1/2) are written to this PTY slave VFS fd
+    /// (so output reaches the bound terminal/SSH channel). None → CONSOLE.
+    pub stdout_pty: Option<crate::vfs::Fd>,
 }
 
 impl WtState {
@@ -25,6 +28,7 @@ impl WtState {
             args,
             exit: None,
             fds: alloc::vec![WtFd::Console, WtFd::Console, WtFd::Console, WtFd::Closed],
+            stdout_pty: None,
         }
     }
 

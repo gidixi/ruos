@@ -39,10 +39,15 @@ pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
                 let len = u32::from_le_bytes(table[b+4..b+8].try_into().unwrap());
                 if len == 0 { continue; }
                 let bytes = match mem::read(&mut caller, ptr, len) { Some(x) => x, None => return EINVAL };
-                if let Ok(s) = core::str::from_utf8(&bytes) {
-                    use core::fmt::Write as _;
-                    let mut c = crate::console::CONSOLE.lock();
-                    let _ = c.write_str(s);
+                match caller.data().stdout_pty {
+                    Some(pfd) => { let _ = vfs::block_on(vfs::write(pfd, &bytes)); }
+                    None => {
+                        if let Ok(s) = core::str::from_utf8(&bytes) {
+                            use core::fmt::Write as _;
+                            let mut c = crate::console::CONSOLE.lock();
+                            let _ = c.write_str(s);
+                        }
+                    }
                 }
                 total += len;
             }

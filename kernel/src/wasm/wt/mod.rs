@@ -35,7 +35,7 @@ pub fn run_hello_demo() -> bool {
 /// Its output reaches the serial log via stdout → CONSOLE; the caller greps it.
 #[cfg(feature = "boot-checks")]
 pub fn run_echo_demo() -> i32 {
-    run_cwasm(ECHO_CWASM, alloc::vec![b"echo".to_vec(), b"WT-ECHO-OK".to_vec()])
+    run_cwasm(ECHO_CWASM, alloc::vec![b"echo".to_vec(), b"WT-ECHO-OK".to_vec()], None)
 }
 
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
@@ -56,7 +56,7 @@ pub fn run_cat_demo() -> i32 {
         crate::vfs::close(fd).await?;
         Ok::<(), crate::vfs::VfsError>(())
     });
-    run_cwasm(CAT_CWASM, alloc::vec![b"cat".to_vec(), b"/wt-cat-test.txt".to_vec()])
+    run_cwasm(CAT_CWASM, alloc::vec![b"cat".to_vec(), b"/wt-cat-test.txt".to_vec()], None)
 }
 
 /// Shared engine (config is fixed; building it once avoids repeat cost).
@@ -66,8 +66,9 @@ pub fn engine() -> &'static wasmtime::Engine {
 }
 
 /// Load and run a precompiled WASI `.cwasm` command (`_start`) with `args`.
-/// Returns the guest exit code (0 if it returned without calling proc_exit).
-pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>) -> i32 {
+/// `pts`: Some(n) routes stdout/stderr to /dev/pts/n (bound terminal/SSH);
+/// None fans out to CONSOLE (serial + framebuffer). Returns the guest exit code.
+pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
     use wasmtime::{Module, Store, Linker};
     let engine = engine();
     // SAFETY: cwasm produced by tools/wt-precompile for this exact config.
@@ -75,7 +76,15 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>) -> i32 {
         Ok(m) => m,
         Err(e) => { kprintln!("ruos: wt deserialize err: {:?}", e); return 126; }
     };
-    let mut store = Store::new(engine, WtState::new(args));
+    let mut state = WtState::new(args);
+    // Bind stdout/stderr to the caller's PTY slave, if any.
+    if let Some(n) = pts {
+        let path = alloc::format!("/dev/pts/{}", n);
+        if let Ok(fd) = crate::vfs::block_on(crate::vfs::open(&path, crate::vfs::OpenFlags::WRITE)) {
+            state.stdout_pty = Some(fd);
+        }
+    }
+    let mut store = Store::new(engine, state);
     let mut linker = Linker::new(engine);
     if let Err(e) = wasi::add_to_linker(&mut linker) {
         kprintln!("ruos: wt wasi link err: {}", e);
@@ -87,6 +96,9 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>) -> i32 {
     };
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         let _ = start.call(&mut store, ()); // proc_exit traps; ignore
+    }
+    if let Some(fd) = store.data().stdout_pty {
+        let _ = crate::vfs::block_on(crate::vfs::close(fd));
     }
     store.data().exit.unwrap_or(0)
 }

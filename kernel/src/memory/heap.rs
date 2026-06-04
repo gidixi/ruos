@@ -10,8 +10,10 @@ use core::fmt;
 use limine::memmap::MEMMAP_USABLE;
 use talc::{ErrOnOom, Span, Talc, Talck};
 
-/// Heap size in bytes: 4 MiB.
-pub const HEAP_SIZE: usize = 16 * 1024 * 1024;
+/// Heap size in bytes: 128 MiB. Large enough to deserialize/instantiate the
+/// egui desktop AOT module (gui.cwasm ~10 MiB) plus its guest linear memory and
+/// the software raster buffers. (Was 16 MiB — too small, OOM'd the GUI.)
+pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();

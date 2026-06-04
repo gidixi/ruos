@@ -234,6 +234,27 @@ pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
     linker.func_wrap("wasi_snapshot_preview1", "environ_get",
         |_caller: Caller<'_, WtState>, _e: i32, _b: i32| -> i32 { OK })?;
 
+    // clock_time_get(id, precision, time_out) -> errno. Monotonic-ish ns from
+    // the 100 Hz timer (10 ms/tick). Good enough for std/egui time bookkeeping.
+    linker.func_wrap("wasi_snapshot_preview1", "clock_time_get",
+        |mut caller: Caller<'_, WtState>, _id: i32, _prec: i64, out: i32| -> i32 {
+            let ns: u64 = crate::timer::ticks().wrapping_mul(10_000_000);
+            if mem::write(&mut caller, out as u32, &ns.to_le_bytes()) { OK } else { EINVAL }
+        })?;
+
+    // random_get(buf, len) -> errno. Fills from the kernel CSPRNG.
+    linker.func_wrap("wasi_snapshot_preview1", "random_get",
+        |mut caller: Caller<'_, WtState>, buf: i32, len: i32| -> i32 {
+            if len < 0 { return EINVAL; }
+            let mut tmp = alloc::vec![0u8; len as usize];
+            crate::rng::fill(&mut tmp);
+            if mem::write(&mut caller, buf as u32, &tmp) { OK } else { EINVAL }
+        })?;
+
+    // sched_yield() -> errno. Cooperative single-core: nothing to do.
+    linker.func_wrap("wasi_snapshot_preview1", "sched_yield",
+        |_caller: Caller<'_, WtState>| -> i32 { OK })?;
+
     Ok(())
 }
 

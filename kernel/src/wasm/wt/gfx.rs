@@ -56,5 +56,14 @@ pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
             n
         })?;
 
+    // gfx_wall_secs() -> f64: seconds (with fraction) since local midnight.
+    // For egui RawInput.time + the desktop clock (Platform::wall_clock_secs).
+    linker.func_wrap("ruos_gfx", "gfx_wall_secs",
+        |_caller: Caller<'_, WtState>| -> f64 {
+            let t = crate::rtc::now();
+            let frac = (crate::timer::ticks() % 100) as f64 / 100.0;
+            (t.hour as f64) * 3600.0 + (t.minute as f64) * 60.0 + (t.second as f64) + frac
+        })?;
+
     Ok(())
 }

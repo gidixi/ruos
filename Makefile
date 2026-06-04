@@ -121,7 +121,15 @@ wt-cwasm: $(WT_KCWASMS)
 # The egui desktop: built from the ruos-desktop submodule (gui-core +
 # ruos-backend) as wasm32-wasip1, then AOT-precompiled to gui.cwasm.
 RUOS_DESKTOP ?= ruos-desktop
-build/gui.cwasm: $(WT_PRECOMPILE)
+# Rebuild gui.cwasm whenever a gui-core/ruos-backend source or manifest changes.
+# Without these prereqs the rule depends only on the precompiler, so Make reuses
+# a stale .cwasm after editing the submodule (had to `rm -f build/gui.cwasm`).
+# Enumerated by find at parse time; empty + safe if the submodule isn't checked
+# out. cargo stays incremental, so only the changed crate recompiles.
+RUOS_DESKTOP_SRCS := $(shell find $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-backend/src -name '*.rs' 2>/dev/null) \
+                     $(wildcard $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock \
+                                $(RUOS_DESKTOP)/gui-core/Cargo.toml $(RUOS_DESKTOP)/ruos-backend/Cargo.toml)
+build/gui.cwasm: $(WT_PRECOMPILE) $(RUOS_DESKTOP_SRCS)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && \
 		cargo build -p ruos-backend --target wasm32-wasip1 --release

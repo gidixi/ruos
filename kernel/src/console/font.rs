@@ -22,3 +22,13 @@ pub fn raster_for(ch: char) -> RasterizedChar {
         .unwrap_or_else(|| get_raster(FALLBACK, FONT_WEIGHT, FONT_HEIGHT)
             .expect("noto fallback '?' missing"))
 }
+
+/// Like `raster_for` but picks the weight (Bold if `bold`). Falls back to '?'
+/// in the same weight, then '?' Regular.
+pub fn raster_for_weight(ch: char, bold: bool) -> RasterizedChar {
+    let w = if bold { FontWeight::Bold } else { FontWeight::Regular };
+    get_raster(ch, w, FONT_HEIGHT)
+        .or_else(|| get_raster(FALLBACK, w, FONT_HEIGHT))
+        .or_else(|| get_raster(FALLBACK, FontWeight::Regular, FONT_HEIGHT))
+        .expect("noto fallback '?' missing")
+}

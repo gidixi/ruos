@@ -215,6 +215,16 @@ fn run_inner() -> Result<(), u32> {
         check(31, s.read_px(0, gh - 2) == WHITE && s.read_px(gw/2, gh - 2) == WHITE)?;
     }
 
+    // T32: la maschera bold differisce da quella regular per lo stesso char.
+    {
+        use crate::console::glyphcache::GlyphCache;
+        use alloc::vec::Vec;
+        let mut gc = GlyphCache::new();
+        let b: Vec<u8> = gc.mask('M', true).alpha.clone();
+        let r: Vec<u8> = gc.mask('M', false).alpha.clone();
+        check(32, b != r)?;
+    }
+
     Ok(())
 }
 

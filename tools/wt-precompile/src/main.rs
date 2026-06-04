@@ -20,11 +20,15 @@ fn feature_policy(feature: &str) -> Option<bool> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: wt-precompile <in.wasm> <out.cwasm>");
-        std::process::exit(2);
-    }
-    let wasm = fs::read(&args[1]).expect("read input wasm");
+    let (component_mode, in_path, out_path) = match args.len() {
+        3 => (false, &args[1], &args[2]),
+        4 if args[1] == "--component" => (true, &args[2], &args[3]),
+        _ => {
+            eprintln!("usage: wt-precompile [--component] <in.wasm> <out.cwasm>");
+            std::process::exit(2);
+        }
+    };
+    let wasm = fs::read(in_path).expect("read input wasm");
     let mut config = Config::new();
     config.target("x86_64-unknown-none").expect("set target");
     // Signals-based traps are OFF in the kernel runtime; match the dependent
@@ -51,7 +55,11 @@ fn main() {
         config.cranelift_flag_set("has_sse42", "true");
     }
     let engine = Engine::new(&config).expect("create engine");
-    let cwasm = engine.precompile_module(&wasm).expect("precompile module");
-    fs::write(&args[2], &cwasm).expect("write output cwasm");
-    eprintln!("wrote {} ({} bytes)", &args[2], cwasm.len());
+    let cwasm = if component_mode {
+        engine.precompile_component(&wasm).expect("precompile component")
+    } else {
+        engine.precompile_module(&wasm).expect("precompile module")
+    };
+    fs::write(out_path, &cwasm).expect("write output cwasm");
+    eprintln!("wrote {} ({} bytes)", out_path, cwasm.len());
 }

@@ -399,6 +399,8 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm $
 		{ echo "FAIL: no smoke lines in boot log"; cat build/test-boot.log | head -60; exit 1; }
 	@grep -qF "$(HELLO)" build/test-boot.log || \
 		{ echo "FAIL: no shell sentinel in boot log"; cat build/test-boot.log | tail -30; exit 1; }
+	@grep -qF "WT-COMPONENT-OK" build/test-boot.log || \
+		{ echo "FAIL: component bring-up did not run (no WT-COMPONENT-OK)"; grep -E "component (bringup|deserialize|instantiate|run)" build/test-boot.log | tail -10; exit 1; }
 	@echo "TEST_BOOT_PASS"
 
 clean:

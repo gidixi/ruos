@@ -1,0 +1,3 @@
+[submodule "ruos-desktop"]
+	path = ruos-desktop
+	url = https://github.com/gidixi/ruos-desktop-ui.git

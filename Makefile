@@ -118,9 +118,9 @@ $(WT_KDIR)/cat.cwasm: user-bin/cat.wasm $(WT_PRECOMPILE)
 .PHONY: wt-cwasm
 wt-cwasm: $(WT_KCWASMS)
 
-# The egui desktop: built from the sibling ruos-desktop repo (gui-core +
+# The egui desktop: built from the ruos-desktop submodule (gui-core +
 # ruos-backend) as wasm32-wasip1, then AOT-precompiled to gui.cwasm.
-RUOS_DESKTOP ?= ../../M/ruos-desktop
+RUOS_DESKTOP ?= ruos-desktop
 build/gui.cwasm: $(WT_PRECOMPILE)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && \

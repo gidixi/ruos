@@ -117,6 +117,33 @@ async fn exec_worker_task() {
         // Wait for a request from a shell fiber.
         let slot = WaitForRequest::new(&EXEC_QUEUE).await;
 
+        // Router: `.cwasm` → Wasmtime AOT runtime; `.wasm` → wasmi.
+        if slot.path.ends_with(".cwasm") {
+            let code: i32 = match crate::wasm::read_all(&slot.path).await {
+                Err(_) => {
+                    kprintln!("ruos: exec_worker: read {} failed", slot.path);
+                    127
+                }
+                Ok(bytes) => {
+                    let pid = crate::proc::register(
+                        alloc::string::String::from(slot.path.trim_start_matches('/')),
+                    );
+                    // stdout/stderr bound to the caller's PTY slave (reaches the
+                    // terminal / SSH channel, like a rebound wasmi tool). stdin
+                    // is EOF for now (blocking PTY reads need epoch/async — TODO).
+                    let c = crate::wasm::wt::run_cwasm(&bytes, slot.argv, Some(slot.term_pts));
+                    crate::proc::unregister(pid);
+                    c
+                }
+            };
+            EXEC_QUEUE.result.store(code, Ordering::SeqCst);
+            EXEC_QUEUE.done.store(true, Ordering::SeqCst);
+            if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
+                w.wake();
+            }
+            continue;
+        }
+
         // Load and run the child wasm.
         let code: i32 = match crate::wasm::read_all(&slot.path).await {
             Err(_) => {

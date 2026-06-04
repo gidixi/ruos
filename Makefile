@@ -88,7 +88,27 @@ user-bin/%.wasm: user/%/src/main.rs user/%/Cargo.toml user/Cargo.toml
 .PHONY: user-wasm
 user-wasm: $(USER_WASMS)
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
+# Wasmtime AOT precompiler (host tool) + a demo `.cwasm` command staged at
+# /bin/wtecho.cwasm so the shell's `.cwasm` router (Wasmtime) can be exercised.
+WT_PRECOMPILE := tools/wt-precompile/target/release/wt-precompile
+
+$(WT_PRECOMPILE): tools/wt-precompile/src/main.rs tools/wt-precompile/Cargo.toml
+	source $$HOME/.cargo/env && cd tools/wt-precompile && cargo build --release
+
+build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
+	@mkdir -p build
+	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
+
+# The egui desktop: built from the sibling ruos-desktop repo (gui-core +
+# ruos-backend) as wasm32-wasip1, then AOT-precompiled to gui.cwasm.
+RUOS_DESKTOP ?= ../../M/ruos-desktop
+build/gui.cwasm: $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && \
+		cargo build -p ruos-backend --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/gui.wasm build/gui.cwasm
+
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -98,6 +118,8 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
+	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
+	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -305,9 +327,9 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
+test-boot: limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	@echo "--- build with boot-checks feature ---"
-	source $$HOME/.cargo/env && cd kernel && cargo build \
+	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
 		-Zbuild-std-features=compiler-builtins-mem \
 		--target x86_64-unknown-none \
@@ -321,6 +343,8 @@ test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
+	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
+	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -332,8 +356,8 @@ test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 		$(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 	@echo "--- test-boot (boot-checks feature) ---"
-	@timeout 60 qemu-system-x86_64 -m 512 -no-reboot -display none -serial stdio \
-		-cdrom $(ISO) > build/test-boot.log 2>&1 || true
+	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -m 512 -no-reboot -display none -serial stdio \
+		-device qemu-xhci -cdrom $(ISO) > build/test-boot.log 2>&1 || true
 	@grep -qF "smoke" build/test-boot.log || \
 		{ echo "FAIL: no smoke lines in boot log"; cat build/test-boot.log | head -60; exit 1; }
 	@grep -qF "$(HELLO)" build/test-boot.log || \

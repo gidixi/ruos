@@ -6,9 +6,10 @@ pub mod heap;
 pub mod frames;
 pub mod mapper;
 pub mod dma;
+pub mod exec;
 
 pub use heap::{ALLOCATOR, HEAP_SIZE, HeapInfo, HeapInitError, init_heap, heap_region};
 pub use frames::{FrameCounts, FrameInitError, allocate_frame, free_frame, frame_counts,
     init as init_frames};
 pub use mapper::{MapError, UnmapError, init as init_mapper, map_page, unmap_page, map_io_page,
-    map_io_range, hhdm_virt, hhdm_offset};
+    map_io_range, hhdm_virt, hhdm_offset, set_flags};

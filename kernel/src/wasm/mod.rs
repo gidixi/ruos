@@ -8,6 +8,7 @@ pub mod fiber;
 pub mod exec_queue;
 pub mod pipeline;
 pub mod ssh_spawn;
+pub mod wt;
 
 use alloc::vec::Vec;
 use crate::kprintln;

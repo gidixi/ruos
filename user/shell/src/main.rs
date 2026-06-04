@@ -136,8 +136,14 @@ fn complete_command(prefix: &[u8]) -> Vec<String> {
     ];
     for dir in ["/bin", "/mnt/bin"] {
         for (name, _) in readdir_entries(dir) {
-            if name.ends_with(".wasm") {
-                let cmd = name.trim_end_matches(".wasm").to_string();
+            let cmd = if name.ends_with(".wasm") {
+                Some(name.trim_end_matches(".wasm").to_string())
+            } else if name.ends_with(".cwasm") {
+                Some(name.trim_end_matches(".cwasm").to_string())
+            } else {
+                None
+            };
+            if let Some(cmd) = cmd {
                 if !out.contains(&cmd) {
                     out.push(cmd);
                 }
@@ -491,13 +497,15 @@ fn resolve_path(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
         return Some(cmd.to_string());
     }
-    let p = format!("/bin/{}.wasm", cmd);
-    if std::fs::metadata(&p).is_ok() {
-        return Some(p);
-    }
-    let q = format!("/mnt/bin/{}.wasm", cmd);
-    if std::fs::metadata(&q).is_ok() {
-        return Some(q);
+    // Try `.wasm` (wasmi) first, then `.cwasm` (Wasmtime AOT), in /bin then
+    // /mnt/bin. A tool present only as `.cwasm` runs on the Wasmtime runtime.
+    for dir in ["/bin", "/mnt/bin"] {
+        for ext in ["wasm", "cwasm"] {
+            let p = format!("{}/{}.{}", dir, cmd, ext);
+            if std::fs::metadata(&p).is_ok() {
+                return Some(p);
+            }
+        }
     }
     None
 }

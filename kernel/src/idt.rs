@@ -9,6 +9,7 @@ use crate::{kprintln, gdt};
 
 pub const VEC_LAPIC_TIMER: u8 = 0x20;
 pub const VEC_KEYBOARD:    u8 = 0x21;
+pub const VEC_MOUSE:       u8 = 0x22;
 /// IPI vector the BSP sends to wake sleeping AP worker cores (SMP Fase 2).
 pub const VEC_WAKE:        u8 = 0x40;
 pub const VEC_SPURIOUS:    u8 = 0xFF;
@@ -33,6 +34,7 @@ pub fn init() {
 
         idt[VEC_LAPIC_TIMER].set_handler_fn(crate::timer::timer_handler);
         idt[VEC_KEYBOARD].set_handler_fn(crate::keyboard::keyboard_handler);
+        idt[VEC_MOUSE].set_handler_fn(crate::mouse::mouse_handler);
         idt[VEC_WAKE].set_handler_fn(wake_handler);
 
         idt

@@ -206,3 +206,31 @@ sostituirebbero.
 **B dominato** (complessità di A senza la sua type-safety). **C** = fallback se il
 gate runtime di A fallisse. **A** scelto perché è l'unico veramente wasm-native +
 con binding host verificati dal compilatore.
+
+## Appendice C — Revisione 2026-06-04: superficie DESKTOP via Approccio B
+
+Dopo il gate Step-0 (CM gira in no_std AOT, CHANGELOG 274) è emerso un vincolo
+non previsto: **la GUI egui è una app `std` `wasm32-wasip1`** (importa 9 funzioni
+`wasi_snapshot_preview1`: args/clock/fd_write/random/proc_exit/…). Renderla un
+**component** richiede l'adapter wasip1→p2 e quindi **WASI Preview 2 implementato
+nel kernel no_std** (le resource per fd/stream; `wasmtime-wasi` è solo-std → a
+mano) — un sotto-progetto grosso. Quindi "egui-on-component" (A puro) **dipende da
+WASI-on-component**, che la spec metteva erroneamente come step successivo.
+
+**Decisione (utente, 2026-06-04):** per la superficie desktop si adotta
+**Approccio B ristretto a gfx/system**, NON A:
+- La GUI resta **core-module** su `run_cwasm` → WASI Preview 1 attuale (`wasi.rs`)
+  INVARIATA, nessuno switch di launch, nessun WASI-p2.
+- `wit/ruos-gui.wit` (sorgente unica) → guest `ruos-backend` con `wit-bindgen`
+  in **modalità core-module** (niente `component new`) → chiamate tipizzate che
+  abbassano sul Canonical ABI. Il kernel aggiunge un piccolo **codec host**
+  (`func_wrap` sotto i nomi-import WIT, decode via `wt/mem.rs`).
+- I tipi di ritorno host restano **scalari o record fissi** (`get-info` via
+  return-area; `poll-event -> option<event>` in loop) → **niente list/string
+  ritornate → niente `cabi_realloc` re-entrante**. I param list/string sono solo
+  `(ptr,len)`.
+
+Beneficio: single-source-of-truth + gfx tipizzato + il bottone poweroff SUBITO,
+senza il detour WASI-p2 e senza toccare i pezzi fragili (engine_config, garble,
+WASI). Gli enum/record `.wit` migrano ad A (component vero) quando/se si
+costruisce WASI-on-component. Piano: `docs/superpowers/plans/2026-06-04-typed-gfx-core-module.md`.

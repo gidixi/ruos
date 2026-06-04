@@ -317,6 +317,21 @@ fn run_inner() -> Result<(), u32> {
         check(43, g.cursor() == (0,1))?;    // resta sul fondo regione
     }
 
+    // T44: alt-screen non corrompe il primario; cursore coerente dopo il ritorno.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh*3, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("\x1b[2;1HKEEP");                       // riga 2 (0-based 1): "KEEP", cursore → (4,1)
+        con.write_str("\x1b[?1049h\x1b[2JALTDATA\x1b[?1049l"); // entra alt, scrive, esce
+        con.write_str("\x1b[3;1Hx");                         // scrive sul primario ripristinato → cursore (1,2)
+        check(44, con.cursor_for_test() == (1, 2))?;
+    }
+
     Ok(())
 }
 

@@ -128,6 +128,7 @@ impl FramebufferConsole {
             alt.mark_all_dirty();
             self.saved = Some(core::mem::replace(&mut self.grid, alt));
         }
+        self.last_cur = self.grid.cursor();
     }
 
     fn leave_alt(&mut self) {
@@ -135,6 +136,7 @@ impl FramebufferConsole {
             primary.mark_all_dirty();
             self.grid = primary;
         }
+        self.last_cur = self.grid.cursor();
     }
 }
 

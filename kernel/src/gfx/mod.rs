@@ -45,7 +45,17 @@ pub const FORMAT_RGBA8888: u32 = 0;
 pub fn gui_mode() -> bool { GUI_MODE.load(Ordering::Acquire) }
 
 /// Enter GUI mode: the console stops painting; the GUI owns the framebuffer.
-pub fn enter() { GUI_MODE.store(true, Ordering::Release); }
+/// Centre the software mouse cursor so it's visible from the first frame.
+pub fn enter() {
+    GUI_MODE.store(true, Ordering::Release);
+    let sw = GFX_W.load(Ordering::Acquire) as i32;
+    let sh = GFX_H.load(Ordering::Acquire) as i32;
+    MOUSE_X.store(sw / 2, Ordering::Relaxed);
+    MOUSE_Y.store(sh / 2, Ordering::Relaxed);
+    CUR_X.store(sw / 2, Ordering::Relaxed);
+    CUR_Y.store(sh / 2, Ordering::Relaxed);
+    CUR_VALID.store(false, Ordering::Release);
+}
 
 /// Leave GUI mode: re-enable the console and clear the screen so the next shell
 /// prompt repaints cleanly.
@@ -53,6 +63,7 @@ pub fn leave() {
     if !GUI_MODE.swap(false, Ordering::AcqRel) {
         return;
     }
+    cursor_erase();
     let mut c = crate::console::CONSOLE.lock();
     if let Some(fb) = &mut c.fb {
         fb.clear();
@@ -89,37 +100,75 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
     let bgr = GFX_FMT.load(Ordering::Acquire) == 1;
     let sw = GFX_W.load(Ordering::Acquire);
     let sh = GFX_H.load(Ordering::Acquire);
-    if w > 0 && h > 0 {
-        let i0 = 0usize;
-        if i0 + 3 < buf.len() {
-            LAST_PIXEL.store(
-                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-                Ordering::Relaxed,
-            );
-        }
-        BLIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if w == 0 || h == 0 { return; }
+
+    if buf.len() >= 4 {
+        LAST_PIXEL.store(
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            Ordering::Relaxed,
+        );
     }
-    for row in 0..h {
-        let dy = y + row;
-        if dy >= sh { break; }
-        for col in 0..w {
-            let dx = x + col;
-            if dx >= sw { continue; }
-            let si = ((row * w + col) * 4) as usize;
-            if si + 3 >= buf.len() { return; }
-            let (r, g, b) = (buf[si], buf[si + 1], buf[si + 2]);
-            let off = (dy as usize) * pitch + (dx as usize) * bpp;
-            // SAFETY: off is within the framebuffer (bounds-checked above).
-            unsafe {
-                let p = base.add(off);
-                if bgr {
-                    *p = b; *p.add(1) = g; *p.add(2) = r;
-                } else {
-                    *p = r; *p.add(1) = g; *p.add(2) = b;
+    BLIT_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Clip the source rect to the screen ONCE (instead of per pixel).
+    if x >= sw || y >= sh { cursor_after_blit(); return; }
+    let vis_w = core::cmp::min(w, sw - x) as usize;
+    let vis_h = core::cmp::min(h, sh - y) as usize;
+    let src_stride = (w as usize) * 4; // guest is always RGBA8888
+
+    // Fast path: 32-bpp framebuffer. A whole visible row is contiguous on both
+    // sides, so RGB blits with a single row memcpy and BGR with a tight per-pixel
+    // swap — no per-pixel screen-bounds branch. (egui blits the full screen every
+    // frame; the old per-pixel loop with per-pixel clamps was the hot host cost.)
+    if bpp == 4 {
+        for row in 0..vis_h {
+            let src_off = row * src_stride;
+            let end = src_off + vis_w * 4;
+            if end > buf.len() { break; }
+            let dst_off = (y as usize + row) * pitch + (x as usize) * 4;
+            let src_row = &buf[src_off..end];
+            // SAFETY: dst_off + vis_w*4 ≤ (y+row+1)*pitch ≤ sh*pitch (clipped above);
+            // framebuffer is 4 bpp.
+            let dst_row = unsafe {
+                core::slice::from_raw_parts_mut(base.add(dst_off), vis_w * 4)
+            };
+            if !bgr {
+                // RGBA src → RGBX dst: identical byte order (alpha lands in the
+                // ignored X slot). One memcpy per row.
+                dst_row.copy_from_slice(src_row);
+            } else {
+                // BGR fb: swap R/B per pixel; leave the X byte untouched.
+                for px in 0..vis_w {
+                    let s = px * 4;
+                    dst_row[s] = src_row[s + 2];
+                    dst_row[s + 1] = src_row[s + 1];
+                    dst_row[s + 2] = src_row[s];
                 }
             }
         }
+        cursor_after_blit();
+        return;
     }
+
+    // Slow path: non-32-bpp framebuffer (rare) — per-pixel 3-byte writes.
+    for row in 0..vis_h {
+        let dy = y as usize + row;
+        for col in 0..vis_w {
+            let dx = x as usize + col;
+            let si = (row * w as usize + col) * 4;
+            if si + 3 >= buf.len() { cursor_after_blit(); return; }
+            let (r, g, b) = (buf[si], buf[si + 1], buf[si + 2]);
+            let off = dy * pitch + dx * bpp;
+            // SAFETY: (dx,dy) is within the framebuffer (clipped above).
+            unsafe {
+                let p = base.add(off);
+                if bgr { *p = b; *p.add(1) = g; *p.add(2) = r; }
+                else   { *p = r; *p.add(1) = g; *p.add(2) = b; }
+            }
+        }
+    }
+    // The full-frame blit overwrote the cursor — repaint it on top.
+    cursor_after_blit();
 }
 
 // --- Input ---------------------------------------------------------------
@@ -164,6 +213,7 @@ static BTN_M: AtomicBool = AtomicBool::new(false);
 pub fn fold_mouse() {
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
+    let mut moved = false;
     while let Some(ev) = crate::mouse::pop_event() {
         let ox = MOUSE_X.load(Ordering::Relaxed);
         let oy = MOUSE_Y.load(Ordering::Relaxed);
@@ -172,6 +222,7 @@ pub fn fold_mouse() {
         if nx != ox || ny != oy {
             MOUSE_X.store(nx, Ordering::Relaxed);
             MOUSE_Y.store(ny, Ordering::Relaxed);
+            moved = true;
             push(GfxEvt {
                 kind: 1,
                 p0: (nx as f32).to_bits(),
@@ -188,6 +239,129 @@ pub fn fold_mouse() {
             }
         }
     }
+    // Responsive software cursor: redraw at the new position without forcing a
+    // (slow) full-frame egui re-render.
+    if moved {
+        cursor_move(MOUSE_X.load(Ordering::Relaxed), MOUSE_Y.load(Ordering::Relaxed));
+    }
+}
+
+// --- Software mouse cursor -----------------------------------------------
+// A small arrow drawn directly on the framebuffer in GUI mode. Responsive
+// (redrawn on each mouse move, no egui re-render) and composited over the
+// full-frame blit. Save/restore the background under the sprite so moving it
+// leaves no trail. Assumes 32-bpp framebuffer (GFX_BPP=32); black/white sprite
+// pixels are RGB/BGR-agnostic.
+
+const CUR_W: usize = 12;
+const CUR_H: usize = 19;
+// ' ' = transparent, 'X' = black outline, '.' = white fill.
+const CUR: [&[u8; CUR_W]; CUR_H] = [
+    b"X           ",
+    b"XX          ",
+    b"X.X         ",
+    b"X..X        ",
+    b"X...X       ",
+    b"X....X      ",
+    b"X.....X     ",
+    b"X......X    ",
+    b"X.......X   ",
+    b"X........X  ",
+    b"X.........X ",
+    b"X......XXXXX",
+    b"X...X..X    ",
+    b"X..XX..X    ",
+    b"X.X  X..X   ",
+    b"XX   X..X   ",
+    b"      X..X  ",
+    b"      X..X  ",
+    b"      XXXX  ",
+];
+
+static CUR_X: AtomicI32 = AtomicI32::new(0);
+static CUR_Y: AtomicI32 = AtomicI32::new(0);
+static CUR_VALID: AtomicBool = AtomicBool::new(false);
+static CUR_SAVE: crate::sync::IrqMutex<[u32; CUR_W * CUR_H]> =
+    crate::sync::IrqMutex::new([0; CUR_W * CUR_H]);
+
+/// Restore the framebuffer pixels saved under the cursor (erase it).
+fn cursor_erase() {
+    if !CUR_VALID.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let base = GFX_VIRT.load(Ordering::Acquire);
+    if base.is_null() {
+        return;
+    }
+    let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
+    let sw = GFX_W.load(Ordering::Acquire) as i32;
+    let sh = GFX_H.load(Ordering::Acquire) as i32;
+    let cx = CUR_X.load(Ordering::Relaxed);
+    let cy = CUR_Y.load(Ordering::Relaxed);
+    let save = CUR_SAVE.lock();
+    for row in 0..CUR_H as i32 {
+        let py = cy + row;
+        if py < 0 || py >= sh { continue; }
+        for col in 0..CUR_W as i32 {
+            let px = cx + col;
+            if px < 0 || px >= sw { continue; }
+            let off = (py as usize) * pitch + (px as usize) * 4;
+            // SAFETY: (px,py) is within the framebuffer.
+            unsafe { *(base.add(off) as *mut u32) = save[(row as usize) * CUR_W + col as usize]; }
+        }
+    }
+}
+
+/// Save the background under (x,y) and draw the cursor sprite. Assumes the
+/// previous cursor has already been erased (or its save buffer invalidated).
+fn cursor_paint(x: i32, y: i32) {
+    let base = GFX_VIRT.load(Ordering::Acquire);
+    if base.is_null() {
+        return;
+    }
+    let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
+    let sw = GFX_W.load(Ordering::Acquire) as i32;
+    let sh = GFX_H.load(Ordering::Acquire) as i32;
+    let mut save = CUR_SAVE.lock();
+    for row in 0..CUR_H as i32 {
+        let py = y + row;
+        for col in 0..CUR_W as i32 {
+            let px = x + col;
+            let idx = (row as usize) * CUR_W + col as usize;
+            if px < 0 || px >= sw || py < 0 || py >= sh {
+                save[idx] = 0;
+                continue;
+            }
+            let off = (py as usize) * pitch + (px as usize) * 4;
+            // SAFETY: (px,py) is within the framebuffer.
+            let p = unsafe { base.add(off) as *mut u32 };
+            save[idx] = unsafe { *p };
+            match CUR[row as usize][col as usize] {
+                b'X' => unsafe { *p = 0x0000_0000; }, // black outline
+                b'.' => unsafe { *p = 0x00FF_FFFF; }, // white fill
+                _ => {}                                // transparent
+            }
+        }
+    }
+    CUR_X.store(x, Ordering::Relaxed);
+    CUR_Y.store(y, Ordering::Relaxed);
+    CUR_VALID.store(true, Ordering::Release);
+}
+
+/// Move the cursor to (x,y): erase the old, paint the new. GUI-mode only.
+pub fn cursor_move(x: i32, y: i32) {
+    if !gui_mode() { return; }
+    cursor_erase();
+    cursor_paint(x, y);
+}
+
+/// Repaint the cursor after a full-frame blit overwrote it. The blit replaced
+/// the cursor area with fresh frame pixels, so the old save buffer is stale —
+/// invalidate it, then save the new background and draw.
+fn cursor_after_blit() {
+    if !gui_mode() { return; }
+    CUR_VALID.store(false, Ordering::Release);
+    cursor_paint(CUR_X.load(Ordering::Relaxed), CUR_Y.load(Ordering::Relaxed));
 }
 
 /// Boot-check: blit a 2×2 red square at (0,0) and read pixel (0,0) back.

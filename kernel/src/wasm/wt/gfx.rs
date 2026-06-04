@@ -2,9 +2,39 @@
 //! ABI mirrors ruos-desktop/gui-core (GfxInfo 4×u32, format RGBA8888=0; events
 //! 16 bytes [kind,p0,p1,p2] — see crate::gfx::GfxEvt).
 
+use core::sync::atomic::{AtomicI64, Ordering};
 use wasmtime::{Caller, Linker};
 use crate::wasm::wt::state::WtState;
 use crate::wasm::wt::mem;
+
+/// Monotonic wall-clock seconds for the GUI. egui's `RawInput.time` MUST be
+/// monotonic. The previous formula — `rtc_second + (ticks()%100)/100` — mixed
+/// two UNSYNCHRONIZED clocks (the CMOS RTC and the LAPIC tick counter): their
+/// phases differ, so the tick fraction wrapped back to 0 before the RTC second
+/// rolled and the value jumped backward ~1×/sec. egui then ran window/menu
+/// open-animations backward then forward (windows appeared to close and reopen)
+/// and stuttered. Fix: latch a wall offset ONCE from the RTC, then advance
+/// purely by the monotonic uptime tick (10 ms resolution) — never goes backward
+/// (egui-safe). The HH:MM clock widget stays correct (it wraps via rem_euclid);
+/// tick-vs-RTC drift over a session is sub-second, irrelevant for minute display.
+static WALL_OFFSET_CS: AtomicI64 = AtomicI64::new(i64::MIN); // centiseconds; MIN = uninit
+
+fn wall_secs() -> f64 {
+    let up_cs = crate::timer::ticks() as i64; // 100 Hz tick = 1 centisecond of uptime
+    let mut off = WALL_OFFSET_CS.load(Ordering::Relaxed);
+    if off == i64::MIN {
+        let t = crate::rtc::now();
+        let wall_cs =
+            ((t.hour as i64) * 3600 + (t.minute as i64) * 60 + (t.second as i64)) * 100;
+        off = wall_cs - up_cs;
+        // First caller wins; any racing caller computes ~the same offset.
+        let _ = WALL_OFFSET_CS.compare_exchange(
+            i64::MIN, off, Ordering::Relaxed, Ordering::Relaxed,
+        );
+        off = WALL_OFFSET_CS.load(Ordering::Relaxed);
+    }
+    (off + up_cs) as f64 / 100.0
+}
 
 pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
     // gfx_info(out_ptr) -> 0; writes GfxInfo{w,h,stride,format} (4×u32 LE).
@@ -75,14 +105,11 @@ pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
             }
         })?;
 
-    // gfx_wall_secs() -> f64: seconds (with fraction) since local midnight.
-    // For egui RawInput.time + the desktop clock (Platform::wall_clock_secs).
+    // gfx_wall_secs() -> f64: MONOTONIC seconds (with 10 ms fraction) since local
+    // midnight. Feeds egui RawInput.time (must be monotonic) + the desktop clock
+    // (Platform::wall_clock_secs). See wall_secs() for why it is latched.
     linker.func_wrap("ruos_gfx", "gfx_wall_secs",
-        |_caller: Caller<'_, WtState>| -> f64 {
-            let t = crate::rtc::now();
-            let frac = (crate::timer::ticks() % 100) as f64 / 100.0;
-            (t.hour as f64) * 3600.0 + (t.minute as f64) * 60.0 + (t.second as f64) + frac
-        })?;
+        |_caller: Caller<'_, WtState>| -> f64 { wall_secs() })?;
 
     Ok(())
 }

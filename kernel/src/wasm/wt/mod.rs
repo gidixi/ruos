@@ -7,6 +7,7 @@ pub mod state;
 pub mod mem;
 pub mod wasi;
 pub mod gfx;
+pub mod component;
 
 use crate::kprintln;
 use alloc::vec::Vec;
@@ -48,6 +49,16 @@ static CAT_CWASM: &[u8] = include_bytes!("cat.cwasm");
 /// gfx_info then gfx_blit a 2×2 red square. Exercises the ruos_gfx Linker path.
 #[cfg(feature = "boot-checks")]
 static GFXTEST_CWASM: &[u8] = include_bytes!("gfxtest.cwasm");
+
+#[cfg(feature = "boot-checks")]
+static BRINGUP_CWASM: &[u8] = include_bytes!("bringup.cwasm");
+
+/// Boot self-test: run the embedded bring-up component; its `run` calls
+/// system.log("WT-COMPONENT-OK") on the host. Returns the guest run() code.
+#[cfg(feature = "boot-checks")]
+pub fn run_bringup_demo() -> i32 {
+    crate::wasm::wt::component::run_component(BRINGUP_CWASM)
+}
 
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller
 /// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,

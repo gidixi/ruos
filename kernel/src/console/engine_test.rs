@@ -272,6 +272,23 @@ fn run_inner() -> Result<(), u32> {
         check(37, con.cursor_for_test() == (7, 0))?;
     }
 
+    // T38-40: ?25l/h toggle visibility; DECSCUSR sets style.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout, cursor_visible_for_test, cursor_style_for_test};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*4, height: gh, pitch: gw*4*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("\x1b[?25l");
+        check(38, cursor_visible_for_test() == false)?;
+        con.write_str("\x1b[?25h");
+        check(39, cursor_visible_for_test() == true)?;
+        con.write_str("\x1b[2 q"); // DECSCUSR 2 = steady block → style block(0)
+        check(40, cursor_style_for_test() == 0)?;
+    }
+
     Ok(())
 }
 

@@ -6,6 +6,7 @@ pub mod platform;
 pub mod state;
 pub mod mem;
 pub mod wasi;
+pub mod gfx;
 
 use crate::kprintln;
 use alloc::vec::Vec;
@@ -42,6 +43,19 @@ pub fn run_echo_demo() -> i32 {
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]
 static CAT_CWASM: &[u8] = include_bytes!("cat.cwasm");
+
+/// Embedded GUI host-fn smoke (tools/wt-gfxtest/gfx.wat precompiled): calls
+/// gfx_info then gfx_blit a 2×2 red square. Exercises the ruos_gfx Linker path.
+#[cfg(feature = "boot-checks")]
+static GFXTEST_CWASM: &[u8] = include_bytes!("gfxtest.cwasm");
+
+/// Boot self-test: run the embedded gfx test; returns its exit code. The caller
+/// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
+/// not cleared by the console restore) to confirm the host-fn path ran.
+#[cfg(feature = "boot-checks")]
+pub fn run_gfxtest_demo() -> i32 {
+    run_cwasm(GFXTEST_CWASM, alloc::vec![b"gfxtest".to_vec()], None)
+}
 
 /// Boot self-test: seed a tmpfs file with a known marker, then `cat` it. The
 /// marker reaches the serial log via cat's stdout; the caller greps it.
@@ -90,6 +104,10 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
         kprintln!("ruos: wt wasi link err: {}", e);
         return 126;
     }
+    if let Err(e) = gfx::add_to_linker(&mut linker) {
+        kprintln!("ruos: wt gfx link err: {}", e);
+        return 126;
+    }
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,
         Err(e) => { kprintln!("ruos: wt instantiate err: {:?}", e); return 126; }
@@ -100,6 +118,8 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
     if let Some(fd) = store.data().stdout_pty {
         let _ = crate::vfs::block_on(crate::vfs::close(fd));
     }
+    // If the guest was a GUI app (called gfx_info), restore the text console.
+    crate::gfx::leave();
     store.data().exit.unwrap_or(0)
 }
 

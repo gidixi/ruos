@@ -7,6 +7,9 @@ pub fn init() -> Result<(), BootError> {
         Ok(mut fb) => {
             let (w, h, p, b) = fb.dims();
             crate::binfo!("dev", "fb ok {}x{} pitch={} bpp={}", w, h, p, b);
+            // Capture the REAL framebuffer geometry for the GUI service before
+            // any boot-checks engine_test clobbers console::fb's statics.
+            crate::gfx::init(fb.info());
 
             #[cfg(feature = "boot-checks")]
             {

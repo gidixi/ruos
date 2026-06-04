@@ -124,6 +124,23 @@ pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
     // SAFETY: 0x60 is the PS/2 controller data port.
     let scancode = unsafe { data.read() };
 
+    // GUI mode: divert raw scancodes to the gfx event queue (encode extended
+    // keys as 0xE0NN, matching the GUI abi) instead of cooking ASCII into the PTY.
+    if crate::gfx::gui_mode() {
+        if scancode == 0xE0 {
+            EXTENDED.store(true, Ordering::SeqCst);
+            apic::lapic::eoi();
+            return;
+        }
+        let ext = EXTENDED.swap(false, Ordering::SeqCst);
+        let release = scancode & 0x80 != 0;
+        let base = (scancode & 0x7F) as u32;
+        let sc = if ext { 0xE000 | base } else { base };
+        crate::gfx::push_key(sc, !release);
+        apic::lapic::eoi();
+        return;
+    }
+
     // 0xE0 prefix: latch the EXTENDED flag and discard this byte.
     if scancode == 0xE0 {
         EXTENDED.store(true, Ordering::SeqCst);

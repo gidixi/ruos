@@ -98,6 +98,9 @@ impl FramebufferConsole {
             parser.advance(self, b);
         }
         self.parser = parser;
+        // GUI owns the framebuffer: keep the grid (+ serial, done by MultiConsole)
+        // coherent for later restore, but skip painting pixels.
+        if crate::gfx::gui_mode() { return; }
         // ghost-fix: repaint the cell the cursor occupied last (the IRQ blink may
         // have XOR'd it); the blit restores it from the back-buffer.
         let (oc, or) = self.last_cur;
@@ -249,6 +252,7 @@ impl vte::Perform for FramebufferConsole {
 pub fn tick_cursor() {
     let n = BLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
     if n % BLINK_DIVIDER != 0 { return; }
+    if crate::gfx::gui_mode() { return; } // GUI owns the framebuffer
     let base = FB_VIRT.load(Ordering::Acquire);
     if base.is_null() { return; }
     if !CURSOR_VISIBLE.load(Ordering::Acquire) { return; }

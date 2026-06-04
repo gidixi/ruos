@@ -171,6 +171,35 @@ fn run_inner() -> Result<(), u32> {
         check(28, f2 == WHITE && b2 == BLACK && a2.is_empty())?;
     }
 
+    // T29-30: reverse scambia fg/bg; dim scurisce fg.
+    {
+        use crate::console::grid::Grid; use crate::console::render;
+        use crate::console::surface::Surface; use crate::console::glyphcache::GlyphCache;
+        use crate::console::fb::{FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK, CellAttr};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw, height: gh, pitch: gw*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut g = Grid::new(1, 1, WHITE, BLACK); let mut s = Surface::new(info); let mut gc = GlyphCache::new();
+        g.set_attr(CellAttr::REVERSE); g.put('X');
+        render::flush(&mut g, &mut gc, &mut s);
+        let m = gc.mask('X', false);
+        let mut hit = false;
+        for y in 0..gh { for x in 0..gw {
+            if m.alpha[(y as usize)*(gw as usize)+(x as usize)] == 255 { check(29, s.read_px(x,y) == BLACK)?; hit = true; break; }
+        } if hit { break; } }
+        let mut g2 = Grid::new(1,1,WHITE,BLACK); let mut s2 = Surface::new(info); let mut gc2 = GlyphCache::new();
+        g2.set_attr(CellAttr::DIM); g2.put('X');
+        render::flush(&mut g2, &mut gc2, &mut s2);
+        let m2 = gc2.mask('X', false);
+        for y in 0..gh { for x in 0..gw {
+            if m2.alpha[(y as usize)*(gw as usize)+(x as usize)] == 255 {
+                let px = s2.read_px(x,y);
+                check(30, px != WHITE && px.r > 0)?; break;
+            }
+        } }
+    }
+
     Ok(())
 }
 

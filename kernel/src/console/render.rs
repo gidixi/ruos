@@ -1,7 +1,7 @@
 //! Ponte griglia→pixel. Compone le celle dirty nel back-buffer della Surface
 //! (maschera alpha × fg over bg) e blitta gli span dirty su MMIO.
 
-use crate::console::ansi::{Cell, Rgb};
+use crate::console::ansi::{Cell, CellAttr, Rgb};
 use crate::console::font::{glyph_height, glyph_width};
 use crate::console::glyphcache::GlyphCache;
 use crate::console::grid::Grid;
@@ -34,9 +34,17 @@ pub fn flush(grid: &mut Grid, cache: &mut GlyphCache, surf: &mut Surface) {
     grid.clear_dirty();
 }
 
+fn dim(fg: Rgb, bg: Rgb) -> Rgb { blend(fg, bg, 160) } // ~63% fg toward bg
+
 fn compose_cell(cell: Cell, col: u32, row: u32, gw: u32, gh: u32,
                 cache: &mut GlyphCache, surf: &mut Surface) {
-    let bold = cell.attr.contains(crate::console::ansi::CellAttr::BOLD);
+    let bold = cell.attr.contains(CellAttr::BOLD);
+    let (mut fg, bg) = if cell.attr.contains(CellAttr::REVERSE) {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    if cell.attr.contains(CellAttr::DIM) { fg = dim(fg, bg); }
     let mask = cache.mask(cell.ch, bold);
     let ox = col * gw;
     let oy = row * gh;
@@ -46,7 +54,7 @@ fn compose_cell(cell: Cell, col: u32, row: u32, gw: u32, gh: u32,
             let alpha = if (rx < w) && ((ry as usize) < mask.h) {
                 mask.alpha[(ry as usize) * mask.w + (rx as usize)]
             } else { 0 };
-            let color = if alpha == 0 { cell.bg } else { blend(cell.fg, cell.bg, alpha) };
+            let color = if alpha == 0 { bg } else { blend(fg, bg, alpha) };
             surf.put_px(ox + rx, oy + ry, color);
         }
     }

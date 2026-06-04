@@ -37,6 +37,7 @@ pub extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
 // ---------------------------------------------------------------------------
 
 /// prot_flags bits (must match wasmtime capi: READ=1, WRITE=2, EXEC=4).
+const PROT_READ: u32 = 1 << 0;
 const PROT_WRITE: u32 = 1 << 1;
 const PROT_EXEC: u32 = 1 << 2;
 const PAGE: u64 = 0x1000;
@@ -67,24 +68,35 @@ pub extern "C" fn wasmtime_page_size() -> usize {
 pub extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: *mut *mut u8) -> i32 {
     let pages = (size as u64 + PAGE - 1) / PAGE;
     let base = NEXT.fetch_add(pages * PAGE, Ordering::SeqCst);
-    let flags = prot_to_flags(prot_flags);
+    let final_flags = prot_to_flags(prot_flags);
+    // wasm requires fresh memory to read as zero, and our frame allocator hands
+    // back DIRTY frames. Wasmtime never memsets grown memory — it assumes the
+    // platform mmap delivers zeroed pages (true on Linux/Windows). So we MUST
+    // zero here. Crucially, wasm *linear memory* is created via `Mmap::reserve`,
+    // i.e. `wasmtime_mmap_new(size, prot=0)` (PROT_NONE), and only later made
+    // writable through `wasmtime_mprotect` (make_accessible). Zeroing only the
+    // PROT_WRITE case therefore missed it entirely → stale frame bytes leaked
+    // into the guest. egui/tiny-skia build the font atlas with `alloc_zeroed`,
+    // which trusts the wasm zero-init guarantee and skips its own memset, so the
+    // garbage surfaced as garbled glyphs (shapes write-before-read, so crisp).
+    // Map each frame writable, zero it, then downgrade to the requested flags.
+    let zero_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let downgrade = (prot_flags & PROT_WRITE == 0) || (prot_flags & PROT_EXEC != 0);
     for i in 0..pages {
         let frame = match allocate_frame() {
             Some(f) => f,
             None => return 1,
         };
         let va = VirtAddr::new(base + i * PAGE);
-        if map_page(va, frame.start_address(), flags).is_err() {
+        if map_page(va, frame.start_address(), zero_flags).is_err() {
             return 1;
         }
-    }
-    // wasm linear memory must be zero-initialised, and the frame allocator does
-    // not hand back zeroed frames. Zero writable mappings (linear memory + RW
-    // code buffers). Skipping this corrupted lazily-grown data — e.g. egui's
-    // font atlas → garbled glyphs.
-    if prot_flags & PROT_WRITE != 0 {
-        // SAFETY: [base, base+pages*PAGE) was just mapped writable above.
-        unsafe { core::ptr::write_bytes(base as *mut u8, 0, (pages * PAGE) as usize); }
+        // SAFETY: the page was just mapped writable for the whole 4 KiB.
+        unsafe { core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, PAGE as usize); }
+        if downgrade && set_flags(va, final_flags).is_err() {
+            return 1;
+        }
     }
     // SAFETY: `ret` is a valid out-pointer supplied by Wasmtime.
     unsafe { *ret = base as *mut u8; }
@@ -184,3 +196,37 @@ pub extern "C" fn wasmtime_memory_image_map_at(
 
 #[no_mangle]
 pub extern "C" fn wasmtime_memory_image_free(_image: *mut c_void) {}
+
+/// Boot-check: verify the wasm zero-init contract across the reserve→commit
+/// path that backs linear memory. Dirties a page, frees its frame, then
+/// reserves a page with PROT_NONE (as `Mmap::reserve` does) and commits it
+/// writable (as `make_accessible` does). Wasmtime never memsets grown memory,
+/// so this committed page MUST read back as all-zero — the guarantee egui's
+/// font atlas (`alloc_zeroed`) relies on. Returns true iff zeroed.
+#[cfg(feature = "boot-checks")]
+pub fn zero_init_self_test() -> bool {
+    const N: usize = PAGE as usize;
+    // 1) Commit a page writable, dirty it, free its frame back to the allocator
+    //    so the reserve below is likely (LIFO) to reuse the dirtied frame.
+    let mut p1: *mut u8 = core::ptr::null_mut();
+    if wasmtime_mmap_new(N, PROT_READ | PROT_WRITE, &mut p1) != 0 {
+        return false;
+    }
+    // SAFETY: [p1, p1+N) is mapped writable.
+    unsafe { core::ptr::write_bytes(p1, 0xAB, N); }
+    if wasmtime_munmap(p1, N) != 0 {
+        return false;
+    }
+    // 2) Reserve (PROT_NONE) then commit writable — the exact linear-memory path.
+    let mut p2: *mut u8 = core::ptr::null_mut();
+    if wasmtime_mmap_new(N, 0, &mut p2) != 0 {
+        return false;
+    }
+    if wasmtime_mprotect(p2, N, PROT_READ | PROT_WRITE) != 0 {
+        return false;
+    }
+    // SAFETY: [p2, p2+N) is mapped writable.
+    let zeroed = unsafe { core::slice::from_raw_parts(p2, N) }.iter().all(|&b| b == 0);
+    let _ = wasmtime_munmap(p2, N);
+    zeroed
+}

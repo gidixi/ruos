@@ -255,6 +255,23 @@ fn run_inner() -> Result<(), u32> {
         check(35, con.cursor_for_test() == (2, 0))?;
     }
 
+    // T36-37: ?1049h entra in alt-screen (pulito), ?1049l ripristina il primario.
+    #[cfg(feature = "boot-checks")]
+    {
+        use crate::console::fb::{FramebufferConsole, FbInfo, PixelLayout};
+        use crate::console::ansi::{WHITE, BLACK};
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width() as u32; let gh = glyph_height() as u32;
+        let info = FbInfo { addr: core::ptr::null_mut(), width: gw*10, height: gh*3, pitch: gw*10*4, bpp: 32, pixel: PixelLayout::Bgr };
+        let mut con = FramebufferConsole::new(info, WHITE, BLACK);
+        con.write_str("PRIMARY");
+        con.write_str("\x1b[?1049h");
+        check(36, con.cursor_for_test() == (0, 0))?;
+        con.write_str("ALT");
+        con.write_str("\x1b[?1049l");
+        check(37, con.cursor_for_test() == (7, 0))?;
+    }
+
     Ok(())
 }
 

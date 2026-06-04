@@ -67,6 +67,11 @@ impl Grid {
         for d in self.dirty.iter_mut() { *d = CLEAN; }
     }
 
+    /// Marca tutte le righe come dirty (full span). Usato al cambio di buffer.
+    pub fn mark_all_dirty(&mut self) {
+        for d in self.dirty.iter_mut() { *d = (0, self.cols - 1); }
+    }
+
     /// Scrive il carattere visibile alla posizione cursore (colori/attr correnti)
     /// e avanza; wrap a fine riga.
     pub fn put(&mut self, ch: char) {

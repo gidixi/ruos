@@ -30,6 +30,7 @@ pub struct FramebufferConsole {
     surf:   Surface,
     cache:  GlyphCache,
     parser: vte::Parser,
+    saved:  Option<Grid>,
 }
 
 unsafe impl Send for FramebufferConsole {}
@@ -59,6 +60,7 @@ impl FramebufferConsole {
             surf:  Surface::new(info),
             cache: GlyphCache::new(),
             parser: vte::Parser::new(),
+            saved:  None,
         };
         // pre-scalda la cache ASCII: render path (incl. panic handler) alloc-free.
         me.cache.prewarm_ascii();
@@ -104,6 +106,22 @@ impl FramebufferConsole {
         render::flush(&mut self.grid, &mut self.cache, &mut self.surf);
         self.publish_cursor();
     }
+
+    fn enter_alt(&mut self) {
+        if self.saved.is_none() {
+            let (fg, bg) = self.grid.current_colors();
+            let mut alt = Grid::new(self.grid.cols, self.grid.rows, fg, bg);
+            alt.mark_all_dirty();
+            self.saved = Some(core::mem::replace(&mut self.grid, alt));
+        }
+    }
+
+    fn leave_alt(&mut self) {
+        if let Some(mut primary) = self.saved.take() {
+            primary.mark_all_dirty();
+            self.grid = primary;
+        }
+    }
 }
 
 /// Boot-time self-test: scrive 'X', flush, e verifica che un pixel acceso
@@ -132,7 +150,7 @@ impl vte::Perform for FramebufferConsole {
             _ => {}
         }
     }
-    fn csi_dispatch(&mut self, params: &vte::Params, _i: &[u8], _ignore: bool, c: char) {
+    fn csi_dispatch(&mut self, params: &vte::Params, i: &[u8], _ignore: bool, c: char) {
         let p1 = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(1);
         match c {
             'm' => {
@@ -162,6 +180,15 @@ impl vte::Perform for FramebufferConsole {
                 self.grid.goto(col.saturating_sub(1), row.saturating_sub(1));
             }
             'K' => self.grid.erase_to_eol(),
+            'h' | 'l' if i.contains(&b'?') => {
+                let set = c == 'h';
+                for p in params.iter().flat_map(|p| p.iter().copied()) {
+                    match p {
+                        1049 | 1047 | 47 => if set { self.enter_alt() } else { self.leave_alt() },
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }

@@ -214,6 +214,12 @@ impl vte::Perform for FramebufferConsole {
                 let style = match n { 0 | 1 | 2 => 0u32, 3 | 4 => 1, 5 | 6 => 2, _ => 1 };
                 CURSOR_STYLE.store(style, Ordering::Release);
             }
+            'r' => {
+                let mut it = params.iter();
+                let top = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
+                let bot = it.next().and_then(|p| p.first().copied()).unwrap_or(self.grid.rows);
+                self.grid.set_scroll_region(top.saturating_sub(1), bot.saturating_sub(1));
+            }
             _ => {}
         }
     }

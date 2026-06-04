@@ -304,6 +304,19 @@ fn run_inner() -> Result<(), u32> {
         check(41, con.last_cur_for_test() == (1, 0))?;
     }
 
+    // T42-43: regione [0,1] su griglia 4 righe; newline a fondo regione scrolla
+    // SOLO la banda 0..=1; le righe 2,3 restano intatte.
+    {
+        use crate::console::grid::Grid;
+        use crate::console::ansi::{WHITE, BLACK};
+        let mut g = Grid::new(4, 4, WHITE, BLACK);
+        g.goto(0,3); g.put('Z');     // riga 3 = "Z..."
+        g.set_scroll_region(0, 1);
+        g.goto(0,1); g.newline();    // a fondo regione → scroll banda [0,1]
+        check(42, g.cell(0,3).ch == 'Z')?;  // riga fuori regione intatta
+        check(43, g.cursor() == (0,1))?;    // resta sul fondo regione
+    }
+
     Ok(())
 }
 

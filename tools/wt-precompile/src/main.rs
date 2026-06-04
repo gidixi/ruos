@@ -39,6 +39,16 @@ fn main() {
     unsafe {
         config.x86_float_abi_ok(true);
         config.detect_host_feature(feature_policy);
+        // Force SSE4.1+ in codegen so cranelift inlines ROUNDSS for f32.floor/
+        // ceil/trunc/nearest instead of emitting a libcall. The no_std wasmtime
+        // libcall path for those rounds is broken in ruos (returns the input),
+        // which corrupted egui's glyph px_bounds → garbled text. ROUNDSS runs on
+        // the CPU and is correct. The kernel runtime stays compatible because its
+        // detect_host_feature already reports sse4.1 present.
+        config.cranelift_flag_set("has_sse3", "true");
+        config.cranelift_flag_set("has_ssse3", "true");
+        config.cranelift_flag_set("has_sse41", "true");
+        config.cranelift_flag_set("has_sse42", "true");
     }
     let engine = Engine::new(&config).expect("create engine");
     let cwasm = engine.precompile_module(&wasm).expect("precompile module");

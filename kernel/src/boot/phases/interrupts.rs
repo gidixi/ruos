@@ -55,6 +55,10 @@ pub fn init() -> Result<(), BootError> {
     {
         let ok = crate::memory::exec::self_test();
         crate::binfo!("mem", "exec W^X self-test {}", if ok { "ok" } else { "FAIL" });
+        // wasm linear memory must read back zero (Mmap::reserve→make_accessible
+        // path); regression for the egui font-atlas garble.
+        let zi = crate::wasm::wt::platform::zero_init_self_test();
+        crate::binfo!("wt", "linear-mem zero-init self-test {}", if zi { "ok" } else { "FAIL" });
         let mok = crate::mouse::self_test();
         crate::binfo!("mouse", "decode self-test {}", if mok { "ok" } else { "FAIL" });
         // Wasmtime no_std AOT runtime self-test (spike gate): run the embedded

@@ -117,6 +117,33 @@ async fn exec_worker_task() {
         // Wait for a request from a shell fiber.
         let slot = WaitForRequest::new(&EXEC_QUEUE).await;
 
+        // Router: `.cwasm` → Wasmtime AOT runtime; `.wasm` → wasmi.
+        if slot.path.ends_with(".cwasm") {
+            let code: i32 = match crate::wasm::read_all(&slot.path).await {
+                Err(_) => {
+                    kprintln!("ruos: exec_worker: read {} failed", slot.path);
+                    127
+                }
+                Ok(bytes) => {
+                    let pid = crate::proc::register(
+                        alloc::string::String::from(slot.path.trim_start_matches('/')),
+                    );
+                    // NB: stdout currently fans out to CONSOLE (serial+fb), like a
+                    // non-rebound wasmi tool. PTY-bound stdio for Wasmtime is a
+                    // follow-up (needs WtState fd 1/2 → pts slave).
+                    let c = crate::wasm::wt::run_cwasm(&bytes, slot.argv);
+                    crate::proc::unregister(pid);
+                    c
+                }
+            };
+            EXEC_QUEUE.result.store(code, Ordering::SeqCst);
+            EXEC_QUEUE.done.store(true, Ordering::SeqCst);
+            if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
+                w.wake();
+            }
+            continue;
+        }
+
         // Load and run the child wasm.
         let code: i32 = match crate::wasm::read_all(&slot.path).await {
             Err(_) => {

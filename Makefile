@@ -88,7 +88,18 @@ user-bin/%.wasm: user/%/src/main.rs user/%/Cargo.toml user/Cargo.toml
 .PHONY: user-wasm
 user-wasm: $(USER_WASMS)
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
+# Wasmtime AOT precompiler (host tool) + a demo `.cwasm` command staged at
+# /bin/wtecho.cwasm so the shell's `.cwasm` router (Wasmtime) can be exercised.
+WT_PRECOMPILE := tools/wt-precompile/target/release/wt-precompile
+
+$(WT_PRECOMPILE): tools/wt-precompile/src/main.rs tools/wt-precompile/Cargo.toml
+	source $$HOME/.cargo/env && cd tools/wt-precompile && cargo build --release
+
+build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
+	@mkdir -p build
+	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
+
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -98,6 +109,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT)
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
+	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -305,7 +317,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
+test-boot: limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -321,6 +333,7 @@ test-boot: limine $(USER_WASMS) $(INIT_SCRIPT)
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
+	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

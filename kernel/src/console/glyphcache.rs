@@ -40,6 +40,9 @@ impl GlyphCache {
 }
 
 fn rasterize(ch: char, bold: bool) -> GlyphMask {
+    if let Some(m) = crate::console::boxdraw::mask(ch) {
+        return m;
+    }
     let w = glyph_width();
     let h = glyph_height();
     let mut alpha = vec![0u8; w * h];

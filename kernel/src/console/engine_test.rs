@@ -225,6 +225,22 @@ fn run_inner() -> Result<(), u32> {
         check(32, b != r)?;
     }
 
+    // T33-34: ─ (U+2500) ha una riga orizzontale al centro; │ (U+2502) verticale.
+    {
+        use crate::console::glyphcache::GlyphCache;
+        use crate::console::font::{glyph_width, glyph_height};
+        let gw = glyph_width(); let gh = glyph_height();
+        let mut gc = GlyphCache::new();
+        let hm = gc.mask('\u{2500}', false);
+        let cy = gh / 2;
+        let hlit = (0..gw).filter(|&x| hm.alpha[cy*gw + x] == 255).count();
+        check(33, hlit >= gw / 2)?;
+        let vm = gc.mask('\u{2502}', false);
+        let cx = gw / 2;
+        let vlit = (0..gh).filter(|&y| vm.alpha[y*gw + cx] == 255).count();
+        check(34, vlit >= gh / 2)?;
+    }
+
     Ok(())
 }
 

@@ -31,6 +31,11 @@ pub fn init(info: FbInfo) {
     GFX_W.store(info.width, Ordering::Release);
     GFX_H.store(info.height, Ordering::Release);
     GFX_FMT.store(match info.pixel { PixelLayout::Rgb => 0, PixelLayout::Bgr => 1 }, Ordering::Release);
+    crate::kprintln!(
+        "ruos: gfx init {}x{} pitch={} bpp={} fmt={}",
+        info.width, info.height, info.pitch, info.bpp,
+        match info.pixel { PixelLayout::Rgb => "RGB", PixelLayout::Bgr => "BGR" },
+    );
 }
 
 /// Canonical app-side pixel format (matches abi::GFX_FORMAT_RGBA8888 = 0).
@@ -143,6 +148,9 @@ pub fn push_key(scancode: u32, pressed: bool) {
 
 /// Drain one GUI event.
 pub fn pop() -> Option<GfxEvt> { EVENTS.lock().pop_front() }
+
+/// Number of queued GUI events (peek, for on-demand repaint).
+pub fn pending() -> usize { EVENTS.lock().len() }
 
 // Absolute cursor position + previous button state (for edge detection).
 static MOUSE_X: AtomicI32 = AtomicI32::new(0);

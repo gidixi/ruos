@@ -34,8 +34,6 @@ fn main() {
     config.memory_reservation(0);
     config.memory_guard_size(0);
     config.memory_reservation_for_growth(0);
-    // Allow linear memory to be a movable malloc()'d region so no host virtual
-    // memory is required (the kernel has no mmap for guest memory).
     config.memory_may_move(true);
     #[cfg(target_arch = "x86_64")]
     unsafe {

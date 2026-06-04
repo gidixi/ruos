@@ -56,6 +56,25 @@ pub fn add_to_linker(linker: &mut Linker<WtState>) -> wasmtime::Result<()> {
             n
         })?;
 
+    // gfx_pending() -> i32: folds the PS/2 mouse queue and returns the number of
+    // queued GUI events. Lets the app skip rendering when nothing changed.
+    linker.func_wrap("ruos_gfx", "gfx_pending",
+        |_caller: Caller<'_, WtState>| -> i32 {
+            crate::gfx::fold_mouse();
+            crate::gfx::pending() as i32
+        })?;
+
+    // gfx_debug(ptr, len): log a UTF-8 string straight to the kernel serial
+    // (bypasses the PTY, which isn't drained while a sync GUI owns the executor).
+    linker.func_wrap("ruos_gfx", "gfx_debug",
+        |mut caller: Caller<'_, WtState>, ptr: i32, len: i32| {
+            if let Some(b) = mem::read(&mut caller, ptr as u32, len as u32) {
+                if let Ok(s) = core::str::from_utf8(&b) {
+                    crate::kprintln!("[gui] {}", s);
+                }
+            }
+        })?;
+
     // gfx_wall_secs() -> f64: seconds (with fraction) since local midnight.
     // For egui RawInput.time + the desktop clock (Platform::wall_clock_secs).
     linker.func_wrap("ruos_gfx", "gfx_wall_secs",

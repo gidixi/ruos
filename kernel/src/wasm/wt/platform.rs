@@ -78,6 +78,14 @@ pub extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: *mut *mut
             return 1;
         }
     }
+    // wasm linear memory must be zero-initialised, and the frame allocator does
+    // not hand back zeroed frames. Zero writable mappings (linear memory + RW
+    // code buffers). Skipping this corrupted lazily-grown data — e.g. egui's
+    // font atlas → garbled glyphs.
+    if prot_flags & PROT_WRITE != 0 {
+        // SAFETY: [base, base+pages*PAGE) was just mapped writable above.
+        unsafe { core::ptr::write_bytes(base as *mut u8, 0, (pages * PAGE) as usize); }
+    }
     // SAFETY: `ret` is a valid out-pointer supplied by Wasmtime.
     unsafe { *ret = base as *mut u8; }
     0

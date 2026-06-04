@@ -112,8 +112,22 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
         Ok(i) => i,
         Err(e) => { kprintln!("ruos: wt instantiate err: {:?}", e); return 126; }
     };
-    if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-        let _ = start.call(&mut store, ()); // proc_exit traps; ignore
+    // Ensure the Direction Flag is clear: the SysV ABI requires DF=0 on entry,
+    // and cranelift/Rust code uses `rep movs` (memcpy/memmove) which run BACKWARD
+    // if DF=1, silently corrupting copied data (e.g. egui's font atlas) → garbled
+    // glyphs. A bare-metal kernel must guarantee DF=0; firmware may leave it set.
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cld", options(nostack)); }
+    match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+        Ok(start) => {
+            if let Err(e) = start.call(&mut store, ()) {
+                // proc_exit traps to unwind; only log unexpected traps.
+                if store.data().exit.is_none() {
+                    kprintln!("ruos: wt _start trap: {:?}", e);
+                }
+            }
+        }
+        Err(e) => kprintln!("ruos: wt no _start: {}", e),
     }
     if let Some(fd) = store.data().stdout_pty {
         let _ = crate::vfs::block_on(crate::vfs::close(fd));
@@ -133,10 +147,8 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
 /// the sse3/sse4/fma features the cwasm was compiled with.
 fn engine_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
-    // NB: no `target()` call — the kernel is compiled FOR x86_64-unknown-none, so
-    // that IS the native target and must not be overridden (wasmtime rejects a
-    // target that doesn't match the host). These tunables must match
-    // tools/wt-precompile exactly so the AOT module's settings hash matches.
+    // These tunables must match tools/wt-precompile exactly so the AOT module's
+    // settings hash matches.
     config.signals_based_traps(false);
     config.memory_init_cow(false);
     config.memory_reservation(0);

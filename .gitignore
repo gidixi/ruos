@@ -1,7 +1,18 @@
 # Rust OS build artifacts
 /build/
 /kernel/target/
+/user/target/
+/tools/*/target/
 /third_party/limine/
+
+# Debug / diagnostic debris
+*.log
+*.ppm
+*.png
+
+# Generated wasm artifacts (rebuilt by `make` from sources in user/ and tools/)
+user-bin/*.wasm
+kernel/src/wasm/wt/*.cwasm
 
 # Editor / IDE
 .vscode/

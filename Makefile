@@ -99,6 +99,25 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	@mkdir -p build
 	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
 
+# Boot-check AOT demos embedded in the kernel via include_bytes! (compiled ONLY
+# under the `boot-checks` feature). Regenerated into the source tree from their
+# .wat/.wasm inputs so the (large) .cwasm need not be committed.
+WT_KDIR    := kernel/src/wasm/wt
+WT_KCWASMS := $(WT_KDIR)/hello.cwasm $(WT_KDIR)/gfxtest.cwasm \
+              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm
+
+$(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/gfxtest.cwasm: tools/wt-gfxtest/gfx.wat $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/echo.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/cat.cwasm: user-bin/cat.wasm $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+
+.PHONY: wt-cwasm
+wt-cwasm: $(WT_KCWASMS)
+
 # The egui desktop: built from the sibling ruos-desktop repo (gui-core +
 # ruos-backend) as wasm32-wasip1, then AOT-precompiled to gui.cwasm.
 RUOS_DESKTOP ?= ../../M/ruos-desktop
@@ -327,7 +346,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \

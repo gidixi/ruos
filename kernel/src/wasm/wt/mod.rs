@@ -10,6 +10,7 @@ pub mod gfx;
 pub mod gui;
 pub mod component;
 pub mod wm;
+pub mod compose;
 
 use crate::kprintln;
 use alloc::vec::Vec;
@@ -71,11 +72,33 @@ pub fn run_reactor_spike_demo() -> (u32, u8, usize) {
     crate::wasm::wt::wm::run_reactor_spike(REACTOR_CWASM)
 }
 
+/// Boot self-test: SP3 window-manager pure-logic selftest (decoration geometry +
+/// hit-test + z-order + drag math, NO wasm instances). Returns a 5-bit flag word
+/// (0b11111 == all sub-checks pass).
+#[cfg(feature = "boot-checks")]
+pub fn run_wm_logic_selftest() -> u32 {
+    crate::wasm::wt::wm::wm_logic_selftest()
+}
+
 /// Boot self-test: run the embedded bring-up component; its `run` calls
 /// system.log("WT-COMPONENT-OK") on the host. Returns the guest run() code.
 #[cfg(feature = "boot-checks")]
 pub fn run_bringup_demo() -> i32 {
     crate::wasm::wt::component::run_component(BRINGUP_CWASM)
+}
+
+/// Boot self-test: the SP5 launcher registry has N entries and all deserialise.
+/// Returns (entry_count, modules_ok).
+#[cfg(feature = "boot-checks")]
+pub fn run_registry_demo() -> (u32, u32) {
+    crate::wasm::wt::wm::registry_self_test()
+}
+
+/// Boot self-test: spawn the self-closing app, run the loop, confirm teardown +
+/// window-id recycle. Returns (spawns, peak_live, final_live).
+#[cfg(feature = "boot-checks")]
+pub fn run_lifecycle_demo() -> (u32, u32, u32) {
+    crate::wasm::wt::wm::lifecycle_self_test()
 }
 
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller

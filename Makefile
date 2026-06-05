@@ -34,7 +34,7 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test
 
 all: iso
 
@@ -154,7 +154,15 @@ kernel/src/wasm/wt/reactor.cwasm: tools/wt-reactor/src/lib.rs tools/wt-reactor/C
 		cargo build --release --target wasm32-unknown-unknown
 	$(WT_PRECOMPILE) tools/wt-reactor/target/wasm32-unknown-unknown/release/wt_reactor.wasm kernel/src/wasm/wt/reactor.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm
+# Self-closing reactor guest (SP5 lifecycle demo): wasm32-unknown-unknown, no_std,
+# precompiled to a CORE .cwasm (not a component). Imports wm.close; calls it on frame 3.
+kernel/src/wasm/wt/reactor_close.cwasm: tools/wt-reactor-close/src/lib.rs tools/wt-reactor-close/Cargo.toml $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/wt-reactor-close && \
+		cargo build --release --target wasm32-unknown-unknown
+	$(WT_PRECOMPILE) tools/wt-reactor-close/target/wasm32-unknown-unknown/release/wt_reactor_close.wasm kernel/src/wasm/wt/reactor_close.cwasm
+
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -167,6 +175,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwas
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
+	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -268,6 +277,15 @@ run-m2b2-test:
 .PHONY: run-dm-test
 run-dm-test:
 	bash tests/disk-mgmt-test.sh
+
+# SP4 SMP-compositing equivalence: prove the parallel (SMP-banded) composite is
+# pixel-identical to a serial (n_bands=1) reference, AND that >=2 cores ran band
+# jobs. Builds two ISOs (default parallel + CARGO_FEATURES=serial-composite),
+# boots each headless under QMP, screendumps the steady two-window composite, and
+# asserts the PNGs are byte-identical. The script does its own `make iso`.
+.PHONY: run-comp-smp-test
+run-comp-smp-test:
+	@bash tests/comp-smp-test.sh
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.
@@ -374,7 +392,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -393,6 +411,7 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
+	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

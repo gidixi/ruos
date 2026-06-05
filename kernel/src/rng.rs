@@ -28,6 +28,12 @@ fn has_rdrand() -> bool {
 }
 
 pub fn init() {
+    // Idempotent: the boot-checks phase may seed the RNG early (an egui guest's
+    // `random_get` needs it) before `userland::init()` calls this again. Re-seeding
+    // is harmless but wastes entropy + double-logs, so return if already seeded.
+    if RNG.lock().is_some() {
+        return;
+    }
     if !has_rdrand() {
         panic!("rng: CPU lacks RDRAND — no secure entropy source (CLAUDE.md forbids timer seeding)");
     }

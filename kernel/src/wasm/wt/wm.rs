@@ -1196,6 +1196,23 @@ pub fn wasip1_probe_self_test() -> usize {
     c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
 }
 
+/// Boot self-test (SP-B): spawn the egui CSD demo as a compositor window and drive
+/// one frame; returns the committed surface length. Builds an empty (headless, no
+/// `gfx::enter`) compositor, finds the `"egui-demo"` registry entry, `spawn_app`s
+/// it (instantiate against the unified `Linker<AppState>` + `run_initialize`), then
+/// `frame_all()` calls the guest's `frame()` once — egui instantiates its Context,
+/// runs one `ctx.run` + tessellate + raster, and `wm.commit`s the surface. A return
+/// of 614400 (480×320×4) proves the full egui pipeline ran headlessly. 0 = the
+/// entry is missing, instantiate failed (a WASI import egui needs isn't registered),
+/// or the egui raster/commit trapped.
+pub fn egui_demo_self_test() -> usize {
+    let mut c = Compositor::new_empty();
+    let idx = APPS.iter().position(|a| a.name == "egui-demo").unwrap_or(usize::MAX);
+    if idx == usize::MAX || c.spawn_app(idx).is_none() { return 0; }
+    c.frame_all();
+    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+}
+
 /// Boot-check: exercise the surviving WM z-order + CSD drag math with NO wasm
 /// instances. Under CSD the kernel no longer owns decorations (no title bar / [X]
 /// geometry to check), so this is a 2-bit word now (all set == 0b11).

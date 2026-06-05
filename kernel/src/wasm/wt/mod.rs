@@ -109,6 +109,15 @@ pub fn run_wasip1_probe_demo() -> usize {
     crate::wasm::wt::wm::wasip1_probe_self_test()
 }
 
+/// Boot self-test (egui SP-B): spawn the egui CSD demo as a compositor window and
+/// drive one frame; returns the committed surface length (614400 on success =
+/// 480×320×4 — the egui guest instantiated against the unified WASI+wm
+/// `Linker<AppState>`, ran one egui ctx.run + tessellate + raster, and committed).
+#[cfg(feature = "boot-checks")]
+pub fn run_egui_demo_demo() -> usize {
+    crate::wasm::wt::wm::egui_demo_self_test()
+}
+
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller
 /// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
 /// not cleared by the console restore) to confirm the host-fn path ran.

@@ -97,6 +97,16 @@ pub fn init() -> Result<(), BootError> {
         // its std heap alloc + commits against the unified Linker<AppState>.
         let pn = crate::wasm::wt::run_wasip1_probe_demo();
         crate::binfo!("wm", "wasip1 probe spawn ok pixels={}", pn);
+        // SP-B: spawn the egui CSD demo as a window + drive one frame. A non-zero
+        // pixels=614400 (480×320×4) proves the egui guest instantiated against the
+        // unified Linker<AppState>, ran one egui ctx.run + tessellate + raster, and
+        // committed its surface — SP-B's core success. egui's first frame seeds an
+        // ahash HashMap via WASI `random_get`, so the CSPRNG must be live: seed it
+        // now (idempotent — `userland::init()` re-calls and no-ops). RDRAND is the
+        // only dependency and it's available this early.
+        crate::rng::init();
+        let en = crate::wasm::wt::run_egui_demo_demo();
+        crate::binfo!("wm", "egui demo spawn ok pixels={}", en);
     }
 
     Ok(())

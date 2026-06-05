@@ -162,6 +162,30 @@ kernel/src/wasm/wt/shell.cwasm: $(WT_PRECOMPILE) $(SHELL_SRCS)
 		cargo build -p shell --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/shell.wasm kernel/src/wasm/wt/shell.cwasm
 
+# Desktop app windows (SP-E): each gui-core DeskApp wrapped as a thin wasip1 window
+# crate (on ruos-window), built wasm32-wasip1 then AOT-precompiled to build/<id>.cwasm,
+# shipped to /bin/<id>.cwasm and spawned by the shell launcher (wm.spawn(id)). Shared
+# prereqs = gui-core + ruos-window src + the workspace manifests; each app rule adds its
+# own crate's src/manifest. Note the underscore in the wasm output (about-app→about_app.wasm).
+APP_SRCS := $(shell find $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-window/src -name '*.rs' 2>/dev/null) \
+            $(wildcard $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock)
+build/about.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/about-app/src/*.rs $(RUOS_DESKTOP)/about-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p about-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/about_app.wasm build/about.cwasm
+build/files.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/files-app/src/*.rs $(RUOS_DESKTOP)/files-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p files-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/files_app.wasm build/files.cwasm
+build/terminal.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/terminal-app/src/*.rs $(RUOS_DESKTOP)/terminal-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p terminal-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/terminal_app.wasm build/terminal.cwasm
+build/system.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/system-app/src/*.rs $(RUOS_DESKTOP)/system-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p system-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/system_app.wasm build/system.cwasm
+
 # Bring-up component (Step-0 gate): guest -> component -> AOT cwasm embedded in kernel.
 kernel/src/wasm/wt/bringup.cwasm: wit/ruos-bringup.wit tools/wt-bringup/src/lib.rs tools/wt-bringup/Cargo.toml $(WT_PRECOMPILE)
 	@mkdir -p build
@@ -197,7 +221,7 @@ kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1
 		cargo build --release --target wasm32-wasip1
 	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -208,7 +232,10 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwas
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
-	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
+	cp build/about.cwasm $(ISO_ROOT)/bin/about.cwasm
+	cp build/files.cwasm $(ISO_ROOT)/bin/files.cwasm
+	cp build/terminal.cwasm $(ISO_ROOT)/bin/terminal.cwasm
+	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
@@ -430,7 +457,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -447,7 +474,10 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
-	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
+	cp build/about.cwasm $(ISO_ROOT)/bin/about.cwasm
+	cp build/files.cwasm $(ISO_ROOT)/bin/files.cwasm
+	cp build/terminal.cwasm $(ISO_ROOT)/bin/terminal.cwasm
+	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm

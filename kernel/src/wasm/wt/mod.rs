@@ -101,6 +101,14 @@ pub fn run_lifecycle_demo() -> (u32, u32, u32) {
     crate::wasm::wt::wm::lifecycle_self_test()
 }
 
+/// Boot self-test (egui SP-A): spawn the wasip1 STD probe as a compositor window
+/// and drive one frame; returns the committed surface length (307200 on success
+/// = the std/wasip1 guest ran against the unified WASI+wm `Linker<AppState>`).
+#[cfg(feature = "boot-checks")]
+pub fn run_wasip1_probe_demo() -> usize {
+    crate::wasm::wt::wm::wasip1_probe_self_test()
+}
+
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller
 /// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
 /// not cleared by the console restore) to confirm the host-fn path ran.

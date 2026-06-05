@@ -19,7 +19,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
-use wasmtime::{Caller, Extern, Instance, Linker, Memory, Module, Store};
+use wasmtime::{Caller, Instance, Linker, Module, Store};
 use crate::gfx::GfxEvt;
 use crate::wasm::wt::engine;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -47,6 +47,10 @@ static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
 /// A reactor that calls `wm.close()` after a few frames (for the despawn
 /// boot-check and the [X]-equivalent demo). Built by `tools/wt-reactor-close`.
 static REACTOR_CLOSE_CWASM: &[u8] = include_bytes!("reactor_close.cwasm");
+/// A wasm32-wasip1 STD reactor (egui SP-A probe): proves a std/WASI guest runs
+/// as a compositor window. Built by `tools/wt-wasip1-probe`; needs `_initialize`
+/// run before its first `frame()` (see `run_initialize`).
+static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
 
 /// A launchable app: a display name + its precompiled `.cwasm` bytes.
 pub struct AppEntry {
@@ -60,6 +64,7 @@ pub static APPS: &[AppEntry] = &[
     AppEntry { name: "react-A", cwasm: REACTOR_CWASM },
     AppEntry { name: "react-B", cwasm: REACTOR_CWASM },
     AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM },
+    AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM },
 ];
 
 /// Cache of deserialised modules, keyed by the cwasm slice's base address (each
@@ -424,39 +429,42 @@ pub struct WmState {
     pub close_requested: bool,
 }
 
-/// Read `len` bytes from this guest's exported linear memory at `ptr`. None if
-/// the export is missing or the range is out of bounds. (Mirrors
-/// `crate::wasm::wt::mem::read`, which is typed to `WtState` and so cannot be
-/// reused for `WmState`.)
-fn read_guest(caller: &mut Caller<'_, WmState>, ptr: u32, len: u32) -> Option<Vec<u8>> {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(m)) => m,
-        _ => return None,
-    };
-    let mem: Memory = mem;
-    let mut out = alloc::vec![0u8; len as usize];
-    mem.read(caller, ptr as usize, &mut out).ok()?;
-    Some(out)
+use crate::wasm::wt::state::{WtState, HasWasi};
+
+/// Capability accessor for the window/surface state (mirror of HasWasi).
+pub trait HasWindow {
+    fn win(&mut self) -> &mut WmState;
+    fn win_ref(&self) -> &WmState;
 }
 
-/// Write `buf` into this guest's exported linear memory at `ptr`. No-op (returns
-/// false) if the memory export is missing or the range is out of bounds. (Mirrors
-/// `crate::wasm::wt::mem::write`, which is typed to `WtState`.)
-fn write_guest(caller: &mut Caller<'_, WmState>, ptr: u32, buf: &[u8]) -> bool {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(m)) => m,
-        _ => return false,
-    };
-    let mem: Memory = mem;
-    mem.write(caller, ptr as usize, buf).is_ok()
+impl HasWindow for WmState {
+    fn win(&mut self) -> &mut WmState { self }
+    fn win_ref(&self) -> &WmState { self }
 }
 
-pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
+/// A compositor window's Store data: BOTH the WASI capability (so a wasip1 egui
+/// guest's std runtime links + runs) AND the window/surface state. Embeds the
+/// existing structs unchanged; implements both accessor traits.
+pub struct AppState {
+    pub wasi: WtState,
+    pub win: WmState,
+}
+
+impl HasWasi for AppState {
+    fn wasi(&mut self) -> &mut WtState { &mut self.wasi }
+    fn wasi_ref(&self) -> &WtState { &self.wasi }
+}
+impl HasWindow for AppState {
+    fn win(&mut self) -> &mut WmState { &mut self.win }
+    fn win_ref(&self) -> &WmState { &self.win }
+}
+
+pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
     // wm.commit(ptr, len, w, h): copy the guest's surface into WmState.pixels.
     linker.func_wrap("wm", "commit",
-        |mut caller: Caller<'_, WmState>, ptr: i32, len: i32, w: i32, h: i32| {
-            if let Some(b) = read_guest(&mut caller, ptr as u32, len as u32) {
-                let s = caller.data_mut();
+        |mut caller: Caller<'_, T>, ptr: i32, len: i32, w: i32, h: i32| {
+            if let Some(b) = crate::wasm::wt::mem::read(&mut caller, ptr as u32, len as u32) {
+                let s = caller.data_mut().win();
                 s.pixels = b;
                 s.win_w = w as u32;
                 s.win_h = h as u32;
@@ -466,22 +474,22 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
     // with an underscore — Rust `#[link]` preserves the symbol verbatim; verified
     // via `wasm-tools print`.)
     linker.func_wrap("wm", "app_id",
-        |caller: Caller<'_, WmState>| -> i32 { caller.data().id as i32 })?;
+        |caller: Caller<'_, T>| -> i32 { caller.data().win_ref().id as i32 })?;
     // wm.tick(): bump the call counter (spike instrumentation).
     linker.func_wrap("wm", "tick",
-        |mut caller: Caller<'_, WmState>| { caller.data_mut().tick += 1; })?;
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().tick += 1; })?;
     // wm.close(): the guest asks the compositor to tear this window down. The
     // reap pass (top of the loop) drops the Store/Instance next iteration.
     linker.func_wrap("wm", "close",
-        |mut caller: Caller<'_, WmState>| { caller.data_mut().close_requested = true; })?;
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().close_requested = true; })?;
     // wm.poll_event(retptr): drain ONE event from THIS window's queue into the
     // guest's 20-byte return area. The calling app is identified by its own
     // Store (caller.data()), so it can only ever see its own window's events.
     // Layout matches `ruos:gui/gfx poll-event`: discriminant u32 @0 (0=none,
     // 1=some), then the gfx-event record kind@4, p0@8, p1@12, p2@16 (all LE).
     linker.func_wrap("wm", "poll_event",
-        |mut caller: Caller<'_, WmState>, retptr: i32| {
-            let ev = caller.data_mut().events.pop_front();
+        |mut caller: Caller<'_, T>, retptr: i32| {
+            let ev = caller.data_mut().win().events.pop_front();
             let mut buf = [0u8; 20];
             if let Some(e) = ev {
                 buf[0..4].copy_from_slice(&1u32.to_le_bytes());   // some
@@ -491,9 +499,24 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
                 buf[16..20].copy_from_slice(&e.p2.to_le_bytes());
             }
             // else: discriminant stays 0 (none); payload zeroed.
-            write_guest(&mut caller, retptr as u32, &buf);
+            crate::wasm::wt::mem::write(&mut caller, retptr as u32, &buf);
         })?;
     Ok(())
+}
+
+/// Run a reactor instance's `_initialize` export ONCE, if it has one.
+///
+/// A `wasm32-wasip1` cdylib with no `main` links as a REACTOR: wasm-ld emits an
+/// `_initialize` export (NOT `_start`) that runs std's static initializers
+/// (heap/runtime setup). A std/wasip1 reactor will FAULT on its first heap alloc
+/// inside `frame()` if `_initialize` was never run. So every site that
+/// instantiates a window instance MUST call this right after `instantiate` and
+/// BEFORE the first `frame()`. The no_std reactors export no `_initialize`, so
+/// the `Ok` arm is simply skipped — safe + necessary only for wasip1 reactors.
+fn run_initialize(store: &mut Store<AppState>, inst: &Instance) {
+    if let Ok(init) = inst.get_typed_func::<(), ()>(&mut *store, "_initialize") {
+        let _ = init.call(&mut *store, ());
+    }
 }
 
 /// SPIKE: instantiate ONE reactor instance, call `frame()` 5× on it, return
@@ -508,9 +531,13 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     };
     let mut store = Store::new(
         engine,
-        WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+        AppState {
+            wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+        },
     );
-    let mut linker: Linker<WmState> = Linker::new(engine);
+    let mut linker: Linker<AppState> = Linker::new(engine);
+    crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
     if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
     // BACKWARD if DF=1, silently corrupting copied data.
@@ -520,6 +547,8 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         Ok(i) => i,
         Err(_) => return (0, 0, 0),
     };
+    // wasip1 std reactors need `_initialize` run before their first heap alloc.
+    run_initialize(&mut store, &instance);
     let frame = match instance.get_typed_func::<(), ()>(&mut store, "frame") {
         Ok(f) => f,
         Err(_) => return (0, 0, 0),
@@ -528,9 +557,9 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         if frame.call(&mut store, ()).is_err() { break; }
     }
     (
-        store.data().tick,
-        store.data().pixels.first().copied().unwrap_or(0),
-        store.data().pixels.len(),
+        store.data().win.tick,
+        store.data().win.pixels.first().copied().unwrap_or(0),
+        store.data().win.pixels.len(),
     )
 }
 
@@ -556,7 +585,7 @@ pub struct DragState {
 /// Surface pixels live in `store.data().pixels` (NOT a field here).
 pub struct Window {
     pub id: u32,
-    pub store: Store<WmState>,
+    pub store: Store<AppState>,
     pub inst: Instance,
     pub rect: (u32, u32, u32, u32), // SURFACE rect (x, y, w, h), EXCLUDING decorations
     pub title: String,              // shown in the SP3 title bar; "" until SP3
@@ -570,7 +599,7 @@ pub struct Window {
 pub struct Compositor {
     pub wins: Vec<Window>,
     pub module: Module,            // shared AOT module; instances cheap
-    pub linker: Linker<WmState>,
+    pub linker: Linker<AppState>,
     pub focused: usize,            // index into wins (the focused window)
     pub drag: Option<DragState>,   // SP3 adds; None until SP3
     pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
@@ -595,8 +624,9 @@ impl Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
         let module = unsafe { Module::deserialize(engine, cwasm) }.expect("reactor module");
-        let mut linker: Linker<WmState> = Linker::new(engine);
-        add_to_linker(&mut linker).expect("wm linker");
+        let mut linker: Linker<AppState> = Linker::new(engine);
+        crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
+        add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
 
         let th = decor::TITLE_H;
         // (surface x, y, w, h, title) — A and B overlap so raise/lower is visible.
@@ -608,9 +638,14 @@ impl Compositor {
         for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
             let mut store = Store::new(
                 engine,
-                WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+                AppState {
+                    wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+                },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
+            // wasip1 std reactors need `_initialize` run before their first frame().
+            run_initialize(&mut store, &inst);
             // Register a proc so `ps` sees demo windows and reap can unregister them.
             let pid = crate::proc::register(alloc::format!("win:{}", title));
             wins.push(Window {
@@ -634,8 +669,9 @@ impl Compositor {
     /// `crate::gfx::enter` (no framebuffer). Spawn/reap run purely in RAM.
     fn new_empty() -> Compositor {
         let engine = engine();
-        let mut linker: Linker<WmState> = Linker::new(engine);
-        add_to_linker(&mut linker).expect("wm linker");
+        let mut linker: Linker<AppState> = Linker::new(engine);
+        crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
+        add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
         let module = module_for(REACTOR_CWASM).expect("reactor module");
         Compositor {
             wins: Vec::new(),
@@ -800,8 +836,11 @@ impl Compositor {
         let id = self.alloc_id();
         let mut store = Store::new(
             engine(),
-            WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
-                      events: VecDeque::new(), close_requested: false },
+            AppState {
+                wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+                win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
+                               events: VecDeque::new(), close_requested: false },
+            },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
         #[cfg(target_arch = "x86_64")]
@@ -814,6 +853,8 @@ impl Compositor {
                 return None;
             }
         };
+        // wasip1 std reactors need `_initialize` run before their first frame().
+        run_initialize(&mut store, &inst);
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
         // fully overlap, honoring sy >= decor::TITLE_H and the launcher strip.
         let g = crate::gfx::geom();
@@ -856,7 +897,7 @@ impl Compositor {
     /// once at the top of each compositor loop, BEFORE driving frames.
     fn reap(&mut self) {
         for w in &mut self.wins {
-            if w.store.data().close_requested {
+            if w.store.data().win.close_requested {
                 w.alive = false;
             }
         }
@@ -877,7 +918,7 @@ impl Compositor {
     fn compose_window(&self, idx: usize) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         let win = &self.wins[idx];
         let (sx, sy, sw, sh) = win.rect;
-        let surface = &win.store.data().pixels;
+        let surface = &win.store.data().win.pixels;
         if surface.is_empty() { return None; }
         let th = decor::TITLE_H;
         let fw = sw;
@@ -900,8 +941,8 @@ impl Compositor {
                          &win.title, decor::TEXT_RGBA);
 
         // Surface below the bar: copy committed pixels row-major (clip to fw).
-        let src_stride = (win.store.data().win_w as usize) * 4;
-        let copy_w = core::cmp::min(win.store.data().win_w, fw) as usize * 4;
+        let src_stride = (win.store.data().win.win_w as usize) * 4;
+        let copy_w = core::cmp::min(win.store.data().win.win_w, fw) as usize * 4;
         for row in 0..sh as usize {
             let src_off = row * src_stride;
             if src_off + copy_w > surface.len() { break; }
@@ -1063,7 +1104,7 @@ impl Compositor {
             decor::Hit::Surface => {
                 let top = self.raise(i);
                 self.set_focus(top);
-                self.wins[top].store.data_mut().events
+                self.wins[top].store.data_mut().win.events
                     .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
                 self.drag = None;
             }
@@ -1118,7 +1159,7 @@ impl Compositor {
                     }
                     0 => { // key -> focused window's queue
                         if self.focused < self.wins.len() {
-                            self.wins[self.focused].store.data_mut().events.push_back(ev);
+                            self.wins[self.focused].store.data_mut().win.events.push_back(ev);
                         }
                     }
                     _ => {}
@@ -1186,6 +1227,25 @@ pub fn lifecycle_self_test() -> (u32, u32, u32) {
     let reused = c.wins.last().map(|w| w.id).unwrap_or(u32::MAX);
     crate::binfo!("wm", "lifecycle reuse: new win_id after recycle = {}", reused);
     (spawns, peak, final_live)
+}
+
+/// Boot self-test (SP-A): spawn the wasip1 STD probe as a compositor window,
+/// drive one frame, and report the committed surface length. Builds an empty
+/// (headless, no `gfx::enter`) compositor, finds the `"wasip1-probe"` registry
+/// entry, `spawn_app`s it (which instantiates against the unified
+/// `Linker<AppState>` and runs `_initialize` via `run_initialize`), then
+/// `frame_all()` calls the guest's `frame()` once. A non-zero return =
+/// 307200 (320×240×4) proves the std/wasip1 guest instantiated, ran its std
+/// heap alloc inside `frame()`, and `wm.commit`ed against the WASI+wm linker.
+/// 0 = the entry is missing, instantiate failed (a needed WASI import isn't
+/// registered), or `frame()`/commit trapped.
+pub fn wasip1_probe_self_test() -> usize {
+    let mut c = Compositor::new_empty();
+    let idx = APPS.iter().position(|a| a.name == "wasip1-probe").unwrap_or(usize::MAX);
+    if idx == usize::MAX { return 0; }
+    if c.spawn_app(idx).is_none() { return 0; }
+    c.frame_all();
+    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
 }
 
 /// Boot-check: exercise the WM geometry + z-order/drag/close math with NO wasm

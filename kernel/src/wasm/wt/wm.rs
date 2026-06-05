@@ -98,6 +98,29 @@ fn module_for(cwasm: &'static [u8]) -> Option<Module> {
     Some(m)
 }
 
+/// SP-C: cache of modules loaded BY NAME from the VFS (`/bin/<name>.cwasm`),
+/// keyed by app name. The VFS bytes are NOT `&'static` (unlike the embedded
+/// `APPS` blobs the ptr-keyed `MODULE_CACHE` serves), so this is a separate
+/// `String`-keyed cache. `Module` is Arc-backed: a cached `clone` is cheap.
+static NAME_CACHE: Mutex<BTreeMap<String, Module>> = Mutex::new(BTreeMap::new());
+
+/// Load `/bin/<name>.cwasm` from the VFS and deserialize it (cached by name).
+/// Returns None on any failure (missing file / bad bytes / deserialize error).
+///
+/// Synchronous: the compositor loop owns the CPU (it is NOT inside the async
+/// executor), so block on the async VFS read via `crate::vfs::block_on` — the
+/// same single-poll driver `state.rs`/`fs.rs`/`ssh` use. The loaded `Vec<u8>`
+/// outlives `deserialize`; `Module` owns its code afterward.
+fn module_by_name(name: &str) -> Option<Module> {
+    if let Some(m) = NAME_CACHE.lock().get(name) { return Some(m.clone()); }
+    let path = alloc::format!("/bin/{}.cwasm", name);
+    let bytes = crate::vfs::block_on(crate::wasm::read_all(&path)).ok()?;
+    // SAFETY: wt-precompile output for this exact engine Config.
+    let m = unsafe { Module::deserialize(engine(), &bytes) }.ok()?;
+    NAME_CACHE.lock().insert(String::from(name), m.clone());
+    Some(m)
+}
+
 /// Boot self-test: every registry entry deserialises to a usable Module.
 /// Returns (entry_count, modules_ok).
 pub fn registry_self_test() -> (u32, u32) {
@@ -391,6 +414,15 @@ pub struct WmState {
     /// turns it into a kernel-driven interactive move (a `DragState`) next frame,
     /// then clears it.
     pub move_requested: bool,
+    /// Set by the guest via `wm.spawn(name)`; the run loop loads
+    /// `/bin/<name>.cwasm` and spawns it as a new window AFTER the current
+    /// `frame_all` pass (deferred so `wins` is never mutated mid-iteration), then
+    /// clears it.
+    pub spawn_request: Option<String>,
+    /// Set by the guest via `wm.set_background()`; the run loop pins THIS window
+    /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
+    /// then clears it.
+    pub bg_request: bool,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -507,7 +539,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: None, bg_request: false },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -566,6 +598,10 @@ pub struct Window {
     pub focused: bool,
     pub alive: bool,                // SP5 sets false to schedule teardown
     pub pid: u32,                   // SP5: proc-registry pid (freed on reap)
+    /// SP-C: the background window. A `bg` window is composited FIRST (z-bottom),
+    /// forced to the full framebuffer, undecorated, never raised/focused/moved/
+    /// closed; it only receives input where no non-`bg` window covers the point.
+    pub bg: bool,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -614,7 +650,7 @@ impl Compositor {
                 engine,
                 AppState {
                     wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
+                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: None, bg_request: false },
                 },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
@@ -631,6 +667,7 @@ impl Compositor {
                 focused: id == 0,
                 alive: true,
                 pid,
+                bg: false,
             });
         }
         let next_id = placements.len() as u32; // spawned ids start past the demo ids
@@ -797,7 +834,8 @@ impl Compositor {
                 wasi: WtState::new(alloc::vec![b"win".to_vec()]),
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
-                               move_requested: false },
+                               move_requested: false, spawn_request: None,
+                               bg_request: false },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -831,6 +869,7 @@ impl Compositor {
             focused: false,
             alive: true,
             pid,
+            bg: false,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order

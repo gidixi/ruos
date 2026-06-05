@@ -511,9 +511,13 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     };
     let mut store = Store::new(
         engine,
-        WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+        AppState {
+            wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+        },
     );
-    let mut linker: Linker<WmState> = Linker::new(engine);
+    let mut linker: Linker<AppState> = Linker::new(engine);
+    crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
     if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
     // BACKWARD if DF=1, silently corrupting copied data.
@@ -531,9 +535,9 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         if frame.call(&mut store, ()).is_err() { break; }
     }
     (
-        store.data().tick,
-        store.data().pixels.first().copied().unwrap_or(0),
-        store.data().pixels.len(),
+        store.data().win.tick,
+        store.data().win.pixels.first().copied().unwrap_or(0),
+        store.data().win.pixels.len(),
     )
 }
 
@@ -559,7 +563,7 @@ pub struct DragState {
 /// Surface pixels live in `store.data().pixels` (NOT a field here).
 pub struct Window {
     pub id: u32,
-    pub store: Store<WmState>,
+    pub store: Store<AppState>,
     pub inst: Instance,
     pub rect: (u32, u32, u32, u32), // SURFACE rect (x, y, w, h), EXCLUDING decorations
     pub title: String,              // shown in the SP3 title bar; "" until SP3
@@ -573,7 +577,7 @@ pub struct Window {
 pub struct Compositor {
     pub wins: Vec<Window>,
     pub module: Module,            // shared AOT module; instances cheap
-    pub linker: Linker<WmState>,
+    pub linker: Linker<AppState>,
     pub focused: usize,            // index into wins (the focused window)
     pub drag: Option<DragState>,   // SP3 adds; None until SP3
     pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
@@ -598,8 +602,9 @@ impl Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
         let module = unsafe { Module::deserialize(engine, cwasm) }.expect("reactor module");
-        let mut linker: Linker<WmState> = Linker::new(engine);
-        add_to_linker(&mut linker).expect("wm linker");
+        let mut linker: Linker<AppState> = Linker::new(engine);
+        crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
+        add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
 
         let th = decor::TITLE_H;
         // (surface x, y, w, h, title) — A and B overlap so raise/lower is visible.
@@ -611,7 +616,10 @@ impl Compositor {
         for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
             let mut store = Store::new(
                 engine,
-                WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+                AppState {
+                    wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+                },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
             // Register a proc so `ps` sees demo windows and reap can unregister them.
@@ -637,8 +645,9 @@ impl Compositor {
     /// `crate::gfx::enter` (no framebuffer). Spawn/reap run purely in RAM.
     fn new_empty() -> Compositor {
         let engine = engine();
-        let mut linker: Linker<WmState> = Linker::new(engine);
-        add_to_linker(&mut linker).expect("wm linker");
+        let mut linker: Linker<AppState> = Linker::new(engine);
+        crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
+        add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
         let module = module_for(REACTOR_CWASM).expect("reactor module");
         Compositor {
             wins: Vec::new(),
@@ -803,8 +812,11 @@ impl Compositor {
         let id = self.alloc_id();
         let mut store = Store::new(
             engine(),
-            WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
-                      events: VecDeque::new(), close_requested: false },
+            AppState {
+                wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+                win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
+                               events: VecDeque::new(), close_requested: false },
+            },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
         #[cfg(target_arch = "x86_64")]
@@ -859,7 +871,7 @@ impl Compositor {
     /// once at the top of each compositor loop, BEFORE driving frames.
     fn reap(&mut self) {
         for w in &mut self.wins {
-            if w.store.data().close_requested {
+            if w.store.data().win.close_requested {
                 w.alive = false;
             }
         }
@@ -880,7 +892,7 @@ impl Compositor {
     fn compose_window(&self, idx: usize) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         let win = &self.wins[idx];
         let (sx, sy, sw, sh) = win.rect;
-        let surface = &win.store.data().pixels;
+        let surface = &win.store.data().win.pixels;
         if surface.is_empty() { return None; }
         let th = decor::TITLE_H;
         let fw = sw;
@@ -903,8 +915,8 @@ impl Compositor {
                          &win.title, decor::TEXT_RGBA);
 
         // Surface below the bar: copy committed pixels row-major (clip to fw).
-        let src_stride = (win.store.data().win_w as usize) * 4;
-        let copy_w = core::cmp::min(win.store.data().win_w, fw) as usize * 4;
+        let src_stride = (win.store.data().win.win_w as usize) * 4;
+        let copy_w = core::cmp::min(win.store.data().win.win_w, fw) as usize * 4;
         for row in 0..sh as usize {
             let src_off = row * src_stride;
             if src_off + copy_w > surface.len() { break; }
@@ -1066,7 +1078,7 @@ impl Compositor {
             decor::Hit::Surface => {
                 let top = self.raise(i);
                 self.set_focus(top);
-                self.wins[top].store.data_mut().events
+                self.wins[top].store.data_mut().win.events
                     .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
                 self.drag = None;
             }
@@ -1121,7 +1133,7 @@ impl Compositor {
                     }
                     0 => { // key -> focused window's queue
                         if self.focused < self.wins.len() {
-                            self.wins[self.focused].store.data_mut().events.push_back(ev);
+                            self.wins[self.focused].store.data_mut().win.events.push_back(ev);
                         }
                     }
                     _ => {}

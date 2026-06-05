@@ -8,13 +8,12 @@
 //! back-to-front (`wins` Vec order = z-order); each window is opaque (alpha
 //! ignored — the SP3 footprints are solid RGBA, last writer wins per pixel).
 //!
-//! NOTE (SP4 / interface contract decision 6): a `WinDesc` describes ONE
-//! DECORATED footprint produced by `Compositor::compose_window` (title bar +
-//! [X] + surface), NOT a raw window surface. The band kernel paints a rect of
-//! RGBA pixels at a screen (x,y); it does not care whether the source is a raw
-//! surface or a decorated footprint, so this code is identical either way —
-//! only the WinDesc CONSTRUCTION (in `wm.rs`) feeds it the decorated footprint
-//! so the decorations survive parallel compositing.
+//! NOTE: a `WinDesc` describes ONE source rect produced by
+//! `Compositor::compose_window`. Under CSD (SP-B) that is the window's RAW
+//! committed surface (the app draws its own title bar / [X]); the band kernel
+//! paints a rect of RGBA pixels at a screen (x,y) regardless of whether the
+//! source is a raw surface or a (legacy) decorated footprint, so this code is
+//! unchanged — only the WinDesc CONSTRUCTION (in `wm.rs`) changed.
 
 /// One decorated footprint as the band kernel sees it: a raw pointer to its
 /// RGBA8888 footprint buffer plus its on-screen rect. `'static`-free; the

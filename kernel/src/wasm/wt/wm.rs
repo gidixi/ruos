@@ -298,66 +298,14 @@ fn dispatch_bands(
     // next frame and read/own `back` for the present.
 }
 
-/// Window decorations: a title bar above each surface + a close [X] button.
-/// All geometry is pure (no framebuffer access) so it is unit-checkable; the
-/// drawing helpers raster into a caller-owned RGBA8888 `Vec<u8>` (also no
-/// framebuffer access), so SP4 can call them on AP compositing jobs.
+/// Kernel chrome rasterisation helpers (the launcher taskbar). CSD retired the
+/// window decorations (the app draws its own title bar / [X] / content), so all
+/// that remains here is the pure software rasteriser the launcher strip uses:
+/// solid rects + bitmap-font text into a caller-owned RGBA8888 `Vec<u8>` (no
+/// framebuffer access, so it stays unit-checkable / AP-callable).
 pub mod decor {
-    /// Title-bar height in pixels (above the surface).
-    pub const TITLE_H: u32 = 28;
-    /// Close-button square edge (inside the title bar, right-aligned).
-    pub const BTN_W: u32 = TITLE_H;
-    /// Text inset from the left edge of the title bar.
+    /// Text inset from the left edge of a chrome element (e.g. a launcher button).
     pub const TEXT_PAD_X: u32 = 8;
-
-    // Decoration colours, RGBA8888 little-endian as [r,g,b,a].
-    pub const BAR_FOCUSED:   [u8; 4] = [0x2E, 0x5A, 0x88, 0xFF]; // blue bar (active)
-    pub const BAR_UNFOCUSED: [u8; 4] = [0x4A, 0x4A, 0x4A, 0xFF]; // grey bar (inactive)
-    pub const TEXT_RGBA:     [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]; // white title text
-    pub const CLOSE_BG:      [u8; 4] = [0xC0, 0x3A, 0x2A, 0xFF]; // red [X] background
-    pub const CLOSE_GLYPH:   [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]; // white [X] glyph
-
-    /// Title-bar rect on screen for a surface rect `(sx,sy,sw,sh)`:
-    /// returns (x, y, w, h) of the bar (directly above the surface).
-    /// Caller guarantees `sy >= TITLE_H`.
-    pub fn title_rect(s: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-        let (sx, sy, sw, _sh) = s;
-        (sx, sy - TITLE_H, sw, TITLE_H)
-    }
-
-    /// Close-button rect on screen for a surface rect `(sx,sy,sw,sh)`:
-    /// a BTN_W square at the right end of the title bar.
-    pub fn close_rect(s: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-        let (sx, sy, sw, _sh) = s;
-        let bw = if sw < BTN_W { sw } else { BTN_W };
-        (sx + sw - bw, sy - TITLE_H, bw, TITLE_H)
-    }
-
-    /// Full window footprint (title bar + surface) for hit-testing/composite.
-    pub fn window_rect(s: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-        let (sx, sy, sw, sh) = s;
-        (sx, sy - TITLE_H, sw, sh + TITLE_H)
-    }
-
-    /// True if (px,py) is inside rect `r=(x,y,w,h)`.
-    pub fn contains(r: (u32, u32, u32, u32), px: i32, py: i32) -> bool {
-        let (x, y, w, h) = r;
-        px >= x as i32 && py >= y as i32
-            && px < (x + w) as i32 && py < (y + h) as i32
-    }
-
-    /// Where a point landed on a window. Used by the input dispatcher.
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub enum Hit { Close, Title, Surface, Outside }
-
-    /// Classify (px,py) against a surface rect `s` (decoration-aware).
-    /// Close takes priority over Title; Title over Surface.
-    pub fn hit(s: (u32, u32, u32, u32), px: i32, py: i32) -> Hit {
-        if contains(close_rect(s), px, py) { return Hit::Close; }
-        if contains(title_rect(s), px, py) { return Hit::Title; }
-        if contains(s, px, py) { return Hit::Surface; }
-        Hit::Outside
-    }
 
     /// Fill a solid RGBA rect into a row-major RGBA8888 buffer `buf` of size
     /// `buf_w × buf_h`. Clips to the buffer. (x,y) is buffer-local.
@@ -404,12 +352,12 @@ pub mod decor {
 
     /// Draw a UTF-8 string starting at buffer-local (x,y), advancing by the
     /// monospace glyph width. Stops at the right edge `max_x`. Uses the kernel's
-    /// noto bitmap font (Regular weight). Vertically centres in TITLE_H.
+    /// noto bitmap font (Regular weight). Vertically centres within `buf_h`.
     pub fn draw_text(buf: &mut [u8], buf_w: u32, buf_h: u32,
                      x: u32, y: u32, max_x: u32, text: &str, c: [u8; 4]) {
         let gw = crate::console::font::glyph_width() as u32;
         let gh = crate::console::font::glyph_height() as i32;
-        let gy = y as i32 + ((TITLE_H as i32 - gh) / 2).max(0);
+        let gy = y as i32 + ((buf_h as i32 - gh) / 2).max(0);
         let mut pen = x;
         for ch in text.chars() {
             if pen + gw > max_x { break; }
@@ -606,8 +554,8 @@ pub struct Window {
     pub id: u32,
     pub store: Store<AppState>,
     pub inst: Instance,
-    pub rect: (u32, u32, u32, u32), // SURFACE rect (x, y, w, h), EXCLUDING decorations
-    pub title: String,              // shown in the SP3 title bar; "" until SP3
+    pub rect: (u32, u32, u32, u32), // WHOLE-window rect (x, y, w, h) under CSD (no decor)
+    pub title: String,              // app name; the app draws its OWN CSD title bar
     pub focused: bool,
     pub alive: bool,                // SP5 sets false to schedule teardown
     pub pid: u32,                   // SP5: proc-registry pid (freed on reap)
@@ -636,9 +584,9 @@ const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
 
 impl Compositor {
     /// Deserialize the shared reactor module, build the `wm` linker, and create
-    /// the demo's 2 OVERLAPPING titled windows. Each surface `sy >= TITLE_H` so
-    /// the title bars are on-screen, and the two windows overlap so the raise /
-    /// lower behaviour is directly visible. Window 0 starts focused.
+    /// the demo's 2 OVERLAPPING windows. CSD: windows are borderless (the surface
+    /// IS the whole window), placed anywhere on-screen; the two overlap so the
+    /// raise/lower behaviour is directly visible. Window 0 starts focused.
     pub fn new(cwasm: &[u8]) -> Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
@@ -647,11 +595,11 @@ impl Compositor {
         crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
 
-        let th = decor::TITLE_H;
-        // (surface x, y, w, h, title) — A and B overlap so raise/lower is visible.
+        // (window x, y, w, h, title) — A and B overlap so raise/lower is visible.
+        // No title-bar offset under CSD: rect IS the whole window.
         let placements: [(u32, u32, u32, u32, &str); 2] = [
-            (60,  th + 60,  WIN_W, WIN_H, "reactor A"),
-            (300, th + 170, WIN_W, WIN_H, "reactor B"),
+            (60,  60,  WIN_W, WIN_H, "reactor A"),
+            (300, 170, WIN_W, WIN_H, "reactor B"),
         ];
         let mut wins: Vec<Window> = Vec::new();
         for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
@@ -765,38 +713,21 @@ impl Compositor {
         self.wins.iter().position(|w| w.id == id)
     }
 
-    /// Topmost window whose FULL FOOTPRINT (title bar + surface) contains
-    /// (px,py). Iterates top→bottom (last index first). Returns the Vec index.
-    /// (Decoration-aware variant of `window_at`, which is surface-only.)
-    pub fn topmost_decor_at(&self, px: i32, py: i32) -> Option<usize> {
-        for i in (0..self.wins.len()).rev() {
-            if decor::contains(decor::window_rect(self.wins[i].rect), px, py) {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    /// Translate window `id`'s surface rect so the grabbed point follows the
-    /// cursor. `(cx,cy)` is the absolute cursor; `grab` is the offset captured
-    /// at mousedown. Clamps so the full footprint stays on screen.
+    /// Translate window `id`'s rect so the grabbed point follows the cursor.
+    /// `(cx,cy)` is the absolute cursor; `grab` is the offset captured at the start
+    /// of the drag (`wm.start_move`). CSD: the rect IS the whole window (no title
+    /// offset), so the window origin = cursor − grab, clamped fully on-screen.
     pub fn drag_to(&mut self, id: u32, cx: i32, cy: i32, grab: (i32, i32)) {
         let g = crate::gfx::geom();
         let (sw_screen, sh_screen) = (g.width as i32, g.height as i32);
         if let Some(i) = self.index_of(id) {
             let (_, _, w, h) = self.wins[i].rect;
-            // New footprint origin = cursor - grab offset.
-            let mut fx = cx - grab.0;
-            let mut fy = cy - grab.1;
-            // Footprint is w × (h + TITLE_H); keep it on screen.
+            // New window origin = cursor - grab offset, kept on screen.
             let fw = w as i32;
-            let fh = (h + decor::TITLE_H) as i32;
-            fx = fx.clamp(0, (sw_screen - fw).max(0));
-            fy = fy.clamp(0, (sh_screen - fh).max(0));
-            // Surface origin = footprint origin + (0, TITLE_H).
-            let sx = fx as u32;
-            let sy = (fy + decor::TITLE_H as i32) as u32;
-            self.wins[i].rect = (sx, sy, w, h);
+            let fh = h as i32;
+            let nx = (cx - grab.0).clamp(0, (sw_screen - fw).max(0)) as u32;
+            let ny = (cy - grab.1).clamp(0, (sh_screen - fh).max(0)) as u32;
+            self.wins[i].rect = (nx, ny, w, h);
         }
     }
 
@@ -876,11 +807,12 @@ impl Compositor {
         // wasip1 std reactors need `_initialize` run before their first frame().
         run_initialize(&mut store, &inst);
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
-        // fully overlap, honoring sy >= decor::TITLE_H and the launcher strip.
+        // fully overlap. CSD = no title-bar offset; just clamp on-screen (keeping
+        // the window clear of the launcher strip at the bottom).
         let g = crate::gfx::geom();
         let n = live as u32;
         let ox = (40 + n * 28).min(g.width.saturating_sub(340));
-        let oy = (decor::TITLE_H + 40 + n * 28)
+        let oy = (40 + n * 28)
             .min(g.height.saturating_sub(LAUNCHER_H + 260));
         let pid = crate::proc::register(alloc::format!("win:{}", app.name));
         self.wins.push(Window {
@@ -931,68 +863,46 @@ impl Compositor {
         }
     }
 
-    /// Build the full-footprint RGBA8888 buffer for window `idx`:
-    /// row 0..TITLE_H = decorated title bar, then the app surface below.
-    /// Returns (buf, footprint_x, footprint_y, footprint_w, footprint_h).
-    /// Returns None if the surface has not been committed yet.
+    /// CSD: the window IS its raw committed surface — no kernel decorations. Returns
+    /// `(pixels, x, y, w, h)`: the guest's last-committed RGBA8888 surface placed at
+    /// `Window.rect`'s origin, sized to the committed `win_w × win_h` (so the band
+    /// kernel's `src_stride = w*4` matches the committed buffer exactly). The app
+    /// draws its OWN title bar / [X] / content. Returns None if nothing committed yet.
     fn compose_window(&self, idx: usize) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         let win = &self.wins[idx];
-        let (sx, sy, sw, sh) = win.rect;
-        let surface = &win.store.data().win.pixels;
-        if surface.is_empty() { return None; }
-        let th = decor::TITLE_H;
-        let fw = sw;
-        let fh = sh + th;
-        let (fx, fy) = (sx, sy - th); // footprint origin (caller keeps sy >= th)
-        let mut buf = alloc::vec![0u8; (fw * fh * 4) as usize];
-
-        // Title bar background (focus-coloured).
-        let bar = if win.focused { decor::BAR_FOCUSED } else { decor::BAR_UNFOCUSED };
-        decor::fill_rect(&mut buf, fw, fh, 0, 0, fw, th, bar);
-
-        // Close [X] button (right-aligned square) + glyph.
-        let bw = if fw < decor::BTN_W { fw } else { decor::BTN_W };
-        let bx = fw - bw;
-        decor::fill_rect(&mut buf, fw, fh, bx, 0, bw, th, decor::CLOSE_BG);
-        decor::draw_text(&mut buf, fw, fh, bx + (bw / 4), 0, fw, "x", decor::CLOSE_GLYPH);
-
-        // Title text (left), clipped so it never runs under the [X] button.
-        decor::draw_text(&mut buf, fw, fh, decor::TEXT_PAD_X, 0, bx,
-                         &win.title, decor::TEXT_RGBA);
-
-        // Surface below the bar: copy committed pixels row-major (clip to fw).
-        let src_stride = (win.store.data().win.win_w as usize) * 4;
-        let copy_w = core::cmp::min(win.store.data().win.win_w, fw) as usize * 4;
-        for row in 0..sh as usize {
-            let src_off = row * src_stride;
-            if src_off + copy_w > surface.len() { break; }
-            let dst_off = ((th as usize + row) * fw as usize) * 4;
-            if dst_off + copy_w > buf.len() { break; }
-            buf[dst_off..dst_off + copy_w]
-                .copy_from_slice(&surface[src_off..src_off + copy_w]);
-        }
-        Some((buf, fx, fy, fw, fh))
+        let s = win.store.data();
+        if s.win.pixels.is_empty() { return None; }
+        let (x, y, _, _) = win.rect;
+        Some((s.win.pixels.clone(), x, y, s.win.win_w, s.win.win_h))
     }
 
     /// Call `frame()` on every window's instance (the gate's get_typed_func loop,
     /// ONE copy). Each app drains its queue via `wm.poll_event` and redraws.
+    ///
+    /// CSD crash safety-net: a `frame()` that returns `Err` — a trap, a
+    /// `panic=abort`, or a guest `proc_exit` (which `wasi.rs` maps to a trap) —
+    /// flags the window `close_requested`, so the reap pass drops it next loop
+    /// instead of leaving a frozen, un-closeable window (its CSD [X] is gone).
     fn frame_all(&mut self) {
         for w in self.wins.iter_mut() {
             if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
-                let _ = frame.call(&mut w.store, ());
+                match frame.call(&mut w.store, ()) {
+                    Ok(()) => {}
+                    Err(_) => { w.store.data_mut().win.close_requested = true; }
+                }
             }
         }
     }
 
     /// Composite ALL windows bottom→top into the kernel back-buffer, then ONE
-    /// blit. SP4: the per-band composite of the DECORATED footprints runs in
-    /// parallel across the SMP compute-pool (the APs); the present is one serial
-    /// blit on the BSP (which also recomposites the cursor). Clearing each band
-    /// to DESKTOP_BG every frame means drag/close leave no ghosts.
+    /// blit. SP4: the per-band composite of each window's surface runs in parallel
+    /// across the SMP compute-pool (the APs); the present is one serial blit on the
+    /// BSP (which also recomposites the cursor). Clearing each band to DESKTOP_BG
+    /// every frame means drag/close leave no ghosts.
     ///
-    /// CRITICAL (interface-contract decision 6): we composite SP3's DECORATED
-    /// footprints from `compose_window` (title bar + [X] + surface), NOT raw
-    /// surfaces — so window decorations survive the parallel raster.
+    /// CSD: `compose_window` now yields each window's RAW committed surface (the
+    /// app draws its own title bar / [X]); the band kernel paints it at the
+    /// window's rect. No kernel decorations are added.
     fn present(&mut self) {
         let g = crate::gfx::geom();
         let (sw, sh) = (g.width, g.height);
@@ -1103,40 +1013,23 @@ impl Compositor {
             .map(|(apps_idx, _)| apps_idx)
     }
 
-    /// Left mouse-down at screen (px,py): a launcher-button click spawns its app
-    /// (handled FIRST, before window dispatch); otherwise the topmost window's
-    /// decoration decides. [X] => close; title bar => raise+focus+begin drag;
-    /// surface => raise+focus AND forward the click to the app (so the app
-    /// surface still reacts to clicks, preserving SP2's per-window input). Empty
-    /// space => nothing.
+    /// Left mouse-down at screen (px,py). A launcher-button click spawns its app
+    /// (handled FIRST). Otherwise, under CSD the kernel only does window management:
+    /// the topmost window under the cursor is raised + focused, and the click is
+    /// forwarded to that window's queue so the app's OWN [X]/title-bar/content (all
+    /// egui-rendered) react. Close + title-drag are now the app's job (via
+    /// `wm.close` / `wm.start_move`). Empty space => nothing.
     fn on_left_down(&mut self, px: i32, py: i32) {
         if let Some(app_idx) = self.launcher_hit(px, py) {
             self.spawn_app(app_idx);
             return;
         }
-        let Some(i) = self.topmost_decor_at(px, py) else { return; };
-        let s = self.wins[i].rect;
-        let id = self.wins[i].id;
-        match decor::hit(s, px, py) {
-            decor::Hit::Close => { self.close(id); self.drag = None; }
-            decor::Hit::Title => {
-                let top = self.raise(i);
-                self.set_focus(top);
-                let fr = decor::window_rect(self.wins[top].rect);
-                self.drag = Some(DragState {
-                    win_id: id,
-                    grab_dx: px - fr.0 as i32,
-                    grab_dy: py - fr.1 as i32,
-                });
-            }
-            decor::Hit::Surface => {
-                let top = self.raise(i);
-                self.set_focus(top);
-                self.wins[top].store.data_mut().win.events
-                    .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
-                self.drag = None;
-            }
-            decor::Hit::Outside => {}
+        if let Some(i) = self.window_at(px, py) {
+            let top = self.raise(i);
+            self.set_focus(top);
+            // Forward the press to the (now-focused) window so its CSD widgets react.
+            self.wins[top].store.data_mut().win.events
+                .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
         }
     }
 
@@ -1296,49 +1189,26 @@ pub fn wasip1_probe_self_test() -> usize {
     c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
 }
 
-/// Boot-check: exercise the WM geometry + z-order/drag/close math with NO wasm
-/// instances. Returns a bitfield of passing sub-checks (all set == 0b1_1111).
+/// Boot-check: exercise the surviving WM z-order + CSD drag math with NO wasm
+/// instances. Under CSD the kernel no longer owns decorations (no title bar / [X]
+/// geometry to check), so this is a 2-bit word now (all set == 0b11).
 #[cfg(feature = "boot-checks")]
 pub fn wm_logic_selftest() -> u32 {
-    use decor::{Hit, hit, title_rect, close_rect};
     let mut flags = 0u32;
 
-    // (bit 0) title bar sits above the surface, full width.
-    let s = (100u32, 50u32, 320u32, 240u32); // surface; sy=50 >= TITLE_H=28
-    let tr = title_rect(s);
-    if tr == (100, 50 - decor::TITLE_H, 320, decor::TITLE_H) { flags |= 1 << 0; }
-
-    // (bit 1) close button is a square at the right end of the bar.
-    let cr = close_rect(s);
-    if cr == (100 + 320 - decor::BTN_W, 50 - decor::TITLE_H, decor::BTN_W, decor::TITLE_H) {
-        flags |= 1 << 1;
-    }
-
-    // (bit 2) hit classification: point in [X] => Close; in bar (left) => Title;
-    // in surface => Surface; above the bar => Outside.
-    let hx = (cr.0 + 2) as i32; let hy = (cr.1 + 2) as i32;          // inside [X]
-    let tx = (tr.0 + 2) as i32; let ty = (tr.1 + 2) as i32;          // left of bar
-    let ix = (s.0 + 4) as i32;  let iy = (s.1 + 4) as i32;           // inside surface
-    if hit(s, hx, hy) == Hit::Close
-        && hit(s, tx, ty) == Hit::Title
-        && hit(s, ix, iy) == Hit::Surface
-        && hit(s, ix, (tr.1 as i32) - 5) == Hit::Outside
-    { flags |= 1 << 2; }
-
-    // (bit 3) z-order move-to-top: ids [10,11,12] (12 top); raise idx 0 (id 10)
+    // (bit 0) z-order move-to-top: ids [10,11,12] (12 top); raise idx 0 (id 10)
     // => order [11,12,10] (10 now top).
     let mut order = alloc::vec![10u32, 11, 12];
     let i = 0usize;
     let w = order.remove(i); order.push(w); // mirrors Compositor::raise
-    if order == alloc::vec![11u32, 12, 10] { flags |= 1 << 3; }
+    if order == alloc::vec![11u32, 12, 10] { flags |= 1 << 0; }
 
-    // (bit 4) drag math: footprint origin = cursor - grab, surface = +TITLE_H.
-    // grab=(10,5), cursor=(200,160) => footprint (190,155) => surface (190,155+28).
+    // (bit 1) CSD drag math: the rect IS the whole window (no title offset), so the
+    // new window origin = cursor - grab. grab=(10,5), cursor=(200,160) => (190,155).
     let grab = (10i32, 5i32);
     let (cxd, cyd) = (200i32, 160i32);
-    let fx = cxd - grab.0; let fy = cyd - grab.1;
-    let sx = fx; let sy = fy + decor::TITLE_H as i32;
-    if sx == 190 && sy == 155 + decor::TITLE_H as i32 { flags |= 1 << 4; }
+    let nx = cxd - grab.0; let ny = cyd - grab.1;
+    if nx == 190 && ny == 155 { flags |= 1 << 1; }
 
     flags
 }

@@ -144,8 +144,15 @@ pub fn set_timer_periodic(vector: u8, initial_count: u32) {
 }
 
 /// Local APIC ID of the current core (xAPIC: register 0x20, bits 31:24).
+/// Returns 0 (BSP sentinel) if `init` has not run yet — safe for very early boot
+/// code (e.g. the magazine allocator cpu_id path) where the MMIO window is not
+/// yet mapped.
 pub fn apic_id() -> u32 {
-    // SAFETY: init ran before this is ever called; reg(0x20) is the ID register.
+    // SAFETY: read is atomic on x86 (naturally aligned 64-bit on 64-bit kernel).
+    if unsafe { core::ptr::read_volatile(&LAPIC_VIRT) } == 0 {
+        return 0;   // pre-init: MMIO not mapped; return BSP sentinel
+    }
+    // SAFETY: LAPIC_VIRT != 0 means init ran; reg(0x20) is the ID register.
     let raw = unsafe { read_volatile(reg(0x20)) };
     raw >> 24
 }

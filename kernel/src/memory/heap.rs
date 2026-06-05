@@ -8,6 +8,7 @@
 
 use core::fmt;
 use limine::memmap::MEMMAP_USABLE;
+#[cfg(not(feature = "alloc-magazine"))]
 use talc::{ErrOnOom, Span, Talc, Talck};
 
 /// Heap size in bytes: 128 MiB. Large enough to deserialize/instantiate the
@@ -21,8 +22,14 @@ pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
 // executor per-core (Step 3). Step 1 lo affianca con arene per-core (vedi
 // memory/alloc_magazine.rs / alloc_percore_talc.rs). NON è un problema di safety
 // (audit CHANGELOG/186: 0 must-fix), è un problema di CONTESA.
+#[cfg(not(any(feature = "alloc-magazine", feature = "alloc-percore-talc")))]
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();
+
+#[cfg(feature = "alloc-magazine")]
+#[global_allocator]
+pub static ALLOCATOR: crate::memory::alloc_magazine::MagazineAlloc =
+    crate::memory::alloc_magazine::MagazineAlloc::new();
 
 /// The heap region claimed by `init_heap`, recorded so that the future physical
 /// frame allocator (Step 6) can mask these frames as already-owned and never hand
@@ -83,12 +90,10 @@ pub fn init_heap() -> Result<HeapInfo, HeapInitError> {
     // region. No other reference into this range exists at this point in boot, so
     // the talc allocator has exclusive ownership. `ALLOCATOR` is `'static`, so
     // the claimed span stays valid for as long as it is used.
-    unsafe {
-        ALLOCATOR
-            .lock()
-            .claim(Span::from_base_size(virt_base as *mut u8, HEAP_SIZE))
-            .map_err(|_| HeapInitError::ClaimFailed)?;
-    }
+    #[cfg(not(feature = "alloc-magazine"))]
+    unsafe { ALLOCATOR.lock().claim(Span::from_base_size(virt_base as *mut u8, HEAP_SIZE)).map_err(|_| HeapInitError::ClaimFailed)?; }
+    #[cfg(feature = "alloc-magazine")]
+    unsafe { ALLOCATOR.claim(virt_base as *mut u8, HEAP_SIZE).map_err(|_| HeapInitError::ClaimFailed)?; }
 
     let info = HeapInfo { phys_base, virt_base, size: HEAP_SIZE };
     HEAP_INFO.call_once(|| info);

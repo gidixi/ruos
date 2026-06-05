@@ -11,6 +11,9 @@ pub mod exec;
 #[cfg(feature = "boot-checks")]
 pub mod allocbench;
 
+#[cfg(feature = "alloc-magazine")]
+pub mod alloc_magazine;
+
 pub use heap::{ALLOCATOR, HEAP_SIZE, HeapInfo, HeapInitError, init_heap, heap_region};
 pub use frames::{FrameCounts, FrameInitError, allocate_frame, free_frame, frame_counts,
     init as init_frames};

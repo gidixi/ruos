@@ -41,6 +41,9 @@ xhci = "0.9"
 [features]
 boot-checks = []
 wasm-trace = []
+# Force the compositor to use a single band on the BSP (no SMP split). Used by
+# the SP4 visual-equivalence test to capture a serial reference screendump.
+serial-composite = []
 # When set, a kernel panic halts (cli; hlt loop) instead of rebooting.
 # Use for debugging: `cargo build --features panic-halt`.
 # Default (no flag): panic triggers a controlled reboot via power::reboot().

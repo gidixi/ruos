@@ -21,6 +21,204 @@ use alloc::vec::Vec;
 use wasmtime::{Caller, Extern, Instance, Linker, Memory, Module, Store};
 use crate::gfx::GfxEvt;
 use crate::wasm::wt::engine;
+use core::sync::atomic::{AtomicU32, Ordering};
+use crate::wasm::wt::compose::{composite_band, WinDesc};
+
+/// Max composite bands per frame. One band per pool slot at most; capped well
+/// under `pool::MAX_JOBS` (64) since a frame uses ~num-cores bands.
+const MAX_BANDS: usize = 16;
+
+/// Shared, snapshot footprint descriptors for the current frame. All band jobs
+/// of one frame read the same footprint list (painter order = `wins` order).
+/// Sized for plenty of windows; the BSP fills `[0, n)` then submits.
+const MAX_WINS: usize = 64;
+
+/// A single band job's encoded descriptor. Lives in the `'static` arena so the
+/// `pool::submit(work, input: &'static [u8])` bound is satisfied soundly. The
+/// BSP fills slot `b`, submits a `&'static [u8]` view of it, and BLOCKS on the
+/// join before reusing it next frame — so no two in-flight jobs alias a slot.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct BandArg {
+    back: usize,    // back-buffer base pointer as usize
+    stride: usize,  // back-buffer byte pitch
+    screen_w: u32,
+    band_y0: u32,
+    band_y1: u32,
+    bg: u32,        // background RGBX
+    wins: usize,    // *const WinDesc (into the shared WIN arena)
+    n_wins: usize,  // number of WinDescs
+}
+
+/// SAFETY of the arena: `BandArg` is `Copy` plain-old-data; the pointers it
+/// carries (`back`, `wins`) point at the back-buffer and the WIN arena, both of
+/// which the BSP keeps alive across the join. Only the BSP writes the arena
+/// (between frames, never concurrently with in-flight jobs).
+static mut BAND_ARENA: [BandArg; MAX_BANDS] = [BandArg {
+    back: 0, stride: 0, screen_w: 0, band_y0: 0, band_y1: 0, bg: 0, wins: 0, n_wins: 0,
+}; MAX_BANDS];
+
+/// Shared snapshot of the DECORATED footprints for the current frame. All band
+/// jobs read the same list (painter order). The BSP fills `[0, n)` then submits;
+/// the footprint backing buffers are kept alive on the BSP across the join.
+static mut WIN_ARENA: [WinDesc; MAX_WINS] = [WinDesc {
+    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0,
+}; MAX_WINS];
+
+/// Distinct cores that ran a composite job in the most recent frame (bitset by
+/// cpu_id). Read by the boot-check marker to prove multi-core compositing.
+static COMPOSITE_CORE_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Read + clear the composite core mask (boot-check marker support).
+pub fn take_composite_core_mask() -> u32 {
+    COMPOSITE_CORE_MASK.swap(0, Ordering::SeqCst)
+}
+
+/// Pool job: composite one band. `input` is a byte view of one `BandArg` in the
+/// static arena (its bytes copied in by the dispatcher). Returns 0 (unused).
+///
+/// SAFETY: the dispatcher guarantees (a) `input` is exactly `size_of::<BandArg>()`
+/// bytes of a valid `BandArg`, (b) `back`/`wins` point at live buffers for the
+/// job's lifetime (BSP blocks on join before freeing), (c) this job's
+/// `[band_y0, band_y1)` is disjoint from every other in-flight job's range.
+fn composite_band_job(input: &[u8]) -> u64 {
+    if input.len() < core::mem::size_of::<BandArg>() {
+        return 0;
+    }
+    // Reconstruct the BandArg from the raw bytes (same round-trip pattern as
+    // pool::run_slot uses for the JobFn pointer).
+    let arg: BandArg = unsafe { core::ptr::read_unaligned(input.as_ptr() as *const BandArg) };
+    // SAFETY: wins points into the live WIN_ARENA for `n_wins` entries.
+    let wins: &[WinDesc] =
+        unsafe { core::slice::from_raw_parts(arg.wins as *const WinDesc, arg.n_wins) };
+    // SAFETY: disjoint band rows + live back-buffer (see fn-level contract).
+    unsafe {
+        composite_band(
+            arg.back as *mut u8,
+            arg.stride,
+            arg.screen_w,
+            arg.band_y0,
+            arg.band_y1,
+            arg.bg,
+            wins,
+        );
+    }
+    // Record which core ran this band (cpu_id is LAPIC-based — VBox-safe).
+    let cpu = crate::cpu::cpu_id();
+    if cpu < 32 {
+        COMPOSITE_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst);
+    }
+    0
+}
+
+/// Dispatch the banded composite into the screen-sized RGBX back-buffer pointed
+/// at by `back_ptr` (len = `stride*screen_h`). The WIN arena MUST already be
+/// filled (by `Compositor::present`) with the `n_wins` decorated footprint
+/// descriptors in painter order — this fn does NOT fill it. It splits the screen
+/// into `n_bands` disjoint horizontal bands, submits one pool job per band,
+/// drains inline when there are no APs (1-CPU fallback) or the pool is full, and
+/// JOINS every submitted job before returning. The caller then presents.
+///
+/// Correctness: bands have DISJOINT row ranges, every job writes only its own
+/// rows ⇒ no two jobs touch the same back-buffer byte. The framebuffer itself is
+/// NOT touched here (the BSP presents serially afterward).
+fn dispatch_bands(
+    back_ptr: usize,
+    stride: usize,
+    screen_w: u32,
+    screen_h: u32,
+    bg: u32,
+    n_wins: usize,
+) {
+    if screen_h == 0 || screen_w == 0 { return; }
+
+    // `wins` base into the shared WIN arena (already filled by present()).
+    let wins_ptr = core::ptr::addr_of!(WIN_ARENA) as usize;
+
+    // Band count: one band per online core (incl. BSP), capped — unless the
+    // serial-composite feature forces a single band (visual-equivalence ref).
+    #[cfg(feature = "serial-composite")]
+    let n_bands = 1usize;
+    #[cfg(not(feature = "serial-composite"))]
+    let n_bands = core::cmp::min(core::cmp::max(crate::cpu::cpus_online() as usize, 1), MAX_BANDS);
+    let band_rows = (screen_h as usize + n_bands - 1) / n_bands; // ceil
+
+    // Fill the band arena + submit one job per band.
+    let mut ids: [usize; MAX_BANDS] = [usize::MAX; MAX_BANDS];
+    let mut n_submitted = 0usize;
+    for b in 0..n_bands {
+        let y0 = (b * band_rows) as u32;
+        if y0 >= screen_h { break; }
+        let y1 = core::cmp::min(((b + 1) * band_rows) as u32, screen_h);
+        let arg = BandArg {
+            back: back_ptr,
+            stride,
+            screen_w,
+            band_y0: y0,
+            band_y1: y1,
+            bg,
+            wins: wins_ptr,
+            n_wins,
+        };
+        // SAFETY: BSP-only write of slot b; previous frame fully joined.
+        unsafe { BAND_ARENA[b] = arg; }
+        // A `&'static [u8]` view of this arena slot. `BAND_ARENA` is a real
+        // `static`, so the slice is genuinely `'static` — the bound is sound,
+        // not transmuted. The BSP blocks on join below before reusing slot b.
+        let bytes: &'static [u8] = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(BAND_ARENA[b]) as *const u8,
+                core::mem::size_of::<BandArg>(),
+            )
+        };
+        match crate::smp::pool::submit(composite_band_job, bytes) {
+            Some(id) => { ids[b] = id; n_submitted += 1; }
+            None => { break; } // pool full: remaining bands run inline below
+        }
+    }
+
+    // 1-CPU (or pool-full) fallback: drain any queued jobs inline on the BSP so
+    // we never deadlock waiting on cores that aren't there.
+    if crate::cpu::cpus_online() <= 1 {
+        while let Some(slot) = crate::smp::pool::take() {
+            crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+        }
+    }
+
+    // If submission stopped early (pool full), composite the leftover bands
+    // inline on the BSP — correctness over parallelism.
+    for b in n_submitted..n_bands {
+        let y0 = (b * band_rows) as u32;
+        if y0 >= screen_h { break; }
+        let y1 = core::cmp::min(((b + 1) * band_rows) as u32, screen_h);
+        // SAFETY: leftover bands are disjoint from submitted ones; submitted jobs
+        // only ever touch THEIR rows, so running these inline cannot race them.
+        unsafe {
+            composite_band(
+                back_ptr as *mut u8,
+                stride,
+                screen_w,
+                y0,
+                y1,
+                bg,
+                core::slice::from_raw_parts(wins_ptr as *const WinDesc, n_wins),
+            );
+        }
+        let cpu = crate::cpu::cpu_id();
+        if cpu < 32 { COMPOSITE_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+    }
+
+    // Join: block until every submitted band is DONE. poll_done frees slots.
+    for b in 0..n_bands {
+        if ids[b] == usize::MAX { continue; }
+        loop {
+            if crate::smp::pool::poll_done(ids[b]).is_some() { break; }
+            core::hint::spin_loop();
+        }
+    }
+    // After this point all jobs are DONE → the BSP may safely reuse the arenas
+    // next frame and read/own `back` for the present.
+}
 
 /// Window decorations: a title bar above each surface + a close [X] button.
 /// All geometry is pure (no framebuffer access) so it is unit-checkable; the
@@ -311,25 +509,6 @@ const WIN_H: u32 = 240;
 /// Desktop background (RGBA8888 [r,g,b,a]) shown where no window covers.
 const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
 
-/// Clipped copy of an `fw × fh` RGBA footprint into the screen back-buffer
-/// at screen (fx,fy). Off-screen pixels are dropped.
-fn blit_into(dst: &mut [u8], dst_w: u32, dst_h: u32,
-             src: &[u8], fx: i32, fy: i32, fw: u32, fh: u32) {
-    let dw = dst_w as usize;
-    for ry in 0..fh as i32 {
-        let py = fy + ry;
-        if py < 0 || py >= dst_h as i32 { continue; }
-        for rx in 0..fw as i32 {
-            let px = fx + rx;
-            if px < 0 || px >= dst_w as i32 { continue; }
-            let so = ((ry as usize * fw as usize) + rx as usize) * 4;
-            let do_ = ((py as usize * dw) + px as usize) * 4;
-            if so + 4 > src.len() || do_ + 4 > dst.len() { continue; }
-            dst[do_..do_ + 4].copy_from_slice(&src[so..so + 4]);
-        }
-    }
-}
-
 impl Compositor {
     /// Deserialize the shared reactor module, build the `wm` linker, and create
     /// the demo's 2 OVERLAPPING titled windows. Each surface `sy >= TITLE_H` so
@@ -531,20 +710,55 @@ impl Compositor {
     }
 
     /// Composite ALL windows bottom→top into the kernel back-buffer, then ONE
-    /// blit. Clearing to DESKTOP_BG each frame means drag/close leave no ghosts.
-    /// SP4 will parallelize the per-window compose + band-copy across the AP pool.
+    /// blit. SP4: the per-band composite of the DECORATED footprints runs in
+    /// parallel across the SMP compute-pool (the APs); the present is one serial
+    /// blit on the BSP (which also recomposites the cursor). Clearing each band
+    /// to DESKTOP_BG every frame means drag/close leave no ghosts.
+    ///
+    /// CRITICAL (interface-contract decision 6): we composite SP3's DECORATED
+    /// footprints from `compose_window` (title bar + [X] + surface), NOT raw
+    /// surfaces — so window decorations survive the parallel raster.
     fn present(&mut self) {
         let g = crate::gfx::geom();
         let (sw, sh) = (g.width, g.height);
-        let need = (sw as usize) * (sh as usize) * 4;
-        if self.backbuf.len() != need { self.backbuf = alloc::vec![0u8; need]; }
-        for px in self.backbuf.chunks_mut(4) { px.copy_from_slice(&DESKTOP_BG); }
+        if sw == 0 || sh == 0 { return; }
+        let stride = (sw as usize) * 4;
+        let needed = stride * sh as usize;
+        if self.backbuf.len() != needed { self.backbuf = alloc::vec![0u8; needed]; }
+
+        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order).
+        //    Keep them ALIVE in `foots` across the join so the band jobs' raw
+        //    pointers (into each footprint buffer) stay valid for the whole
+        //    parallel composite.
+        let mut foots: alloc::vec::Vec<(alloc::vec::Vec<u8>, u32, u32, u32, u32)> =
+            alloc::vec::Vec::new();
         for i in 0..self.wins.len() {
-            if let Some((buf, fx, fy, fw, fh)) = self.compose_window(i) {
-                blit_into(&mut self.backbuf, sw, sh, &buf, fx as i32, fy as i32, fw, fh);
+            if let Some(f) = self.compose_window(i) { foots.push(f); }
+        }
+        let n = core::cmp::min(foots.len(), MAX_WINS);
+        // SAFETY: BSP-only write of WIN_ARENA between joined frames (the previous
+        // frame's jobs were joined inside dispatch_bands before we returned, so
+        // no job is in flight while we mutate the arena here).
+        for (i, (buf, fx, fy, fw, fh)) in foots.iter().enumerate().take(n) {
+            unsafe {
+                WIN_ARENA[i] = WinDesc {
+                    px: buf.as_ptr(),
+                    px_len: buf.len(),
+                    x: *fx,
+                    y: *fy,
+                    w: *fw,
+                    h: *fh,
+                };
             }
         }
-        crate::gfx::blit(&self.backbuf, 0, 0, sw, sh);
+
+        // 2) Dispatch the banded composite into backbuf, then present.
+        let bg = u32::from_le_bytes(DESKTOP_BG);
+        let back_ptr = self.backbuf.as_mut_ptr() as usize;
+        dispatch_bands(back_ptr, stride, sw, sh, bg, n);
+        crate::gfx::blit(&self.backbuf[..needed], 0, 0, sw, sh);
+        // `foots` drops here — AFTER dispatch_bands joined all jobs, so the
+        // footprint buffers were alive for the entire parallel composite.
     }
 
     /// Left mouse-down at screen (px,py): topmost window's decoration decides.
@@ -601,6 +815,8 @@ impl Compositor {
         unsafe { core::arch::asm!("cld", options(nostack)); }
 
         let mut btn_l = false;
+        let mut frame_no: u32 = 0;
+        let mut marker_done = false;
         loop {
             crate::gfx::fold_mouse();
             while let Some(ev) = crate::gfx::pop() {
@@ -629,6 +845,24 @@ impl Compositor {
 
             self.frame_all();
             self.present();
+            frame_no += 1;
+
+            // After 30 composited frames, report the distinct cores that ran
+            // band jobs (one-shot; greppable by the boot-marker test). The
+            // warm-up gives the APs time to pick up several frames of jobs (the
+            // wake-IPI + worker-loop latency means the first frame or two may
+            // run partly inline on the BSP before APs warm up). cpu_id is
+            // LAPIC-based per core, VBox-safe — see project memory.
+            if !marker_done && frame_no >= 30 {
+                let mask = take_composite_core_mask();
+                let mut cores: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                for c in 0..32u32 {
+                    if mask & (1u32 << c) != 0 { cores.push(c); }
+                }
+                let n_cores = cores.len();
+                crate::binfo!("wm", "composite cores={} {:?}", n_cores, cores);
+                marker_done = true;
+            }
 
             // Crude pacing so the colour cycle + input feel responsive.
             for _ in 0..2_000_000u32 { core::hint::spin_loop(); }

@@ -52,6 +52,9 @@ pub fn init() -> Result<(), BootError> {
     crate::smp::bringup();
 
     #[cfg(feature = "boot-checks")]
+    crate::memory::allocbench::run_multicore();
+
+    #[cfg(feature = "boot-checks")]
     {
         let ok = crate::memory::exec::self_test();
         crate::binfo!("mem", "exec W^X self-test {}", if ok { "ok" } else { "FAIL" });

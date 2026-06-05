@@ -23,3 +23,4 @@ Step 1. Task 3 della spike.
 
 - kernel/src/memory/allocbench.rs
 - kernel/src/boot/phases/interrupts.rs
+- CHANGELOG/299-26-06-05-smp-step1-allocbench-mc.md

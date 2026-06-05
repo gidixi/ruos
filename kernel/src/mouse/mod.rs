@@ -74,6 +74,12 @@ pub fn pop_event() -> Option<MouseEvent> {
     QUEUE.lock().pop_front()
 }
 
+/// Inject an externally-sourced mouse event (e.g. a USB HID boot mouse) into the
+/// same queue the GUI drains, so USB and PS/2 pointers coexist transparently.
+pub fn inject(ev: MouseEvent) {
+    push_event(ev);
+}
+
 /// Number of mouse events seen since boot.
 pub fn event_count() -> u32 {
     EVENT_COUNT.load(Ordering::Relaxed)

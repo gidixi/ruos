@@ -61,6 +61,10 @@ pub fn init() -> Result<(), BootError> {
         crate::binfo!("wt", "linear-mem zero-init self-test {}", if zi { "ok" } else { "FAIL" });
         let mok = crate::mouse::self_test();
         crate::binfo!("mouse", "decode self-test {}", if mok { "ok" } else { "FAIL" });
+        let umok = crate::usb::mouse::self_test();
+        crate::binfo!("usb", "boot-mouse decode self-test {}", if umok { "ok" } else { "FAIL" });
+        let usk = crate::usb::usage::scancode_self_test();
+        crate::binfo!("usb", "usage->scancode self-test {}", if usk { "ok" } else { "FAIL" });
         // Wasmtime no_std AOT runtime self-test (spike gate): run the embedded
         // hello.cwasm; its `run` export calls ruos.print(42).
         let wt = crate::wasm::wt::run_hello_demo();

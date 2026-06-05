@@ -417,8 +417,9 @@ pub struct WmState {
     /// Set by the guest via `wm.spawn(name)`; the run loop loads
     /// `/bin/<name>.cwasm` and spawns it as a new window AFTER the current
     /// `frame_all` pass (deferred so `wins` is never mutated mid-iteration), then
-    /// clears it.
-    pub spawn_request: Option<String>,
+    /// drains it. A VecDeque so multiple `wm.spawn` calls in one frame are all
+    /// honoured (last-wins Option was a spec violation).
+    pub spawn_request: VecDeque<String>,
     /// Set by the guest via `wm.set_background()`; the run loop pins THIS window
     /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
     /// then clears it.
@@ -493,7 +494,7 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
         |mut caller: Caller<'_, T>, name_ptr: i32, name_len: i32| {
             if let Some(b) = crate::wasm::wt::mem::read(&mut caller, name_ptr as u32, name_len as u32) {
                 if let Ok(s) = core::str::from_utf8(&b) {
-                    caller.data_mut().win().spawn_request = Some(String::from(s));
+                    caller.data_mut().win().spawn_request.push_back(String::from(s));
                 }
             }
         })?;
@@ -557,7 +558,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: None, bg_request: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -852,7 +853,7 @@ impl Compositor {
                 wasi: WtState::new(alloc::vec![b"win".to_vec()]),
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
-                               move_requested: false, spawn_request: None,
+                               move_requested: false, spawn_request: VecDeque::new(),
                                bg_request: false },
             },
         );
@@ -1217,7 +1218,7 @@ impl Compositor {
             //    `frame_all`.
             let mut to_spawn: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
             for w in self.wins.iter_mut() {
-                if let Some(name) = w.store.data_mut().win.spawn_request.take() {
+                while let Some(name) = w.store.data_mut().win.spawn_request.pop_front() {
                     to_spawn.push(name);
                 }
             }
@@ -1387,10 +1388,10 @@ pub fn spc_self_test() -> u32 {
     // `spawn_request` (as `wm.spawn` would), then run the SAME drain logic the run
     // loop uses (collect names, then spawn) — but resolve via the embedded module
     // since the VFS isn't up. A successful spawn grows `wins` from 1 to 2.
-    c.wins[0].store.data_mut().win.spawn_request = Some(String::from("egui-demo"));
+    c.wins[0].store.data_mut().win.spawn_request.push_back(String::from("egui-demo"));
     let mut to_spawn: Vec<String> = Vec::new();
     for w in c.wins.iter_mut() {
-        if let Some(name) = w.store.data_mut().win.spawn_request.take() {
+        while let Some(name) = w.store.data_mut().win.spawn_request.pop_front() {
             to_spawn.push(name);
         }
     }

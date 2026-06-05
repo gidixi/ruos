@@ -41,6 +41,11 @@ xhci = "0.9"
 [features]
 boot-checks = []
 wasm-trace = []
+# When set, the USB boot phase synchronously drains enumeration, prints a
+# one-screen device summary, and halts — so a real machine with no serial can
+# be photographed to see WHERE USB enumeration breaks. Diagnostic only.
+# Use: `cargo build --features usb-probe`.
+usb-probe = []
 # When set, a kernel panic halts (cli; hlt loop) instead of rebooting.
 # Use for debugging: `cargo build --features panic-halt`.
 # Default (no flag): panic triggers a controlled reboot via power::reboot().

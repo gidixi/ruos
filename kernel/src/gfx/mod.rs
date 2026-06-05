@@ -216,9 +216,16 @@ static BTN_L: AtomicBool = AtomicBool::new(false);
 static BTN_R: AtomicBool = AtomicBool::new(false);
 static BTN_M: AtomicBool = AtomicBool::new(false);
 
-/// Drain the raw PS/2 mouse queue, fold deltas into an absolute position
-/// (clamped to the screen), and emit MouseMove/MouseButton GUI events.
+/// Drain the raw mouse queue, fold deltas into an absolute position (clamped to
+/// the screen), and emit MouseMove/MouseButton GUI events.
+///
+/// Called by the GUI every frame. A sync GUI owns the executor and never yields,
+/// so the async `usb_poll_task` is starved while it runs — USB is polled, not
+/// interrupt-driven, so without this the USB keyboard/mouse go dead in the GUI
+/// (PS/2 keeps working because it is IRQ-driven). Pump the USB controller here so
+/// USB HID reports are serviced and injected before we fold them.
 pub fn fold_mouse() {
+    crate::usb::poll();
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
     let mut moved = false;

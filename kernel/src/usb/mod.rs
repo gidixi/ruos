@@ -4,6 +4,7 @@ pub mod control;
 pub mod device;
 pub mod encoding;
 pub mod hid;
+pub mod mouse;
 pub mod hub;
 pub mod registry;
 pub mod usage;
@@ -26,4 +27,42 @@ pub fn init() {
 /// Drain the event ring + process HID input. Called by `usb_poll_task`.
 pub fn poll() {
     xhci::poll();
+}
+
+/// One connected root port's decoded PORTSC, for the `usb-probe` summary.
+/// Fields: `(port, ped, pr, pls, pp, speed)`. `speed` PSI: 1=Full 2=Low 3=High
+/// 4=Super. `pls`: 0=U0(enabled) 4=Disabled 5=RxDetect 6=Inactive 7=Polling.
+#[cfg(feature = "usb-probe")]
+pub struct ProbePort {
+    pub port: u8,
+    pub ped: bool,
+    pub pr: bool,
+    pub pls: u8,
+    pub pp: bool,
+    pub speed: u8,
+}
+
+/// Diagnostic snapshot of the **connected** root ports (disconnected ports are
+/// skipped to keep the frozen summary on one screen on real controllers, which
+/// can expose 20+ ports). Read once, after enumeration has been drained, so the
+/// PED/PLS shown is the post-reset state.
+#[cfg(feature = "usb-probe")]
+pub fn probe_ports() -> alloc::vec::Vec<ProbePort> {
+    let mut v = alloc::vec::Vec::new();
+    let cell = match CTRL.get() { Some(c) => c, None => return v };
+    let mut g = cell.lock();
+    let x = match g.as_mut() { Some(x) => x, None => return v };
+    for port in 1..=x.max_ports {
+        let p = x.regs.port_register_set.read_volatile_at((port - 1) as usize);
+        if !p.portsc.current_connect_status() { continue; }
+        v.push(ProbePort {
+            port,
+            ped: p.portsc.port_enabled_disabled(),
+            pr: p.portsc.port_reset(),
+            pls: p.portsc.port_link_state(),
+            pp: p.portsc.port_power(),
+            speed: p.portsc.port_speed(),
+        });
+    }
+    v
 }

@@ -17,6 +17,7 @@ pub const MAX_SLOTS: usize = 256;
 pub enum SlotKind {
     Hub(crate::usb::hub::HubState),
     Keyboard(crate::usb::hid::HidState),
+    Mouse(crate::usb::hid::HidState),
     Other,
 }
 
@@ -58,9 +59,31 @@ pub fn with_slot<R>(slot: u8, f: impl FnOnce(&mut SlotEntry) -> R) -> Option<R> 
 pub fn dispatch_transfer(x: &mut crate::usb::xhci::Xhci, slot: u8, dci: u8) {
     with_slot(slot, |e| match &mut e.kind {
         SlotKind::Keyboard(st) if st.dci == dci => crate::usb::hid::on_report(x, st),
+        SlotKind::Mouse(st) if st.dci == dci => crate::usb::hid::on_report_mouse(x, st),
         SlotKind::Hub(hs) if hs.dci == dci => crate::usb::hub::on_status(x, slot, hs),
         _ => {}
     });
+}
+
+/// Diagnostic snapshot of every enumerated slot: `(slot, root_port, speed,
+/// kind)`. Used by the `usb-probe` boot diagnostic to print a one-screen device
+/// summary on machines with no serial. `speed`: 1=Full, 2=Low, 3=High, 4=Super.
+#[cfg(feature = "usb-probe")]
+pub fn probe_dump() -> alloc::vec::Vec<(u8, u8, u8, &'static str)> {
+    let g = SLOTS.lock();
+    let mut v = alloc::vec::Vec::new();
+    for i in 1..MAX_SLOTS {
+        if let Some(e) = g[i].as_ref() {
+            let kind = match e.kind {
+                SlotKind::Hub(_) => "Hub",
+                SlotKind::Keyboard(_) => "Keyboard",
+                SlotKind::Mouse(_) => "Mouse",
+                SlotKind::Other => "Other",
+            };
+            v.push((i as u8, e.root_port, e.speed, kind));
+        }
+    }
+    v
 }
 
 /// Root device on root-hub port `port`, if one is already enumerated. A root
@@ -131,7 +154,9 @@ pub fn teardown(x: &mut crate::usb::xhci::Xhci, slot: u8) {
         dma::dealloc(entry.dev.dev_ctx);
         match entry.kind {
             SlotKind::Hub(h) => { dma::dealloc(h.int_ring); dma::dealloc(h.change_buf); }
-            SlotKind::Keyboard(k) => { dma::dealloc(k.int_ring); dma::dealloc(k.report); }
+            SlotKind::Keyboard(k) | SlotKind::Mouse(k) => {
+                dma::dealloc(k.int_ring); dma::dealloc(k.report);
+            }
             SlotKind::Other => {}
         }
         crate::binfo!("usb", "teardown slot={}", slot);

@@ -37,6 +37,36 @@ pub fn reset_root_port(x: &mut Xhci, port: u8) -> Option<u8> {
         return None;
     }
 
+    // Diagnostic (usb-probe): the connect→reset path retries forever while a port
+    // refuses to enable, which would flood the screen. Log the raw PORTSC dump
+    // only the FIRST time we touch each port (one PRE + one POST line per port).
+    #[cfg(feature = "usb-probe")]
+    let first_probe = {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        let bit = 1u32 << idx.min(31);
+        (LOGGED.fetch_or(bit, Ordering::Relaxed) & bit) == 0
+    };
+
+    // Raw PORTSC state BEFORE we touch the port. On real hardware a port can be
+    // connected yet sit in a link state (PLS) that a plain PR reset does not
+    // advance to Enabled — this shows which.
+    #[cfg(feature = "usb-probe")]
+    if first_probe {
+        crate::binfo!(
+            "usb",
+            "port {} PRE  ccs={} ped={} pr={} pls={} pp={} speed={} csc={}",
+            port,
+            p.portsc.current_connect_status(),
+            p.portsc.port_enabled_disabled(),
+            p.portsc.port_reset(),
+            p.portsc.port_link_state(),
+            p.portsc.port_power(),
+            p.portsc.port_speed(),
+            p.portsc.connect_status_change(),
+        );
+    }
+
     // Assert port reset (PR bit, RW1S). Preserve all RW1C change bits by
     // writing 0 to them so the read-modify-write does not accidentally clear
     // them (writing 1 to a RW1C bit clears it in hardware).
@@ -78,15 +108,51 @@ pub fn reset_root_port(x: &mut Xhci, port: u8) -> Option<u8> {
         p.portsc.set_0_port_config_error_change();
     });
 
+    // Real hardware raises PED (Port Enabled/Disabled) a short, controller-
+    // specific delay AFTER it raises PRC — not simultaneously the way QEMU/VBox
+    // do. Reading PED immediately here returned `enabled=false` on real xHCI even
+    // though the very same port reads PED=1 a few ms later, so every device was
+    // dropped (None → no enumeration) and the connect→reset cycle retried
+    // forever. Poll PED (bounded) until the controller actually enables the port.
+    let mut enabled = false;
+    let ped_start = crate::boot::clock::elapsed_ms();
+    while crate::boot::clock::elapsed_ms() - ped_start < 100 {
+        if x.regs.port_register_set
+            .read_volatile_at(idx).portsc.port_enabled_disabled()
+        {
+            enabled = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
     let p = x.regs.port_register_set.read_volatile_at(idx);
-    let speed   = p.portsc.port_speed();
-    let enabled = p.portsc.port_enabled_disabled();
+    let speed = p.portsc.port_speed();
 
     crate::binfo!(
         "usb",
         "port {} connected speed={} enabled={} reset_done={}",
         port, speed, enabled, reset_done
     );
+
+    // Diagnostic (usb-probe): full PORTSC state AFTER the reset attempt. PED=0
+    // with reset_done=true means the reset cycled (PRC fired) but the controller
+    // did not enable the port; PLS tells us what state it landed in.
+    #[cfg(feature = "usb-probe")]
+    if first_probe {
+        crate::binfo!(
+            "usb",
+            "port {} POST ped={} pr={} prc={} pls={} pp={} speed={} reset_done={}",
+            port,
+            p.portsc.port_enabled_disabled(),
+            p.portsc.port_reset(),
+            p.portsc.port_reset_change(),
+            p.portsc.port_link_state(),
+            p.portsc.port_power(),
+            speed,
+            reset_done,
+        );
+    }
 
     if enabled { Some(speed) } else { None }
 }
@@ -308,9 +374,14 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
         let hs = crate::usb::hub::setup(x, slot_id, &mut dev, &loc)?;
         crate::usb::registry::SlotKind::Hub(hs)
     } else if let Some(kb) = configure(x, &mut dev) {
-        // HID boot keyboard: configure its interrupt-IN endpoint + queue a report.
+        // HID boot keyboard or mouse: configure its interrupt-IN endpoint + queue
+        // the first report. `proto` (1=kbd, 2=mouse) picks the slot kind.
         let st = crate::usb::hid::configure_endpoint(x, &mut dev, &kb)?;
-        crate::usb::registry::SlotKind::Keyboard(st)
+        if kb.proto == 2 {
+            crate::usb::registry::SlotKind::Mouse(st)
+        } else {
+            crate::usb::registry::SlotKind::Keyboard(st)
+        }
     } else {
         crate::usb::registry::SlotKind::Other
     };
@@ -350,9 +421,10 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
 }
 
 /// Read the Configuration Descriptor, walk interface/endpoint descriptors to
-/// find the HID boot keyboard interrupt-IN endpoint, then issue SET_CONFIGURATION.
-/// Returns the HidKeyboard descriptor on success.
-pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::HidKeyboard> {
+/// find a HID boot keyboard (protocol 1) or mouse (protocol 2) interrupt-IN
+/// endpoint, then issue SET_CONFIGURATION. Returns the endpoint descriptor on
+/// success (its `proto` field says which kind).
+pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::HidBootEndpoint> {
     // `buf` is a one-shot scratch page used only for this descriptor walk. It is
     // freed on EVERY return path: DmaRegion has no Drop, so the body runs in an
     // inner closure (which has the `?`/early returns), then we dealloc, then
@@ -391,7 +463,7 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
         let mut pos: usize = 0;
         // (iface_num, class, subclass, protocol)
         let mut cur_iface: Option<(u8, u8, u8, u8)> = None;
-        let mut found: Option<crate::usb::hid::HidKeyboard> = None;
+        let mut found: Option<crate::usb::hid::HidBootEndpoint> = None;
 
         while pos + 2 <= n {
             let blen = rd(pos) as usize;
@@ -404,6 +476,14 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
                     // Interface descriptor
                     if pos + 9 <= n {
                         cur_iface = Some((rd(pos + 2), rd(pos + 5), rd(pos + 6), rd(pos + 7)));
+                        // Diagnostic: dump every interface so a device that fails
+                        // the HID-boot match (e.g. a mouse with subclass!=1, or a
+                        // composite whose mouse interface isn't first) is visible.
+                        #[cfg(feature = "usb-probe")]
+                        crate::binfo!(
+                            "usb", "  iface={} class={} sub={} proto={}",
+                            rd(pos + 2), rd(pos + 5), rd(pos + 6), rd(pos + 7)
+                        );
                     }
                 }
                 5 => {
@@ -414,15 +494,18 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
                             let attr = rd(pos + 3);
                             let is_in  = (addr & 0x80) != 0;
                             let is_int = (attr & 0x03) == 3;
-                            if cls == 3 && sub == 1 && proto == 1 && is_in && is_int
-                                && found.is_none()
+                            // HID (class 3) boot subclass (1), keyboard (proto 1)
+                            // or mouse (proto 2), interrupt-IN. Take the first.
+                            if cls == 3 && sub == 1 && (proto == 1 || proto == 2)
+                                && is_in && is_int && found.is_none()
                             {
                                 let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
-                                found = Some(crate::usb::hid::HidKeyboard {
+                                found = Some(crate::usb::hid::HidBootEndpoint {
                                     iface,
                                     ep_addr:    addr,
                                     max_packet: mps,
                                     interval:   rd(pos + 6),
+                                    proto,
                                 });
                             }
                         }
@@ -437,12 +520,13 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
             Some(kb) => {
                 crate::binfo!(
                     "usb",
-                    "HID kbd iface={} ep=0x{:02x} mps={} interval={}",
+                    "HID boot {} iface={} ep=0x{:02x} mps={} interval={}",
+                    if kb.proto == 2 { "mouse" } else { "kbd" },
                     kb.iface, kb.ep_addr, kb.max_packet, kb.interval
                 );
             }
             None => {
-                crate::bwarn!("usb", "no HID boot keyboard found");
+                crate::bwarn!("usb", "no HID boot keyboard/mouse found");
                 return None;
             }
         }

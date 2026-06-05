@@ -30,6 +30,9 @@ use crate::wasm::wt::compose::{composite_band, WinDesc};
 /// clamps windows above it.
 const LAUNCHER_H: u32 = 28;
 
+/// Width of one launcher button (one per `APPS` entry, left-to-right).
+const LAUNCHER_BTN_W: u32 = 96;
+
 /// Max simultaneously-live windows. Each live window holds a wasm instance (its
 /// own linear memory) + a surface buffer; this bounds the heap budget. (Reactor
 /// surface ≈ 0.3 MB; a full-window app ≈ 4 MB. 8 windows ≈ a few MB of surfaces
@@ -972,11 +975,76 @@ impl Compositor {
         // footprint buffers were alive for the entire parallel composite.
     }
 
-    /// Left mouse-down at screen (px,py): topmost window's decoration decides.
-    /// [X] => close; title bar => raise+focus+begin drag; surface => raise+focus
-    /// AND forward the click to the app (so the app surface still reacts to
-    /// clicks, preserving SP2's per-window input). Empty space => nothing.
+    /// Draw the launcher taskbar: a dark strip across the bottom of the screen
+    /// with one tinted, labelled button per `APPS` entry. Kernel-drawn chrome
+    /// (NOT a wasm surface): builds ONE RGBA8888 strip buffer `g.width ×
+    /// LAUNCHER_H`, rasters the buttons + labels into it, then ONE
+    /// `gfx::blit`. Called each frame AFTER `present()` so it overlays the
+    /// composited windows (always-on-top chrome); `gfx::blit` recomposites the
+    /// cursor over it.
+    fn draw_launcher(&self) {
+        let g = crate::gfx::geom();
+        let (sw, lh) = (g.width, LAUNCHER_H);
+        if sw == 0 || lh == 0 { return; }
+        let mut strip = alloc::vec![0u8; (sw * lh * 4) as usize];
+
+        // Strip background (dark, opaque).
+        decor::fill_rect(&mut strip, sw, lh, 0, 0, sw, lh, [0x30, 0x30, 0x38, 0xFF]);
+
+        // Per-button tints (distinct per index so buttons read as separate).
+        const BTN_TINTS: [[u8; 4]; 4] = [
+            [0x3A, 0x5A, 0x8A, 0xFF], // blue
+            [0x3A, 0x7A, 0x4A, 0xFF], // green
+            [0x8A, 0x4A, 0x3A, 0xFF], // red-brown
+            [0x6A, 0x4A, 0x8A, 0xFF], // purple
+        ];
+
+        for (i, app) in APPS.iter().enumerate() {
+            let bx = i as u32 * LAUNCHER_BTN_W;
+            if bx >= sw { break; }
+            // Button rect inset 2px from the cell so cells read as buttons.
+            let inset = 2u32;
+            let bw = LAUNCHER_BTN_W.min(sw - bx);
+            let rect_w = bw.saturating_sub(inset * 2);
+            let rect_h = lh.saturating_sub(inset * 2);
+            let tint = BTN_TINTS[i % BTN_TINTS.len()];
+            decor::fill_rect(&mut strip, sw, lh, bx + inset, inset, rect_w, rect_h, tint);
+            // Label (white), clipped to the button's right edge.
+            let label_x = bx + inset + decor::TEXT_PAD_X;
+            let max_x = bx + bw;
+            decor::draw_text(&mut strip, sw, lh, label_x, 0, max_x, app.name,
+                             [0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        crate::gfx::blit(&strip, 0, g.height - lh, sw, lh);
+    }
+
+    /// Hit-test a screen point against the launcher buttons. Returns the `APPS`
+    /// index of the button under (px,py), or None if the point is above the
+    /// strip / past the last button / off the right edge of the screen.
+    fn launcher_hit(&self, px: i32, py: i32) -> Option<usize> {
+        let g = crate::gfx::geom();
+        let y0 = g.height as i32 - LAUNCHER_H as i32;
+        if py < y0 { return None; }
+        let idx = (px / LAUNCHER_BTN_W as i32) as usize;
+        if px >= 0 && idx < APPS.len() && (idx as u32 * LAUNCHER_BTN_W) < g.width {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Left mouse-down at screen (px,py): a launcher-button click spawns its app
+    /// (handled FIRST, before window dispatch); otherwise the topmost window's
+    /// decoration decides. [X] => close; title bar => raise+focus+begin drag;
+    /// surface => raise+focus AND forward the click to the app (so the app
+    /// surface still reacts to clicks, preserving SP2's per-window input). Empty
+    /// space => nothing.
     fn on_left_down(&mut self, px: i32, py: i32) {
+        if let Some(app_idx) = self.launcher_hit(px, py) {
+            self.spawn_app(app_idx);
+            return;
+        }
         let Some(i) = self.topmost_decor_at(px, py) else { return; };
         let s = self.wins[i].rect;
         let id = self.wins[i].id;
@@ -1059,6 +1127,10 @@ impl Compositor {
 
             self.frame_all();
             self.present();
+            // Always-on-top chrome: present() blits the whole back-buffer, so the
+            // launcher must be redrawn over it every frame. gfx::blit recomposites
+            // the cursor over the strip.
+            self.draw_launcher();
             frame_no += 1;
 
             // After 30 composited frames, report the distinct cores that ran

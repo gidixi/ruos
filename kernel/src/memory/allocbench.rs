@@ -18,6 +18,20 @@ fn cyc_to_ns(cyc: u64, iters: u64) -> u64 {
 const SMALL_ITERS: u64 = 100_000;
 const LARGE_ITERS: u64 = 256;
 
+/// Micro-benchmark del costo di `cpu_id()` da solo (LAPIC MMIO read). Permette di
+/// quantificare quanto dell'overhead degli allocatori per-core è cpu_id() vs lavoro reale.
+pub fn run_cpuid_bench() {
+    const ITERS: u64 = 100_000;
+    let mut acc: u64 = 0;
+    let t0 = read_tsc();
+    for _ in 0..ITERS {
+        acc = acc.wrapping_add(crate::cpu::cpu_id() as u64);
+        core::hint::black_box(acc);
+    }
+    let cyc = read_tsc().saturating_sub(t0);
+    crate::binfo!("allocbench", "cpuid ns_per_call={} iters={} acc={}", cyc_to_ns(cyc, ITERS), ITERS, acc);
+}
+
 /// Single-core alloc/free latency su BSP. Stampa il marker greppabile dal test.
 pub fn run_single_core() {
     let mut acc: u64 = 0;

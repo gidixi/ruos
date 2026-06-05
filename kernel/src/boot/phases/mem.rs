@@ -20,7 +20,6 @@ pub fn init() -> Result<(), BootError> {
         let b = Box::new(0xCAFEBABEu64);
         let v: Vec<u32> = (0..5).collect();
         crate::binfo!("mem", "alloc smoke ok box=0x{:X} vec={:?}", *b, v);
-        crate::memory::allocbench::run_single_core();
     }
 
     // ACPI.

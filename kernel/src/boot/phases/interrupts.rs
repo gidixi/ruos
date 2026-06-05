@@ -52,7 +52,11 @@ pub fn init() -> Result<(), BootError> {
     crate::smp::bringup();
 
     #[cfg(feature = "boot-checks")]
-    crate::memory::allocbench::run_multicore();
+    {
+        crate::memory::allocbench::run_cpuid_bench();
+        crate::memory::allocbench::run_single_core();
+        crate::memory::allocbench::run_multicore();
+    }
 
     #[cfg(feature = "boot-checks")]
     {

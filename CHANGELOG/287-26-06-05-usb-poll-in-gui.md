@@ -1,4 +1,4 @@
-# 282 — Fix: pompa usb::poll() nel loop GUI (input USB in GUI)
+# 287 — Fix: pompa usb::poll() nel loop GUI (input USB in GUI)
 
 **Data:** 2026-06-05
 

@@ -1,4 +1,4 @@
-# 281 — USB HID boot mouse
+# 286 — USB HID boot mouse
 
 **Data:** 2026-06-05
 

@@ -1,4 +1,4 @@
-# 279 — Fix: USB port reset attende PED su hardware reale
+# 284 — Fix: USB port reset attende PED su hardware reale
 
 **Data:** 2026-06-05
 
@@ -16,7 +16,7 @@ immediata di PED restituiva `enabled=false` anche se la stessa porta leggeva
 `enumerate` non veniva mai chiamato, nessun device USB enumerava, e il ciclo
 connect→reset andava in retry infinito.
 
-Diagnosi via feature `usb-probe` (changelog 278) su hardware reale: lo scrollback
+Diagnosi via feature `usb-probe` (changelog 283) su hardware reale: lo scrollback
 mostrava `enabled=false reset_done=true` durante il reset, ma il summary post-reset
 (3 s dopo) mostrava le stesse porte connesse con `ped=true pls=0` ed `enumerated
 slots: (none)`. La contraddizione (PED falso al reset, vero dopo) ha individuato

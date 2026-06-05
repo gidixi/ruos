@@ -1,4 +1,4 @@
-# 278 — Diagnostica USB `usb-probe` per hardware reale
+# 283 — Diagnostica USB `usb-probe` per hardware reale
 
 **Data:** 2026-06-05
 

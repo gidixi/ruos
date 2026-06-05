@@ -1,4 +1,4 @@
-# 280 — Fix: encoding interval endpoint HID speed-aware
+# 285 — Fix: encoding interval endpoint HID speed-aware
 
 **Data:** 2026-06-05
 

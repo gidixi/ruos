@@ -1,4 +1,4 @@
-# 283 — USB tastiera: eventi tasto anche alla GUI
+# 288 — USB tastiera: eventi tasto anche alla GUI
 
 **Data:** 2026-06-05
 
@@ -20,7 +20,7 @@ La GUI legge i tasti dagli eventi `gfx` (kind=0, scancode Set 1), non dal PTY. I
 driver PS/2 spinge sia `gfx::push_key` sia `pty::master_input_push(0)`; la tastiera
 USB spingeva solo il PTY → funzionava nella shell ma **non nella GUI**. Aggiunto il
 ramo GUI mancante. (Combinato con il pompaggio `usb::poll()` in `fold_mouse`,
-changelog 282, la tastiera USB ora funziona dentro la GUI.)
+changelog 287, la tastiera USB ora funziona dentro la GUI.)
 
 ## Verifica
 - `usb::usage::scancode_self_test()` (boot-checks): PASS (lettere, cifre, Enter,

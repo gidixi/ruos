@@ -898,6 +898,17 @@ impl Compositor {
                     Err(_) => { w.store.data_mut().win.close_requested = true; }
                 }
             }
+            // CSD: the window IS its committed surface, so the hit-rect size must
+            // track the committed `win_w × win_h` (apps pick their own size — the
+            // egui demo commits 480×320, not the 320×240 spawn placeholder). Without
+            // this, `window_at` / drag clamp use the stale placeholder size and a
+            // click on the app's [X] (past the placeholder right/bottom edge) is
+            // never routed. Keep the rect ORIGIN (x,y); only adopt the real w/h.
+            let (rx, ry, _, _) = w.rect;
+            let (cw, ch) = { let s = w.store.data(); (s.win.win_w, s.win.win_h) };
+            if cw != 0 && ch != 0 {
+                w.rect = (rx, ry, cw, ch);
+            }
         }
     }
 
@@ -1020,12 +1031,39 @@ impl Compositor {
             .map(|(apps_idx, _)| apps_idx)
     }
 
+    /// Push a window-local MouseMove (kind 1) into window `idx`'s queue so the app's
+    /// egui pointer tracks the cursor. Coords are screen − window origin, encoded as
+    /// f32 bits (the `wm.poll_event` / gui-core ABI: p0=x.bits, p1=y.bits). Always
+    /// forwarded (even slightly outside the rect) so egui sees the pointer leave.
+    fn forward_mouse_move(&mut self, idx: usize, sx: i32, sy: i32) {
+        if idx >= self.wins.len() { return; }
+        let (rx, ry, _, _) = self.wins[idx].rect;
+        let lx = (sx - rx as i32) as f32;
+        let ly = (sy - ry as i32) as f32;
+        self.wins[idx].store.data_mut().win.events.push_back(crate::gfx::GfxEvt {
+            kind: 1, p0: lx.to_bits(), p1: ly.to_bits(), p2: 0,
+        });
+    }
+
+    /// Forward a left-button event (press/release) to the focused window so its
+    /// egui widgets ([X], counter, title-bar drag-sense) react. `pressed` selects
+    /// the edge. ABI: kind 2, p0=button(0=left), p1=pressed. A MouseMove to the same
+    /// window-local point is pushed FIRST so egui's pointer is positioned at the
+    /// click site before the button edge (egui clicks at the latest pointer pos).
+    fn forward_left_button(&mut self, idx: usize, sx: i32, sy: i32, pressed: bool) {
+        if idx >= self.wins.len() { return; }
+        self.forward_mouse_move(idx, sx, sy);
+        self.wins[idx].store.data_mut().win.events.push_back(crate::gfx::GfxEvt {
+            kind: 2, p0: 0, p1: pressed as u32, p2: 0,
+        });
+    }
+
     /// Left mouse-down at screen (px,py). A launcher-button click spawns its app
     /// (handled FIRST). Otherwise, under CSD the kernel only does window management:
-    /// the topmost window under the cursor is raised + focused, and the click is
-    /// forwarded to that window's queue so the app's OWN [X]/title-bar/content (all
-    /// egui-rendered) react. Close + title-drag are now the app's job (via
-    /// `wm.close` / `wm.start_move`). Empty space => nothing.
+    /// the topmost window under the cursor is raised + focused, and the positioned
+    /// press is forwarded to that window's queue (window-local coords) so the app's
+    /// OWN [X]/title-bar/content (all egui-rendered) react. Close + title-drag are
+    /// the app's job (via `wm.close` / `wm.start_move`). Empty space => nothing.
     fn on_left_down(&mut self, px: i32, py: i32) {
         if let Some(app_idx) = self.launcher_hit(px, py) {
             self.spawn_app(app_idx);
@@ -1034,9 +1072,9 @@ impl Compositor {
         if let Some(i) = self.window_at(px, py) {
             let top = self.raise(i);
             self.set_focus(top);
-            // Forward the press to the (now-focused) window so its CSD widgets react.
-            self.wins[top].store.data_mut().win.events
-                .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
+            // Forward the POSITIONED press to the now-focused window so egui clicks
+            // at the cursor (not 0,0) and its drag-sense (title bar) can arm.
+            self.forward_left_button(top, px, py, true);
         }
     }
 
@@ -1073,16 +1111,45 @@ impl Compositor {
             while let Some(ev) = crate::gfx::pop() {
                 let (cx, cy) = crate::gfx::mouse_pos();
                 match ev.kind {
-                    1 => { // mousemove: if dragging, move the window
+                    1 => { // mousemove
                         if let Some(d) = self.drag {
+                            // A kernel-driven interactive move owns the cursor: track
+                            // the dragged window and DON'T forward to apps (egui would
+                            // fight the move). The move ends on button-up below.
                             self.drag_to(d.win_id, cx, cy, (d.grab_dx, d.grab_dy));
+                        } else if let Some(i) = self.window_at(cx, cy) {
+                            // Hover: forward a window-local move to the TOPMOST window
+                            // under the cursor so its egui pointer tracks (hover state,
+                            // and the click site is positioned before the next press).
+                            // Only the topmost gets it (no false hover on covered ones).
+                            self.forward_mouse_move(i, cx, cy);
                         }
                     }
                     2 => { // mouse button: edge-track the left button
                         if ev.p0 == 0 {
                             let pressed = ev.p1 != 0;
-                            if pressed && !btn_l { btn_l = true; self.on_left_down(cx, cy); }
-                            else if !pressed && btn_l { btn_l = false; self.drag = None; }
+                            if pressed && !btn_l {
+                                btn_l = true;
+                                self.on_left_down(cx, cy);
+                            } else if !pressed && btn_l {
+                                btn_l = false;
+                                // ALWAYS forward the release to the relevant window so
+                                // egui's pointer state never sticks "down". If a kernel
+                                // interactive move was active, route the release to the
+                                // DRAGGED window (its title-bar label's drag-sense must
+                                // see the pointer-up that ended the grab) and clear the
+                                // drag. Otherwise route to the focused window so a plain
+                                // click completes (counter / [X] activate on release).
+                                let target = match self.drag.take() {
+                                    Some(d) => self.index_of(d.win_id),
+                                    None => Some(self.focused),
+                                };
+                                if let Some(i) = target {
+                                    if i < self.wins.len() {
+                                        self.forward_left_button(i, cx, cy, false);
+                                    }
+                                }
+                            }
                         }
                     }
                     0 => { // key -> focused window's queue

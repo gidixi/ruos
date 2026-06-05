@@ -71,6 +71,14 @@ pub fn run_reactor_spike_demo() -> (u32, u8, usize) {
     crate::wasm::wt::wm::run_reactor_spike(REACTOR_CWASM)
 }
 
+/// Boot self-test: SP3 window-manager pure-logic selftest (decoration geometry +
+/// hit-test + z-order + drag math, NO wasm instances). Returns a 5-bit flag word
+/// (0b11111 == all sub-checks pass).
+#[cfg(feature = "boot-checks")]
+pub fn run_wm_logic_selftest() -> u32 {
+    crate::wasm::wt::wm::wm_logic_selftest()
+}
+
 /// Boot self-test: run the embedded bring-up component; its `run` calls
 /// system.log("WT-COMPONENT-OK") on the host. Returns the guest run() code.
 #[cfg(feature = "boot-checks")]

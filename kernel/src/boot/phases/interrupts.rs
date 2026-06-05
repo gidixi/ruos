@@ -77,6 +77,10 @@ pub fn init() -> Result<(), BootError> {
         // buffer (commit_b0==0x05, pixels==307200) arrives intact in the kernel.
         let (calls, b0, plen) = crate::wasm::wt::run_reactor_spike_demo();
         crate::binfo!("wm", "reactor spike calls={} commit_b0=0x{:02X} pixels={}", calls, b0, plen);
+        // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
+        // + z-order raise + drag math, NO wasm instances (fast + deterministic).
+        let wmf = crate::wasm::wt::run_wm_logic_selftest();
+        crate::binfo!("wm", "sp3 logic selftest flags=0b{:05b}", wmf);
     }
 
     Ok(())

@@ -87,10 +87,10 @@ Ogni step ha il suo ciclo spec → piano → implementazione.
 
 ## Ambiente di build
 
-**Host build = WSL** (distro **`Ubuntu-22.04`**, utente root). Repo visibile a
-`/mnt/w/Work/GitHub/ruos`. Comandi build/run vanno eseguiti via WSL, es.:
+**Host build = WSL** (distro **`Ubuntu`**, utente root). Repo visibile a
+`/mnt/e/MinimalOS/BasicOperatingSystem`. Comandi build/run vanno eseguiti via WSL, es.:
 ```bash
-wsl -d Ubuntu-22.04 -u root -e bash -c 'cd /mnt/w/Work/GitHub/ruos && <cmd>'
+wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <cmd>'
 ```
 
 - **Toolchain installato in WSL:** rustup nightly (`nightly-2026-05-26`) +
@@ -98,7 +98,7 @@ wsl -d Ubuntu-22.04 -u root -e bash -c 'cd /mnt/w/Work/GitHub/ruos && <cmd>'
   e `wasm32-unknown-unknown` (finestre compositor); `xorriso`, `qemu-system-x86_64`,
   `gcc`/`make` (per buildare il tool host `limine`).
 - **Submodule:** `git submodule update --init --recursive` (serve `ruos-desktop`
-  per buildare `gui.cwasm`). Su `/mnt/w` può servire
+  per buildare `gui.cwasm`). Su `/mnt/e` può servire
   `git config --global --add safe.directory '*'` (dubious-ownership).
 - **Build:** `make iso` dalla root del repo (clona Limine v11.4.1-binary la prima
   volta, builda kernel + tool WASM + desktop egui + `.cwasm` AOT, assembla ISO).

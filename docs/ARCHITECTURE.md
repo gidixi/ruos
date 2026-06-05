@@ -323,6 +323,16 @@ lives in a `WmState` (id, committed `pixels`, an event `VecDeque`, a
 is the z-order** (index 0 = bottom, last = top), the focused index, an optional
 drag, and a screen back-buffer.
 
+A window app need not be a bare `no_std` reactor. The compositor instantiates
+windows on a unified `Store<AppState>` / `Linker<AppState>` where `AppState`
+combines the WASI state and the window state, exposed through `HasWasi` /
+`HasWindow` accessor traits so `wasi::add_to_linker` and `wm::add_to_linker` both
+register onto the *one* linker. That lets a window be a full `wasm32-wasip1`
+**std** binary that uses WASI *and* the `wm` surface protocol at once (a
+`_initialize` call runs after instantiate for std reactors) — the foundation for
+running **egui itself inside a compositor window**, not just fullscreen. The
+app-from-shell path keeps its own `Linker<WtState>` unchanged.
+
 One compositor frame (`run_compositor_gate` loop):
 
 1. **Reap** — windows that called `wm.close()` (or finished their lifecycle) are

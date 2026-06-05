@@ -1,4 +1,4 @@
-# 289 — Doc: sync completo dei documenti di progetto
+# 291 — Doc: sync completo dei documenti di progetto
 
 **Data:** 2026-06-05
 
@@ -50,6 +50,14 @@ Per-doc:
 ## Perché
 I doc erano fermi a prima del lavoro GUI/egui/compositor/Wasmtime e USB mouse;
 CLAUDE.md aveva path di build stantii (rischio per i lavori futuri).
+
+## Nota merge
+Mergiato `origin/main` (egui SP-A: unificazione stato + WASI sul linker del
+compositor, changelog 289/290) — nessun conflitto (i doc non toccano file del
+codice). Questa entry rinumerata 289→291 per la collisione con le entry SP-A. La
+sezione compositor di `ARCHITECTURE.md` aggiornata per SP-A: le finestre girano su
+`Store<AppState>`/`Linker<AppState>` (trait `HasWasi`/`HasWindow`), quindi una
+finestra può essere un'app `wasm32-wasip1` std — base per egui dentro una finestra.
 
 ## File toccati
 - README.md

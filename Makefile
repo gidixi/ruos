@@ -148,6 +148,20 @@ kernel/src/wasm/wt/egui_demo.cwasm: $(WT_PRECOMPILE) $(EGUI_DEMO_SRCS)
 		cargo build -p compositor-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/compositor_app.wasm kernel/src/wasm/wt/egui_demo.cwasm
 
+# Userspace desktop SHELL (SP-D): the `shell` crate built wasm32-wasip1 (std,
+# gui-core's shell_chrome + ruos-window's frame_once_bare), then AOT-precompiled
+# to a CORE .cwasm shipped at /bin/shell.cwasm. The compositor boots this as the
+# full-screen background window. Like egui-demo the output lands under the shared
+# ruos-desktop/target/ dir; the crate also pulls ruos-window, so its src is a prereq.
+SHELL_SRCS := $(shell find $(RUOS_DESKTOP)/shell/src $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-window/src -name '*.rs' 2>/dev/null) \
+              $(wildcard $(RUOS_DESKTOP)/shell/Cargo.toml $(RUOS_DESKTOP)/ruos-window/Cargo.toml \
+                         $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock)
+kernel/src/wasm/wt/shell.cwasm: $(WT_PRECOMPILE) $(SHELL_SRCS)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && \
+		cargo build -p shell --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/shell.wasm kernel/src/wasm/wt/shell.cwasm
+
 # Bring-up component (Step-0 gate): guest -> component -> AOT cwasm embedded in kernel.
 kernel/src/wasm/wt/bringup.cwasm: wit/ruos-bringup.wit tools/wt-bringup/src/lib.rs tools/wt-bringup/Cargo.toml $(WT_PRECOMPILE)
 	@mkdir -p build
@@ -183,7 +197,7 @@ kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1
 		cargo build --release --target wasm32-wasip1
 	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -199,6 +213,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwas
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
+	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -415,7 +430,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -437,6 +452,7 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
+	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

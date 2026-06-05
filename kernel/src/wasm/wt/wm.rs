@@ -19,7 +19,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
-use wasmtime::{Caller, Extern, Instance, Linker, Memory, Module, Store};
+use wasmtime::{Caller, Instance, Linker, Module, Store};
 use crate::gfx::GfxEvt;
 use crate::wasm::wt::engine;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -454,39 +454,12 @@ impl HasWindow for AppState {
     fn win_ref(&self) -> &WmState { &self.win }
 }
 
-/// Read `len` bytes from this guest's exported linear memory at `ptr`. None if
-/// the export is missing or the range is out of bounds. (Mirrors
-/// `crate::wasm::wt::mem::read`, which is typed to `WtState` and so cannot be
-/// reused for `WmState`.)
-fn read_guest(caller: &mut Caller<'_, WmState>, ptr: u32, len: u32) -> Option<Vec<u8>> {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(m)) => m,
-        _ => return None,
-    };
-    let mem: Memory = mem;
-    let mut out = alloc::vec![0u8; len as usize];
-    mem.read(caller, ptr as usize, &mut out).ok()?;
-    Some(out)
-}
-
-/// Write `buf` into this guest's exported linear memory at `ptr`. No-op (returns
-/// false) if the memory export is missing or the range is out of bounds. (Mirrors
-/// `crate::wasm::wt::mem::write`, which is typed to `WtState`.)
-fn write_guest(caller: &mut Caller<'_, WmState>, ptr: u32, buf: &[u8]) -> bool {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(m)) => m,
-        _ => return false,
-    };
-    let mem: Memory = mem;
-    mem.write(caller, ptr as usize, buf).is_ok()
-}
-
-pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
+pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
     // wm.commit(ptr, len, w, h): copy the guest's surface into WmState.pixels.
     linker.func_wrap("wm", "commit",
-        |mut caller: Caller<'_, WmState>, ptr: i32, len: i32, w: i32, h: i32| {
-            if let Some(b) = read_guest(&mut caller, ptr as u32, len as u32) {
-                let s = caller.data_mut();
+        |mut caller: Caller<'_, T>, ptr: i32, len: i32, w: i32, h: i32| {
+            if let Some(b) = crate::wasm::wt::mem::read(&mut caller, ptr as u32, len as u32) {
+                let s = caller.data_mut().win();
                 s.pixels = b;
                 s.win_w = w as u32;
                 s.win_h = h as u32;
@@ -496,22 +469,22 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
     // with an underscore — Rust `#[link]` preserves the symbol verbatim; verified
     // via `wasm-tools print`.)
     linker.func_wrap("wm", "app_id",
-        |caller: Caller<'_, WmState>| -> i32 { caller.data().id as i32 })?;
+        |caller: Caller<'_, T>| -> i32 { caller.data().win_ref().id as i32 })?;
     // wm.tick(): bump the call counter (spike instrumentation).
     linker.func_wrap("wm", "tick",
-        |mut caller: Caller<'_, WmState>| { caller.data_mut().tick += 1; })?;
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().tick += 1; })?;
     // wm.close(): the guest asks the compositor to tear this window down. The
     // reap pass (top of the loop) drops the Store/Instance next iteration.
     linker.func_wrap("wm", "close",
-        |mut caller: Caller<'_, WmState>| { caller.data_mut().close_requested = true; })?;
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().close_requested = true; })?;
     // wm.poll_event(retptr): drain ONE event from THIS window's queue into the
     // guest's 20-byte return area. The calling app is identified by its own
     // Store (caller.data()), so it can only ever see its own window's events.
     // Layout matches `ruos:gui/gfx poll-event`: discriminant u32 @0 (0=none,
     // 1=some), then the gfx-event record kind@4, p0@8, p1@12, p2@16 (all LE).
     linker.func_wrap("wm", "poll_event",
-        |mut caller: Caller<'_, WmState>, retptr: i32| {
-            let ev = caller.data_mut().events.pop_front();
+        |mut caller: Caller<'_, T>, retptr: i32| {
+            let ev = caller.data_mut().win().events.pop_front();
             let mut buf = [0u8; 20];
             if let Some(e) = ev {
                 buf[0..4].copy_from_slice(&1u32.to_le_bytes());   // some
@@ -521,7 +494,7 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
                 buf[16..20].copy_from_slice(&e.p2.to_le_bytes());
             }
             // else: discriminant stays 0 (none); payload zeroed.
-            write_guest(&mut caller, retptr as u32, &buf);
+            crate::wasm::wt::mem::write(&mut caller, retptr as u32, &buf);
         })?;
     Ok(())
 }

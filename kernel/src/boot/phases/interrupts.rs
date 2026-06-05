@@ -113,6 +113,14 @@ pub fn init() -> Result<(), BootError> {
         // real VFS wm.spawn is covered visually. Expect flags=0b11.
         let spc = crate::wasm::wt::run_spc_demo();
         crate::binfo!("wm", "spc flags=0b{:02b}", spc);
+        // SP-D: prove the desktop-shell boot wiring headlessly — the new
+        // wm.poweroff/wm.surface_size host fns register (the empty compositor
+        // builds past add_to_linker) AND the wm.set_background full-screen
+        // mechanism the shell self-flags with still pins a window to the whole
+        // framebuffer. Returns the forced bg size packed (w<<16)|h. The shell
+        // booting AS the bg desktop (+ launcher → wm.spawn) is verified visually.
+        let spd = crate::wasm::wt::run_spd_demo();
+        crate::binfo!("wm", "spd: hostfns ok bg={}x{}", spd >> 16, spd & 0xffff);
     }
 
     Ok(())

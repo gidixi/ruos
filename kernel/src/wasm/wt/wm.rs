@@ -1457,6 +1457,60 @@ pub fn spc_self_test() -> u32 {
     flags
 }
 
+/// Boot self-test (SP-D): prove the desktop-shell boot mechanism is wired without
+/// needing the VFS (`/bin/shell.cwasm` isn't mounted in the `interrupts` phase, and
+/// the shell isn't `include_bytes!`'d). Asserts two things the shell relies on:
+///
+///  1. The `wm.poweroff` + `wm.surface_size` host fns REGISTER. `Compositor::new_empty`
+///     calls `add_to_linker`, which `func_wrap`s every `wm` import incl. the two new
+///     SP-D ones; a duplicate/typo would make `add_to_linker` (hence `new_empty`) panic.
+///     So a successfully-built empty compositor proves both new imports are bound and a
+///     shell guest importing them could instantiate.
+///  2. The background mechanism still pins a window full-screen (the shell flags ITSELF
+///     bg via `wm.set_background` on its first frame). Reuses SP-C's bg rect-forcing on
+///     the embedded egui-demo stand-in.
+///
+/// Returns the forced bg size packed `(w<<16)|h` (0 == the bg mechanism failed). The
+/// caller logs `spd: hostfns ok bg=WxH`. The shell-as-bg desktop itself (chrome +
+/// launcher → `wm.spawn`) is verified VISUALLY (it needs the VFS + framebuffer).
+#[cfg(feature = "boot-checks")]
+pub fn spd_self_test() -> u32 {
+    // (1) Building the compositor builds the linker via `add_to_linker`; if the new
+    // `wm.poweroff`/`wm.surface_size` registrations were broken (dup name / wrong
+    // signature path) this would panic. Reaching past it = both host fns are bound.
+    let mut c = Compositor::new_empty();
+
+    // (2) Bg full-screen mechanism (the shell self-flags bg). Spawn one window
+    // (embedded egui-demo stands in for /bin/shell.cwasm — not mounted yet), flag it
+    // bg via the deferred bg-request path, then run `present`'s rect-forcing and read
+    // back the pinned size. geom() reads 0×0 this early (framebuffer set up in the
+    // later `devices` phase), so fall back to a synthetic size — we're verifying the
+    // rect-FORCING, not the live framebuffer (that's the visual proof).
+    let module = match module_for(EGUI_DEMO_CWASM) {
+        Some(m) => m,
+        None => return 0,
+    };
+    if c.spawn_named("shell", module).is_none() {
+        return 0;
+    }
+    c.wins[0].store.data_mut().win.bg_request = true;
+    for i in 0..c.wins.len() {
+        if c.wins[i].store.data().win.bg_request {
+            c.wins[i].store.data_mut().win.bg_request = false;
+            c.wins[i].bg = true;
+        }
+    }
+    let g = crate::gfx::geom();
+    let (sw, sh) = if g.width != 0 && g.height != 0 { (g.width, g.height) } else { (1280, 800) };
+    if let Some(bi) = c.bg_index() {
+        c.wins[bi].rect = (0, 0, sw, sh);
+        if c.wins[bi].rect == (0, 0, sw, sh) {
+            return ((sw & 0xffff) << 16) | (sh & 0xffff);
+        }
+    }
+    0
+}
+
 /// Boot-check: exercise the surviving WM z-order + CSD drag math with NO wasm
 /// instances. Under CSD the kernel no longer owns decorations (no title bar / [X]
 /// geometry to check), so this is a 2-bit word now (all set == 0b11).

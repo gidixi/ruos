@@ -51,6 +51,12 @@ static REACTOR_CLOSE_CWASM: &[u8] = include_bytes!("reactor_close.cwasm");
 /// as a compositor window. Built by `tools/wt-wasip1-probe`; needs `_initialize`
 /// run before its first `frame()` (see `run_initialize`).
 static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
+/// The egui CSD demo window (SP-B): a wasm32-wasip1 std reactor that draws its own
+/// egui window (CSD title bar + counter) via gui-core's raster, over the `wm`
+/// surface protocol. Built from `ruos-desktop/compositor-app`; like the probe it
+/// needs `_initialize` run before its first `frame()`. The FIRST launcher-visible
+/// app (`show_in_launcher: true`).
+static EGUI_DEMO_CWASM: &[u8] = include_bytes!("egui_demo.cwasm");
 
 /// A launchable app: a display name + its precompiled `.cwasm` bytes.
 pub struct AppEntry {
@@ -70,6 +76,7 @@ pub static APPS: &[AppEntry] = &[
     AppEntry { name: "react-B", cwasm: REACTOR_CWASM, show_in_launcher: false },
     AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM, show_in_launcher: false },
     AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM, show_in_launcher: false },
+    AppEntry { name: "egui-demo", cwasm: EGUI_DEMO_CWASM, show_in_launcher: true },
 ];
 
 /// Cache of deserialised modules, keyed by the cwasm slice's base address (each

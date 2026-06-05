@@ -154,7 +154,7 @@ kernel/src/wasm/wt/reactor.cwasm: tools/wt-reactor/src/lib.rs tools/wt-reactor/C
 		cargo build --release --target wasm32-unknown-unknown
 	$(WT_PRECOMPILE) tools/wt-reactor/target/wasm32-unknown-unknown/release/wt_reactor.wasm kernel/src/wasm/wt/reactor.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwasm kernel/src/wasm/wt/reactor.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -166,6 +166,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/gui.cwas
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
+	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -391,6 +392,7 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	cp build/gui.cwasm $(ISO_ROOT)/bin/gui.cwasm
+	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

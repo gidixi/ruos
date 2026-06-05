@@ -90,3 +90,51 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         store.data().pixels.len(),
     )
 }
+
+/// Visual GATE: 2 reactor instances, side-by-side, both updating. Owns the CPU
+/// (like the single-GUI path today). Never returns.
+///
+/// Keeps two persistent `(Store<WmState>, Instance)` alive, calls each one's
+/// exported `frame()` round-robin per loop, then blits each store's last
+/// committed surface to its window rect (left half / right half of the screen).
+/// Both windows visibly cycle colour (different per-id offset) — proving N
+/// persistent instances + round-robin frame() + per-app surface + compositing.
+pub fn run_compositor_gate(cwasm: &[u8]) -> ! {
+    crate::kprintln!("[wm] compositor gate: 2 reactor windows");
+    crate::gfx::enter();
+    let engine = engine();
+    // SAFETY: produced by wt-precompile for this exact engine Config.
+    let module = unsafe { Module::deserialize(engine, cwasm) }.expect("reactor module");
+    let mut linker: Linker<WmState> = Linker::new(engine);
+    add_to_linker(&mut linker).expect("wm linker");
+    // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
+    // BACKWARD if DF=1, silently corrupting copied data.
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cld", options(nostack)); }
+
+    // Two windows: left and right halves of the screen (rect origins).
+    let g = crate::gfx::geom();
+    let origins = [(0u32, 0u32), (g.width / 2, 0u32)];
+    let mut wins: Vec<(Store<WmState>, wasmtime::Instance, (u32, u32))> = Vec::new();
+    for (id, &origin) in origins.iter().enumerate() {
+        let mut store = Store::new(
+            engine,
+            WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0 },
+        );
+        let inst = linker.instantiate(&mut store, &module).expect("instantiate");
+        wins.push((store, inst, origin));
+    }
+    loop {
+        for (store, inst, origin) in wins.iter_mut() {
+            if let Ok(frame) = inst.get_typed_func::<(), ()>(&mut *store, "frame") {
+                let _ = frame.call(&mut *store, ());
+            }
+            let s = store.data();
+            if !s.pixels.is_empty() {
+                crate::gfx::blit(&s.pixels, origin.0, origin.1, s.win_w, s.win_h);
+            }
+        }
+        // Crude pacing so the colour cycle is visible.
+        for _ in 0..2_000_000u32 { core::hint::spin_loop(); }
+    }
+}

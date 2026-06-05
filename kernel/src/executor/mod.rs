@@ -125,6 +125,13 @@ async fn exec_worker_task() {
                     127
                 }
                 Ok(bytes) => {
+                    // Compositor GATE: `compositor` resolves to /bin/compositor.cwasm
+                    // (the reactor cwasm shipped under that name). It owns the CPU
+                    // and never returns — like the single-GUI path — so the exec
+                    // task blocks here. That is intentional for the visual gate.
+                    if slot.path.ends_with("compositor.cwasm") {
+                        crate::wasm::wt::wm::run_compositor_gate(&bytes);
+                    }
                     let pid = crate::proc::register(
                         alloc::string::String::from(slot.path.trim_start_matches('/')),
                     );

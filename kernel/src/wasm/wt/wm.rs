@@ -526,6 +526,20 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             // else: discriminant stays 0 (none); payload zeroed.
             crate::wasm::wt::mem::write(&mut caller, retptr as u32, &buf);
         })?;
+    // wm.poweroff(): the calling window (the shell's power button) asks the
+    // kernel to power off the machine. Same primitive `ruos:gui/power.poweroff`
+    // uses (`gui.rs`). Never returns; the `-> ()` annotation pins the closure's
+    // Wasm return type so never-type fallback stays `()` (matches `gui.rs`).
+    linker.func_wrap("wm", "poweroff",
+        |_caller: Caller<'_, T>| -> () { crate::power::poweroff() })?;
+    // wm.surface_size() -> i64: the full framebuffer size, packed (w<<32)|h. The
+    // background shell sizes ITSELF to this (the bg window is forced full-screen
+    // by the compositor; this lets the guest's egui raster match the screen).
+    linker.func_wrap("wm", "surface_size",
+        |_caller: Caller<'_, T>| -> i64 {
+            let g = crate::gfx::geom();
+            ((g.width as i64) << 32) | (g.height as i64)
+        })?;
     Ok(())
 }
 
@@ -646,15 +660,17 @@ const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
 
 impl Compositor {
     /// Build the `wm` + WASI linker and boot the compositor into ONE initial
-    /// window: the egui demo. SP-C dropped the kernel launcher/taskbar + the
-    /// 2-demo-reactor scene; the desktop UX (panel/launcher/wallpaper) now lives
-    /// in SP-D's userspace shell (which `wm.spawn`s apps + `wm.set_background()`s
-    /// itself). The initial window is loaded from `/bin/egui-demo.cwasm` (VFS, via
-    /// `module_by_name` — the compositor runs after fs init so `/bin` is mounted);
-    /// if that early load fails for any reason we fall back to the embedded
-    /// `EGUI_DEMO_CWASM` (same module, `include_bytes!`). `cwasm` is the
-    /// `compositor.cwasm` bytes the executor handed us — kept only to satisfy the
-    /// `module` field (the shared reactor module used by the headless paths).
+    /// window: the userspace desktop SHELL (`/bin/shell.cwasm`). The desktop UX
+    /// (panel/launcher/wallpaper) lives in SP-D's userspace shell, which flags
+    /// ITSELF as the full-screen background (`wm.set_background()`) on its first
+    /// frame and `wm.spawn`s apps from its launcher. The initial window is loaded
+    /// from `/bin/shell.cwasm` (VFS, via `module_by_name` — the compositor runs
+    /// after fs init so `/bin` is mounted); if that load fails (shell.cwasm not in
+    /// /bin yet) we fall back to the VFS egui-demo, then to the embedded
+    /// `EGUI_DEMO_CWASM` (`include_bytes!`), so the compositor ALWAYS shows
+    /// something. `cwasm` is the `compositor.cwasm` bytes the executor handed us —
+    /// kept only to satisfy the `module` field (the shared reactor module used by
+    /// the headless paths).
     pub fn new(cwasm: &[u8]) -> Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
@@ -674,13 +690,21 @@ impl Compositor {
             next_id: 0,
         };
 
-        // Initial window = the egui demo. Prefer the VFS `/bin/egui-demo.cwasm`
-        // (so the spawn path is exercised at boot); fall back to the embedded blob
-        // if the VFS load fails (early/edge — same module bytes).
-        let initial = module_by_name("egui-demo").or_else(|| module_for(EGUI_DEMO_CWASM));
+        // Initial window = the userspace desktop SHELL. Prefer the VFS
+        // `/bin/shell.cwasm`; if it's not in `/bin` yet (or fails to load), fall
+        // back to the VFS egui-demo, then to the embedded egui-demo blob — so the
+        // compositor always shows SOMETHING. The shell self-flags bg on its first
+        // frame; the egui-demo fallbacks come up as a plain window.
+        let (name, initial) = match module_by_name("shell") {
+            Some(m) => ("shell", Some(m)),
+            None => {
+                crate::bwarn!("wm", "shell.cwasm unavailable; falling back to egui-demo");
+                ("egui-demo", module_by_name("egui-demo").or_else(|| module_for(EGUI_DEMO_CWASM)))
+            }
+        };
         match initial {
-            Some(m) => { let _ = c.spawn_named("egui-demo", m); }
-            None => { crate::bwarn!("wm", "no initial window: egui-demo module unavailable"); }
+            Some(m) => { let _ = c.spawn_named(name, m); }
+            None => { crate::bwarn!("wm", "no initial window: shell + egui-demo modules unavailable"); }
         }
         c
     }

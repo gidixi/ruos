@@ -1470,11 +1470,11 @@ pub fn spc_self_test() -> u32 {
 ///     bg via `wm.set_background` on its first frame). Reuses SP-C's bg rect-forcing on
 ///     the embedded egui-demo stand-in.
 ///
-/// Returns the forced bg size packed `(w<<16)|h` (0 == the bg mechanism failed). The
+/// Returns the forced bg size packed `(w<<32)|h` (0 == the bg mechanism failed). The
 /// caller logs `spd: hostfns ok bg=WxH`. The shell-as-bg desktop itself (chrome +
 /// launcher → `wm.spawn`) is verified VISUALLY (it needs the VFS + framebuffer).
 #[cfg(feature = "boot-checks")]
-pub fn spd_self_test() -> u32 {
+pub fn spd_self_test() -> i64 {
     // (1) Building the compositor builds the linker via `add_to_linker`; if the new
     // `wm.poweroff`/`wm.surface_size` registrations were broken (dup name / wrong
     // signature path) this would panic. Reaching past it = both host fns are bound.
@@ -1505,7 +1505,7 @@ pub fn spd_self_test() -> u32 {
     if let Some(bi) = c.bg_index() {
         c.wins[bi].rect = (0, 0, sw, sh);
         if c.wins[bi].rect == (0, 0, sw, sh) {
-            return ((sw & 0xffff) << 16) | (sh & 0xffff);
+            return ((sw as i64) << 32) | (sh as i64);
         }
     }
     0

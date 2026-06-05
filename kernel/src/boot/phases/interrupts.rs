@@ -117,10 +117,10 @@ pub fn init() -> Result<(), BootError> {
         // wm.poweroff/wm.surface_size host fns register (the empty compositor
         // builds past add_to_linker) AND the wm.set_background full-screen
         // mechanism the shell self-flags with still pins a window to the whole
-        // framebuffer. Returns the forced bg size packed (w<<16)|h. The shell
+        // framebuffer. Returns the forced bg size packed (w<<32)|h. The shell
         // booting AS the bg desktop (+ launcher → wm.spawn) is verified visually.
         let spd = crate::wasm::wt::run_spd_demo();
-        crate::binfo!("wm", "spd: hostfns ok bg={}x{}", spd >> 16, spd & 0xffff);
+        crate::binfo!("wm", "spd: hostfns ok bg={}x{}", spd >> 32, spd & 0xffff_ffff);
     }
 
     Ok(())

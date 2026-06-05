@@ -131,10 +131,10 @@ pub fn run_spc_demo() -> u32 {
 /// Boot self-test (egui SP-D): prove the desktop-shell boot wiring without the VFS —
 /// the `wm.poweroff`/`wm.surface_size` host fns register (the empty compositor builds)
 /// AND the `wm.set_background` full-screen mechanism the shell uses still works.
-/// Returns the forced bg size packed `(w<<16)|h` (0 == failed). The shell-as-bg
+/// Returns the forced bg size packed `(w<<32)|h` (0 == failed). The shell-as-bg
 /// desktop + launcher→`wm.spawn` is verified visually.
 #[cfg(feature = "boot-checks")]
-pub fn run_spd_demo() -> u32 {
+pub fn run_spd_demo() -> i64 {
     crate::wasm::wt::wm::spd_self_test()
 }
 

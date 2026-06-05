@@ -141,6 +141,8 @@ impl FrameDeallocator<Size4KiB> for Frames {
     }
 }
 
+// ORDINE LOCK (invariante SMP): chi serve sia MAPPER che FRAMES prende MAPPER PRIMA.
+// FRAMES è preso da solo (allocate_frame/free_frame) o dopo MAPPER, mai prima.
 pub(crate) static FRAMES: spin::Mutex<Option<Frames>> = spin::Mutex::new(None);
 
 pub fn init() -> Result<FrameCounts, FrameInitError> {

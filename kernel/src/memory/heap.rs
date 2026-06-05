@@ -15,6 +15,12 @@ use talc::{ErrOnOom, Span, Talc, Talck};
 /// the software raster buffers. (Was 16 MiB — too small, OOM'd the GUI.)
 pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
+// SMP baseline (migrazione shared-nothing, spec 2026-06-05): questo è un VERO
+// spinlock SMP (spin 0.9.8, CAS cross-core), non uno stub single-core. È preso su
+// OGNI alloc/free di OGNI core → è il collo di contesa #1 quando arriveranno gli
+// executor per-core (Step 3). Step 1 lo affianca con arene per-core (vedi
+// memory/alloc_magazine.rs / alloc_percore_talc.rs). NON è un problema di safety
+// (audit CHANGELOG/186: 0 must-fix), è un problema di CONTESA.
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();
 

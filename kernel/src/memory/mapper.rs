@@ -10,6 +10,9 @@ use x86_64::structures::paging::{
 };
 use x86_64::structures::paging::mapper::{MapToError, UnmapError as XUnmapError, FlagUpdateError};
 
+// ORDINE LOCK (invariante SMP): MAPPER.lock() PRIMA di FRAMES.lock(), mai invertito.
+// map_page acquisisce MAPPER poi (via il frame allocator) FRAMES. Non tenere nessuno
+// dei due attraverso un await o un send/wait di messaggio cross-core.
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 static HHDM_OFFSET: spin::Once<u64> = spin::Once::new();
 

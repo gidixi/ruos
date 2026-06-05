@@ -1,4 +1,4 @@
-# 284 — egui SP-A: unificazione stato + WASI nel linker del compositor
+# 290 — egui SP-A: unificazione stato + WASI nel linker del compositor
 
 **Data:** 2026-06-05
 

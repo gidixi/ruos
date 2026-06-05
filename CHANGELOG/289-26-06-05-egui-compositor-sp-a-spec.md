@@ -1,4 +1,4 @@
-# 283 — Spec SP-A: unificazione stato + WASI nel compositor (egui apps in finestra)
+# 289 — Spec SP-A: unificazione stato + WASI nel compositor (egui apps in finestra)
 
 **Data:** 2026-06-05
 

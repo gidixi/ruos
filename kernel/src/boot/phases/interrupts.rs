@@ -72,6 +72,10 @@ pub fn init() -> Result<(), BootError> {
         // Component Model bring-up: prove the no_std AOT component path runs.
         let cc = crate::wasm::wt::run_bringup_demo();
         crate::binfo!("wt", "component bringup run={}", cc);
+        // Compositor GATE spike: a PERSISTENT reactor instance whose `frame()`
+        // export is called 5× → tick==5. Proves the core multi-window mechanism.
+        let rt = crate::wasm::wt::run_reactor_spike_demo();
+        crate::binfo!("wm", "reactor spike frame-calls={}", rt);
     }
 
     Ok(())

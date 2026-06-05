@@ -9,6 +9,7 @@ pub mod wasi;
 pub mod gfx;
 pub mod gui;
 pub mod component;
+pub mod wm;
 
 use crate::kprintln;
 use alloc::vec::Vec;
@@ -53,6 +54,21 @@ static GFXTEST_CWASM: &[u8] = include_bytes!("gfxtest.cwasm");
 
 #[cfg(feature = "boot-checks")]
 static BRINGUP_CWASM: &[u8] = include_bytes!("bringup.cwasm");
+
+/// Embedded reactor guest (`tools/wt-reactor` → `wasm32-unknown-unknown` →
+/// precompiled). Exercises the compositor GATE: a PERSISTENT wasm instance whose
+/// `frame()` export is called repeatedly (the core risk of the multi-window
+/// compositor).
+#[cfg(feature = "boot-checks")]
+static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
+
+/// Boot self-test: a reactor instance whose `frame()` is called 5× → tick==5.
+/// Proves the kernel can hold a persistent instance and call an exported
+/// function on it repeatedly.
+#[cfg(feature = "boot-checks")]
+pub fn run_reactor_spike_demo() -> u32 {
+    crate::wasm::wt::wm::run_reactor_spike(REACTOR_CWASM)
+}
 
 /// Boot self-test: run the embedded bring-up component; its `run` calls
 /// system.log("WT-COMPONENT-OK") on the host. Returns the guest run() code.

@@ -861,9 +861,9 @@ impl Compositor {
         unsafe { core::arch::asm!("cld", options(nostack)); }
         let inst = match self.linker.instantiate(&mut store, &module) {
             Ok(i) => i,
-            Err(_) => {
+            Err(e) => {
                 self.free_ids.push(id);
-                crate::bwarn!("wm", "spawn: instantiate failed");
+                crate::bwarn!("wm", "spawn: instantiate failed: {:?}", e);
                 return None;
             }
         };

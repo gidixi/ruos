@@ -10,10 +10,15 @@ use core::fmt;
 use limine::memmap::MEMMAP_USABLE;
 use talc::{ErrOnOom, Span, Talc, Talck};
 
-/// Heap size in bytes: 128 MiB. Large enough to deserialize/instantiate the
-/// egui desktop AOT module (gui.cwasm ~10 MiB) plus its guest linear memory and
-/// the software raster buffers. (Was 16 MiB — too small, OOM'd the GUI.)
-pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
+/// Heap size in bytes: 256 MiB. Large enough to hold MULTIPLE egui compositor
+/// windows simultaneously: each egui wasm instance reserves ~48 MiB of guest
+/// linear memory (its declared minimum) plus its ~9 MiB AOT module and software
+/// raster buffers. SP-C's `wm.spawn` instantiates a SECOND egui window while the
+/// first is live, so 128 MiB OOM'd the second linear-memory allocation
+/// (`failed to allocate 0x3000000 bytes`). 256 MiB fits several windows; the QEMU
+/// run-config gives 512 MiB RAM so the USABLE region is ample.
+/// (Was 16 MiB — OOM'd the GUI; then 128 MiB — OOM'd the 2nd compositor window.)
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();

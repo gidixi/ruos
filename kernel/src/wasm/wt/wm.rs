@@ -300,6 +300,7 @@ pub struct Compositor {
     pub linker: Linker<WmState>,
     pub focused: usize,            // index into wins (the focused window)
     pub drag: Option<DragState>,   // SP3 adds; None until SP3
+    pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -307,30 +308,33 @@ pub struct Compositor {
 const WIN_W: u32 = 320;
 const WIN_H: u32 = 240;
 
-/// Draw a `thick`-px solid border (RGBA `color`) just inside the surface rect
-/// `(rx, ry, rw, rh)`, so it sits over the app's committed surface. Uses tiny
-/// stack-allocated rows blitted via `crate::gfx::blit` (clips to screen,
-/// recomposites the cursor).
-fn draw_border(rect: (u32, u32, u32, u32), thick: u32, color: [u8; 4]) {
-    let (rx, ry, rw, rh) = rect;
-    if rw == 0 || rh == 0 || thick == 0 { return; }
-    let t = thick.min(rh).min(rw);
-    // Horizontal strips (top + bottom): rw wide, t tall.
-    let mut hrow = alloc::vec![0u8; (rw * t * 4) as usize];
-    for px in hrow.chunks_mut(4) { px.copy_from_slice(&color); }
-    crate::gfx::blit(&hrow, rx, ry, rw, t);
-    crate::gfx::blit(&hrow, rx, ry + rh - t, rw, t);
-    // Vertical strips (left + right): t wide, rh tall.
-    let mut vrow = alloc::vec![0u8; (t * rh * 4) as usize];
-    for px in vrow.chunks_mut(4) { px.copy_from_slice(&color); }
-    crate::gfx::blit(&vrow, rx, ry, t, rh);
-    crate::gfx::blit(&vrow, rx + rw - t, ry, t, rh);
+/// Desktop background (RGBA8888 [r,g,b,a]) shown where no window covers.
+const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
+
+/// Clipped copy of an `fw × fh` RGBA footprint into the screen back-buffer
+/// at screen (fx,fy). Off-screen pixels are dropped.
+fn blit_into(dst: &mut [u8], dst_w: u32, dst_h: u32,
+             src: &[u8], fx: i32, fy: i32, fw: u32, fh: u32) {
+    let dw = dst_w as usize;
+    for ry in 0..fh as i32 {
+        let py = fy + ry;
+        if py < 0 || py >= dst_h as i32 { continue; }
+        for rx in 0..fw as i32 {
+            let px = fx + rx;
+            if px < 0 || px >= dst_w as i32 { continue; }
+            let so = ((ry as usize * fw as usize) + rx as usize) * 4;
+            let do_ = ((py as usize * dw) + px as usize) * 4;
+            if so + 4 > src.len() || do_ + 4 > dst.len() { continue; }
+            dst[do_..do_ + 4].copy_from_slice(&src[so..so + 4]);
+        }
+    }
 }
 
 impl Compositor {
     /// Deserialize the shared reactor module, build the `wm` linker, and create
-    /// the demo's 2 windows (the SP-GATE layout: left at (0,0), right at
-    /// (g.width/2, 0), both WIN_W x WIN_H). Window 0 starts focused.
+    /// the demo's 2 OVERLAPPING titled windows. Each surface `sy >= TITLE_H` so
+    /// the title bars are on-screen, and the two windows overlap so the raise /
+    /// lower behaviour is directly visible. Window 0 starts focused.
     pub fn new(cwasm: &[u8]) -> Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
@@ -338,10 +342,14 @@ impl Compositor {
         let mut linker: Linker<WmState> = Linker::new(engine);
         add_to_linker(&mut linker).expect("wm linker");
 
-        let g = crate::gfx::geom();
-        let origins = [(0u32, 0u32), (g.width / 2, 0u32)];
+        let th = decor::TITLE_H;
+        // (surface x, y, w, h, title) — A and B overlap so raise/lower is visible.
+        let placements: [(u32, u32, u32, u32, &str); 2] = [
+            (60,  th + 60,  WIN_W, WIN_H, "reactor A"),
+            (300, th + 170, WIN_W, WIN_H, "reactor B"),
+        ];
         let mut wins: Vec<Window> = Vec::new();
-        for (id, &(ox, oy)) in origins.iter().enumerate() {
+        for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
             let mut store = Store::new(
                 engine,
                 WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new() },
@@ -351,13 +359,13 @@ impl Compositor {
                 id: id as u32,
                 store,
                 inst,
-                rect: (ox, oy, WIN_W, WIN_H),
-                title: String::new(),
+                rect: (x, y, w, h),
+                title: String::from(title),
                 focused: id == 0,
                 alive: true,
             });
         }
-        Compositor { wins, module, linker, focused: 0, drag: None }
+        Compositor { wins, module, linker, focused: 0, drag: None, backbuf: Vec::new() }
     }
 
     /// TOPMOST window whose surface rect contains framebuffer point (px, py).
@@ -522,73 +530,105 @@ impl Compositor {
         }
     }
 
-    /// The per-frame input-routed compositor loop. Owns the CPU; never returns.
+    /// Composite ALL windows bottom→top into the kernel back-buffer, then ONE
+    /// blit. Clearing to DESKTOP_BG each frame means drag/close leave no ghosts.
+    /// SP4 will parallelize the per-window compose + band-copy across the AP pool.
+    fn present(&mut self) {
+        let g = crate::gfx::geom();
+        let (sw, sh) = (g.width, g.height);
+        let need = (sw as usize) * (sh as usize) * 4;
+        if self.backbuf.len() != need { self.backbuf = alloc::vec![0u8; need]; }
+        for px in self.backbuf.chunks_mut(4) { px.copy_from_slice(&DESKTOP_BG); }
+        for i in 0..self.wins.len() {
+            if let Some((buf, fx, fy, fw, fh)) = self.compose_window(i) {
+                blit_into(&mut self.backbuf, sw, sh, &buf, fx as i32, fy as i32, fw, fh);
+            }
+        }
+        crate::gfx::blit(&self.backbuf, 0, 0, sw, sh);
+    }
+
+    /// Left mouse-down at screen (px,py): topmost window's decoration decides.
+    /// [X] => close; title bar => raise+focus+begin drag; surface => raise+focus
+    /// AND forward the click to the app (so the app surface still reacts to
+    /// clicks, preserving SP2's per-window input). Empty space => nothing.
+    fn on_left_down(&mut self, px: i32, py: i32) {
+        let Some(i) = self.topmost_decor_at(px, py) else { return; };
+        let s = self.wins[i].rect;
+        let id = self.wins[i].id;
+        match decor::hit(s, px, py) {
+            decor::Hit::Close => { self.close(id); self.drag = None; }
+            decor::Hit::Title => {
+                let top = self.raise(i);
+                self.set_focus(top);
+                let fr = decor::window_rect(self.wins[top].rect);
+                self.drag = Some(DragState {
+                    win_id: id,
+                    grab_dx: px - fr.0 as i32,
+                    grab_dy: py - fr.1 as i32,
+                });
+            }
+            decor::Hit::Surface => {
+                let top = self.raise(i);
+                self.set_focus(top);
+                self.wins[top].store.data_mut().events
+                    .push_back(crate::gfx::GfxEvt { kind: 2, p0: 0, p1: 1, p2: 0 });
+                self.drag = None;
+            }
+            decor::Hit::Outside => {}
+        }
+    }
+
+    /// The per-frame window-manager loop. Owns the CPU; never returns.
     ///
     /// Each loop:
     ///  1. `fold_mouse()` (PS/2 -> absolute cursor + move/button GfxEvts), then
-    ///     drain the kernel gfx event queue (the compositor is the SOLE consumer).
-    ///  2. Route each event: a mouse-button-DOWN hit-tested inside a window
-    ///     RAISES then FOCUSES it (click-to-focus). For every event, translate
-    ///     mouse coords to window-local and push it into ONLY the focused
-    ///     window's queue (`WmState.events`).
-    ///  3. `frame_all()` (each app drains its queue + redraws), composite each
-    ///     window's surface to its rect, then draw a focus border on the focused
-    ///     window.
+    ///     drain the kernel gfx queue (the compositor is the SOLE consumer).
+    ///  2. Dispatch via the decorations: mousemove drives an in-progress drag;
+    ///     a left-button edge (press/release) begins/ends a drag via
+    ///     `on_left_down` ([X] close, title raise+focus+drag, surface
+    ///     raise+focus+forward); keys go to the focused window's queue.
+    ///  3. `frame_all()` (each app drains its queue + redraws), then `present()`
+    ///     composites ALL windows into the back-buffer with ONE blit.
+    ///
+    /// Cursor source = `gfx::mouse_pos()` ONLY (kept current by `fold_mouse`);
+    /// it is NOT re-tracked from kind-1 events. Focus is shown by the title-bar
+    /// colour (blue focused / grey unfocused), so there is no focus border.
     pub fn run(mut self) -> ! {
-        crate::kprintln!("[wm] compositor SP2: input + focus routing");
+        crate::kprintln!("[wm] compositor SP3: window manager ({} windows)", self.wins.len());
         // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
         // BACKWARD if DF=1, silently corrupting copied data.
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("cld", options(nostack)); }
 
+        let mut btn_l = false;
         loop {
-            // 1. Input: fold PS/2 -> events, then drain the kernel queue.
             crate::gfx::fold_mouse();
             while let Some(ev) = crate::gfx::pop() {
-                // Latest cursor position (kept up to date by fold_mouse). Single
-                // source of truth — do NOT re-track from kind-1 events.
                 let (cx, cy) = crate::gfx::mouse_pos();
-
-                // Click-to-focus: a mouse-button DOWN inside a window raises +
-                // focuses it. `p1 != 0` = pressed (any button).
-                if ev.kind == 2 && ev.p1 != 0 {
-                    if let Some(i) = self.window_at(cx, cy) {
-                        let new_i = self.raise(i);
-                        self.set_focus(new_i);
+                match ev.kind {
+                    1 => { // mousemove: if dragging, move the window
+                        if let Some(d) = self.drag {
+                            self.drag_to(d.win_id, cx, cy, (d.grab_dx, d.grab_dy));
+                        }
                     }
+                    2 => { // mouse button: edge-track the left button
+                        if ev.p0 == 0 {
+                            let pressed = ev.p1 != 0;
+                            if pressed && !btn_l { btn_l = true; self.on_left_down(cx, cy); }
+                            else if !pressed && btn_l { btn_l = false; self.drag = None; }
+                        }
+                    }
+                    0 => { // key -> focused window's queue
+                        if self.focused < self.wins.len() {
+                            self.wins[self.focused].store.data_mut().events.push_back(ev);
+                        }
+                    }
+                    _ => {}
                 }
-
-                // Route to the focused window. Translate mouse coords to
-                // window-local; pass key/other events through unchanged.
-                let (ox, oy, _, _) = self.wins[self.focused].rect;
-                let routed = match ev.kind {
-                    1 => {
-                        // mousemove: p0/p1 are f32 bits of absolute x/y -> local.
-                        let lx = (cx - ox as i32).max(0) as f32;
-                        let ly = (cy - oy as i32).max(0) as f32;
-                        GfxEvt { kind: 1, p0: lx.to_bits(), p1: ly.to_bits(), p2: 0 }
-                    }
-                    // mousebtn keeps button(p0)+pressed(p1); key/resize/quit pass
-                    // through unchanged.
-                    _ => ev,
-                };
-                self.wins[self.focused].store.data_mut().events.push_back(routed);
             }
 
-            // 2. Drive each app's frame(), then composite its committed surface.
             self.frame_all();
-            for w in self.wins.iter() {
-                let s = w.store.data();
-                if !s.pixels.is_empty() {
-                    let (rx, ry, _, _) = w.rect;
-                    crate::gfx::blit(&s.pixels, rx, ry, s.win_w, s.win_h);
-                }
-            }
-
-            // 3. Focus border: 2px bright yellow inside the focused window's rect.
-            if self.focused < self.wins.len() {
-                draw_border(self.wins[self.focused].rect, 2, [0xFF, 0xFF, 0x00, 0xFF]);
-            }
+            self.present();
 
             // Crude pacing so the colour cycle + input feel responsive.
             for _ in 0..2_000_000u32 { core::hint::spin_loop(); }

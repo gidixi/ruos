@@ -1,6 +1,6 @@
 # Roadmap — ruos (Rust `no_std`, Limine, WASM userspace)
 
-**Ultimo aggiornamento:** 2026-05-28 (pivot da Linux-ABI a WASM-first)
+**Ultimo aggiornamento:** 2026-06-05 (step 1-19 ✅; GUI = egui, non rlvgl)
 
 ## North star
 
@@ -8,7 +8,9 @@ Eseguire **app `.wasm`** (compilate `wasm32-wasi`) come unico modello di
 "userspace", con:
 
 - una **shell** che esegue moduli WASM come comandi;
-- **GUI** via `rlvgl` (host functions custom esposte al modulo WASM);
+- **GUI** via **egui** (rasterizzata on-device con `tiny-skia`, eseguita come
+  `.cwasm` su Wasmtime AOT; host fn `ruos_gfx` + bridge WIT). Era pianificata
+  `rlvgl`, sostituita da egui;
 - **accesso remoto** via SSH (sessione interattiva attraverso PTY).
 
 Il runtime WASM **è** il sandbox: superficie di syscall minima (WASI Preview 1),
@@ -32,29 +34,27 @@ toolchain è ottima per Rust/C/Go/Zig).
 
 ## Stato del codice
 
-Funziona oggi (commit `969c2fd`+ in `main`):
+Tutti gli step 1-19 sono ✅ DONE in `main` (dettaglio per-step sotto; quadro
+d'insieme: [`README.md`](../../README.md) e
+[`docs/ARCHITECTURE.md`](../ARCHITECTURE.md)). In sintesi, oggi gira:
 
-- Boot Limine BIOS+UEFI hybrid ISO; kernel ELF higher-half a `0xFFFFFFFF80000000`.
-- Seriale COM1 + `SERIAL: spin::Mutex<Serial>` globale + macro `kprintln!`
-  (deadlock-safe via `without_interrupts`).
-- Heap kernel 4 MiB via `talc`, backing su prima regione USABLE Limine accessibile
-  tramite HHDM. `Box`/`Vec`/`String`/`BTreeMap` utilizzabili.
-- GDT custom + TSS con IST 0 (16 KiB) per `#DF`.
-- IDT con handler tipati `extern "x86-interrupt"` per `#DE`/`#UD`/`#GP`/`#PF`/
-  `#DF` (su IST) + `#BP` resumibile.
-- 8259 PIC mascherato; ACPI parsato (`acpi` crate 5.x) per LAPIC/IOAPIC base.
-- LAPIC (xAPIC MMIO) enable + EOI + timer LVT in modalità periodica a 100 Hz,
-  calibrato via PIT one-shot. `TICKS: AtomicU64` incrementato dall'handler timer.
-- IOAPIC con redirection mask-first/atomic-low-write applicando ACPI IRQ
-  source overrides.
-- Tastiera PS/2 su IRQ1 (IOAPIC redirect → vettore `0x21`) → scancode raw su
-  seriale.
-- Mapping MMIO custom (`apic/mmio.rs`) — Limine HHDM non copre MMIO, page-walk +
-  UC leaf con guardia `HUGE_PAGE`.
+- Boot Limine BIOS+UEFI hybrid ISO; kernel ELF higher-half; boot a fasi
+  (arch → mem → interrupts+SMP → pci → devices → fs → storage → usb → userland).
+- Fondamenta: COM1 + `kprintln!`, heap `talc` (16 MiB), frame allocator + paging,
+  GDT/TSS/IDT, LAPIC/IOAPIC, timer 100 Hz (calibrato su ACPI PM su HW reale).
+- I/O: PCIe (ECAM), AHCI/GPT/FAT32 (`/mnt`), networking (`smoltcp` + virtio-net +
+  e1000, DHCP), **xHCI USB** (tastiera **e mouse** HID + hub + hot-plug).
+- Input: PS/2 e USB per tastiera **e mouse** → shell (PTY) e GUI.
+- Runtime: **`wasmi`** (tool `.wasm`) + **Wasmtime AOT no_std** (`.cwasm`
+  GUI/component), fiber + fuel + ResourceLimiter, un solo accessor memoria guest.
+- Userland: shell con pipeline, ~54 tool WASI, SSH (ed25519, password+pubkey),
+  self-install su SSD, SMP compute pool (speedup 2-3×).
+- **GUI**: servizio framebuffer `gfx` (`ruos_gfx`) + desktop **egui** (Wasmtime
+  AOT) + **compositor kernel-side** multi-finestra (focus, drag/raise/close,
+  compositing SMP, launcher).
 
-Asserzione `make run-test`: stringa `ruos: ticks=` sulla seriale. Verificato
-TEST_PASS in QEMU, VirtualBox (con I/O APIC abilitato), e in principio su HW
-reale via USB.
+Verificato in QEMU, VirtualBox e su **hardware reale** (USB input, GUI, installer
+SSD). Battery di test headless: `make run-test` + i target `run-*` per sottosistema.
 
 ## Step 1-5 — Fondamenta (✅ DONE)
 
@@ -272,16 +272,38 @@ step. Primo item landato:
   (dirent Preview 1 + cookie), risoluzione path relativa a `dir_fd`. La host
   fn legacy `ruos.readdir` (record 12-byte) resta per `ls`/`find`/`du`/`grep`.
 
-## Step 17 — Mouse PS/2 + rlvgl + host functions grafiche
+## Step 17 — Mouse + GUI egui + host functions grafiche (✅ DONE)
 
-- Driver mouse PS/2 (porta 0x64 controller, IRQ12 via IOAPIC, scancode 3 byte).
-- Crate `rlvgl` (port Rust di LVGL, no_std).
-- Host functions custom (NON WASI standard):
-  - `ruos_fb_info(w, h, format)`
-  - `ruos_draw_pixel`, `ruos_draw_rect`, `ruos_blit`
-  - `ruos_input_poll()` → eventi keyboard/mouse
-- App WASM grafiche sono ruos-specific (legate alle host fn custom), non
-  portabili agli altri WASI runtime. Trade-off accettato.
+**Pivot rispetto al piano originale:** la GUI è **egui** (rasterizzata on-device
+con `tiny-skia`), **non `rlvgl`**. La scelta dà UI portabile sviluppabile su PC
+e ricompilata invariata in ruos. La GUI gira su **Wasmtime AOT** (vedi Step
+16-bis sotto), non su `wasmi`.
+
+- **Mouse PS/2** (IRQ12, pacchetto 3 byte) **e mouse USB HID boot** (xHCI) →
+  coda `MouseEvent` comune.
+- **Servizio framebuffer `gfx`** con ABI `ruos_gfx`:
+  - blit RGBA8888 (convertito al layout RGB/BGR del pannello), rendering
+    dirty-rect, cursore software;
+  - eventi input al guest: `MouseMove`/`MouseButton` + tasti (scancode PS/2
+    Set 1; la tastiera USB mappa usage→Set 1).
+- **Desktop egui** (`gui.cwasm`) end-to-end: submodule `ruos-desktop` (`gui-core`
+  portabile + `ruos-backend`), raster `tiny-skia`.
+- **Bridge tipizzato WIT / Component Model** (`ruos:gui/*`) oltre alle host fn
+  raw, per ABI sicure verso desktop e compositor.
+- **Compositor / window manager kernel-side**: ogni finestra è un'app WASM
+  separata; input routing + click-to-focus, decorazioni + drag/raise/close,
+  compositing SMP-parallelo a bande, launcher + lifecycle.
+
+Le app grafiche sono ruos-specific (legate a `ruos_gfx`/WIT), non portabili agli
+altri runtime WASI. Trade-off accettato.
+
+## Step 16-bis — Runtime Wasmtime AOT no_std (✅ DONE)
+
+Secondo runtime accanto a `wasmi`, abilitante per Step 17-19: **Wasmtime** in
+`no_std`, runtime-only (no JIT/Cranelift), che esegue `.cwasm` **AOT-precompilati**
+(`tools/wt-precompile`) a velocità quasi-nativa, con allocatore di memoria
+eseguibile **W^X** (`memory/exec.rs`) e feature **Component Model**. Il router
+`.cwasm` della shell instrada a Wasmtime; `wasmi` resta per i tool `.wasm`.
 
 ## Step 18 — SMP / multi-CPU
 
@@ -498,28 +520,33 @@ Catena critica north-star (accesso remoto):
                               └──────────▶ [Step 15: AHCI + FAT] ──▶ (NVMe / virtio-blk)
 
 Rami indipendenti (qualsiasi momento dopo i loro prereq):
-  [Step 17: mouse + rlvgl]  ← framebuffer/executor (8,9)
-  [Step 18: SMP]            ← trasversale, alto rischio, ultimo
+  [Step 17: mouse + GUI egui + compositor]  ← framebuffer/executor (8,9)
+  [Step 18: SMP]                            ← trasversale, alto rischio, ultimo
 ```
 
 ## Decisioni tecniche fissate
 
-- **Runtime WASM:** `wasmi` (Rust puro, no_std, interpreter). Performance
-  adeguata per CLI tool e shell. JIT (WAMR/wasmtime) solo se profiling lo
-  giustifica.
+- **Runtime WASM:** `wasmi` (Rust puro, no_std, interpreter) per i tool `.wasm`
+  CLI; **Wasmtime AOT no_std** (runtime-only, no JIT) per i `.cwasm`
+  GUI/Component-Model dove serve velocità quasi-nativa. Due runtime, stessa
+  filosofia sandbox.
 - **Async executor:** `embassy-executor` (no_std, IRQ-aware).
 - **CSPRNG:** ChaCha20 seedato da RDRAND. Mai usare il timer come entropy
   source.
 - **SSH crate:** `sunset` (no_alloc) preferito; `russh` se l'integrazione
   async-first si rivela più semplice.
-- **GUI:** `rlvgl` con host functions ruos-specific. App grafiche WASM non sono
-  portabili — è OK.
+- **GUI:** **egui** (non `rlvgl`), rasterizzata on-device con `tiny-skia`, su
+  Wasmtime AOT, con host fn `ruos_gfx` + bridge WIT e un compositor kernel-side.
+  App grafiche WASM ruos-specific (legate a `ruos_gfx`/WIT), non portabili — è OK.
 
 ## Cosa NON è in roadmap (rifiutato esplicitamente)
 
-- Multi-utente Unix-style (uid/gid, permessi POSIX) — fuori scope hobby.
-- Multi-CPU/SMP — solo se serve dopo Step 16.
+- Multi-utente Unix-style (uid/gid, permessi POSIX) — fuori scope (tesi
+  WASM-as-sandbox single-address-space).
+- ~~Multi-CPU/SMP — solo se serve dopo Step 16.~~ → era differito, **poi
+  implementato** (Step 18: bring-up AP + compute pool; il compositor lo usa per
+  il compositing parallelo).
 - Filesystem on-disk persistente in Step 7 — solo tmpfs RAM. FAT/AHCI spostati
   allo Step 15 (richiede prima lo Step 13 PCI/ECAM).
-- Hardware reale "ben rifinito" — l'OS funzionerà su HW reale (Limine ISO USB)
-  ma il primary target di sviluppo è QEMU + VBox.
+- Hardware reale "ben rifinito" — primary target di sviluppo resta QEMU + VBox,
+  ma l'OS è **verificato su HW reale** (USB input, GUI/desktop, installer SSD).

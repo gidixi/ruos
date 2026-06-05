@@ -11,35 +11,41 @@ the *what's done* picture.
 ruos is a single-address-space, ring-0 operating system. There is no CPU
 privilege separation (no ring 3, no `SYSCALL`/`SYSRET`, no per-process page
 tables) and no preemptive scheduler. Instead, **the sandbox is the WebAssembly
-runtime** (`wasmi`) and **concurrency is cooperative async** driven by the timer
-IRQ. Every userspace program is a `wasm32-wasip1` module; the kernel is the host
-that lends it memory, files, sockets, and a terminal through host functions.
-Everything — kernel, runtime, and apps — shares one address space and runs at
-ring 0.
+runtime** and **concurrency is cooperative async** driven by the timer IRQ. Two
+runtimes coexist: **`wasmi`** (an interpreter) runs the `wasm32-wasip1`
+coreutils, and **Wasmtime** (no_std, AOT — no JIT) runs precompiled `.cwasm`
+modules at near-native speed for the GUI and the WIT/Component-Model bridge.
+Every userspace program is a WASM module; the kernel is the host that lends it
+memory, files, sockets, a terminal, and a framebuffer through host functions.
+A graphical **egui desktop** with a **kernel-side compositor** runs window apps
+as separate WASM modules. Everything — kernels, runtimes, and apps — shares one
+address space and runs at ring 0.
 
 ## Layer cake
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ Userland  .wasm tools (~54): shell, coreutils, nano, rtop,         │
-│           ip/ping/nc/wget, mkdisk/mkboot/install, smptest …        │  ring 0,
+│ Userland  .wasm tools (~54): shell, coreutils, nano, rtop, …  +    │
+│           GUI: egui desktop + window apps (.cwasm), compositor      │  ring 0,
 ├──────────────────────────────────────────────────────────────────┤  but
-│ WASI / host ABI   "wasi_snapshot_preview1" (25 fns) + "ruos" (33)  │  sandboxed
-├──────────────────────────────────────────────────────────────────┤  by wasmi
-│ WASM runtime      wasmi interpreter + fibers + fuel + limits       │
+│ Host ABI   wasi_snapshot_preview1 (25) + ruos (33) + ruos_gfx /    │  sandboxed
+│            WIT components (framebuffer, input, window mgmt)         │  by the
+├──────────────────────────────────────────────────────────────────┤  WASM
+│ WASM runtimes   wasmi (interp, .wasm tools) + Wasmtime AOT          │  runtime
+│                 (.cwasm GUI/components) · fibers · fuel · limits    │
 ├──────────────────────────────────────────────────────────────────┤
-│ Kernel services   VFS · PTY · pipes · proc registry · service mgr  │
-│                   net (smoltcp) · storage (AHCI/GPT/FAT32) · SSH    │
+│ Kernel services VFS · PTY · pipes · proc registry · service mgr ·  │
+│                 GUI service (gfx) + compositor · net · storage · SSH│
 ├──────────────────────────────────────────────────────────────────┤
-│ Core kernel       async executor (embassy) · heap (talc) ·         │
-│                   frame allocator + paging · IrqMutex · klog        │
+│ Core kernel     async executor (embassy) · heap (talc) ·           │
+│                 frame allocator + paging · IrqMutex · klog          │
 ├──────────────────────────────────────────────────────────────────┤
-│ Arch / drivers    GDT/TSS/IDT · LAPIC/IOAPIC · timer · SMP ·       │
-│                   PS/2 · PCIe(ECAM) · AHCI · NIC · xHCI · FB · COM1 │
+│ Arch / drivers  GDT/TSS/IDT · LAPIC/IOAPIC · timer · SMP · PS/2 kbd │
+│                 + mouse · PCIe(ECAM) · AHCI · NIC · xHCI · FB · COM1 │
 ├──────────────────────────────────────────────────────────────────┤
-│ Firmware          Limine (UEFI or BIOS) → loads kernel + modules   │
+│ Firmware        Limine (UEFI or BIOS) → loads kernel + modules     │
 ├──────────────────────────────────────────────────────────────────┤
-│ Hardware          x86-64 PC (QEMU / VirtualBox / real, 1–N cores)  │
+│ Hardware        x86-64 PC (QEMU / VirtualBox / real, 1–N cores)    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,18 +66,20 @@ strict order — [`kernel/src/boot/mod.rs`](../kernel/src/boot/mod.rs):
 | # | Phase | Brings up |
 |---|-------|-----------|
 | 1 | `arch` | GDT/TSS + IDT loaded (CPU can take exceptions/INT3). |
-| 2 | `mem` | `talc` heap (16 MiB), physical frame allocator + `map/unmap_page`, ACPI tables parsed (MADT, MCFG). |
+| 2 | `mem` | `talc` heap (128 MiB), physical frame allocator + `map/unmap_page`, ACPI tables parsed (MADT, MCFG). |
 | 3 | `interrupts` | PIC masked, LAPIC + IOAPIC from MADT, 100 Hz LAPIC timer (calibrated vs ACPI PM timer on real HW), `STI`, then **SMP bring-up** (APs parked in `hlt`). |
 | 4 | `pci` | PCIe enumeration over ECAM (from ACPI MCFG). |
-| 5 | `devices` | Framebuffer console (font + ANSI) and PS/2 keyboard. |
+| 5 | `devices` | Framebuffer console (font + ANSI), GUI framebuffer geometry captured, PS/2 keyboard **and mouse** (IRQ12). |
 | 6 | `fs` | VFS + tmpfs mounted; Limine modules copied into `/bin`, `/etc/init.sh`, etc. |
 | 7 | `storage` | AHCI HBA + SATA ports; data partition mounted FAT32 at `/mnt`. |
-| 8 | `usb` | xHCI controller, HID boot keyboard, hubs (after FB so logs are visible on real HW). |
+| 8 | `usb` | xHCI controller, HID boot **keyboard and mouse**, hubs, hot-plug (after FB so logs are visible on real HW; waits for the port to actually enable on real silicon). |
 | 9 | `userland` | RNG, networking, service manager, SSH server, then `executor::run()` — **never returns**. |
 
 After phase 9 the framebuffer console is quieted to WARN+ (INFO still flows to
 serial and the `dmesg` ring buffer), the async executor takes over, and the
-boot shell — spawned from `/etc/init.sh` — gives you a prompt.
+boot shell — spawned from `/etc/init.sh` — gives you a prompt. From there a GUI
+`.cwasm` (the egui desktop, or the compositor running window apps) can take over
+the framebuffer; see *GUI & compositor* below.
 
 ## Hardware / driver layer
 
@@ -98,12 +106,22 @@ ruos targets a generic x86-64 PC. What it drives:
   back-ends: paravirtual **virtio-net** and the Intel **e1000**. DHCP brings
   the interface up.
 - **USB** — `usb/` is an xHCI host driver with a USB core (slot registry +
-  event dispatch), an HID boot-keyboard driver, a hub class driver, and runtime
-  hot-plug. Keyboards on root ports or behind hubs all feed the same input path.
+  event dispatch), HID boot **keyboard and mouse** drivers, a hub class driver,
+  and runtime hot-plug. Devices on root ports or behind hubs all feed the same
+  input paths (keystrokes → PTY + GUI, pointer → the mouse queue). USB is
+  *polled* (no MSI), so the poll is also pumped from the GUI frame loop — a sync
+  GUI owns the cooperative executor and would otherwise starve it. Real-hardware
+  quirks handled: BIOS→OS legacy handoff, waiting for *port-enabled* after reset
+  (real silicon sets it a few ms after *reset-change*), and a speed-aware
+  endpoint-interval encoding so low/full-speed devices are actually polled.
+- **Input** — `mouse/` is the PS/2 mouse driver (IRQ12) feeding a shared
+  `MouseEvent` queue; PS/2 (`keyboard/`, IRQ1) and USB HID both emit keystrokes
+  *and* pointer events. Keystrokes reach the shell via the PTY and the GUI via
+  `gfx::push_key` (PS/2 Set 1 scancodes); pointer deltas are folded into an
+  absolute cursor by the GUI service.
 - **Console & serial** — `console/` is a framebuffer text console (bitmap font,
-  anti-aliased blend, `vte` ANSI parser); `serial.rs` is the COM1 driver. Both
-  PS/2 and USB keystrokes land in one input queue, so a monitor + keyboard or a
-  serial line work interchangeably.
+  anti-aliased blend, `vte` ANSI parser); `serial.rs` is the COM1 driver. A
+  monitor + keyboard (+ mouse) or a serial line work interchangeably.
 - **Misc** — `rtc.rs` (wall-clock from CMOS), `rng.rs` (see below).
 
 ## Core kernel
@@ -111,7 +129,7 @@ ruos targets a generic x86-64 PC. What it drives:
 - **Memory** — `memory/` owns a bitmap **physical frame allocator** built from
   the Limine memory map and a generic paging API (`map_page`/`unmap_page`,
   MMIO ranges, DMA-contiguous frames). The Rust global allocator is **`talc`**
-  on a 16 MiB heap, which enables `alloc` (`Vec`/`Box`/`String`/`BTreeMap`).
+  on a 128 MiB heap, which enables `alloc` (`Vec`/`Box`/`String`/`BTreeMap`).
   There are **no** per-process page tables — one address space for everything.
 - **Synchronisation** — `sync/` provides `IrqMutex`, an IRQ-safe spinlock that
   disables interrupts while held (so an IRQ handler can't deadlock against a
@@ -159,6 +177,17 @@ ruos targets a generic x86-64 PC. What it drives:
   terminal control (`tcgetattr`/`tcsetattr`, `poll_stdin`), system info
   (`meminfo`, `cpustat`, `proc_stat` for `ps`/`rtop`), sockets, SMP benchmarking
   (`smp_bench`), and disk authoring/install (`mkdisk`, `mkboot`, `install`).
+
+**The second runtime — Wasmtime AOT (`wasm/wt/`).** Graphical and
+component-model apps don't run on `wasmi`; they run on **Wasmtime** built
+`no_std`, runtime-only (no Cranelift/JIT). The module is **AOT-precompiled** on
+the host (`tools/wt-precompile`) to a `.cwasm` and `include_bytes!`'d or staged
+at `/bin`, then executed at near-native speed on bare metal — backed by a W^X
+executable-memory allocator (`memory/exec.rs`). The shell's command router sends
+`.cwasm` to Wasmtime and `.wasm` to `wasmi`. Two extra host surfaces ride on it:
+`ruos_gfx` (framebuffer **blit** of guest RGBA8888 + **input events** —
+keyboard scancodes and absolute mouse) and a typed **WIT / Component Model**
+bridge (`ruos:gui/*`) for the desktop and the compositor's window protocol.
 
 Host-call mechanics:
 
@@ -212,6 +241,134 @@ SSH channel to a fresh shell on a PTY.
   authors long filenames (LFN) and the mounted driver reads them back, so the
   tools keep their real names on disk.
 
+## GUI: the kernel↔WASM contract and the compositor
+
+The graphical stack lives in `gfx/` (the kernel-side service) and `wasm/wt/`
+(the Wasmtime apps + the compositor); the UI itself is the `ruos-desktop` git
+submodule. The whole point of the design is **decoupling**: a GUI app is a
+sandboxed WASM module that knows nothing about the kernel — it speaks a small,
+fixed ABI, and the kernel is the host that implements it. Two ABI styles coexist.
+
+### Talking to the kernel without coupling
+
+A WASM module cannot call kernel functions directly — there are no syscalls. It
+declares **imports** (functions it expects the host to provide) and **exports**
+(functions the host may call). The kernel-side `Linker` binds each import name to
+a Rust closure that runs in ring 0 with full kernel access, and the guest only
+ever sees the function signature. That boundary is the decoupling: either side
+can change its internals freely as long as the import/export shapes hold.
+
+ruos uses this boundary at two levels of formality:
+
+- **Raw host modules** (`func_wrap`) — the fast, hand-rolled style used by
+  `ruos_gfx` and the compositor's `wm` module. The host registers e.g.
+  `wm.commit(ptr, len, w, h)` or `gfx.blit(ptr, len, x, y, w, h)`; pointers are
+  offsets into the guest's **own** linear memory, which the host reads/writes
+  through `Caller::get_export("memory")` (see `wm.rs::read_guest`/`write_guest`).
+  Compound values (a 20-byte input event) are marshalled by hand as
+  little-endian fields at fixed offsets. Simple and zero-codegen, but both sides
+  must agree on the byte layout by convention.
+
+- **WIT / the Component Model** — the typed, generated style. An interface is
+  declared once in a **`.wit`** file (`wit/ruos-gui.wit`, `wit/ruos-bringup.wit`)
+  as the *single source of truth*: records, functions, and a `world` of imports
+  and exports. For example `ruos:gui` declares a `gfx` interface with
+  `get-info -> gfx-info`, `blit(list<u8>, …)`, `poll-event -> option<gfx-event>`,
+  and a `power` interface. From that one file:
+  - the **guest** generates its import stubs with `wit-bindgen`;
+  - the **host** generates a Rust trait with `wasmtime::component::bindgen!`
+    (`component.rs`), then just `impl`s it — e.g. `impl ruos::bringup::system::Host
+    for BringupHost { fn log(&mut self, msg: String) { … } }`.
+
+  Wasmtime lifts/lowers the values across the boundary (strings, lists,
+  `option`, records) — no manual pointer math, no layout to keep in sync. The
+  host flow is: `Component::deserialize` the AOT `.cwasm` → `Store` holding the
+  host state → component `Linker` → `World::add_to_linker` → `instantiate` →
+  call a typed export (`bringup.call_run(&mut store) -> i32`). Because the `.wit`
+  is shared and the marshalling is generated, the contract is enforced at
+  compile time on both sides — this is the disciplined version of the same
+  decoupling the raw modules do by hand, and the direction the real apps move
+  toward.
+
+In both cases the guest is still sandboxed by the WASM runtime (its own linear
+memory, fuel, resource limits); the host functions are the *only* way out.
+
+### The egui desktop
+
+The desktop UI is plain **egui**, written once in the portable `gui-core` crate.
+During development it runs on a PC backend (`winit` + `softbuffer`); for ruos the
+same `gui-core` is compiled `wasm32-wasip1`, paired with a thin `ruos-backend`
+that implements the `Platform` trait against the `gfx` ABI, and AOT-precompiled
+to `gui.cwasm`. Each frame the backend pulls input events (`poll-event`), feeds
+them to egui as `RawInput`, lets egui lay out the UI, **rasterises the result on
+the CPU with `tiny-skia`** to an RGBA8888 buffer (no GPU — the same raster path
+on PC and on device), and `blit`s it. The `gfx` service converts RGBA→panel
+layout, does **dirty-rect** updates (only changed regions re-blitted), composites
+a software mouse cursor on top, and — because a synchronous GUI owns the
+cooperative executor — pumps `usb::poll()` so the polled USB keyboard/mouse keep
+delivering events while the GUI runs. Input itself is layout-agnostic: PS/2 and
+USB both feed one `MouseEvent` queue (folded into an absolute, screen-clamped
+cursor) and emit key events as PS/2 Set 1 scancodes (USB maps HID usage → Set 1),
+so the egui side need not know which device produced them.
+
+### The kernel-side compositor
+
+Multi-window is **process-isolated**: every window is a *separate* WASM instance
+with its own linear memory (`wasm/wt/wm.rs`). A window app is a "reactor" — it
+exports `frame()` and imports the `wm` module (`commit`, `app_id`, `tick`,
+`poll_event`, `close`). The compositor owns the screen; the guest only ever draws
+into its own surface buffer and drains its own input queue. Per-window state
+lives in a `WmState` (id, committed `pixels`, an event `VecDeque`, a
+`close_requested` flag); the `Compositor` holds `wins: Vec<Window>` whose **order
+is the z-order** (index 0 = bottom, last = top), the focused index, an optional
+drag, and a screen back-buffer.
+
+A window app need not be a bare `no_std` reactor. The compositor instantiates
+windows on a unified `Store<AppState>` / `Linker<AppState>` where `AppState`
+combines the WASI state and the window state, exposed through `HasWasi` /
+`HasWindow` accessor traits so `wasi::add_to_linker` and `wm::add_to_linker` both
+register onto the *one* linker. That lets a window be a full `wasm32-wasip1`
+**std** binary that uses WASI *and* the `wm` surface protocol at once (a
+`_initialize` call runs after instantiate for std reactors) — the foundation for
+running **egui itself inside a compositor window**, not just fullscreen. The
+app-from-shell path keeps its own `Linker<WtState>` unchanged.
+
+One compositor frame (`run_compositor_gate` loop):
+
+1. **Reap** — windows that called `wm.close()` (or finished their lifecycle) are
+   dropped; their ids are recycled (`free_ids`).
+2. **Route input** — the compositor is the *sole* consumer of `gfx::pop()` in
+   this mode. It folds the mouse to an absolute cursor, hit-tests it against
+   window footprints, sets focus on a mouse-button-down (**click-to-focus**,
+   which also `raise`s the window to the top of `wins`), starts/continues a
+   title-bar **drag**, handles the **[X]** close box, and translates the cursor
+   to window-local coordinates before pushing the event into **only the focused
+   window's** queue. Each app reads its events back via `wm.poll_event`, so a
+   window can never see another's input.
+3. **Run guests** — `frame_all()` calls every window's `frame()`. The guest
+   drains its queue, redraws, and `wm.commit(ptr,len,w,h)`s its surface; the host
+   copies those pixels into that window's `WmState.pixels`.
+4. **Decorate** — `compose_window` wraps each surface in a **decorated
+   footprint**: a focus-coloured title bar, the title text, and an [X] button
+   drawn above the committed surface, all in one RGBA buffer.
+5. **Composite** — the decorated footprints are painted bottom→top into the
+   back-buffer. The screen is split into horizontal **bands** and the
+   painter's-algorithm composite of each band (`compose.rs::composite_band`, a
+   pure, allocation-free, I/O-free kernel) is **fanned out across the SMP
+   compute pool** — APs composite disjoint bands in parallel while the BSP joins.
+   This parallel path is verified **byte-identical** to the single-core serial
+   path (`run-comp-smp-test`).
+6. **Present** — one blit of the back-buffer to the framebuffer, plus the
+   software cursor. Clearing each band to the desktop background every frame
+   means a moved or closed window leaves no ghost.
+
+A **launcher** strip (taskbar) spawns registered apps (`spawn_app`, capped at
+`MAX_WINDOWS`, reusing a shared AOT `Module` so new instances are cheap), and the
+lifecycle layer tears down closed windows and recycles their ids and pids. The
+single fullscreen egui desktop and this multi-window compositor are two modes of
+the same `gfx`/Wasmtime machinery — a window app is just a reactor whose surface
+happens to be rendered by egui.
+
 ## Concurrency model (and what SMP does)
 
 The default model is **cooperative async on one core**: the BSP runs the
@@ -254,10 +411,14 @@ keypress (PS/2 or USB HID)            firmware/driver IRQ
 | PCIe | `kernel/src/pci/` |
 | Storage (SATA, GPT, FAT32) | `kernel/src/{ahci,gpt,disk,crc32}.rs`, `kernel/src/vfs/fat32.rs` |
 | Networking | `kernel/src/net/` |
-| USB | `kernel/src/usb/` |
+| USB (kbd + mouse + hub) | `kernel/src/usb/` |
+| Input (PS/2 mouse) | `kernel/src/mouse/`, `kernel/src/keyboard/` |
 | VFS / PTY / pipes | `kernel/src/{vfs,pty,pipe}/` |
 | Console / serial | `kernel/src/{console,serial.rs}` |
-| WASM runtime + host ABI | `kernel/src/wasm/` |
+| GUI framebuffer service | `kernel/src/gfx/` |
+| WASM runtime (`wasmi`) + host ABI | `kernel/src/wasm/` |
+| Wasmtime AOT + WIT + compositor | `kernel/src/wasm/wt/`, `tools/wt-*` |
+| egui desktop UI (submodule) | `ruos-desktop/` |
 | SSH | `kernel/src/ssh/` |
 | Async executor | `kernel/src/executor/` |
 | Userspace tools | `user/` → `user-bin/` |

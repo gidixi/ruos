@@ -209,6 +209,13 @@ pub fn pop() -> Option<GfxEvt> { EVENTS.lock().pop_front() }
 /// Number of queued GUI events (peek, for on-demand repaint).
 pub fn pending() -> usize { EVENTS.lock().len() }
 
+/// Current absolute software-cursor position (x, y) in framebuffer pixels.
+/// The compositor hit-tests this against window rects to route input. Updated
+/// by `fold_mouse()` from the PS/2 mouse. Single source of truth for the cursor.
+pub fn mouse_pos() -> (i32, i32) {
+    (MOUSE_X.load(Ordering::Relaxed), MOUSE_Y.load(Ordering::Relaxed))
+}
+
 // Absolute cursor position + previous button state (for edge detection).
 static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);

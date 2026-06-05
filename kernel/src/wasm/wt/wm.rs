@@ -56,15 +56,20 @@ static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
 pub struct AppEntry {
     pub name: &'static str,
     pub cwasm: &'static [u8],
+    /// `false` = spawnable BY NAME (boot-checks still find it via
+    /// `APPS.iter().position(..)`) but HIDDEN from the launcher taskbar. The CSD
+    /// demo reactors are kept for boot-checks but retired from the visible
+    /// launcher (a real egui app gets `true` in SP-B Task 6).
+    pub show_in_launcher: bool,
 }
 
 /// The launcher's app table. Adding a real app later = one more entry here. Two
 /// display names map to the same reactor module (distinct launcher entries).
 pub static APPS: &[AppEntry] = &[
-    AppEntry { name: "react-A", cwasm: REACTOR_CWASM },
-    AppEntry { name: "react-B", cwasm: REACTOR_CWASM },
-    AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM },
-    AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM },
+    AppEntry { name: "react-A", cwasm: REACTOR_CWASM, show_in_launcher: false },
+    AppEntry { name: "react-B", cwasm: REACTOR_CWASM, show_in_launcher: false },
+    AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM, show_in_launcher: false },
+    AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM, show_in_launcher: false },
 ];
 
 /// Cache of deserialised modules, keyed by the cwasm slice's base address (each
@@ -1040,15 +1045,19 @@ impl Compositor {
             [0x6A, 0x4A, 0x8A, 0xFF], // purple
         ];
 
-        for (i, app) in APPS.iter().enumerate() {
-            let bx = i as u32 * LAUNCHER_BTN_W;
+        // Lay out ONLY launcher-visible entries left-to-right by their position
+        // among the visible subset (`pos`), independent of the real APPS index.
+        let visible: Vec<(usize, &AppEntry)> =
+            APPS.iter().enumerate().filter(|(_, a)| a.show_in_launcher).collect();
+        for (pos, (_apps_idx, app)) in visible.iter().enumerate() {
+            let bx = pos as u32 * LAUNCHER_BTN_W;
             if bx >= sw { break; }
             // Button rect inset 2px from the cell so cells read as buttons.
             let inset = 2u32;
             let bw = LAUNCHER_BTN_W.min(sw - bx);
             let rect_w = bw.saturating_sub(inset * 2);
             let rect_h = lh.saturating_sub(inset * 2);
-            let tint = BTN_TINTS[i % BTN_TINTS.len()];
+            let tint = BTN_TINTS[pos % BTN_TINTS.len()];
             decor::fill_rect(&mut strip, sw, lh, bx + inset, inset, rect_w, rect_h, tint);
             // Label (white), clipped to the button's right edge.
             let label_x = bx + inset + decor::TEXT_PAD_X;
@@ -1060,19 +1069,23 @@ impl Compositor {
         crate::gfx::blit(&strip, 0, g.height - lh, sw, lh);
     }
 
-    /// Hit-test a screen point against the launcher buttons. Returns the `APPS`
-    /// index of the button under (px,py), or None if the point is above the
-    /// strip / past the last button / off the right edge of the screen.
+    /// Hit-test a screen point against the launcher buttons. Buttons are laid out
+    /// over ONLY the launcher-visible `APPS` entries (in the same order as
+    /// `draw_launcher`); a clicked visible-position is mapped back to the real
+    /// `APPS` index. Returns that `APPS` index, or None if the point is above the
+    /// strip / past the last visible button / off the right edge of the screen.
     fn launcher_hit(&self, px: i32, py: i32) -> Option<usize> {
         let g = crate::gfx::geom();
         let y0 = g.height as i32 - LAUNCHER_H as i32;
-        if py < y0 { return None; }
-        let idx = (px / LAUNCHER_BTN_W as i32) as usize;
-        if px >= 0 && idx < APPS.len() && (idx as u32 * LAUNCHER_BTN_W) < g.width {
-            Some(idx)
-        } else {
-            None
-        }
+        if py < y0 || px < 0 { return None; }
+        let pos = (px / LAUNCHER_BTN_W as i32) as usize; // position among VISIBLE entries
+        if (pos as u32 * LAUNCHER_BTN_W) >= g.width { return None; }
+        // Map the visible position back to the real APPS index.
+        APPS.iter()
+            .enumerate()
+            .filter(|(_, a)| a.show_in_launcher)
+            .nth(pos)
+            .map(|(apps_idx, _)| apps_idx)
     }
 
     /// Left mouse-down at screen (px,py): a launcher-button click spawns its app

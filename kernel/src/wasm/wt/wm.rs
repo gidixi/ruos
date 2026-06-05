@@ -996,13 +996,31 @@ impl Compositor {
         let needed = stride * sh as usize;
         if self.backbuf.len() != needed { self.backbuf = alloc::vec![0u8; needed]; }
 
-        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order).
+        // SP-C: a `bg` window is pinned to the full framebuffer and composited
+        // FIRST (z-bottom), independent of its position in `wins`. Force its rect
+        // to (0,0,sw,sh) here every frame (frame_all resets it to the committed
+        // size); its surface is blitted at (0,0) and `DESKTOP_BG` fills any area
+        // the surface doesn't cover.
+        let bg_idx = self.bg_index();
+        if let Some(bi) = bg_idx {
+            self.wins[bi].rect = (0, 0, sw, sh);
+        }
+
+        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order),
+        //    but with the `bg` window FIRST (z-bottom, forced to origin (0,0)).
         //    Keep them ALIVE in `foots` across the join so the band jobs' raw
         //    pointers (into each footprint buffer) stay valid for the whole
         //    parallel composite.
         let mut foots: alloc::vec::Vec<(alloc::vec::Vec<u8>, u32, u32, u32, u32)> =
             alloc::vec::Vec::new();
+        if let Some(bi) = bg_idx {
+            // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
+            if let Some((px, _, _, fw, fh)) = self.compose_window(bi) {
+                foots.push((px, 0, 0, fw, fh));
+            }
+        }
         for i in 0..self.wins.len() {
+            if bg_idx == Some(i) { continue; } // bg already composited first
             if let Some(f) = self.compose_window(i) { foots.push(f); }
         }
         let n = core::cmp::min(foots.len(), MAX_WINS);

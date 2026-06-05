@@ -262,6 +262,132 @@ altro Unix".
 
 ---
 
+## 8. Il vero rischio del modello (oltre la concorrenza)
+
+L'SMP e la performance NON sono il rischio principale. Il rischio è **strutturale**:
+
+> **L'integrità dell'intero sistema poggia sulla correttezza di una trusted base
+> che cresce, con ZERO contenimento hardware.** Failure mode = *bug raro →
+> corruzione totale, silenziosa, irrecuperabile*. La probabilità **cresce con ogni
+> riga** aggiunta (driver, runtime, SMP).
+
+In un OS classico un driver buggato in ring 0 può crashare il kernel, ma i processi
+utente hanno address space separati: li killi e ispezioni. In ruos **tutto** è nel
+blast radius della trusted base: niente MMU, niente ring, niente da killare — la
+macchina va in stato indefinito e lo stesso panic handler gira nella memoria corrotta.
+
+Le facce concrete, in ordine di gravità:
+
+1. **Trusted base illimitata e tutta portante.** Ogni driver (`unsafe` MMIO/DMA),
+   ogni host fn, ogni riga dell'interprete WASM, allocatore, paging. UN bug di
+   memory-safety *ovunque* corrompe stato arbitrario, irreversibile. Il rischio
+   scala con la dimensione del codice fidato.
+2. **Il runtime È il security kernel — e non lo controlli tu.** Tutta la storia
+   isolamento/sicurezza poggia su `wasmi` E Wasmtime corretti. Wasmtime `no_std`
+   AOT su bare metal è una montagna di codice (Cranelift output, component model,
+   virtual memory custom). Un bug nel bounds-check o nella **deserializzazione del
+   `.cwasm`** = sandbox escape = codice arbitrario in ring 0. È una codebase di
+   terzi più grande del kernel, fidata al 100%.
+3. **DMA = il killer silenzioso.** I driver (USB/AHCI/NIC) danno al dispositivo
+   indirizzi RAM e l'hardware ci scrive da solo, asincrono. Un indirizzo sbagliato
+   in un descrittore DMA → scribacchio di memoria kernel arbitraria, **senza
+   IOMMU** a fermarlo. Classe di bug più subdola e dannosa, sintomo lontano dalla
+   causa (cfr. il debug USB su HW reale).
+4. **L'SMP peggiora 1-3.** Shared-nothing *per disciplina* (§3.2) = un bug su core
+   A corrompe lo stato "posseduto" da B (niente enforcement). Arrivano i bug di
+   concorrenza (lock sbagliato, barriera mancata, race nel message bus lock-free) e
+   le garanzie Rust si indeboliscono ai confini `unsafe` SMP (Sync dell'executor,
+   ordering atomici). Il single-core cooperativo era sicuro anche perché non c'era
+   vera concorrenza; l'SMP toglie quella rete.
+5. **Niente recovery/introspezione.** Quando si rompe sei al buio; *"freezato /
+   corrotto"* senza contenimento diventa il failure mode dominante man mano che cresce.
+
+**Perché è strutturale:** non puoi comprare contenimento hardware senza tradire il
+pivot (servirebbe ring 3 + page-table per-processo). Le leve immediate sono leve di
+**correttezza**, non di isolamento: `unsafe` minimo e auditato, restringere la
+superficie host, **fuzzing di ogni confine** (host fn, parsing descrittori,
+deserializzazione `.cwasm` — oggi fuzzi solo l'accessor memoria), supervisore +
+post-mortem (dmesg persistente, snapshot su panic), e l'**unica eccezione hardware
+sensata: IOMMU per il DMA** (protegge senza ring 3, coerente col modello).
+
+## 9. Il modello elegante: WASM come isolamento universale
+
+La soluzione *strutturale* ed elegante non aggiunge un meccanismo estraneo: usa
+**ricorsivamente la scommessa già fatta** (WASM = isolamento).
+
+> **Rendi WASM il meccanismo di isolamento universale: non solo le app, ma anche
+> driver, filesystem, stack di rete e servizi diventano componenti WASM. La trusted
+> base si restringe a un NUCLEO nativo minuscolo + il runtime. DMA coperto da IOMMU.
+> Guasti contenuti + supervisione.**
+
+È un **microkernel** dove la primitiva di isolamento è il **sandbox WASM +
+capabilities**, non gli address space + ring.
+
+### 9.1 Perché è elegante
+- Un **driver-in-WASM** buggato non può scribacchiare memoria arbitraria: il
+  runtime fa bounds-check → guasto **contenuto a quel modulo**.
+- La trusted base **si restringe** a `{ nucleo nativo + runtime }`; tutto il resto è
+  WASM-isolato.
+- **Risolve gratis il buco dell'SMP (§3.2/§8.4):** due componenti WASM su due core
+  **non possono toccarsi la memoria — enforced dal runtime, non per disciplina**. Lo
+  shared-nothing diventa *garantito*. La stessa mossa abbatte ENTRAMBI i rischi.
+
+### 9.2 I pezzi
+| Pezzo | Cosa |
+|---|---|
+| **Nucleo nativo** | L'unico codice pienamente fidato: boot, host/runtime glue, scheduler, accesso CPU/interrupt raw, setup IOMMU, message bus. Piccolo → audit/fuzz/forse verifica formale. |
+| **Componenti WASM** | Driver, FS, net stack, servizi. Linear memory isolata ciascuno. Crash → killa il componente, il sistema vive. |
+| **Capabilities** | Capability esplicite e non falsificabili: "questo driver tocca QUESTA MMIO + QUESTO IRQ + QUESTI buffer DMA, nient'altro". Least privilege. Il **Component Model / WASI Preview 2** è capability-based → già in mano (Wasmtime component-model abilitato, cfr. `wasm/wt/component.rs`). |
+| **IOMMU** | Backstop hardware per il DMA, l'unico punto dove l'HW aiuta senza ring 3. Il nucleo programma l'IOMMU: descrittore DMA sbagliato non scribacchia tutta la RAM. |
+| **Supervisione** | Componente crasha → restart, il resto sopravvive. Possibile perché i guasti sono contenuti. Erlang-style. |
+
+### 9.3 Analogo storico
+**Microsoft Singularity** isolava i processi con la type-safety di un IL gestito
+(Software-Isolated Processes in un solo address space), non con l'hardware.
+**ruos = Singularity con WASM come IL** — stessa idea, toolchain moderna e portabile.
+Linea di ricerca reale (unikernel+Wasm, nanoprocess Lucet/Fastly, Wasm-OS accademici).
+
+### 9.4 Costi onesti
+- **Il runtime resta il punto fidato concentrato.** Un escape da wasmi/Wasmtime =
+  game over. Ma hai UNA cosa da blindare (componente diffuso, fuzzabile,
+  aggiornabile) invece di tutto sparso in N driver. Ottimo scambio.
+- **Overhead host-call sui path caldi.** Ogni MMIO/DMA attraverso il confine runtime
+  costa (un NIC a 10Gbps lo sente). Mitigazioni: **AOT** (già c'è), **ring in
+  shared-memory** componente↔nucleo (il driver possiede la sua ring DMA, la polla →
+  pochissimi attraversamenti), e i path ultra-caldi **restano nel nucleo**. Non
+  *tutto* deve essere WASM.
+- **Ingegneria enorme:** definire le ABI dei componenti (capability MMIO/IRQ/DMA),
+  l'interfaccia host stile-WASI per i servizi kernel. È il costo vero.
+- **Nucleo irriducibile:** non puoi WASM-isolare la cosa che esegue WASM.
+
+### 9.5 Lo stai già facendo
+ruos **è già** un OS a componenti WASM al livello app + GUI: app `.wasm`, **finestre
+del compositor = istanze WASM separate** (`wasm/wt/wm.rs`, AppState/Linker per
+finestra), desktop egui `.cwasm`. Il modello elegante = **spingere quel confine GIÙ
+nel kernel** (driver, servizi), non su.
+
+**Staging realistico (non big-bang):**
+1. **IOMMU subito** — contenimento DMA più economico, driver nativi restano.
+2. **Restringi + auditi il nucleo nativo**; definisci la ABI-componente per UNA
+   classe di driver come prova.
+3. **I componenti nuovi/rischiosi nascono WASM** — come già fai per le finestre GUI.
+   Il confine scende da solo.
+
+### 9.6 Bottom line
+Il modello elegante NON è "aggiungi isolamento hardware" (tradirebbe il pivot). È:
+
+> **Fai del sandbox WASM il meccanismo di isolamento universale. Riduci la trusted
+> base a un nucleo nativo minuscolo + il runtime. Lascia che runtime + IOMMU siano le
+> UNICHE cose che devono essere corrette. Contieni e supervisiona i guasti.**
+
+Il rischio strategico (§8) si capovolge: da *"tutto è fidato e cresce senza rete"* a
+**"quasi niente è fidato; il poco che lo è è piccolo e blindabile"**. È la conclusione
+naturale e coerente del pivot WASM-as-sandbox — non un compromesso, il suo
+**completamento**. (Relazione con l'SMP §3: shared-nothing per-core + componenti
+WASM-isolati sono la stessa idea su due assi — ownership per i core, sandbox per i
+moduli — e si rinforzano: i componenti danno l'enforcement che allo shared-nothing
+"per disciplina" manca.)
+
 ## Riferimenti codice (ancore)
 
 - Executor single-core + asserzione: `kernel/src/executor/mod.rs:32,45,51,62,113,129`

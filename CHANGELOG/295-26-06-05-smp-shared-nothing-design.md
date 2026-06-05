@@ -25,6 +25,16 @@ Contenuto, fondato sul codice attuale (riferimenti file:riga):
   SSH subito).
 - **Trade-off onesti**, anti-pattern da evitare (no preemption + lock ovunque),
   coerenza con la tesi (isolamento per ownership = WASM esteso al kernel).
+- **§8 — Il vero rischio del modello:** trusted base illimitata senza contenimento
+  hardware (un bug = sistemico), il runtime come security kernel, DMA come killer
+  silenzioso, l'SMP `unsafe` che peggiora tutto, niente recovery. Leve di
+  correttezza + IOMMU per il DMA.
+- **§9 — Il modello elegante (WASM come isolamento universale):** microkernel dove
+  driver/FS/net/servizi diventano componenti WASM; trusted base ridotta a nucleo
+  nativo minuscolo + runtime; capabilities (Component Model/WASI p2) + IOMMU +
+  supervisione. Risolve sia la trusted base illimitata sia l'enforcement mancante
+  dello shared-nothing. Analogo: Singularity con WASM come IL. Staging + "lo stai
+  già facendo a livello app/GUI".
 
 ## Perché
 Discussione architetturale: il modello cooperativo single-core è giusto per

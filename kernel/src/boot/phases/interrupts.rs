@@ -88,6 +88,11 @@ pub fn init() -> Result<(), BootError> {
         // confirm it tears itself down (final_live==0) + the id is recycled.
         let (sp, peak, fin) = crate::wasm::wt::run_lifecycle_demo();
         crate::binfo!("wm", "lifecycle spawns={} peak_live={} final_live={}", sp, peak, fin);
+        // SP-A: spawn the wasip1 STD probe as a window + drive one frame. A
+        // non-zero pixels=307200 proves a std/wasip1 guest instantiates + runs
+        // its std heap alloc + commits against the unified Linker<AppState>.
+        let pn = crate::wasm::wt::run_wasip1_probe_demo();
+        crate::binfo!("wm", "wasip1 probe spawn ok pixels={}", pn);
     }
 
     Ok(())

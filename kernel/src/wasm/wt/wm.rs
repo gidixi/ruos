@@ -1229,6 +1229,25 @@ pub fn lifecycle_self_test() -> (u32, u32, u32) {
     (spawns, peak, final_live)
 }
 
+/// Boot self-test (SP-A): spawn the wasip1 STD probe as a compositor window,
+/// drive one frame, and report the committed surface length. Builds an empty
+/// (headless, no `gfx::enter`) compositor, finds the `"wasip1-probe"` registry
+/// entry, `spawn_app`s it (which instantiates against the unified
+/// `Linker<AppState>` and runs `_initialize` via `run_initialize`), then
+/// `frame_all()` calls the guest's `frame()` once. A non-zero return =
+/// 307200 (320×240×4) proves the std/wasip1 guest instantiated, ran its std
+/// heap alloc inside `frame()`, and `wm.commit`ed against the WASI+wm linker.
+/// 0 = the entry is missing, instantiate failed (a needed WASI import isn't
+/// registered), or `frame()`/commit trapped.
+pub fn wasip1_probe_self_test() -> usize {
+    let mut c = Compositor::new_empty();
+    let idx = APPS.iter().position(|a| a.name == "wasip1-probe").unwrap_or(usize::MAX);
+    if idx == usize::MAX { return 0; }
+    if c.spawn_app(idx).is_none() { return 0; }
+    c.frame_all();
+    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+}
+
 /// Boot-check: exercise the WM geometry + z-order/drag/close math with NO wasm
 /// instances. Returns a bitfield of passing sub-checks (all set == 0b1_1111).
 #[cfg(feature = "boot-checks")]

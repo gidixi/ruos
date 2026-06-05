@@ -64,9 +64,10 @@ static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
 
 /// Boot self-test: a reactor instance whose `frame()` is called 5× → tick==5.
 /// Proves the kernel can hold a persistent instance and call an exported
-/// function on it repeatedly.
+/// function on it repeatedly, and that the committed surface buffer arrives
+/// intact in the kernel (commit_b0 == 0x05, pixels == 307200).
 #[cfg(feature = "boot-checks")]
-pub fn run_reactor_spike_demo() -> u32 {
+pub fn run_reactor_spike_demo() -> (u32, u8, usize) {
     crate::wasm::wt::wm::run_reactor_spike(REACTOR_CWASM)
 }
 

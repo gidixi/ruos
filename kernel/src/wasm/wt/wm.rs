@@ -56,32 +56,37 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
     Ok(())
 }
 
-/// SPIKE: instantiate ONE reactor instance, call `frame()` 5× on it, return the
-/// tick count. Proves a persistent instance + repeated export call.
-pub fn run_reactor_spike(cwasm: &[u8]) -> u32 {
+/// SPIKE: instantiate ONE reactor instance, call `frame()` 5× on it, return
+/// `(tick, first_pixel_byte0, pixels_len)`. Proves a persistent instance +
+/// repeated export call AND that the committed surface buffer arrives intact.
+pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     let engine = engine();
     // SAFETY: produced by wt-precompile for this exact engine Config.
     let module = match unsafe { Module::deserialize(engine, cwasm) } {
         Ok(m) => m,
-        Err(_) => return 0,
+        Err(_) => return (0, 0, 0),
     };
     let mut store = Store::new(engine, WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0 });
     let mut linker: Linker<WmState> = Linker::new(engine);
-    if add_to_linker(&mut linker).is_err() { return 0; }
+    if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
     // BACKWARD if DF=1, silently corrupting copied data.
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("cld", options(nostack)); }
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,
-        Err(_) => return 0,
+        Err(_) => return (0, 0, 0),
     };
     let frame = match instance.get_typed_func::<(), ()>(&mut store, "frame") {
         Ok(f) => f,
-        Err(_) => return 0,
+        Err(_) => return (0, 0, 0),
     };
     for _ in 0..5 {
         if frame.call(&mut store, ()).is_err() { break; }
     }
-    store.data().tick
+    (
+        store.data().tick,
+        store.data().pixels.first().copied().unwrap_or(0),
+        store.data().pixels.len(),
+    )
 }

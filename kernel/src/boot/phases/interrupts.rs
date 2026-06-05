@@ -73,9 +73,10 @@ pub fn init() -> Result<(), BootError> {
         let cc = crate::wasm::wt::run_bringup_demo();
         crate::binfo!("wt", "component bringup run={}", cc);
         // Compositor GATE spike: a PERSISTENT reactor instance whose `frame()`
-        // export is called 5× → tick==5. Proves the core multi-window mechanism.
-        let rt = crate::wasm::wt::run_reactor_spike_demo();
-        crate::binfo!("wm", "reactor spike frame-calls={}", rt);
+        // export is called 5× → tick==5. Also verifies the committed surface
+        // buffer (commit_b0==0x05, pixels==307200) arrives intact in the kernel.
+        let (calls, b0, plen) = crate::wasm::wt::run_reactor_spike_demo();
+        crate::binfo!("wm", "reactor spike calls={} commit_b0=0x{:02X} pixels={}", calls, b0, plen);
     }
 
     Ok(())

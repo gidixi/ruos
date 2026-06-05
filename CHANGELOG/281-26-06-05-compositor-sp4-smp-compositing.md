@@ -44,10 +44,12 @@ parallelo.
   1280×800 — nessuna seam di banda; decorazioni intatte. `TEST_PASS_COMP_SMP`.
 - Review finale (unsafe SMP, aliasing bande, lifetime footprint, join, contract):
   **pulita**.
-- **VirtualBox (≥4 vCPU + EFI): VERIFICA MANUALE PENDENTE** (non eseguibile
-  headless da qui). Atteso: `smp N/M APs online` + `composite cores=K (K≥2)` +
-  finestre identiche a QEMU. Da fare prima del merge se si vuole copertura HW-like
-  (memoria: testare VBox per modifiche CPU/MSR/STI-sensitive).
+- **VirtualBox (VM `ruos`, 6 vCPU + EFI): VERIFICATO** — `smp 5/5 APs online` +
+  `composite cores=5 [1, 2, 3, 4, 5]` (5 core AP hanno composto bande su VBox) +
+  le 2 finestre decorate renderizzano identiche a QEMU (nessuna seam). Eseguito
+  headless via `VBoxManage` (UART1→`build/log-vbox.log`, screenshot
+  `build/vbox-sp4.png`). Copre la regola di progetto "testare VBox per modifiche
+  CPU/MSR/STI-sensitive".
 
 ## File toccati
 - kernel/src/wasm/wt/compose.rs (nuovo)

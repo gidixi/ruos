@@ -43,3 +43,18 @@ impl WtState {
         self.fds.get(fd as usize)
     }
 }
+
+/// Capability accessor: any Store-data type that carries a `WtState` (the WASI
+/// state) exposes it here, so `wasi::add_to_linker` can be generic over the
+/// store-data type instead of hard-wired to `WtState`. `WtState` itself is the
+/// trivial holder (returns `self`); `AppState` (compositor windows) returns its
+/// embedded `wasi` field.
+pub trait HasWasi {
+    fn wasi(&mut self) -> &mut WtState;
+    fn wasi_ref(&self) -> &WtState;
+}
+
+impl HasWasi for WtState {
+    fn wasi(&mut self) -> &mut WtState { self }
+    fn wasi_ref(&self) -> &WtState { self }
+}

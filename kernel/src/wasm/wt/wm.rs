@@ -432,6 +432,10 @@ pub struct WmState {
     pub events: VecDeque<GfxEvt>,
     /// Set by the guest via `wm.close()`; the compositor reaps the window next loop.
     pub close_requested: bool,
+    /// Set by the guest via `wm.start_move()` (CSD title-bar grab); the run loop
+    /// turns it into a kernel-driven interactive move (a `DragState`) next frame,
+    /// then clears it.
+    pub move_requested: bool,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -487,6 +491,16 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // reap pass (top of the loop) drops the Store/Instance next iteration.
     linker.func_wrap("wm", "close",
         |mut caller: Caller<'_, T>| { caller.data_mut().win().close_requested = true; })?;
+    // wm.start_move(): the guest (CSD title-bar grab) asks the compositor to begin
+    // a kernel-driven interactive move of THIS window. We only record the request;
+    // the run loop turns it into a `DragState` (reusing SP3's drag machinery) so
+    // the window tracks the screen cursor without the app needing its screen origin.
+    linker.func_wrap("wm", "start_move",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().move_requested = true; })?;
+    // wm.wall_seconds() -> f64: MONOTONIC seconds since boot (the same latched
+    // source the desktop uses). egui needs it for `RawInput.time` + animations.
+    linker.func_wrap("wm", "wall_seconds",
+        |_caller: Caller<'_, T>| -> f64 { crate::wasm::wt::gfx::wall_secs() })?;
     // wm.poll_event(retptr): drain ONE event from THIS window's queue into the
     // guest's 20-byte return area. The calling app is identified by its own
     // Store (caller.data()), so it can only ever see its own window's events.
@@ -538,7 +552,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -645,7 +659,7 @@ impl Compositor {
                 engine,
                 AppState {
                     wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
+                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
                 },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
@@ -844,7 +858,8 @@ impl Compositor {
             AppState {
                 wasi: WtState::new(alloc::vec![b"win".to_vec()]),
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
-                               events: VecDeque::new(), close_requested: false },
+                               events: VecDeque::new(), close_requested: false,
+                               move_requested: false },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -1180,6 +1195,26 @@ impl Compositor {
             }
 
             self.frame_all();
+
+            // CSD interactive move: a guest that called `wm.start_move()` this
+            // frame (title-bar grab) has `move_requested` set. Turn it into a
+            // kernel-driven drag of that window — grab offset = cursor − window
+            // origin — and let the existing mousemove→`drag_to` / button-up→
+            // `drag=None` machinery (below) drive + end the move. Last request
+            // wins if several fire in one frame (only one cursor).
+            for i in 0..self.wins.len() {
+                if self.wins[i].store.data().win.move_requested {
+                    self.wins[i].store.data_mut().win.move_requested = false;
+                    let (cx, cy) = crate::gfx::mouse_pos();
+                    let rect = self.wins[i].rect;
+                    self.drag = Some(DragState {
+                        win_id: self.wins[i].id,
+                        grab_dx: cx - rect.0 as i32,
+                        grab_dy: cy - rect.1 as i32,
+                    });
+                }
+            }
+
             self.present();
             // Always-on-top chrome: present() blits the whole back-buffer, so the
             // launcher must be redrawn over it every frame. gfx::blit recomposites

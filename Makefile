@@ -34,7 +34,7 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test
 
 all: iso
 
@@ -268,6 +268,15 @@ run-m2b2-test:
 .PHONY: run-dm-test
 run-dm-test:
 	bash tests/disk-mgmt-test.sh
+
+# SP4 SMP-compositing equivalence: prove the parallel (SMP-banded) composite is
+# pixel-identical to a serial (n_bands=1) reference, AND that >=2 cores ran band
+# jobs. Builds two ISOs (default parallel + CARGO_FEATURES=serial-composite),
+# boots each headless under QMP, screendumps the steady two-window composite, and
+# asserts the PNGs are byte-identical. The script does its own `make iso`.
+.PHONY: run-comp-smp-test
+run-comp-smp-test:
+	@bash tests/comp-smp-test.sh
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.

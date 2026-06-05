@@ -248,6 +248,9 @@ impl Compositor {
     /// `self.focused`. SP3/SP5 call this; they do NOT add their own.
     pub fn set_focus(&mut self, idx: usize) {
         if idx >= self.wins.len() { return; }
+        if idx != self.focused {
+            crate::binfo!("wm", "WM-FOCUS {}", idx);
+        }
         if self.focused < self.wins.len() {
             self.wins[self.focused].focused = false;
         }

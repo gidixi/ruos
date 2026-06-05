@@ -47,6 +47,10 @@ static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
 /// A reactor that calls `wm.close()` after a few frames (for the despawn
 /// boot-check and the [X]-equivalent demo). Built by `tools/wt-reactor-close`.
 static REACTOR_CLOSE_CWASM: &[u8] = include_bytes!("reactor_close.cwasm");
+/// A wasm32-wasip1 STD reactor (egui SP-A probe): proves a std/WASI guest runs
+/// as a compositor window. Built by `tools/wt-wasip1-probe`; needs `_initialize`
+/// run before its first `frame()` (see `run_initialize`).
+static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
 
 /// A launchable app: a display name + its precompiled `.cwasm` bytes.
 pub struct AppEntry {
@@ -60,6 +64,7 @@ pub static APPS: &[AppEntry] = &[
     AppEntry { name: "react-A", cwasm: REACTOR_CWASM },
     AppEntry { name: "react-B", cwasm: REACTOR_CWASM },
     AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM },
+    AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM },
 ];
 
 /// Cache of deserialised modules, keyed by the cwasm slice's base address (each
@@ -499,6 +504,21 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     Ok(())
 }
 
+/// Run a reactor instance's `_initialize` export ONCE, if it has one.
+///
+/// A `wasm32-wasip1` cdylib with no `main` links as a REACTOR: wasm-ld emits an
+/// `_initialize` export (NOT `_start`) that runs std's static initializers
+/// (heap/runtime setup). A std/wasip1 reactor will FAULT on its first heap alloc
+/// inside `frame()` if `_initialize` was never run. So every site that
+/// instantiates a window instance MUST call this right after `instantiate` and
+/// BEFORE the first `frame()`. The no_std reactors export no `_initialize`, so
+/// the `Ok` arm is simply skipped — safe + necessary only for wasip1 reactors.
+fn run_initialize(store: &mut Store<AppState>, inst: &Instance) {
+    if let Ok(init) = inst.get_typed_func::<(), ()>(&mut *store, "_initialize") {
+        let _ = init.call(&mut *store, ());
+    }
+}
+
 /// SPIKE: instantiate ONE reactor instance, call `frame()` 5× on it, return
 /// `(tick, first_pixel_byte0, pixels_len)`. Proves a persistent instance +
 /// repeated export call AND that the committed surface buffer arrives intact.
@@ -527,6 +547,8 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         Ok(i) => i,
         Err(_) => return (0, 0, 0),
     };
+    // wasip1 std reactors need `_initialize` run before their first heap alloc.
+    run_initialize(&mut store, &instance);
     let frame = match instance.get_typed_func::<(), ()>(&mut store, "frame") {
         Ok(f) => f,
         Err(_) => return (0, 0, 0),
@@ -622,6 +644,8 @@ impl Compositor {
                 },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
+            // wasip1 std reactors need `_initialize` run before their first frame().
+            run_initialize(&mut store, &inst);
             // Register a proc so `ps` sees demo windows and reap can unregister them.
             let pid = crate::proc::register(alloc::format!("win:{}", title));
             wins.push(Window {
@@ -829,6 +853,8 @@ impl Compositor {
                 return None;
             }
         };
+        // wasip1 std reactors need `_initialize` run before their first frame().
+        run_initialize(&mut store, &inst);
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
         // fully overlap, honoring sy >= decor::TITLE_H and the launcher strip.
         let g = crate::gfx::geom();

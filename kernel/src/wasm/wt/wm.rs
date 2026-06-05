@@ -15,14 +15,79 @@
 //! the mechanism: a PERSISTENT instance whose `frame()` export is called
 //! repeatedly. WIT-ification comes when building the real apps.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use spin::Mutex;
 use wasmtime::{Caller, Extern, Instance, Linker, Memory, Module, Store};
 use crate::gfx::GfxEvt;
 use crate::wasm::wt::engine;
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::wasm::wt::compose::{composite_band, WinDesc};
+
+/// Launcher (taskbar) height in px — a strip across the bottom of the screen.
+/// Reserved by SP5; SP5-B draws clickable app entries here. Spawn placement
+/// clamps windows above it.
+const LAUNCHER_H: u32 = 28;
+
+/// Max simultaneously-live windows. Each live window holds a wasm instance (its
+/// own linear memory) + a surface buffer; this bounds the heap budget. (Reactor
+/// surface ≈ 0.3 MB; a full-window app ≈ 4 MB. 8 windows ≈ a few MB of surfaces
+/// + N linear memories — comfortably within the kernel heap.)
+const MAX_WINDOWS: usize = 8;
+
+// --- App registry + shared Module cache (SP5) -----------------------------
+
+/// The persistent reactor (cycling colour, runs forever). Embedded
+/// unconditionally because the compositor — not a boot-check — needs it.
+static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
+/// A reactor that calls `wm.close()` after a few frames (for the despawn
+/// boot-check and the [X]-equivalent demo). Built by `tools/wt-reactor-close`.
+static REACTOR_CLOSE_CWASM: &[u8] = include_bytes!("reactor_close.cwasm");
+
+/// A launchable app: a display name + its precompiled `.cwasm` bytes.
+pub struct AppEntry {
+    pub name: &'static str,
+    pub cwasm: &'static [u8],
+}
+
+/// The launcher's app table. Adding a real app later = one more entry here. Two
+/// display names map to the same reactor module (distinct launcher entries).
+pub static APPS: &[AppEntry] = &[
+    AppEntry { name: "react-A", cwasm: REACTOR_CWASM },
+    AppEntry { name: "react-B", cwasm: REACTOR_CWASM },
+    AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM },
+];
+
+/// Cache of deserialised modules, keyed by the cwasm slice's base address (each
+/// embedded blob is a distinct `&'static`, so its pointer is a stable unique
+/// key). Deserialising is the costly step; instantiation off a cached `Module`
+/// is cheap (wasmtime `Module` is Arc-backed: `clone` bumps a refcount).
+static MODULE_CACHE: Mutex<BTreeMap<usize, Module>> = Mutex::new(BTreeMap::new());
+
+/// Get (deserialising once, then caching) the `Module` for an app's cwasm.
+fn module_for(cwasm: &'static [u8]) -> Option<Module> {
+    let key = cwasm.as_ptr() as usize;
+    let mut cache = MODULE_CACHE.lock();
+    if let Some(m) = cache.get(&key) {
+        return Some(m.clone());
+    }
+    // SAFETY: produced by wt-precompile for this exact engine Config.
+    let m = unsafe { Module::deserialize(engine(), cwasm) }.ok()?;
+    cache.insert(key, m.clone());
+    Some(m)
+}
+
+/// Boot self-test: every registry entry deserialises to a usable Module.
+/// Returns (entry_count, modules_ok).
+pub fn registry_self_test() -> (u32, u32) {
+    let n = APPS.len() as u32;
+    let mut ok = 0u32;
+    for app in APPS {
+        if module_for(app.cwasm).is_some() { ok += 1; }
+    }
+    (n, ok)
+}
 
 /// Max composite bands per frame. One band per pool slot at most; capped well
 /// under `pool::MAX_JOBS` (64) since a frame uses ~num-cores bands.
@@ -352,6 +417,8 @@ pub struct WmState {
     pub pixels: Vec<u8>,
     pub tick: u32,
     pub events: VecDeque<GfxEvt>,
+    /// Set by the guest via `wm.close()`; the compositor reaps the window next loop.
+    pub close_requested: bool,
 }
 
 /// Read `len` bytes from this guest's exported linear memory at `ptr`. None if
@@ -400,6 +467,10 @@ pub fn add_to_linker(linker: &mut Linker<WmState>) -> wasmtime::Result<()> {
     // wm.tick(): bump the call counter (spike instrumentation).
     linker.func_wrap("wm", "tick",
         |mut caller: Caller<'_, WmState>| { caller.data_mut().tick += 1; })?;
+    // wm.close(): the guest asks the compositor to tear this window down. The
+    // reap pass (top of the loop) drops the Store/Instance next iteration.
+    linker.func_wrap("wm", "close",
+        |mut caller: Caller<'_, WmState>| { caller.data_mut().close_requested = true; })?;
     // wm.poll_event(retptr): drain ONE event from THIS window's queue into the
     // guest's 20-byte return area. The calling app is identified by its own
     // Store (caller.data()), so it can only ever see its own window's events.
@@ -434,7 +505,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     };
     let mut store = Store::new(
         engine,
-        WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new() },
+        WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
     );
     let mut linker: Linker<WmState> = Linker::new(engine);
     if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
@@ -488,6 +559,7 @@ pub struct Window {
     pub title: String,              // shown in the SP3 title bar; "" until SP3
     pub focused: bool,
     pub alive: bool,                // SP5 sets false to schedule teardown
+    pub pid: u32,                   // SP5: proc-registry pid (freed on reap)
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -499,6 +571,8 @@ pub struct Compositor {
     pub focused: usize,            // index into wins (the focused window)
     pub drag: Option<DragState>,   // SP3 adds; None until SP3
     pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
+    pub free_ids: Vec<u32>,        // SP5: window-ids returned by reaped windows (LIFO)
+    pub next_id: u32,              // SP5: next never-used id (high-water mark)
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -531,9 +605,11 @@ impl Compositor {
         for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
             let mut store = Store::new(
                 engine,
-                WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new() },
+                WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false },
             );
             let inst = linker.instantiate(&mut store, &module).expect("instantiate");
+            // Register a proc so `ps` sees demo windows and reap can unregister them.
+            let pid = crate::proc::register(alloc::format!("win:{}", title));
             wins.push(Window {
                 id: id as u32,
                 store,
@@ -542,9 +618,43 @@ impl Compositor {
                 title: String::from(title),
                 focused: id == 0,
                 alive: true,
+                pid,
             });
         }
-        Compositor { wins, module, linker, focused: 0, drag: None, backbuf: Vec::new() }
+        let next_id = placements.len() as u32; // spawned ids start past the demo ids
+        Compositor { wins, module, linker, focused: 0, drag: None, backbuf: Vec::new(),
+                     free_ids: Vec::new(), next_id }
+    }
+
+    /// Headless compositor for the lifecycle boot-check: builds the linker +
+    /// shared reactor Module but creates NO windows and NEVER calls
+    /// `crate::gfx::enter` (no framebuffer). Spawn/reap run purely in RAM.
+    fn new_empty() -> Compositor {
+        let engine = engine();
+        let mut linker: Linker<WmState> = Linker::new(engine);
+        add_to_linker(&mut linker).expect("wm linker");
+        let module = module_for(REACTOR_CWASM).expect("reactor module");
+        Compositor {
+            wins: Vec::new(),
+            module,
+            linker,
+            focused: 0,
+            drag: None,
+            backbuf: Vec::new(),
+            free_ids: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Allocate a window-id, preferring a recycled one from the free-list.
+    fn alloc_id(&mut self) -> u32 {
+        if let Some(id) = self.free_ids.pop() {
+            id
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
     }
 
     /// TOPMOST window whose surface rect contains framebuffer point (px, py).
@@ -632,16 +742,20 @@ impl Compositor {
         }
     }
 
-    /// Close (remove) the window with `id`: drop it from `wins`, which drops its
-    /// (Store, Instance) → tears down the wasm instance. Returns true if a window
-    /// was removed. Fixes up `self.focused` (real SP2 tracks it) so it never
-    /// dangles past the end and the surviving window flagged `focused` matches.
-    pub fn close(&mut self, id: u32) -> bool {
-        let Some(i) = self.index_of(id) else { return false; };
-        self.wins.remove(i); // Window owns Store+Instance → Drop tears it down
+    /// Unified teardown of `wins[i]`: remove it (dropping its Store+Instance →
+    /// the wasm instance + guest linear memory + surface buffer are freed),
+    /// unregister its proc, recycle its window-id to the free-list, and fix up
+    /// `self.focused` so it never dangles and exactly one survivor is flagged.
+    /// The SOLE place a window leaves `wins` (close + reap both route here).
+    fn remove_at(&mut self, i: usize) {
+        if i >= self.wins.len() { return; }
+        let w = self.wins.remove(i); // Drop tears down Store+Instance (frees guest mem)
+        crate::proc::unregister(w.pid);
+        self.free_ids.push(w.id);
+        crate::binfo!("wm", "reaped win_id={} pid={} (Store/Instance dropped)", w.id, w.pid);
         if self.wins.is_empty() {
             self.focused = 0;
-            return true;
+            return;
         }
         // Shift `self.focused` left if the removed window was at/below it, then
         // clamp into range, then re-assert the `focused` flag on exactly that
@@ -653,7 +767,104 @@ impl Compositor {
         for (j, w) in self.wins.iter_mut().enumerate() {
             w.focused = j == self.focused;
         }
-        true
+    }
+
+    /// Close (remove) the window with `id` IMMEDIATELY (used by the [X] click in
+    /// `on_left_down`). Returns true if a window was removed. Routes through
+    /// `remove_at` so proc-unregister + id-recycle happen exactly once.
+    pub fn close(&mut self, id: u32) -> bool {
+        if let Some(i) = self.index_of(id) {
+            self.remove_at(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Spawn registry app `idx` as a new window: allocate a window-id,
+    /// instantiate a fresh `(Store<WmState>, Instance)` off the cached Module,
+    /// place it at a cascading origin (honoring the title-bar/launcher clamps),
+    /// raise+focus it, and push it. Returns the new window-id, or None (budget
+    /// full / bad app idx / bad module / instantiate failed).
+    pub fn spawn_app(&mut self, idx: usize) -> Option<u32> {
+        let live = self.wins.iter().filter(|w| w.alive).count();
+        if live >= MAX_WINDOWS {
+            crate::bwarn!("wm", "spawn refused: window budget full ({})", live);
+            return None;
+        }
+        let app = APPS.get(idx)?;
+        let module = module_for(app.cwasm)?;
+        let id = self.alloc_id();
+        let mut store = Store::new(
+            engine(),
+            WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
+                      events: VecDeque::new(), close_requested: false },
+        );
+        // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cld", options(nostack)); }
+        let inst = match self.linker.instantiate(&mut store, &module) {
+            Ok(i) => i,
+            Err(_) => {
+                self.free_ids.push(id);
+                crate::bwarn!("wm", "spawn: instantiate failed");
+                return None;
+            }
+        };
+        // Cascade placement (TUPLE rect): offset each new window so it doesn't
+        // fully overlap, honoring sy >= decor::TITLE_H and the launcher strip.
+        let g = crate::gfx::geom();
+        let n = live as u32;
+        let ox = (40 + n * 28).min(g.width.saturating_sub(340));
+        let oy = (decor::TITLE_H + 40 + n * 28)
+            .min(g.height.saturating_sub(LAUNCHER_H + 260));
+        let pid = crate::proc::register(alloc::format!("win:{}", app.name));
+        self.wins.push(Window {
+            id,
+            store,
+            inst,
+            rect: (ox, oy, 320, 240),
+            title: String::from(app.name),
+            focused: false,
+            alive: true,
+            pid,
+        });
+        let last = self.wins.len() - 1;
+        self.raise(last);                 // move to top of z-order
+        self.set_focus(self.wins.len() - 1); // focus the now-top window
+        crate::binfo!("wm", "spawn app='{}' win_id={} pid={} live={}",
+                      app.name, id, pid, live + 1);
+        Some(id)
+    }
+
+    /// Mark the window with this id for teardown (external/programmatic close,
+    /// e.g. a future IPC path). Idempotent; unknown ids are ignored. The reap
+    /// pass (top of the loop) does the actual removal.
+    pub fn request_close(&mut self, id: u32) {
+        if let Some(w) = self.wins.iter_mut().find(|w| w.id == id) {
+            w.alive = false;
+            crate::binfo!("wm", "close requested win_id={}", id);
+        }
+    }
+
+    /// Reap dead windows: first promote any guest-requested closes
+    /// (`close_requested`) to `alive=false`, then remove every dead window via
+    /// `remove_at` (drops Store/Instance, unregisters proc, recycles id). Call
+    /// once at the top of each compositor loop, BEFORE driving frames.
+    fn reap(&mut self) {
+        for w in &mut self.wins {
+            if w.store.data().close_requested {
+                w.alive = false;
+            }
+        }
+        let mut i = 0;
+        while i < self.wins.len() {
+            if !self.wins[i].alive {
+                self.remove_at(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Build the full-footprint RGBA8888 buffer for window `idx`:
@@ -818,6 +1029,9 @@ impl Compositor {
         let mut frame_no: u32 = 0;
         let mut marker_done = false;
         loop {
+            // SP5: reap any window that requested close (guest wm.close or the [X]
+            // path) on its last frame BEFORE we fold input or drive frames.
+            self.reap();
             crate::gfx::fold_mouse();
             while let Some(ev) = crate::gfx::pop() {
                 let (cx, cy) = crate::gfx::mouse_pos();
@@ -875,6 +1089,31 @@ impl Compositor {
 pub fn run_compositor_gate(cwasm: &[u8]) -> ! {
     crate::gfx::enter();
     Compositor::new(cwasm).run()
+}
+
+/// Headless boot self-test of the spawn/despawn lifecycle: build an empty
+/// compositor (NO `gfx::enter`), spawn the self-closing app (registry idx 2),
+/// call `frame()`+`reap` repeatedly, and report `(spawns, peak_live,
+/// final_live)`. The self-closer requests close on its 3rd `frame()`, so after
+/// enough rounds `final_live` must be 0 (the instance was torn down). Then spawn
+/// again to prove the freed id was recycled from the free-list.
+pub fn lifecycle_self_test() -> (u32, u32, u32) {
+    let mut c = Compositor::new_empty();
+    let spawns = c.spawn_app(2).is_some() as u32; // selfclose = idx 2
+    let mut peak = 0u32;
+    for _ in 0..8 {
+        c.reap();
+        c.frame_all();
+        let live = c.wins.iter().filter(|w| w.alive).count() as u32;
+        if live > peak { peak = live; }
+    }
+    c.reap();
+    let final_live = c.wins.iter().filter(|w| w.alive).count() as u32;
+    // Spawn again to prove the id was recycled (free-list reuse).
+    let _ = c.spawn_app(2);
+    let reused = c.wins.last().map(|w| w.id).unwrap_or(u32::MAX);
+    crate::binfo!("wm", "lifecycle reuse: new win_id after recycle = {}", reused);
+    (spawns, peak, final_live)
 }
 
 /// Boot-check: exercise the WM geometry + z-order/drag/close math with NO wasm

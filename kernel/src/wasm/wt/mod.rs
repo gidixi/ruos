@@ -87,6 +87,20 @@ pub fn run_bringup_demo() -> i32 {
     crate::wasm::wt::component::run_component(BRINGUP_CWASM)
 }
 
+/// Boot self-test: the SP5 launcher registry has N entries and all deserialise.
+/// Returns (entry_count, modules_ok).
+#[cfg(feature = "boot-checks")]
+pub fn run_registry_demo() -> (u32, u32) {
+    crate::wasm::wt::wm::registry_self_test()
+}
+
+/// Boot self-test: spawn the self-closing app, run the loop, confirm teardown +
+/// window-id recycle. Returns (spawns, peak_live, final_live).
+#[cfg(feature = "boot-checks")]
+pub fn run_lifecycle_demo() -> (u32, u32, u32) {
+    crate::wasm::wt::wm::lifecycle_self_test()
+}
+
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller
 /// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
 /// not cleared by the console restore) to confirm the host-fn path ran.

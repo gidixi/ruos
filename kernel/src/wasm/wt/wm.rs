@@ -424,6 +424,36 @@ pub struct WmState {
     pub close_requested: bool,
 }
 
+use crate::wasm::wt::state::{WtState, HasWasi};
+
+/// Capability accessor for the window/surface state (mirror of HasWasi).
+pub trait HasWindow {
+    fn win(&mut self) -> &mut WmState;
+    fn win_ref(&self) -> &WmState;
+}
+
+impl HasWindow for WmState {
+    fn win(&mut self) -> &mut WmState { self }
+    fn win_ref(&self) -> &WmState { self }
+}
+
+/// A compositor window's Store data: BOTH the WASI capability (so a wasip1 egui
+/// guest's std runtime links + runs) AND the window/surface state. Embeds the
+/// existing structs unchanged; implements both accessor traits.
+pub struct AppState {
+    pub wasi: WtState,
+    pub win: WmState,
+}
+
+impl HasWasi for AppState {
+    fn wasi(&mut self) -> &mut WtState { &mut self.wasi }
+    fn wasi_ref(&self) -> &WtState { &self.wasi }
+}
+impl HasWindow for AppState {
+    fn win(&mut self) -> &mut WmState { &mut self.win }
+    fn win_ref(&self) -> &WmState { &self.win }
+}
+
 /// Read `len` bytes from this guest's exported linear memory at `ptr`. None if
 /// the export is missing or the range is out of bounds. (Mirrors
 /// `crate::wasm::wt::mem::read`, which is typed to `WtState` and so cannot be

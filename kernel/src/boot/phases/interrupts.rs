@@ -107,6 +107,12 @@ pub fn init() -> Result<(), BootError> {
         crate::rng::init();
         let en = crate::wasm::wt::run_egui_demo_demo();
         crate::binfo!("wm", "egui demo spawn ok pixels={}", en);
+        // SP-C: prove the wm.spawn deferred-spawn mechanism grows the window list
+        // to 2 (bit0) AND the wm.set_background mechanism forces a window to the
+        // full framebuffer (bit1). Embedded module (VFS /bin not mounted yet); the
+        // real VFS wm.spawn is covered visually. Expect flags=0b11.
+        let spc = crate::wasm::wt::run_spc_demo();
+        crate::binfo!("wm", "spc flags=0b{:02b}", spc);
     }
 
     Ok(())

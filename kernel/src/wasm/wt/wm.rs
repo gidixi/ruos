@@ -170,7 +170,7 @@ static mut BAND_ARENA: [BandArg; MAX_BANDS] = [BandArg {
 /// jobs read the same list (painter order). The BSP fills `[0, n)` then submits;
 /// the footprint backing buffers are kept alive on the BSP across the join.
 static mut WIN_ARENA: [WinDesc; MAX_WINS] = [WinDesc {
-    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0,
+    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0, shadow: false,
 }; MAX_WINS];
 
 /// Distinct cores that ran a composite job in the most recent frame (bitset by
@@ -429,6 +429,20 @@ pub struct WmState {
     /// frame only when SOME window committed (or geometry changed) — an idle app
     /// that commits nothing keeps its last surface and costs no composite/blit.
     pub committed: bool,
+    /// Set by `wm.minimize()`; the run loop hides this window (Window.minimized).
+    pub minimize_request: bool,
+    /// Set by `wm.toggle_maximize()`; the run loop maximizes/restores this window.
+    pub maximize_request: bool,
+    /// Window-ids the guest asked to activate via `wm.activate(id)` (the shell's
+    /// taskbar): un-minimize + raise + focus. A queue so several clicks in one frame
+    /// are all honoured. Drained by the run loop.
+    pub activate_request: VecDeque<u32>,
+    /// Configure channel (kernel→app size authority): the size the kernel wants this
+    /// window to render at, packed by `wm.window_size()` as `(w<<32)|h`. `(0,0)` =
+    /// not yet established → the app uses its own default and the kernel adopts the
+    /// first committed size. Maximize/restore/resize update these.
+    pub target_w: u32,
+    pub target_h: u32,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -546,8 +560,63 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             let g = crate::gfx::geom();
             ((g.width as i64) << 32) | (g.height as i64)
         })?;
+    // wm.window_size() -> i64: THIS window's kernel-assigned size, packed (w<<32)|h
+    // (the "configure" the app renders to). `(0,0)` until established — the app then
+    // uses its own default and the kernel adopts the first committed size. Maximize/
+    // restore/resize change it; the app reads it each frame and re-rasters.
+    linker.func_wrap("wm", "window_size",
+        |caller: Caller<'_, T>| -> i64 {
+            let s = caller.data().win_ref();
+            ((s.target_w as i64) << 32) | (s.target_h as i64)
+        })?;
+    // wm.minimize(): the guest (yellow titlebar dot) asks to be hidden into the
+    // taskbar. Deferred to the run loop (sets Window.minimized).
+    linker.func_wrap("wm", "minimize",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().minimize_request = true; })?;
+    // wm.toggle_maximize(): the guest (green dot) asks to maximize to the work-area
+    // or restore. Deferred to the run loop (toggles Window.maximized + geometry).
+    linker.func_wrap("wm", "toggle_maximize",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().maximize_request = true; })?;
+    // wm.activate(id): the guest (the shell's taskbar) asks the kernel to un-minimize
+    // + raise + focus the window with that id. Deferred to the run loop.
+    linker.func_wrap("wm", "activate",
+        |mut caller: Caller<'_, T>, id: i32| {
+            caller.data_mut().win().activate_request.push_back(id as u32);
+        })?;
+    // wm.window_list(ptr, max) -> u32: write up to `max` taskbar records of the
+    // current non-bg windows into guest memory at `ptr`, return the count. Each
+    // record is 32 bytes: id(u32 LE) + flags(u32 LE: bit0=minimized, bit1=focused)
+    // + title(24 bytes UTF-8, NUL-padded). Reads the compositor's per-frame snapshot
+    // (the host fn cannot reach `wins`, so the run loop publishes it each frame).
+    linker.func_wrap("wm", "window_list",
+        |mut caller: Caller<'_, T>, ptr: i32, max: i32| -> i32 {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let snap = WINDOW_SNAPSHOT.lock();
+                let n = core::cmp::min(snap.len(), (max.max(0)) as usize);
+                for (id, flags, title) in snap.iter().take(n) {
+                    buf.extend_from_slice(&id.to_le_bytes());
+                    buf.extend_from_slice(&flags.to_le_bytes());
+                    let mut t = [0u8; 24];
+                    let tb = title.as_bytes();
+                    let k = core::cmp::min(tb.len(), 24);
+                    t[..k].copy_from_slice(&tb[..k]);
+                    buf.extend_from_slice(&t);
+                }
+            } // drop the lock before touching guest memory
+            let count = buf.len() / 32;
+            crate::wasm::wt::mem::write(&mut caller, ptr as u32, &buf);
+            count as i32
+        })?;
     Ok(())
 }
+
+/// Per-frame taskbar snapshot of the non-bg windows (id, flags, title), published
+/// by the run loop and read by `wm.window_list`. flags: bit0 = minimized, bit1 =
+/// focused. Single producer (the compositor loop) + single consumer (the shell's
+/// `window_list` call during `frame_all`), but guarded for safety.
+static WINDOW_SNAPSHOT: crate::sync::IrqMutex<Vec<(u32, u32, String)>> =
+    crate::sync::IrqMutex::new(Vec::new());
 
 /// Run a reactor instance's `_initialize` export ONCE, if it has one.
 ///
@@ -578,7 +647,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -641,6 +710,18 @@ pub struct Window {
     /// forced to the full framebuffer, undecorated, never raised/focused/moved/
     /// closed; it only receives input where no non-`bg` window covers the point.
     pub bg: bool,
+    /// SP6 window controls: minimized windows are kept in `wins` but skipped by the
+    /// composite + input hit-test (the taskbar restores them via `wm.activate`).
+    pub minimized: bool,
+    /// Maximized to the work-area; `saved_rect` holds the pre-maximize geometry to
+    /// restore on toggle-off.
+    pub maximized: bool,
+    pub saved_rect: Option<(u32, u32, u32, u32)>,
+    /// Configure (kernel→app size authority): false until the window's size is
+    /// established. We bootstrap `rect.w/h` from the app's FIRST committed surface,
+    /// then the kernel owns the size (`wm.window_size()` reports it; maximize/resize
+    /// change it) and stops blindly adopting the committed size.
+    pub sized: bool,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -665,6 +746,11 @@ pub struct Compositor {
 /// this size in SP2; SP3 will make them resizable.
 const WIN_W: u32 = 320;
 const WIN_H: u32 = 240;
+
+/// Top inset reserved for the shell's panel/taskbar (the bg window's top strip).
+/// A maximized window fills the work-area BELOW this, so the panel/taskbar stays
+/// visible. Approximate the shell panel height; refine if the panel grows.
+const WORKAREA_TOP: u32 = 32;
 
 /// Desktop background (RGBA8888 [r,g,b,a]) shown where no window covers.
 const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
@@ -760,7 +846,7 @@ impl Compositor {
     /// non-`bg` window falls through to the `bg` window via `bg_index`).
     pub fn window_at(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.wins.len()).rev() {
-            if self.wins[i].bg { continue; }
+            if self.wins[i].bg || self.wins[i].minimized { continue; }
             let (rx, ry, rw, rh) = self.wins[i].rect;
             let (rx, ry) = (rx as i32, ry as i32);
             if px >= rx && px < rx + rw as i32 && py >= ry && py < ry + rh as i32 {
@@ -835,6 +921,60 @@ impl Compositor {
         }
     }
 
+    /// Publish the kernel's desired size for window `i` into its guest WmState, so
+    /// `wm.window_size()` reports it and the app re-rasters to match (configure).
+    fn set_target(&mut self, i: usize, w: u32, h: u32) {
+        let s = self.wins[i].store.data_mut();
+        s.win.target_w = w;
+        s.win.target_h = h;
+    }
+
+    /// Toggle window `i` between maximized (filling the work-area below the panel)
+    /// and its saved geometry. Sets the configure target so the app re-rasters at
+    /// the new size; marks the window `sized` so `frame_all` stops adopting the
+    /// committed size (the kernel now owns it).
+    fn toggle_maximize(&mut self, i: usize) {
+        if i >= self.wins.len() || self.wins[i].bg { return; }
+        if self.wins[i].maximized {
+            if let Some(r) = self.wins[i].saved_rect.take() {
+                self.wins[i].rect = r;
+                self.set_target(i, r.2, r.3);
+            }
+            self.wins[i].maximized = false;
+        } else {
+            self.wins[i].saved_rect = Some(self.wins[i].rect);
+            let g = crate::gfx::geom();
+            let wa = (0u32, WORKAREA_TOP, g.width, g.height.saturating_sub(WORKAREA_TOP));
+            self.wins[i].rect = wa;
+            self.set_target(i, wa.2, wa.3);
+            self.wins[i].maximized = true;
+        }
+        self.wins[i].sized = true;
+        self.dirty = true;
+    }
+
+    /// Restore (un-minimize) + raise + focus the window with `id` (the taskbar's
+    /// `wm.activate`). No-op for an unknown id.
+    fn activate(&mut self, id: u32) {
+        if let Some(i) = self.index_of(id) {
+            self.wins[i].minimized = false;
+            let top = self.raise(i);
+            self.set_focus(top);
+            self.dirty = true;
+        }
+    }
+
+    /// Move focus to the topmost visible (non-bg, non-minimized) window, if any.
+    /// Used after minimizing the focused window so focus never sticks on a hidden one.
+    fn focus_topmost_visible(&mut self) {
+        for i in (0..self.wins.len()).rev() {
+            if !self.wins[i].bg && !self.wins[i].minimized {
+                self.set_focus(i);
+                return;
+            }
+        }
+    }
+
     /// Unified teardown of `wins[i]`: remove it (dropping its Store+Instance →
     /// the wasm instance + guest linear memory + surface buffer are freed),
     /// unregister its proc, recycle its window-id to the free-list, and fix up
@@ -896,7 +1036,9 @@ impl Compositor {
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
                                move_requested: false, spawn_request: VecDeque::new(),
-                               bg_request: false, committed: false },
+                               bg_request: false, committed: false,
+                               minimize_request: false, maximize_request: false,
+                               activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -931,6 +1073,10 @@ impl Compositor {
             alive: true,
             pid,
             bg: false,
+            minimized: false,
+            maximized: false,
+            saved_rect: None,
+            sized: false,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order
@@ -1020,10 +1166,20 @@ impl Compositor {
             // this, `window_at` / drag clamp use the stale placeholder size and a
             // click on the app's [X] (past the placeholder right/bottom edge) is
             // never routed. Keep the rect ORIGIN (x,y); only adopt the real w/h.
-            let (rx, ry, _, _) = w.rect;
             let (cw, ch) = { let s = w.store.data(); (s.win.win_w, s.win.win_h) };
-            if cw != 0 && ch != 0 {
+            if cw != 0 && ch != 0 && !w.sized {
+                // Configure bootstrap: the FIRST committed surface establishes the
+                // window's size. Keep the rect ORIGIN (x,y); adopt the committed
+                // w/h, publish it as the configure target, and mark `sized` — from
+                // now the kernel owns the size (maximize/resize set rect + target;
+                // the app renders to `wm.window_size()`, so the committed size
+                // already matches rect.w/h and we must NOT re-adopt it).
+                let (rx, ry, _, _) = w.rect;
                 w.rect = (rx, ry, cw, ch);
+                let s = w.store.data_mut();
+                s.win.target_w = cw;
+                s.win.target_h = ch;
+                w.sized = true;
             }
         }
     }
@@ -1061,26 +1217,31 @@ impl Compositor {
         //    place (no clone). The pixels live in each window's Store and are NOT
         //    mutated between here and the `dispatch_bands` join, so the raw
         //    pointers stay valid for the whole parallel composite.
-        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32)> =
+        // Each desc carries a `shadow` flag: the bg window casts none (it's the
+        // full-screen backdrop), every normal window does.
+        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32, bool)> =
             alloc::vec::Vec::new();
         if let Some(bi) = bg_idx {
             // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
             if let Some((px, len, _, _, fw, fh)) = self.compose_window(bi) {
-                descs.push((px, len, 0, 0, fw, fh));
+                descs.push((px, len, 0, 0, fw, fh, false));
             }
         }
         for i in 0..self.wins.len() {
             if bg_idx == Some(i) { continue; } // bg already composited first
-            if let Some(d) = self.compose_window(i) { descs.push(d); }
+            if self.wins[i].minimized { continue; } // hidden → not composited
+            if let Some((px, len, x, y, w, h)) = self.compose_window(i) {
+                descs.push((px, len, x, y, w, h, true));
+            }
         }
         let n = core::cmp::min(descs.len(), MAX_WINS);
         // SAFETY: BSP-only write of WIN_ARENA between joined frames (the previous
         // frame's jobs were joined inside dispatch_bands before we returned, so
         // no job is in flight while we mutate the arena here).
-        for (i, (px, len, fx, fy, fw, fh)) in descs.iter().enumerate().take(n) {
+        for (i, (px, len, fx, fy, fw, fh, sh)) in descs.iter().enumerate().take(n) {
             unsafe {
                 WIN_ARENA[i] = WinDesc {
-                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh,
+                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh, shadow: *sh,
                 };
             }
         }
@@ -1300,6 +1461,48 @@ impl Compositor {
                         grab_dx: cx - rect.0 as i32,
                         grab_dy: cy - rect.1 as i32,
                     });
+                }
+            }
+
+            // SP6 window controls (deferred, like spawn/move): the traffic-light dots.
+            // Minimize (yellow) → hide into the taskbar; toggle-maximize (green) →
+            // work-area / restore. (Close = red is the existing `close_requested`.)
+            for i in 0..self.wins.len() {
+                if self.wins[i].store.data().win.minimize_request {
+                    self.wins[i].store.data_mut().win.minimize_request = false;
+                    if !self.wins[i].bg {
+                        self.wins[i].minimized = true;
+                        self.dirty = true;
+                        crate::binfo!("wm", "minimize win_id={}", self.wins[i].id);
+                        if self.focused == i { self.focus_topmost_visible(); }
+                    }
+                }
+                if self.wins[i].store.data().win.maximize_request {
+                    self.wins[i].store.data_mut().win.maximize_request = false;
+                    self.toggle_maximize(i);
+                }
+            }
+            // Taskbar activate requests (`wm.activate`): drain each window's queue,
+            // then apply (un-minimize + raise + focus the target id).
+            let mut to_activate: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            for w in self.wins.iter_mut() {
+                while let Some(id) = w.store.data_mut().win.activate_request.pop_front() {
+                    to_activate.push(id);
+                }
+            }
+            for id in to_activate { self.activate(id); }
+
+            // Publish the taskbar snapshot (non-bg windows) for the shell's
+            // `wm.window_list`. flags: bit0 = minimized, bit1 = focused.
+            {
+                let mut snap = WINDOW_SNAPSHOT.lock();
+                snap.clear();
+                for (i, w) in self.wins.iter().enumerate() {
+                    if w.bg { continue; }
+                    let mut flags = 0u32;
+                    if w.minimized { flags |= 1; }
+                    if i == self.focused { flags |= 2; }
+                    snap.push((w.id, flags, w.title.clone()));
                 }
             }
 

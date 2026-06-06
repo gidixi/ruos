@@ -15,7 +15,7 @@ pub const VEC_WAKE:        u8 = 0x40;
 /// IPI vector: inter-core inbox delivery (Step 2). Handler marks this core's
 /// inbox pending + EOIs; the core's run loop then drains its inbox.
 pub const VEC_INBOX:         u8 = 0x41;
-/// Reserved (Step 3 — cross-core TLB shootdown). No handler yet.
+/// IPI vector for cross-core TLB shootdown (Step 3d). Handler: invlpg + ack + EOI.
 pub const VEC_TLB_SHOOTDOWN: u8 = 0x42;
 /// Reserved (Step 6 — supervisor core reset). No handler yet.
 pub const VEC_RESET:         u8 = 0x43;
@@ -44,6 +44,7 @@ pub fn init() {
         idt[VEC_MOUSE].set_handler_fn(crate::mouse::mouse_handler);
         idt[VEC_WAKE].set_handler_fn(wake_handler);
         idt[VEC_INBOX].set_handler_fn(inbox_handler);
+        idt[VEC_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_handler);
 
         idt
     });
@@ -105,6 +106,14 @@ extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
 /// (executor poll / AP worker) drains it, then EOIs.
 extern "x86-interrupt" fn inbox_handler(_frame: InterruptStackFrame) {
     crate::smp::inbox::mark_pending(crate::cpu::cpu_id());
+    crate::apic::lapic::eoi();
+}
+
+/// TLB shootdown IPI handler (Step 3d). Invalidates the page the mutator core
+/// stored in SHOOT_ADDR, increments the ack counter so the mutator can proceed,
+/// then EOIs. Must run on every non-mutator core before the mutator releases MAPPER.
+extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
+    crate::memory::tlb::on_ipi();
     crate::apic::lapic::eoi();
 }
 

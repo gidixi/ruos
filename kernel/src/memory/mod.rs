@@ -5,6 +5,7 @@
 pub mod heap;
 pub mod frames;
 pub mod mapper;
+pub mod tlb;
 pub mod dma;
 pub mod exec;
 

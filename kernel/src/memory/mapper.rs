@@ -96,6 +96,12 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: PageTableFlags)
             })?
             .flush();
     }
+    // NOTE: no TLB shootdown here. map_page installs a NEW present mapping over a
+    // previously not-present page. x86 does NOT cache not-present entries in the TLB
+    // (a negative access on any core just re-walks the page table and finds the new
+    // entry), so there is no stale entry to invalidate. shootdown() is called only by
+    // unmap_page (present→absent) and set_flags (restrict permissions), where stale
+    // entries on other cores would be a silent safety violation.
     Ok(())
 }
 
@@ -110,7 +116,12 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
         XUnmapError::ParentEntryHugePage   => UnmapError::ParentHugePage,
         XUnmapError::InvalidFrameAddress(_) => UnmapError::InvalidFrame,
     })?;
-    flush.flush();
+    flush.flush(); // local invlpg on this core
+    // Shootdown: a present→absent unmap can leave a stale TLB entry on every
+    // other core. Broadcast VEC_TLB_SHOOTDOWN IPI and wait for all acks while
+    // still holding MAPPER (MAPPER serializes shootdowns; IRQs stay enabled so
+    // waiting cores can service the IPI — see tlb.rs deadlock analysis).
+    crate::memory::tlb::shootdown(virt.as_u64());
     Ok(frame)
 }
 
@@ -129,8 +140,13 @@ pub fn set_flags(virt: VirtAddr, flags: PageTableFlags) -> Result<(), UnmapError
                 FlagUpdateError::PageNotMapped       => UnmapError::NotMapped,
                 FlagUpdateError::ParentEntryHugePage => UnmapError::ParentHugePage,
             })?
-            .flush();
+            .flush(); // local invlpg on this core
     }
+    // Shootdown: a permission-restricting set_flags (e.g. W→RO+X for W^X) can
+    // leave a stale TLB entry on every other core. Broadcast VEC_TLB_SHOOTDOWN
+    // IPI and wait for all acks while still holding MAPPER (see tlb.rs for the
+    // deadlock analysis; MAPPER must remain a spin::Mutex, not IrqMutex).
+    crate::memory::tlb::shootdown(virt.as_u64());
     Ok(())
 }
 

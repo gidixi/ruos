@@ -110,6 +110,26 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // Step 3b boot-check: verify AP1's per-core executor is polling its heartbeat
+    // task (which uses AP1's per-core Delay + LAPIC timer). We wait ~100 ms (10
+    // BSP ticks) and check that the counter grew > 0 (expect ~5, one bump per
+    // Delay::ticks(2) ≈ 20 ms). grew == 0 means AP1's executor isn't running or
+    // its Delay/timer is broken — the 3a+3b chain is broken. Skipped on 1-core.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 2 {
+            let h0 = crate::executor::HEARTBEAT.load(core::sync::atomic::Ordering::SeqCst);
+            let start = crate::timer::ticks();
+            while crate::timer::ticks() < start + 10 { core::hint::spin_loop(); } // ~100 ms
+            let grew = crate::executor::HEARTBEAT
+                .load(core::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(h0);
+            crate::binfo!("exec", "ap1 heartbeat ticks in 100ms = {} (expect ~5)", grew);
+        } else {
+            crate::binfo!("exec", "ap1 heartbeat check skipped (1 core)");
+        }
+    }
+
     #[cfg(feature = "boot-checks")]
     {
         let ok = crate::memory::exec::self_test();

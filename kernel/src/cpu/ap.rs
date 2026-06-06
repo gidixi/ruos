@@ -2,9 +2,9 @@
 //! 64-bit long mode on a Limine-owned stack; we load this core's GDT/TSS and
 //! the shared IDT, enable this core's LAPIC, arm this core's LAPIC timer in
 //! periodic mode (100 Hz, same calibrated count as the BSP), register online,
-//! then enter a compute WORKER loop (Fase 2). APs pull pure-CPU jobs from the
-//! shared pool and run them on their core; when the queue is empty they `hlt`
-//! (0% CPU) and sleep until the BSP or the periodic timer wakes them. The timer
+//! then enter its per-core cooperative executor (Step 3b). The executor loop
+//! polls async tasks, drains the inter-core inbox, drains the compute pool
+//! (so banded compositing keeps its workers), and `hlt`s when idle. The timer
 //! IPI also drains this core's `PER_CORE_DELAYS` list on each tick (Step 3a).
 
 use limine::mp::MpInfo;
@@ -36,41 +36,9 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();
-    ap_worker_loop()
-}
-
-/// AP worker loop: drain pure-CPU jobs from the pool + inter-core inbox messages,
-/// then `hlt` until a wake IPI arrives. The BSP sends the wake IPI on every
-/// `submit`. Anti-missed-wake: disable IRQs and re-check all queues before
-/// sleeping, so a job or message submitted between the drain and the `hlt` is not
-/// missed (the `sti; hlt` is atomic — the IPI cannot fire in the 1-instruction
-/// shadow of `sti`).
-fn ap_worker_loop() -> ! {
-    let me = crate::cpu::cpu_id() as usize;
-    loop {
-        // Drain all available jobs, charging their run time as busy.
-        while let Some(slot) = crate::smp::pool::take() {
-            let busy_start = crate::boot::clock::read_tsc();
-            crate::smp::pool::run_slot(slot, me as u32);
-            crate::sched::cpustat::add_busy(
-                me, crate::boot::clock::read_tsc().saturating_sub(busy_start));
-        }
-
-        // Run any inter-core messages addressed to this core.
-        crate::smp::inbox::drain_inbox(me as u32);
-
-        // No work: sleep until woken, charging the halt as idle.
-        x86_64::instructions::interrupts::disable();
-        if crate::smp::pool::is_empty() && !crate::smp::inbox::is_pending(me as u32) {
-            let idle_start = crate::boot::clock::read_tsc();
-            // Atomic sti;hlt — the wake IPI cannot land between the two.
-            x86_64::instructions::interrupts::enable_and_hlt();
-            crate::sched::cpustat::add_idle(
-                me, crate::boot::clock::read_tsc().saturating_sub(idle_start));
-        } else {
-            // A job or inbox message arrived during the drain/disable window;
-            // re-enable and loop.
-            x86_64::instructions::interrupts::enable();
-        }
-    }
+    // Enter this core's per-core cooperative executor (Step 3b). The executor
+    // loop: polls async tasks → drains inbox → drains compute pool → hlt.
+    // Pool drain moved here from the old ap_worker_loop so banded compositing
+    // keeps its workers; the BSP's run_core(0) can also drain pool jobs now.
+    crate::executor::run_core(cpu_id as u32)
 }

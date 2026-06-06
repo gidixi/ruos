@@ -1,13 +1,23 @@
-//! Prototipo A: magazine per-core davanti a UN talc globale (feature alloc-magazine).
-//! THROWAWAY spike — confronto con alloc_percore_talc. NON di produzione.
+//! Per-core magazine allocator: a per-CPU size-class free-list cache in front of one
+//! global talc heap. Small alloc/free (size & align fit a class, align <= 16) hit the
+//! local magazine without touching talc — eliminating the global talc-lock traffic that
+//! per-core executors (SMP Step 3) would otherwise serialise on. Cache miss / overflow
+//! and all large or high-align allocations go to the shared talc.
 //!
-//! Limite noto (accettabile per uno spike di misura): la magazine ricicla i blocchi
-//! per size-class. Ogni blocco in classe `idx` è allocato da talc con la Layout
-//! canonica della classe (size=16<<idx, align=16). Le dealloc di overflow passano a
-//! talc la stessa Layout canonica (non quella del chiamante). Il chiamante non vede
-//! la differenza: il blocco restituito soddisfa la sua Layout per size e align
-//! (class_size >= request.size, 16 >= request.align per costruzione di size_class).
-//! La magazine è bypassata per align > 16 (→ talc diretto) e size > MAX_SMALL.
+//! Per-core indexing uses `cpu_id()` (RDTSCP fast path, ~tens of cycles). Each core
+//! touches only `mags[cpu_id]`, with interrupts disabled across the short push/pop so an
+//! ISR on the same core cannot observe a half-updated free-list (no cross-core sharing
+//! of a magazine).
+//!
+//! INVARIANTS:
+//! - Every cached block in class `i` was allocated from talc with the CANONICAL layout
+//!   `Layout(16<<i, 16)`, so any block handed out for a request that maps to class `i`
+//!   is >= the requested size and 16-aligned; recycling never returns an undersized or
+//!   misaligned block. `align > 16` and `size > MAX_SMALL` bypass the magazine entirely.
+//! - talc only ever sees alloc/free at the canonical class layout (cache miss / overflow),
+//!   so its metadata is always consistent. Cross-core free is trivial: the freeing core
+//!   pushes to ITS magazine, or returns the block to the single global talc which owns
+//!   the whole heap — no remote-free queue needed.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -20,6 +30,10 @@ const CACHE_DEPTH: usize = 64;          // nodi liberi per (core, classe)
 
 /// Canonical per-class alignment: all magazine blocks have align=16.
 const CLASS_ALIGN: usize = 16;
+
+// Compile-time check: the class table size and MAX_SMALL must be consistent.
+// Class 0 = 16 B, class NUM_CLASSES-1 = 16 << (NUM_CLASSES-1) = MAX_SMALL.
+const _: () = assert!(16 << (NUM_CLASSES - 1) == MAX_SMALL);
 
 /// Returns (class_index, class_layout) for the given layout, or None if the
 /// layout bypasses the magazine (align > 16 or size > MAX_SMALL or size == 0).

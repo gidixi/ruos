@@ -1,7 +1,7 @@
 # Allocator Architecture Decision — SMP Step 1
 
 **Data:** 2026-06-05  
-**Status:** PENDING controller/user confirmation  
+**Status:** ✅ RESOLVED (2026-06-05) — **Step 1a fast cpu_id via RDTSCP (done+verified) → Step 1b = Magazine A.** See §8.  
 **Spike branch:** `docs/smp-shared-nothing`  
 **Related spec:** `docs/superpowers/specs/2026-06-05-smp-shared-nothing-migration-design.md` §6
 
@@ -271,3 +271,65 @@ The controller should answer:
 3. Is the align=16 assumption in Prototype B's remote-free a blocking concern?
 
 Once confirmed, update this document with the chosen option and rationale.
+
+---
+
+## 8. RESOLUTION (verified, 2026-06-05)
+
+**Decision: Option 1 + Option 2.** Build a fast `cpu_id()` first (Step 1a), then adopt
+**Prototype A (magazine)** for the per-core allocator (Step 1b). Both validated with
+data below.
+
+### 8.1 Fast cpu_id() chosen primitive — RDTSCP, not gs-base
+
+The §4 root-cause (the ~200 ns `cpu_id()` LAPIC-MMIO tax) was confirmed as THE cause.
+The §5 mitigation candidate "gs-base" was **rejected** — it is broken on VirtualBox
+(the documented quirk). Instead: **`RDTSCP` + `IA32_TSC_AUX`** — write the dense id into
+`IA32_TSC_AUX` per core at bring-up, then `cpu_id()` = one `rdtscp` (id in ECX), ~few
+cycles, no MMIO, no gs-base. CPUID-detected with a LAPIC fallback (diverse-system-safe).
+
+Verified DIRECTLY on three environments (boot `cpuprobe` marker):
+
+| Environment | RDTSCP | RDPID | wrmsr TSC_AUX + readback |
+|---|---|---|---|
+| QEMU `-cpu max` | ✅ | ✅ | ✅ |
+| **VirtualBox guest** | ✅ | ❌ | ✅ |
+| Bare metal (i7-8700 Coffee Lake) | ✅ | ❌ | ✅ |
+
+`RDPID` is NOT portable (absent on VBox + Coffee Lake) → rejected. `RDTSCP`+`TSC_AUX`
+works everywhere including VirtualBox — the very environment where gs-base fails.
+
+Implemented in `cpu/mod.rs` (`detect_rdtscp`/`set_tsc_aux`/`RDTSCP_OK` + fast-path
+`cpu_id()`), `cpu/ap.rs` (`set_tsc_aux` first in `ap_entry`), `init_bsp`. `make test-boot`
+→ `TEST_BOOT_PASS` (cpu_id correct across the whole boot + SMP). Measured cost dropped
+**~200 ns → 23 ns** (allocbench `cpuid ns_per_call`).
+
+### 8.2 Re-measurement with fast cpu_id (the decisive data)
+
+Same `-smp 4` benchmark, re-run with `cpu_id()` = 23 ns:
+
+| Variant | multi per_job — BEFORE (cpu_id ~200 ns) | multi per_job — AFTER (cpu_id 23 ns) | vs default (after) |
+|---|---|---|---|
+| Default talc | 19.7 ms | 14.9 ms | baseline |
+| **Magazine A** | 31.9 ms | **9.6 ms** | **−36% (wins)** |
+| Percore-talc B | 37.8 ms | 12.2 ms | −18% |
+
+**The spike hypothesis is confirmed end-to-end:** the per-core allocators' only
+disadvantage was the cpu_id tax. Removed, **both beat the global talc under contention,
+and Magazine A wins clearly** (9.6 vs 14.9 ms; and beats B 9.6 vs 12.2). This matches the
+structural analysis: A avoids the allocator entirely on a cache hit, while B pays
+`drain_remote` (IrqMutex) + `owner_of` O(16) per op. The §4 cache-coherence speculation
+was secondary; the cpu_id tax was the dominant factor as predicted.
+
+### 8.3 Consequences
+
+- **Step 1a (fast cpu_id):** DONE + verified. It is a hard prerequisite of Step 1b and
+  benefits every per-core access in the shared-nothing model.
+- **Step 1b (allocator):** adopt **Magazine A**. The production version should drop the
+  spike's throwaway shortcuts (keep the canonical-class-layout + align>16 bypass already
+  in the prototype; profile the size-class table). Prototype B's remote-free / align=16 /
+  drain_remote complexity is NOT needed (the magazine recycles to its own core; the
+  single global talc owns the whole heap, so any block returns validly).
+- **§6 of the spec** has been updated (Step 1a/1b split + this verified result).
+- Earlier "neither prototype wins" (criterion 2, measured WITHOUT fast cpu_id) is
+  superseded by §8.2 — those numbers were dominated by the cpu_id tax.

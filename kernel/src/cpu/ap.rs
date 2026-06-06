@@ -1,11 +1,11 @@
 //! Application Processor entry point. Limine hands each AP here already in
 //! 64-bit long mode on a Limine-owned stack; we load this core's GDT/TSS and
-//! the shared IDT, enable this core's LAPIC, register online, then enter a
-//! compute WORKER loop (Fase 2). APs pull pure-CPU jobs from the shared pool
-//! and run them on their core; when the queue is empty they `hlt` (0% CPU) and
-//! sleep until the BSP wakes them with an IPI after submitting a job. The AP's
-//! only enabled interrupt is the wake IPI (its timer LVT is masked, keyboard
-//! IRQ routes to the BSP).
+//! the shared IDT, enable this core's LAPIC, arm this core's LAPIC timer in
+//! periodic mode (100 Hz, same calibrated count as the BSP), register online,
+//! then enter a compute WORKER loop (Fase 2). APs pull pure-CPU jobs from the
+//! shared pool and run them on their core; when the queue is empty they `hlt`
+//! (0% CPU) and sleep until the BSP or the periodic timer wakes them. The timer
+//! IPI also drains this core's `PER_CORE_DELAYS` list on each tick (Step 3a).
 
 use limine::mp::MpInfo;
 
@@ -26,8 +26,13 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Load this core's GDT/TSS (slot cpu_id) and the shared IDT.
     crate::gdt::init(cpu_id);
     crate::idt::load();
-    // Enable this core's LAPIC (so the wake IPI is serviced) + mask its timer.
+    // Enable this core's LAPIC (SVR bit 8; init_ap masks the timer LVT).
     crate::apic::lapic::init_ap(crate::idt::VEC_SPURIOUS);
+    // Arm this AP's LAPIC timer in periodic mode with the BSP-calibrated count.
+    // `init_ap` left the LVT timer masked; `start_ap_timer` reprograms it UNMASKED
+    // with VEC_LAPIC_TIMER at the calibrated count. After this returns, this core
+    // receives 100 Hz timer IRQs and `timer_handler` drains PER_CORE_DELAYS[cpu].
+    crate::timer::start_ap_timer();
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();

@@ -94,6 +94,22 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // Step 3a boot-check: verify AP1's LAPIC timer is firing at ~100 Hz.
+    // We wait ~50 ms (5 BSP ticks at 100 Hz) and check that AP1's per-core
+    // tick counter advanced by > 0 (expect ~5). Skipped on 1-core boots.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 2 {
+            let t0 = crate::timer::ap_ticks(1);
+            let start = crate::timer::ticks();
+            while crate::timer::ticks() < start + 5 { core::hint::spin_loop(); } // ~50 ms
+            let grew = crate::timer::ap_ticks(1).saturating_sub(t0);
+            crate::binfo!("timer", "ap1 ticks in 50ms = {} (expect > 0)", grew);
+        } else {
+            crate::binfo!("timer", "ap1 tick check skipped (1 core)");
+        }
+    }
+
     #[cfg(feature = "boot-checks")]
     {
         let ok = crate::memory::exec::self_test();

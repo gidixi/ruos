@@ -3,6 +3,7 @@
 pub mod termios;
 pub mod ldisc;
 pub mod pair;
+pub mod spsc;
 
 use spin::Mutex;
 use pair::PtyPair;

@@ -1,0 +1,13 @@
+{
+  "name": "ruos-local",
+  "description": "Plugin locali per lo sviluppo di ruos / ruos-desktop.",
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "ruos-desktop",
+      "displayName": "ruos-desktop tools",
+      "description": "Scaffolding per le app del desktop ruos (Model A): DeskApp + crate + wiring.",
+      "source": "./ruos-desktop"
+    }
+  ]
+}

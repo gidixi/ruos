@@ -126,6 +126,9 @@ pub fn run_core(cpu: u32) -> ! {
         // BSP owns the I/O task set (unchanged from the old run()).
         crate::binfo!("user", "executor: core 0 spawning tasks");
         spawner.spawn(tick_task()).unwrap();
+        // Supervisor 6-detect: BSP polls per-core heartbeats every ~1 s and
+        // logs any mute core. Detection only; recovery is 6-recover.
+        spawner.spawn(supervisor_task()).unwrap();
         spawner.spawn(net_poll_task()).unwrap();
         spawner.spawn(usb_poll_task()).unwrap();
         spawner.spawn(console_drain_task()).unwrap();
@@ -142,14 +145,22 @@ pub fn run_core(cpu: u32) -> ! {
         crate::binfo!("user", "executor: core 0 tasks spawned");
     }
 
-    // 3b test hook: AP 1 runs a heartbeat task to prove the per-core executor
-    // + per-core Delay + AP timer work end-to-end. Only under boot-checks.
+    // 3b test hook: the first ComputeApp AP (cpu 2 on SMP≥3, skipped on ≤2
+    // where core 1 is the GUI core) runs a heartbeat task to prove the
+    // per-core executor + per-core Delay + AP timer chain end-to-end.
+    // Core 1 = GuiCompositor runs gui_worker_loop (no executor), so we skip
+    // it and use the first ComputeApp AP instead.
     #[cfg(feature = "boot-checks")]
-    if cpu == 1 {
+    if cpu == 2 && crate::cpu::core_role(2) == crate::cpu::CoreRole::ComputeApp {
         spawner.spawn(heartbeat_task()).unwrap();
     }
 
     loop {
+        // Supervisor 6-detect: bump once per loop iteration so the BSP supervisor
+        // task can tell this core is alive. Even idle cores advance (the LAPIC
+        // timer wakes them ~100 Hz → they loop → they bump → they hlt again).
+        crate::sched::cpustat::heartbeat_bump(cpu as usize);
+
         // Clear the wake flag *before* polling so any wakes raised
         // during this poll round are visible to the post-poll check.
         WAKE_PENDING[cpu as usize].store(false, Ordering::SeqCst);
@@ -557,6 +568,41 @@ async fn tick_task() {
     // available so the run queue never becomes empty.
     loop {
         delay::Delay::ticks(1000).await; // 10s heartbeat
+    }
+}
+
+/// Supervisor 6-detect task (BSP only). Runs on core 0's executor (Step 5 freed
+/// it). Every ~1 s it snapshots per-core heartbeat counters, waits, and compares.
+/// A core whose counter did not advance is logged as "mute". DETECTION ONLY —
+/// recovery (killing stuck WASM instances) requires per-core process registries
+/// (6-recover, a later step). Just log liveness; add no cross-core locks.
+#[embassy_executor::task]
+async fn supervisor_task() {
+    let mut prev = [0u64; crate::cpu::MAX_CPUS];
+    let mut first = true;
+    loop {
+        // Total cores = BSP (always 1) + online APs. cpus_online() counts APs only.
+        let n = (1 + crate::cpu::cpus_online()) as usize;
+        delay::Delay::ticks(100).await; // ~1 s at 100 Hz
+        let mut alive = 0u32;
+        let mut mute  = 0u32;
+        for c in 0..n {
+            let h = crate::sched::cpustat::heartbeat(c);
+            if h != prev[c] {
+                alive += 1;
+            } else if !first {
+                mute += 1;
+            }
+            prev[c] = h;
+        }
+        if first {
+            crate::binfo!("super", "supervisor up, watching {} cores", n);
+            first = false;
+        } else if mute > 0 {
+            crate::bwarn!("super", "mute cores={} alive={}/{}", mute, alive, n);
+        } else {
+            crate::binfo!("super", "all {} cores alive", n);
+        }
     }
 }
 

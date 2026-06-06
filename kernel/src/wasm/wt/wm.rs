@@ -1104,6 +1104,11 @@ impl Compositor {
         let mut frame_no: u32 = 0;
         let mut marker_done = false;
         loop {
+            // Supervisor 6-detect: bump the GUI core's heartbeat each compositor
+            // frame so the supervisor never false-mutes it. The GUI core owns the
+            // CPU here and may not call run_core(), so it must bump explicitly.
+            crate::sched::cpustat::heartbeat_bump(crate::cpu::cpu_id() as usize);
+
             // SP5: reap any window that requested close (guest wm.close or the [X]
             // path) on its last frame BEFORE we fold input or drive frames.
             self.reap();
@@ -1251,6 +1256,13 @@ pub fn gui_worker_loop() -> ! {
     crate::binfo!("wm", "gui core {} waiting for compositor",
                   crate::cpu::cpu_id());
     loop {
+        // Supervisor 6-detect: bump the GUI core's heartbeat each time it wakes
+        // from hlt while waiting for the compositor hand-off. Without this bump
+        // the supervisor would see a mute core for the entire pre-compositor window
+        // (potentially many seconds). The LAPIC timer wakes this core ~100 Hz →
+        // it runs this loop body → it bumps → it halts again.
+        crate::sched::cpustat::heartbeat_bump(crate::cpu::cpu_id() as usize);
+
         if COMPOSITOR_MAILBOX.ready.load(core::sync::atomic::Ordering::Acquire) {
             let ptr = COMPOSITOR_MAILBOX.ptr.load(core::sync::atomic::Ordering::Acquire)
                 as *const u8;

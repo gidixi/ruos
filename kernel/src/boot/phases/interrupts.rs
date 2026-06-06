@@ -61,15 +61,20 @@ pub fn init() -> Result<(), BootError> {
         crate::memory::allocbench::run_multicore();
     }
 
-    // Step 2 boot-check: BSP→AP1 message round-trip. Proves targeted IPI delivery,
+    // Step 2 boot-check: BSP→AP message round-trip. Proves targeted IPI delivery,
     // AP inbox drain, op execution, reply publish, and future resolution on the BSP.
+    // Step 5 moved core 1 to `gui_worker_loop` (GuiCompositor); that loop does NOT
+    // drain inboxes, so we target the first ComputeApp AP (core 2 on ≥3-CPU builds).
+    // On 2-CPU builds (core 1 = GUI, no ComputeApp), the check is skipped.
     #[cfg(feature = "boot-checks")]
     {
-        if crate::cpu::cpus_online() >= 2 {
-            // op: sum the input bytes; run it on core 1.
+        let target_ap = (0..crate::cpu::cpus_online())
+            .find(|&c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp);
+        if let Some(target) = target_ap {
+            // op: sum the input bytes; run it on the target ComputeApp AP.
             fn sum_op(input: &[u8]) -> u64 { input.iter().map(|&b| b as u64).sum() }
             let input: alloc::boxed::Box<[u8]> = alloc::boxed::Box::from(&[1u8, 2, 3, 4][..]);
-            let mut fut = crate::smp::inbox::request(1, sum_op, input);
+            let mut fut = crate::smp::inbox::request(target, sum_op, input);
             // Drive the future inline (no executor in this phase). A no-op waker is
             // fine — we poll in a bounded spin; the AP completes the reply async.
             use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -86,11 +91,11 @@ pub fn init() -> Result<(), BootError> {
                 core::hint::spin_loop();
             }
             match result {
-                Some(v) => crate::binfo!("inbox", "roundtrip ok core1 sum={} (expect 10)", v),
+                Some(v) => crate::binfo!("inbox", "roundtrip ok core{} sum={} (expect 10)", target, v),
                 None    => crate::binfo!("inbox", "roundtrip TIMEOUT"),
             }
         } else {
-            crate::binfo!("inbox", "roundtrip skipped (1 core)");
+            crate::binfo!("inbox", "roundtrip skipped (no ComputeApp AP)");
         }
     }
 
@@ -110,43 +115,51 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
-    // Step 3b boot-check: verify AP1's per-core executor is polling its heartbeat
-    // task (which uses AP1's per-core Delay + LAPIC timer). We wait ~100 ms (10
-    // BSP ticks) and check that the counter grew > 0 (expect ~5, one bump per
-    // Delay::ticks(2) ≈ 20 ms). grew == 0 means AP1's executor isn't running or
-    // its Delay/timer is broken — the 3a+3b chain is broken. Skipped on 1-core.
+    // Step 3b boot-check: verify a ComputeApp AP's per-core executor is polling
+    // its heartbeat task (which uses per-core Delay + LAPIC timer). We wait
+    // ~100 ms (10 BSP ticks) and check that the counter grew > 0 (expect ~5).
+    // Core 1 = GuiCompositor (gui_worker_loop, no executor); the heartbeat_task
+    // is spawned on core 2 (first ComputeApp AP) when ≥3 CPUs. Skipped on
+    // ≤2-CPU boots where no ComputeApp AP exists.
     #[cfg(feature = "boot-checks")]
     {
-        if crate::cpu::cpus_online() >= 2 {
+        let has_compute_ap = (0..crate::cpu::cpus_online())
+            .any(|c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp);
+        if has_compute_ap {
             let h0 = crate::executor::HEARTBEAT.load(core::sync::atomic::Ordering::SeqCst);
             let start = crate::timer::ticks();
             while crate::timer::ticks() < start + 10 { core::hint::spin_loop(); } // ~100 ms
             let grew = crate::executor::HEARTBEAT
                 .load(core::sync::atomic::Ordering::SeqCst)
                 .saturating_sub(h0);
-            crate::binfo!("exec", "ap1 heartbeat ticks in 100ms = {} (expect ~5)", grew);
+            crate::binfo!("exec", "compute-ap heartbeat ticks in 100ms = {} (expect ~5)", grew);
         } else {
-            crate::binfo!("exec", "ap1 heartbeat check skipped (1 core)");
+            crate::binfo!("exec", "compute-ap heartbeat check skipped (no ComputeApp AP)");
         }
     }
 
-    // Step 3c boot-check: BSP spawns a probe task onto core 1 via spawn_on().
-    // If the cross-core spawn + wake chain works, the probe runs on core 1
-    // and stores cpu_id()==1 into SPAWN_RAN_ON. `ran_on=core1` is the proof.
+    // Step 3c boot-check: BSP spawns a probe task onto a ComputeApp AP via
+    // spawn_on(). Step 5 moved core 1 to `gui_worker_loop` (GuiCompositor);
+    // that core never calls `run_core` so it has no executor / SendSpawner.
+    // We target the FIRST ComputeApp AP (core 2 when ≥3 CPUs, else skip on
+    // 2-CPU builds where only core 1 exists and it is the GUI core).
     #[cfg(feature = "boot-checks")]
     {
-        if crate::cpu::cpus_online() >= 2 {
-            // Retry until core 1 has published its SendSpawner (it enters run_core
-            // during bringup, so usually the very first attempt succeeds).
+        // Find the first ComputeApp AP (has a real executor via run_core).
+        let target_ap = (0..crate::cpu::cpus_online())
+            .find(|&c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp);
+        if let Some(target) = target_ap {
+            // Retry until the target AP has published its SendSpawner (it enters
+            // run_core during bringup; usually the very first attempt succeeds).
             let mut spawned = false;
             for _ in 0..1_000_000u64 {
-                if crate::executor::spawn_on(1, crate::executor::cross_spawn_probe()).is_ok() {
+                if crate::executor::spawn_on(target, crate::executor::cross_spawn_probe()).is_ok() {
                     spawned = true;
                     break;
                 }
                 core::hint::spin_loop();
             }
-            // Wait for the probe to run on core 1 (woken via cross-core IPI).
+            // Wait for the probe to run on the target AP (woken via cross-core IPI).
             let mut ran_on = u32::MAX;
             for _ in 0..50_000_000u64 {
                 let v = crate::executor::SPAWN_RAN_ON
@@ -156,12 +169,12 @@ pub fn init() -> Result<(), BootError> {
             }
             crate::binfo!(
                 "exec",
-                "cross-spawn ran_on=core{} (spawned={}, expect core1)",
-                ran_on,
-                spawned,
+                "cross-spawn ran_on=core{} (spawned={}, expect core{})",
+                ran_on, spawned, target,
             );
         } else {
-            crate::binfo!("exec", "cross-spawn skipped (1 core)");
+            // 1-CPU or 2-CPU (core 1 = GUI core, no ComputeApp AP): skip.
+            crate::binfo!("exec", "cross-spawn skipped (no ComputeApp AP)");
         }
     }
 
@@ -221,6 +234,40 @@ pub fn init() -> Result<(), BootError> {
         crate::rng::init();
         let en = crate::wasm::wt::run_egui_demo_demo();
         crate::binfo!("wm", "egui demo spawn ok pixels={}", en);
+
+        // RNG per-core distinct-streams check: draw a value on the BSP (core 0 →
+        // RNG[0]) and one on a ComputeApp AP via the message bus; they must differ.
+        // Core 1 = GuiCompositor (gui_worker_loop, no inbox drain) — must skip it.
+        // Target: first ComputeApp AP. Skipped if none exists (≤2-CPU boots).
+        {
+            fn rng_draw(_in: &[u8]) -> u64 { crate::rng::next_u64() }
+            let target_ap = (0..crate::cpu::cpus_online())
+                .find(|&c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp);
+            if let Some(target) = target_ap {
+                let bsp = crate::rng::next_u64();
+                let mut fut = crate::smp::inbox::request(target, rng_draw, alloc::boxed::Box::from(&[][..]));
+                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                fn noop(_: *const ()) {}
+                fn cl(_: *const ()) -> RawWaker { RawWaker::new(core::ptr::null(), &RNG_VT) }
+                static RNG_VT: RawWakerVTable = RawWakerVTable::new(cl, noop, noop, noop);
+                let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &RNG_VT)) };
+                let mut cx = Context::from_waker(&w);
+                let mut ap: Option<u64> = None;
+                for _ in 0..50_000_000u64 {
+                    if let Poll::Ready(v) = core::future::Future::poll(
+                        core::pin::Pin::new(&mut fut), &mut cx,
+                    ) {
+                        ap = Some(v);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::binfo!("rng", "percore distinct bsp!=ap{} -> {}",
+                    target, ap.map_or(false, |a| a != bsp));
+            } else {
+                crate::binfo!("rng", "percore distinct skipped (no ComputeApp AP)");
+            }
+        }
     }
 
     Ok(())

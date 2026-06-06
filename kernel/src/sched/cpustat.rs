@@ -47,3 +47,32 @@ pub fn read(cpu: usize) -> (u64, u64) {
         None => (0, 0),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-core supervisor heartbeat (Step 6-detect)
+// ---------------------------------------------------------------------------
+//
+// Each core bumps its slot once per iteration of its main loop. The BSP
+// supervisor task snapshots all slots, waits ~1 s, and compares — a slot that
+// did not advance is "mute" (stuck core). Detection only; recovery is later.
+
+/// Per-core monotonic heartbeat counter. Bumped in every core's main loop
+/// (run_core for BSP/ComputeApp APs; gui_worker_loop + run_compositor_gate
+/// for the GUI core) so a core idle in `hlt` still advances (its LAPIC timer
+/// wakes it ~100 Hz → it loops → it bumps → it halts again).
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_HB: AtomicU64 = AtomicU64::new(0);
+static HEARTBEAT: [AtomicU64; MAX_CPUS] = [ZERO_HB; MAX_CPUS];
+
+/// Bump the heartbeat counter for core `cpu` (call once per main-loop iteration).
+#[inline]
+pub fn heartbeat_bump(cpu: usize) {
+    if let Some(h) = HEARTBEAT.get(cpu) {
+        h.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Read the current heartbeat value for core `cpu`.
+pub fn heartbeat(cpu: usize) -> u64 {
+    HEARTBEAT.get(cpu).map_or(0, |h| h.load(Ordering::Relaxed))
+}

@@ -36,9 +36,15 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();
-    // Enter this core's per-core cooperative executor (Step 3b). The executor
-    // loop: polls async tasks → drains inbox → drains compute pool → hlt.
-    // Pool drain moved here from the old ap_worker_loop so banded compositing
-    // keeps its workers; the BSP's run_core(0) can also drain pool jobs now.
-    crate::executor::run_core(cpu_id as u32)
+    // Step 5: dispatch on the role assigned to this core in smp::bringup.
+    // GuiCompositor → dedicated GUI spinner (waits for compositor hand-off, then
+    //   runs run_compositor_gate forever — never returns to the executor).
+    // All others → per-core cooperative executor (Step 3b), which drains async
+    //   tasks, the inbox, and the compute pool (banded compositing workers).
+    match crate::cpu::core_role(cpu_id as u32) {
+        crate::cpu::CoreRole::GuiCompositor =>
+            crate::wasm::wt::wm::gui_worker_loop(),
+        _ =>
+            crate::executor::run_core(cpu_id as u32),
+    }
 }

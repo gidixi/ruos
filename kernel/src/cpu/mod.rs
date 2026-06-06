@@ -24,6 +24,52 @@ static LAPIC_TO_CPU: [AtomicU8; 256] = {
 /// Count of cores that have registered online via `mark_online`.
 static CPUS_ONLINE: AtomicU32 = AtomicU32::new(0);
 
+// ---------------------------------------------------------------------------
+// Core roles (Step 5: GUI-core pinning)
+// ---------------------------------------------------------------------------
+
+/// The role assigned to each dense cpu_id. Defaults to `ComputeApp` (= 2) for
+/// every core until `set_core_role` is called during `smp::bringup`.
+///
+/// * `BspIo` (0)       – core 0: the cooperative I/O executor (net/usb/ssh).
+/// * `GuiCompositor` (1) – first AP (id 1): the dedicated GUI spinner that runs
+///   `run_compositor_gate` forever once the BSP hands off the compositor cwasm.
+/// * `ComputeApp` (2)  – every other AP: drains the SMP pool for banded
+///   compositing + runs its per-core cooperative executor.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum CoreRole {
+    BspIo        = 0,
+    GuiCompositor = 1,
+    ComputeApp   = 2,
+}
+
+/// Per-core role table. Index = dense cpu_id. All slots default to `ComputeApp`
+/// (= 2) — the BSP and first AP are pinned in `smp::bringup` before their APs
+/// start, so every core reads the correct role the instant it enters `ap_entry`.
+static CORE_ROLES: [AtomicU8; MAX_CPUS] = {
+    const Z: AtomicU8 = AtomicU8::new(2); // 2 = ComputeApp
+    [Z; MAX_CPUS]
+};
+
+/// Assign a role to dense core `cpu`. Called by `smp::bringup` BEFORE
+/// `cpu.bootstrap(ap_entry, ...)` so the AP reads the correct role on entry.
+pub fn set_core_role(cpu: u32, role: CoreRole) {
+    if (cpu as usize) < MAX_CPUS {
+        CORE_ROLES[cpu as usize].store(role as u8, Ordering::SeqCst);
+    }
+}
+
+/// Read the role of dense core `cpu`.
+pub fn core_role(cpu: u32) -> CoreRole {
+    if (cpu as usize) >= MAX_CPUS { return CoreRole::ComputeApp; }
+    match CORE_ROLES[cpu as usize].load(Ordering::SeqCst) {
+        0 => CoreRole::BspIo,
+        1 => CoreRole::GuiCompositor,
+        _ => CoreRole::ComputeApp,
+    }
+}
+
 #[repr(C)]
 pub struct PerCpu {
     /// MUST be offset 0: a pointer to self, so `mov rax, gs:[0]` loads &PerCpu.

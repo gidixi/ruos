@@ -1219,6 +1219,100 @@ pub fn run_compositor_gate(cwasm: &[u8]) -> ! {
     Compositor::new(cwasm).run()
 }
 
+// ---------------------------------------------------------------------------
+// Step 5: GUI-core hand-off infrastructure
+// ---------------------------------------------------------------------------
+
+/// One-shot mailbox from the BSP to the GUI core. The BSP publishes ptr+len
+/// with Release ordering, then sets `ready` with Release. The GUI core polls
+/// `ready` with Acquire; the ptr+len Acquire-loads follow the same barrier.
+///
+/// The slice outlives the kernel (the BSP leaks a Box<[u8]> before hand-off),
+/// so the GUI core can safely read it forever.
+struct CompositorMailbox {
+    ptr:   core::sync::atomic::AtomicUsize,
+    len:   core::sync::atomic::AtomicUsize,
+    ready: core::sync::atomic::AtomicBool,
+}
+
+static COMPOSITOR_MAILBOX: CompositorMailbox = CompositorMailbox {
+    ptr:   core::sync::atomic::AtomicUsize::new(0),
+    len:   core::sync::atomic::AtomicUsize::new(0),
+    ready: core::sync::atomic::AtomicBool::new(false),
+};
+
+/// GUI core entry point (Step 5). Called by `ap_entry` when this core's role
+/// is `GuiCompositor`. Halts until the BSP publishes the compositor cwasm,
+/// then runs `run_compositor_gate` forever on THIS dedicated core.
+///
+/// The BSP's `exec_worker_task` keeps running (the hand-off returns) so the
+/// BSP executor continues polling net/usb/ssh — the goal of Step 5.
+pub fn gui_worker_loop() -> ! {
+    crate::binfo!("wm", "gui core {} waiting for compositor",
+                  crate::cpu::cpu_id());
+    loop {
+        if COMPOSITOR_MAILBOX.ready.load(core::sync::atomic::Ordering::Acquire) {
+            let ptr = COMPOSITOR_MAILBOX.ptr.load(core::sync::atomic::Ordering::Acquire)
+                as *const u8;
+            let len = COMPOSITOR_MAILBOX.len.load(core::sync::atomic::Ordering::Acquire);
+            // SAFETY: the BSP leaked a Box<[u8]> (so the allocation lives forever)
+            // and published ptr+len with Release before setting `ready`. We
+            // Acquire-load all three. The compositor never returns, so the leak is
+            // permanent and correct.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            run_compositor_gate(bytes); // -> !
+        }
+        // Not ready yet: halt until the hand-off IPI (wake_core → VEC_WAKE)
+        // wakes us. The sti+hlt sequence is race-free: if the IPI fires between
+        // the disable and the hlt, it is held pending until sti's one-instruction
+        // shadow, then delivered before hlt executes.
+        x86_64::instructions::interrupts::disable();
+        if !COMPOSITOR_MAILBOX.ready.load(core::sync::atomic::Ordering::Acquire) {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        } else {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
+/// Hand the compositor cwasm bytes to the GUI core (Step 5). Returns `true` if
+/// handed off (a GUI core exists and is waiting — the caller must NOT run the
+/// gate inline). Returns `false` if no GUI core exists (1-core fallback: the
+/// caller runs `run_compositor_gate` inline, today's behaviour).
+///
+/// `bytes` MUST be a leaked 'static slice (Box::leak or equivalent) whose
+/// allocation lives for the kernel's lifetime, because the GUI core reads it
+/// indefinitely. Passing a stack slice or a Vec<u8> that may be freed is UB.
+pub fn send_compositor_to_gui_core(bytes: &'static [u8]) -> bool {
+    // Find a GuiCompositor core that is online.
+    let mut gui: Option<u32> = None;
+    for c in 0..crate::cpu::cpus_online() {
+        if crate::cpu::core_role(c) == crate::cpu::CoreRole::GuiCompositor {
+            gui = Some(c);
+            break;
+        }
+    }
+    let gui = match gui {
+        Some(c) => c,
+        None    => return false, // no GUI core (1 CPU or no APs)
+    };
+
+    // Publish ptr + len BEFORE setting ready (Release → Acquire pairing with
+    // the GUI core's poll). The GUI core only reads ptr/len after seeing ready.
+    COMPOSITOR_MAILBOX.ptr.store(bytes.as_ptr() as usize,
+                                 core::sync::atomic::Ordering::Release);
+    COMPOSITOR_MAILBOX.len.store(bytes.len(),
+                                 core::sync::atomic::Ordering::Release);
+    COMPOSITOR_MAILBOX.ready.store(true, core::sync::atomic::Ordering::Release);
+
+    // Wake the GUI core: set its WAKE_PENDING + send a targeted VEC_WAKE IPI.
+    // The IPI wakes it from `hlt`; the GUI core then re-checks `ready` and
+    // calls run_compositor_gate.
+    crate::executor::wake_core(gui);
+    crate::binfo!("wm", "compositor handed off to gui core {}", gui);
+    true
+}
+
 /// Headless boot self-test of the spawn/despawn lifecycle: build an empty
 /// compositor (NO `gfx::enter`), spawn the self-closing app (registry idx 2),
 /// call `frame()`+`reap` repeatedly, and report `(spawns, peak_live,

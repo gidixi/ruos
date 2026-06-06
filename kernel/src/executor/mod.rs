@@ -235,12 +235,34 @@ async fn exec_worker_task() {
                     127
                 }
                 Ok(bytes) => {
-                    // Compositor GATE: `compositor` resolves to /bin/compositor.cwasm
-                    // (the reactor cwasm shipped under that name). It owns the CPU
-                    // and never returns — like the single-GUI path — so the exec
-                    // task blocks here. That is intentional for the visual gate.
+                    // Step 5: compositor hand-off to the dedicated GUI core.
+                    // The compositor owns the CPU and never returns, but we want
+                    // the BSP executor to stay alive (for net/usb/ssh). So:
+                    //   1. Leak the bytes so they live forever ('static).
+                    //   2. Try to hand them to the GUI core (cpu 1 on SMP ≥2).
+                    //   3a. GUI core exists → hand-off: complete the EXEC_QUEUE
+                    //       handshake (result+done+waker) so the boot shell that
+                    //       ran `compositor` gets a return code and keeps going.
+                    //       The BSP executor keeps polling I/O. THE GOAL.
+                    //   3b. No GUI core (1 CPU) → run inline (today's fallback).
                     if slot.path.ends_with("compositor.cwasm") {
-                        crate::wasm::wt::wm::run_compositor_gate(&bytes);
+                        let leaked: &'static [u8] =
+                            alloc::boxed::Box::leak(bytes.into_boxed_slice());
+                        if crate::wasm::wt::wm::send_compositor_to_gui_core(leaked) {
+                            // Handed off: the GUI core will run the gate.
+                            // Complete the exec handshake so the calling shell
+                            // fiber (in boot_shell_task) gets a pid=0 return
+                            // code and doesn't hang waiting for `done`.
+                            EXEC_QUEUE.result.store(0, Ordering::SeqCst);
+                            EXEC_QUEUE.done.store(true, Ordering::SeqCst);
+                            if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
+                                w.wake();
+                            }
+                            continue; // back to the top of the exec-worker loop
+                        }
+                        // 1-core fallback: no GUI core → run gate inline (today's
+                        // behaviour; the BSP is blocked for the GUI's lifetime).
+                        crate::wasm::wt::wm::run_compositor_gate(leaked);
                     }
                     let pid = crate::proc::register(
                         alloc::string::String::from(slot.path.trim_start_matches('/')),

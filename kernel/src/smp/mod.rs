@@ -21,6 +21,8 @@ pub fn bringup() {
     let bsp_lapic = resp.bsp_lapic_id;
     // BSP is cpu_id 0; map it so cpu_id() resolves on the BSP too.
     crate::cpu::set_cpu_mapping(bsp_lapic, 0);
+    // BSP is always the I/O executor core.
+    crate::cpu::set_core_role(0, crate::cpu::CoreRole::BspIo);
 
     let mut next_id: u8 = 1;
     let mut started: u32 = 0;
@@ -47,6 +49,15 @@ pub fn bringup() {
         // instant it runs.
         crate::cpu::set_cpu_mapping(cpu.lapic_id, id);
 
+        // Step 5: assign the FIRST AP (id == 1) as the dedicated GUI/compositor
+        // core; all subsequent APs stay ComputeApp (already the default).
+        // Role is set BEFORE bootstrap so ap_entry reads the correct role.
+        if id == 1 {
+            crate::cpu::set_core_role(1, crate::cpu::CoreRole::GuiCompositor);
+            crate::binfo!("smp", "cpu 1 → GuiCompositor (dedicated compositor core)");
+        }
+        // id >= 2: leave as ComputeApp (default in CORE_ROLES).
+
         // Hand the AP its dense cpu_id via the extra argument.
         cpu.bootstrap(crate::cpu::ap::ap_entry, id as u64);
         started += 1;
@@ -66,5 +77,16 @@ pub fn bringup() {
         crate::binfo!("smp", "{}/{} APs online", online, started);
     } else {
         crate::bwarn!("smp", "{}/{} APs online (timeout)", online, started);
+    }
+
+    // Log the core-role table so the boot log is greppable.
+    let total = 1 + started; // BSP (0) + started APs
+    for c in 0..total {
+        let role = match crate::cpu::core_role(c) {
+            crate::cpu::CoreRole::BspIo        => "BspIo",
+            crate::cpu::CoreRole::GuiCompositor => "GuiCompositor",
+            crate::cpu::CoreRole::ComputeApp   => "ComputeApp",
+        };
+        crate::binfo!("smp", "core_role[{}]={}", c, role);
     }
 }

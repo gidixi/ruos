@@ -268,6 +268,129 @@ pub fn init() -> Result<(), BootError> {
                 crate::binfo!("rng", "percore distinct skipped (no ComputeApp AP)");
             }
         }
+
+        // Step 3d boot-check: no-fault remap test — proves cross-core TLB shootdown
+        // actually invalidates stale entries on other cores.
+        //
+        // Protocol:
+        //   1. Map test_virt → frame_A; write sentinel 0xAAAAAAAA into frame_A's HHDM alias.
+        //   2. AP reads test_virt → r1 (caches the TLB translation A in its TLB).
+        //   3. unmap(test_virt) [fires shootdown] then map(test_virt → frame_B) [no shootdown].
+        //   4. AP reads test_virt → r2.
+        //   r1=0xAAAAAAAA AND r2=0xBBBBBBBB → shootdown flushed the stale entry. PROOF.
+        //   r2=0xAAAAAAAA → stale TLB entry survived (shootdown broken). FAIL.
+        //
+        // We target the first ComputeApp AP (core 2 when ≥3 CPUs). Skipped if none exists.
+        {
+            use x86_64::{PhysAddr, VirtAddr};
+            use x86_64::structures::paging::PageTableFlags;
+
+            // A dedicated virt range that does not collide with any existing test mapping.
+            const TEST_VIRT: u64 = 0x4444_0000_0000;
+
+            let target_ap = (0..crate::cpu::cpus_online())
+                .find(|&c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp);
+
+            if let Some(target) = target_ap {
+                // Allocate two physical frames.
+                let frame_a = crate::memory::allocate_frame()
+                    .expect("tlb-test: failed to allocate frame A");
+                let frame_b = crate::memory::allocate_frame()
+                    .expect("tlb-test: failed to allocate frame B");
+
+                // Write sentinels into each frame via their HHDM alias.
+                let va_a = crate::memory::hhdm_virt(frame_a.start_address());
+                let va_b = crate::memory::hhdm_virt(frame_b.start_address());
+                unsafe {
+                    core::ptr::write_volatile(va_a.as_mut_ptr::<u32>(), 0xAAAAAAAAu32);
+                    core::ptr::write_volatile(va_b.as_mut_ptr::<u32>(), 0xBBBBBBBBu32);
+                }
+
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::NO_EXECUTE;
+
+                // Step 1: map test_virt → frame_A.
+                crate::memory::map_page(
+                    VirtAddr::new(TEST_VIRT),
+                    frame_a.start_address(),
+                    flags,
+                ).expect("tlb-test: map frame_A failed");
+
+                // Step 2: AP reads test_virt → r1 (caches translation A in its TLB).
+                fn read_virt(_input: &[u8]) -> u64 {
+                    unsafe { core::ptr::read_volatile(TEST_VIRT as *const u32) as u64 }
+                }
+                let mut fut1 = crate::smp::inbox::request(
+                    target,
+                    read_virt,
+                    alloc::boxed::Box::from(&[][..]),
+                );
+                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                fn tlb_noop(_: *const ()) {}
+                fn tlb_clone(_: *const ()) -> RawWaker {
+                    RawWaker::new(core::ptr::null(), &TLB_VT)
+                }
+                static TLB_VT: RawWakerVTable =
+                    RawWakerVTable::new(tlb_clone, tlb_noop, tlb_noop, tlb_noop);
+                let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &TLB_VT)) };
+                let mut cx = Context::from_waker(&waker);
+                let mut r1: Option<u64> = None;
+                for _ in 0..50_000_000u64 {
+                    if let Poll::Ready(v) = core::future::Future::poll(
+                        core::pin::Pin::new(&mut fut1), &mut cx,
+                    ) {
+                        r1 = Some(v);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                let r1 = r1.unwrap_or(0xDEAD);
+
+                // Step 3: unmap (fires shootdown → invalidates AP's cached entry),
+                // then remap to frame_B (map_page: no shootdown needed for new mapping).
+                let _ = crate::memory::unmap_page(VirtAddr::new(TEST_VIRT));
+                crate::memory::map_page(
+                    VirtAddr::new(TEST_VIRT),
+                    frame_b.start_address(),
+                    flags,
+                ).expect("tlb-test: map frame_B failed");
+
+                // Step 4: AP reads test_virt → r2.  Must see 0xBBBBBBBB (frame_B),
+                // not 0xAAAAAAAA (stale frame_A entry), proving the shootdown worked.
+                let mut fut2 = crate::smp::inbox::request(
+                    target,
+                    read_virt,
+                    alloc::boxed::Box::from(&[][..]),
+                );
+                let mut r2: Option<u64> = None;
+                for _ in 0..50_000_000u64 {
+                    if let Poll::Ready(v) = core::future::Future::poll(
+                        core::pin::Pin::new(&mut fut2), &mut cx,
+                    ) {
+                        r2 = Some(v);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                let r2 = r2.unwrap_or(0xDEAD);
+
+                // Clean up: unmap + free both frames.
+                let _ = crate::memory::unmap_page(VirtAddr::new(TEST_VIRT));
+                crate::memory::free_frame(frame_a);
+                crate::memory::free_frame(frame_b);
+
+                crate::binfo!(
+                    "tlb",
+                    "remap seen by ap: r1=0x{:X} r2=0x{:X} shootdown_ok={}",
+                    r1,
+                    r2,
+                    r1 == 0xAAAAAAAA && r2 == 0xBBBBBBBB
+                );
+            } else {
+                crate::binfo!("tlb", "remap test skipped (no ComputeApp AP)");
+            }
+        }
     }
 
     Ok(())

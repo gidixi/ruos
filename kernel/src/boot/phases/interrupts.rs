@@ -438,5 +438,51 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // C2a boot-check: spawn `cwasm_ap_probe` onto core 2 (a ComputeApp core)
+    // and wait for it to complete. The probe calls `run_echo_demo()` (the real
+    // WASI path: shared engine + WASI Linker + argv + per-instance Store) ON
+    // THAT CORE — proving the full run_cwasm WASI path works off the BSP.
+    // This de-risks C2b: routing real exec'd .cwasm apps to ComputeApp cores.
+    //
+    // Skipped if fewer than 3 CPUs or core 2 is not a ComputeApp core.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 3
+            && crate::cpu::core_role(2) == crate::cpu::CoreRole::ComputeApp
+        {
+            // Retry until core 2 has published its SendSpawner.
+            let mut spawned = false;
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(2, crate::executor::cwasm_ap_probe()).is_ok() {
+                    spawned = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            // Wait for the probe to finish. run_cwasm (WASI Linker + Store +
+            // instantiation + _start) is heavier than hello — give a generous budget.
+            let mut code: i32 = i32::MIN;
+            let mut ran: u32 = u32::MAX;
+            for _ in 0..200_000_000u64 {
+                let c = crate::executor::CWASM_AP_CODE
+                    .load(core::sync::atomic::Ordering::SeqCst);
+                if c != i32::MIN {
+                    code = c;
+                    ran  = crate::executor::CWASM_AP_RAN_ON
+                        .load(core::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            crate::binfo!(
+                "cwasm-ap",
+                "ran_on=core{} code={} spawned={} (expect core2, echo exit code)",
+                ran, code, spawned,
+            );
+        } else {
+            crate::binfo!("cwasm-ap", "skipped (<3 cores or core2 not ComputeApp)");
+        }
+    }
+
     Ok(())
 }

@@ -227,6 +227,38 @@ pub async fn cross_spawn_probe() {
     SPAWN_RAN_ON.store(crate::cpu::cpu_id(), core::sync::atomic::Ordering::SeqCst);
 }
 
+// ── C2a: WASI-path (run_cwasm) on AP probe ───────────────────────────────────
+
+/// C2a boot-check: which core the cwasm AP probe task ran on.
+/// Starts at u32::MAX (unset). The probe stores `cpu_id()` after run_echo_demo()
+/// returns, so the BSP can confirm the full WASI path executed on core 2.
+#[cfg(feature = "boot-checks")]
+pub static CWASM_AP_RAN_ON: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// C2a boot-check: exit code from `run_echo_demo()` on the AP.
+/// i32::MIN = unset (initial). Stores the actual exit code after the demo runs.
+#[cfg(feature = "boot-checks")]
+pub static CWASM_AP_CODE: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// C2a boot-check: probe task that runs `run_echo_demo()` (the REAL WASI app
+/// path: shared engine + WASI Linker + argv + per-instance Store) on whichever
+/// core embassy schedules it on. Spawned onto core 2 (a ComputeApp core) by the
+/// boot-check in `interrupts.rs`. Proves the full WASI run_cwasm path works off
+/// the BSP — de-risking C2b (routing real exec'd apps to AP cores).
+///
+/// Send-safe: `run_echo_demo` captures nothing non-Send (uses only `'static`
+/// slices and the shared ENGINE spin::Once).
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task]
+pub async fn cwasm_ap_probe() {
+    // run_echo_demo() = run_cwasm(ECHO_CWASM, argv, None) — the REAL WASI app path.
+    let code = crate::wasm::wt::run_echo_demo();
+    CWASM_AP_RAN_ON.store(crate::cpu::cpu_id(), core::sync::atomic::Ordering::SeqCst);
+    CWASM_AP_CODE.store(code, core::sync::atomic::Ordering::SeqCst);
+}
+
 // ── C1: WASM-on-AP probe ──────────────────────────────────────────────────────
 
 /// C1 boot-check: which core the WASM AP probe task ran on.

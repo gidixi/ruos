@@ -5,13 +5,18 @@ use super::pair::PtyPair;
 use super::termios::*;
 
 /// Process one input byte arriving at the master end (e.g. from the keyboard
-/// ISR or the SSH bridge). Handles termios.c_lflag modes.
+/// ISR or the SSH bridge). Handles termios.c_lflag modes. `idx` is the pair so
+/// delivered bytes go into the per-pair SPSC slave-input ring (the producer is
+/// the owner core, which runs this fn).
 ///
 /// Returns `Some(pid)` when a cooked-mode `^C` (VINTR) should cooperatively
 /// kill the foreground app `pid`; the caller performs the kill AFTER releasing
-/// the pair lock (this fn must not touch the proc registry under the lock).
+/// the pair lock (this fn must not touch the proc registry under the lock). The
+/// caller also wakes the slave consumer (`wake_slave`) after this returns —
+/// this fn no longer touches the slave waker (it lives outside the pair lock).
 #[must_use]
-pub fn process_input(pair: &mut PtyPair, byte: u8) -> Option<u32> {
+pub fn process_input(idx: usize, pair: &mut PtyPair, byte: u8) -> Option<u32> {
+    let ring = super::slave_rx_ring(idx);
     // ICRNL: \r -> \n on input
     let byte = if pair.termios.c_iflag & ICRNL != 0 && byte == b'\r' {
         b'\n'
@@ -20,8 +25,7 @@ pub fn process_input(pair: &mut PtyPair, byte: u8) -> Option<u32> {
     if pair.termios.c_lflag & ICANON == 0 {
         // Raw mode: byte passes through unchanged (apps like rtop read ^C=0x03
         // themselves). No signal handling.
-        pair.slave_rx.push_back(byte);
-        if let Some(w) = pair.slave_waker.take() { w.wake(); }
+        ring.push(byte);
         return None;
     }
 
@@ -32,11 +36,10 @@ pub fn process_input(pair: &mut PtyPair, byte: u8) -> Option<u32> {
             for &b in b"^C\r\n" { pair.master_out.push_back(b); }
             if let Some(w) = pair.master_waker.take() { w.wake(); }
         }
-        // Wake any stdin-blocked foreground reader so its read re-polls and
-        // returns EOF (the read checks foreground_pid's kill flag). The caller
-        // sets that flag via the returned pid.
-        if let Some(w) = pair.slave_waker.take() { w.wake(); }
-        return pair.foreground_pid;
+        // The caller wakes the stdin-blocked foreground reader so its read
+        // re-polls and returns EOF (the read checks foreground_pid's kill flag,
+        // which the caller sets via the returned pid).
+        return super::foreground_pid(idx);
     }
 
     if byte == pair.termios.c_cc[VERASE] {
@@ -50,21 +53,19 @@ pub fn process_input(pair: &mut PtyPair, byte: u8) -> Option<u32> {
     if byte == b'\n' {
         pair.line_buffer.push(b'\n');
         for b in pair.line_buffer.drain(..) {
-            pair.slave_rx.push_back(b);
+            ring.push(b);
         }
         if pair.termios.c_lflag & ECHO != 0 {
             for &b in b"\r\n" { pair.master_out.push_back(b); }
             if let Some(w) = pair.master_waker.take() { w.wake(); }
         }
-        if let Some(w) = pair.slave_waker.take() { w.wake(); }
         return None;
     }
 
     if byte == pair.termios.c_cc[VEOF] {
         for b in pair.line_buffer.drain(..) {
-            pair.slave_rx.push_back(b);
+            ring.push(b);
         }
-        if let Some(w) = pair.slave_waker.take() { w.wake(); }
         return None;
     }
 

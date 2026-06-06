@@ -67,32 +67,46 @@ impl File for PtySlaveFile {
         if buf.is_empty() { return Ok(0); }
         let idx = self.idx;
         let n = core::future::poll_fn(|cx| {
-            use x86_64::instructions::interrupts::without_interrupts;
             use core::task::Poll;
-            without_interrupts(|| {
-                let mut g = crate::pty::pair(idx).lock();
-                let mut n = 0;
-                while n < buf.len() {
-                    match g.slave_rx.pop_front() {
-                        Some(b) => { buf[n] = b; n += 1; }
-                        None => break,
-                    }
+            // Lock-free drain of the SPSC slave-input ring (no pair lock).
+            let mut n = 0;
+            while n < buf.len() {
+                match crate::pty::slave_rx_ring(idx).pop() {
+                    Some(b) => { buf[n] = b; n += 1; }
+                    None => break,
                 }
-                if n > 0 {
-                    Poll::Ready(Ok::<usize, VfsError>(n))
-                } else if crate::pty::is_shutdown(idx)
-                    || g.foreground_pid.map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
-                {
-                    // Pair was hung up (SSH session dropped / watchdog idle
-                    // timeout), OR the foreground app was `^C`'d / killed.
-                    // Return EOF so a stdin-blocked app unwinds and exits
-                    // (its fiber's post-dispatch kill check then fires).
-                    Poll::Ready(Ok::<usize, VfsError>(0))
-                } else {
-                    g.slave_waker = Some(cx.waker().clone());
-                    Poll::Pending
+            }
+            if n > 0 {
+                return Poll::Ready(Ok::<usize, VfsError>(n));
+            }
+            if crate::pty::is_shutdown(idx)
+                || crate::pty::foreground_pid(idx).map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+            {
+                // Pair was hung up (SSH session dropped / watchdog idle
+                // timeout), OR the foreground app was `^C`'d / killed.
+                // Return EOF so a stdin-blocked app unwinds and exits
+                // (its fiber's post-dispatch kill check then fires).
+                return Poll::Ready(Ok::<usize, VfsError>(0));
+            }
+            // Register the consumer waker, then re-check the ring + EOF (avoid a
+            // lost wake from a push that lands between the drain above and now).
+            crate::pty::register_slave_waker(idx, cx.waker().clone());
+            let mut n = 0;
+            while n < buf.len() {
+                match crate::pty::slave_rx_ring(idx).pop() {
+                    Some(b) => { buf[n] = b; n += 1; }
+                    None => break,
                 }
-            })
+            }
+            if n > 0 {
+                return Poll::Ready(Ok::<usize, VfsError>(n));
+            }
+            if crate::pty::is_shutdown(idx)
+                || crate::pty::foreground_pid(idx).map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+            {
+                return Poll::Ready(Ok::<usize, VfsError>(0));
+            }
+            Poll::Pending
         }).await?;
         if n > 0 { crate::pty::touch_activity(idx); }
         Ok(n)
@@ -101,12 +115,25 @@ impl File for PtySlaveFile {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
         if buf.is_empty() { return Ok(0); }
         let idx = self.idx;
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut g = crate::pty::pair(idx).lock();
-            for &b in buf {
-                crate::pty::ldisc::process_output(&mut g, b);
-            }
-        });
+        let owner = crate::pty::pty_owner(idx);
+        if crate::cpu::cpu_id() == owner {
+            // Local fast path (owner core): process_output into owner-local
+            // master_out. On 1 core this is always taken (today's behavior).
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut g = crate::pty::pair(idx).lock();
+                for &b in buf {
+                    crate::pty::ldisc::process_output(&mut g, b);
+                }
+            });
+        } else {
+            // Off-owner (e.g. .cwasm app on core 2): route the whole slice to
+            // the owner via the bus (one message per write() — same granularity
+            // as the local lock path). Owner runs process_output locally; the
+            // app core never locks the pair.
+            let n = crate::pty::route_write_to_owner(idx, buf).await;
+            crate::pty::touch_activity(idx);
+            return Ok(n);
+        }
         crate::pty::touch_activity(idx);
         Ok(buf.len())
     }

@@ -21,6 +21,92 @@ pub fn pair(idx: usize) -> &'static Mutex<PtyPair> {
     &PAIRS[idx]
 }
 
+/// Owner core for pair `idx`. v1: the BSP owns every pair (all PTY input + SSH
+/// master-read run on the BSP). Extension point: round-robin to dedicated
+/// pty-cores when core count grows — the SPSC ring stays valid as long as ONE
+/// core (the owner) is the sole producer of `idx`'s slave input.
+pub fn pty_owner(_idx: usize) -> u32 { 0 }
+
+/// Per-pair slave-input ring (replaces `PtyPair::slave_rx`). Producer = owner
+/// (line discipline); consumer = the app core reading stdin.
+static SLAVE_RX: [spsc::SpscRing; NUM_PAIRS] = [
+    spsc::SpscRing::new(), spsc::SpscRing::new(),
+    spsc::SpscRing::new(), spsc::SpscRing::new(),
+];
+pub fn slave_rx_ring(idx: usize) -> &'static spsc::SpscRing { &SLAVE_RX[idx] }
+
+/// Foreground pid per pair as an atomic (0 = none) so the app-side read path
+/// can check kill/EOF without taking the owner-local pair lock.
+static FOREGROUND: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+];
+
+/// Foreground app pid for pair `idx`, or `None` (at the shell prompt). Read by
+/// the app-side stdin path to detect a `^C`/kill and report EOF.
+pub fn foreground_pid(idx: usize) -> Option<u32> {
+    if idx >= NUM_PAIRS { return None; }
+    match FOREGROUND[idx].load(Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Per-pair slave-input consumer waker. The consumer (app core) registers its
+/// `Waker` here; the producer (owner) wakes it after `push`. Lives outside the
+/// pair lock so producer + consumer never share the pair lock just for the
+/// waker handoff.
+static SLAVE_WAKER: [crate::sync::IrqMutex<Option<core::task::Waker>>; NUM_PAIRS] =
+    [crate::sync::IrqMutex::new(None), crate::sync::IrqMutex::new(None),
+     crate::sync::IrqMutex::new(None), crate::sync::IrqMutex::new(None)];
+
+/// Consumer (app core): register the waker to be notified when input arrives.
+pub fn register_slave_waker(idx: usize, w: core::task::Waker) {
+    if idx >= NUM_PAIRS { return; }
+    *SLAVE_WAKER[idx].lock() = Some(w);
+}
+
+/// Producer (owner): wake the slave consumer after pushing input (or on shutdown).
+pub fn wake_slave(idx: usize) {
+    if idx >= NUM_PAIRS { return; }
+    if let Some(w) = SLAVE_WAKER[idx].lock().take() { w.wake(); }
+}
+
+/// Off-owner caller: send `buf` to pair `idx`'s owner; the owner appends it to
+/// master_out via process_output. Returns bytes accepted. One bus msg per call
+/// (same granularity as the owner-local lock path — no per-byte regression).
+pub async fn route_write_to_owner(idx: usize, buf: &[u8]) -> usize {
+    let owner = pty_owner(idx);
+    let mut input = alloc::vec::Vec::with_capacity(4 + buf.len());
+    input.extend_from_slice(&(idx as u32).to_le_bytes());
+    input.extend_from_slice(buf);
+    let n = crate::smp::inbox::request(owner, pty_write_op, input.into_boxed_slice()).await;
+    n as usize
+}
+
+/// Owner-side bus op: input = [idx:u32 le][bytes...]; run process_output locally
+/// into the owner's `master_out`. Plain `fn` (no captures) → valid bus op ptr.
+/// Takes ONLY the pair lock (no registry / other lock) → no cross-core
+/// contention (the owner is the sole locker) and no new ordering hazard.
+fn pty_write_op(input: &[u8]) -> u64 {
+    if input.len() < 4 { return 0; }
+    let idx = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    if idx >= NUM_PAIRS { return 0; }
+    let bytes = &input[4..];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut g = PAIRS[idx].lock();
+        for &b in bytes { ldisc::process_output(&mut g, b); }
+    });
+    #[cfg(feature = "boot-checks")]
+    PTY_ROUTED.fetch_add(1, Ordering::SeqCst);
+    bytes.len() as u64
+}
+
+/// Boot-check counter: incremented by the owner each time it runs `pty_write_op`
+/// (i.e. an off-owner write was routed to it). Used by the pty-route gate.
+#[cfg(feature = "boot-checks")]
+pub static PTY_ROUTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Called from boot fs phase after vfs::init.
 pub fn init() {
     crate::binfo!("pty", "{} pairs ready", NUM_PAIRS);
@@ -32,8 +118,12 @@ pub fn init() {
 pub fn master_input_push(idx: usize, byte: u8) {
     if idx >= NUM_PAIRS { return; }
     let mut g = PAIRS[idx].lock();
-    let kill = ldisc::process_input(&mut g, byte);
+    let kill = ldisc::process_input(idx, &mut g, byte);
     drop(g);
+    // Wake the slave consumer (app core) after dropping the pair lock: input was
+    // pushed into the SPSC ring (or a `^C` requires the reader to re-poll and see
+    // the kill). The ring's Release + this wake order the cross-core handoff.
+    wake_slave(idx);
     // `^C` on a foreground app: request its cooperative kill AFTER releasing the
     // pair lock (request_kill takes the proc REGISTRY lock; keeping the orders
     // disjoint avoids any pair<->registry deadlock).
@@ -48,8 +138,7 @@ pub fn master_input_push(idx: usize, byte: u8) {
 /// child exits, so `^C` knows which process to interrupt.
 pub fn set_foreground(idx: usize, pid: Option<u32>) {
     if idx >= NUM_PAIRS { return; }
-    use x86_64::instructions::interrupts::without_interrupts;
-    without_interrupts(|| { PAIRS[idx].lock().foreground_pid = pid; });
+    FOREGROUND[idx].store(pid.unwrap_or(0), Ordering::SeqCst);
 }
 
 /// Snapshot pair `idx`'s termios so the exec worker can restore it after a
@@ -163,11 +252,9 @@ static LAST_ACTIVITY: [AtomicU64; NUM_PAIRS] = [
 pub fn request_shutdown(idx: usize) {
     if idx >= NUM_PAIRS { return; }
     SHUTDOWN[idx].store(true, Ordering::SeqCst);
-    // Take + wake the slave waker so a blocked reader unblocks immediately.
-    let waker = x86_64::instructions::interrupts::without_interrupts(|| {
-        PAIRS[idx].lock().slave_waker.take()
-    });
-    if let Some(w) = waker { w.wake(); }
+    // Wake the slave consumer so a blocked reader unblocks immediately and sees
+    // EOF. The waker lives outside the pair lock (cross-core slot).
+    wake_slave(idx);
 }
 
 pub fn is_shutdown(idx: usize) -> bool {
@@ -196,30 +283,32 @@ pub async fn slave_read_one_timeout(idx: usize, timeout_ticks: u64) -> i32 {
     use core::future::Future;
     let mut delay = core::pin::pin!(crate::executor::delay::Delay::ticks(timeout_ticks));
     core::future::poll_fn(|cx| {
-        use x86_64::instructions::interrupts::without_interrupts;
         use core::task::Poll;
-        // First, try to consume a byte (or detect EOF). Register the slave
-        // waker while we hold the lock so a byte arriving right after we look
-        // is guaranteed to wake us.
-        let ready: Option<i32> = without_interrupts(|| {
-            let mut g = PAIRS[idx].lock();
-            if let Some(b) = g.slave_rx.pop_front() {
-                Some(b as i32)
-            } else if SHUTDOWN[idx].load(Ordering::Relaxed)
-                || g.foreground_pid.map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
-            {
-                // Pair hung up, or the foreground app was `^C`'d / killed —
-                // report EOF so the reader unwinds and the fiber's kill check
-                // fires.
-                Some(-2)
-            } else {
-                g.slave_waker = Some(cx.waker().clone());
-                None
-            }
-        });
-        if let Some(v) = ready {
-            if v >= 0 { touch_activity(idx); }
-            return Poll::Ready(v);
+        // Lock-free read from the SPSC ring (no pair lock). Register the
+        // consumer waker BEFORE the final emptiness re-check so a byte the
+        // producer pushes right after we look still wakes us.
+        if let Some(b) = slave_rx_ring(idx).pop() {
+            touch_activity(idx);
+            return Poll::Ready(b as i32);
+        }
+        if SHUTDOWN[idx].load(Ordering::Relaxed)
+            || foreground_pid(idx).map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+        {
+            // Pair hung up, or the foreground app was `^C`'d / killed — report
+            // EOF so the reader unwinds and the fiber's kill check fires.
+            return Poll::Ready(-2);
+        }
+        // Register the waker, then re-check the ring (avoid a lost wake from a
+        // push that lands between the pop above and the registration).
+        register_slave_waker(idx, cx.waker().clone());
+        if let Some(b) = slave_rx_ring(idx).pop() {
+            touch_activity(idx);
+            return Poll::Ready(b as i32);
+        }
+        if SHUTDOWN[idx].load(Ordering::Relaxed)
+            || foreground_pid(idx).map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false)
+        {
+            return Poll::Ready(-2);
         }
         // No byte yet — arm the timeout. `Delay` registers its own waker; the
         // future always completes, so it is dropped (freeing its slot) cleanly.

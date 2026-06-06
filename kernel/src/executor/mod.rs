@@ -1,4 +1,4 @@
-//! Cooperative async executor for ruos — per-core edition (Step 3b).
+//! Cooperative async executor for ruos — per-core edition (Step 3b/3c).
 //!
 //! Built on `embassy-executor`'s low-level `raw::Executor` API because
 //! the `x86_64-unknown-none` target isn't covered by any built-in
@@ -8,8 +8,9 @@
 //!
 //! Each core owns a slot in `PER_CORE_EXECUTOR` and calls `run_core(cpu)`
 //! exactly once, becoming the sole writer and sole poller for that slot.
-//! Cross-core task injection goes through a per-core spawn queue + IPI
-//! (Step 3c) — never a direct touch of a remote `RawExecutor`.
+//! Cross-core task injection (Step 3c) goes through embassy's `SendSpawner`,
+//! which enqueues atomically onto the target core's run-queue and calls
+//! `__pender(target)` → `wake_core(target)` → targeted IPI.
 //!
 //! The outer loop uses `sti; hlt` (atomic IRQ-enable + halt) so that
 //! the window between checking the wake flag and halting is
@@ -21,8 +22,10 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::raw::Executor as RawExecutor;
+use embassy_executor::SendSpawner;
 use x86_64::instructions::interrupts;
 use crate::kprintln;
+use crate::sync::IrqMutex;
 
 /// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
 /// core's run loop before each poll. (Was a single global AtomicBool — single-core.)
@@ -49,12 +52,53 @@ static PER_CORE_EXECUTOR: [ExecCell; crate::cpu::MAX_CPUS] = {
     [E; crate::cpu::MAX_CPUS]
 };
 
+/// Per-core `SendSpawner` slots. Published by `run_core` once that core's executor
+/// is initialised. Any core can call `spawn_on(target, token)` to enqueue a task
+/// onto `target`'s run-queue via embassy's atomic intrusive list — fully cross-core
+/// safe. Embassy then calls `__pender(target)` → `wake_core(target)` → targeted
+/// VEC_WAKE IPI → target leaves `hlt` and polls the new task.
+///
+/// `None` until the target core has entered `run_core`. `spawn_on` returns `Err`
+/// in that window (caller may retry). The `IrqMutex` protects against the rare
+/// case where a BSP publish and a simultaneous ISR-driven read race on the same
+/// slot (in practice the BSP publishes before APs are woken, so the window is tiny).
+static PER_CORE_SPAWNER: [IrqMutex<Option<SendSpawner>>; crate::cpu::MAX_CPUS] = {
+    const S: IrqMutex<Option<SendSpawner>> = IrqMutex::new(None);
+    [S; crate::cpu::MAX_CPUS]
+};
+
+/// Spawn `token` onto core `cpu`'s executor from any core. Returns `Err` if
+/// `cpu` hasn't entered `run_core` yet (spawner not yet published) or if the
+/// task pool for that task is exhausted.
+///
+/// This is the Step-3c cross-core spawn primitive: embassy enqueues the task
+/// atomically on `cpu`'s run-queue and calls `__pender(cpu)` → `wake_core(cpu)`
+/// → targeted VEC_WAKE IPI → that core leaves `hlt` and polls it.
+pub fn spawn_on<S: Send>(cpu: u32, token: embassy_executor::SpawnToken<S>)
+    -> Result<(), embassy_executor::SpawnError>
+{
+    let g = PER_CORE_SPAWNER[cpu as usize].lock();
+    match g.as_ref() {
+        Some(s) => s.spawn(token),
+        None    => Err(embassy_executor::SpawnError::Busy), // not ready; caller may retry
+    }
+}
+
 /// Boot-check heartbeat counter for AP1's per-core executor (Step 3b gate).
 /// Incremented by `heartbeat_task` every ~20 ms; checked in the interrupts phase
 /// boot-check to prove AP1's executor + Delay + timer fire end-to-end.
 #[cfg(feature = "boot-checks")]
 pub static HEARTBEAT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Step 3c boot-check: records which core the cross-spawn probe task RAN on.
+/// BSP sets this to u32::MAX; after spawn_on(1, cross_spawn_probe()), the probe
+/// (running on core 1) stores cpu_id(). `ran_on==1` proves the full chain:
+/// BSP→spawn_on(1)→embassy enqueue on core 1's run-queue→__pender(1)→wake_core(1)
+/// →IPI→core 1 leaves hlt→polls the probe.
+#[cfg(feature = "boot-checks")]
+pub static SPAWN_RAN_ON: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Run this core's cooperative executor forever. `cpu` is the dense core id; it
 /// is encoded into the executor context so `__pender` (Step 2) wakes THIS core.
@@ -72,6 +116,12 @@ pub fn run_core(cpu: u32) -> ! {
     };
 
     let spawner = exec.spawner();
+    // Publish this core's SendSpawner so other cores can spawn tasks here via
+    // `spawn_on`. Must be published BEFORE the first `hlt`, so tasks enqueued
+    // from other cores during bringup are never lost. `make_send()` captures
+    // the executor's `SyncExecutor` reference (embassy's cross-thread spawn handle).
+    *PER_CORE_SPAWNER[cpu as usize].lock() = Some(spawner.make_send());
+
     if cpu == 0 {
         // BSP owns the I/O task set (unchanged from the old run()).
         crate::binfo!("user", "executor: core 0 spawning tasks");
@@ -154,6 +204,16 @@ async fn heartbeat_task() {
         HEARTBEAT.fetch_add(1, Ordering::SeqCst);
         delay::Delay::ticks(2).await; // ~20 ms at 100 Hz; uses THIS core's Delay
     }
+}
+
+/// Step 3c boot-check: cross-core spawn probe. The BSP calls
+/// `spawn_on(1, cross_spawn_probe())` — if it really runs on core 1,
+/// `SPAWN_RAN_ON` will read 1 after the first poll. Send-safe (no non-Send
+/// captures), so `SendSpawner::spawn` accepts it.
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task]
+pub async fn cross_spawn_probe() {
+    SPAWN_RAN_ON.store(crate::cpu::cpu_id(), core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Runs child WASM processes on behalf of shell fibers that issue exec()

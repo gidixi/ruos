@@ -415,6 +415,40 @@ pub async fn parallel_probe(idx: u32, iters: u32) {
     PARALLEL_DONE.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }
 
+// ── Step 4 (pty-core): owner-routed write probe (boot-check) ─────────────────
+
+/// Step 4 boot-check: which core the pty-route probe ran on (u32::MAX = unset).
+#[cfg(feature = "boot-checks")]
+pub static PTY_ROUTE_RAN_ON: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Step 4 boot-check: 2 = unset, 1 = the owner ran `pty_write_op` for our routed
+/// write (PTY_ROUTED advanced) AND the byte count came back right, 0 = it didn't.
+#[cfg(feature = "boot-checks")]
+pub static PTY_ROUTE_OK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(2);
+
+/// Step 4 boot-check: spawned on a ComputeApp core (core 2), this probe calls
+/// `route_write_to_owner` for a test pair — an OFF-OWNER write that must hop to
+/// the owner (BSP, core 0) over the inbox bus and be processed there. Proves the
+/// app-core stdout path routes to the owner instead of locking the pair.
+///
+/// Send-safe: captures nothing non-Send (only `'static` and the byte literal).
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task]
+pub async fn pty_route_probe() {
+    // Pair 3: not used by the console/SSH path at boot-check time.
+    const TEST_IDX: usize = 3;
+    let before = crate::pty::PTY_ROUTED.load(core::sync::atomic::Ordering::SeqCst);
+    let n = crate::pty::route_write_to_owner(TEST_IDX, b"PTYROUTE").await;
+    let after = crate::pty::PTY_ROUTED.load(core::sync::atomic::Ordering::SeqCst);
+    let ran_on = crate::cpu::cpu_id();
+    // OK iff: the owner ran the op (counter advanced) and accepted all 8 bytes.
+    let ok = (after > before) && (n == 8);
+    PTY_ROUTE_RAN_ON.store(ran_on, core::sync::atomic::Ordering::SeqCst);
+    PTY_ROUTE_OK.store(ok as u32, core::sync::atomic::Ordering::SeqCst);
+}
+
 // ── C1: WASM-on-AP probe ──────────────────────────────────────────────────────
 
 /// C1 boot-check: which core the WASM AP probe task ran on.

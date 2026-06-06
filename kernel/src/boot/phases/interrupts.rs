@@ -484,6 +484,57 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // Step 4 (pty-core) boot-check: routed-write gate. Spawn `pty_route_probe`
+    // onto core 2 (a ComputeApp core). It calls `route_write_to_owner` for a
+    // test pair — an OFF-OWNER write that must hop to the owner (BSP) over the
+    // inbox bus and be processed there. Proves the app-core stdout path routes
+    // to the owner instead of locking the pair cross-core. Gate:
+    // `from=core2 routed_ok=true`.
+    //
+    // Skipped if fewer than 3 CPUs or core 2 is not a ComputeApp core.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 2
+            && crate::cpu::core_role(2) == crate::cpu::CoreRole::ComputeApp
+        {
+            let mut spawned = false;
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(2, crate::executor::pty_route_probe()).is_ok() {
+                    spawned = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            // Wait for the probe to publish its result. The routed write hops
+            // to the owner (BSP = core 0 = THIS core) over the inbox bus; the
+            // owner-side op runs when core 0 drains its inbox. During this boot
+            // phase the BSP is spinning here, NOT yet in its executor poll loop
+            // (which is what drains the inbox at runtime), so we MUST drain it
+            // by hand or the routed op never runs (the reply would never fire).
+            let mut ran: u32 = u32::MAX;
+            let mut ok: u32 = 2;
+            for _ in 0..200_000_000u64 {
+                crate::smp::inbox::drain_inbox(0);
+                let o = crate::executor::PTY_ROUTE_OK
+                    .load(core::sync::atomic::Ordering::SeqCst);
+                if o != 2 {
+                    ok = o;
+                    ran = crate::executor::PTY_ROUTE_RAN_ON
+                        .load(core::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            crate::binfo!(
+                "pty-route",
+                "from=core{} routed_ok={} spawned={}",
+                ran, ok == 1, spawned,
+            );
+        } else {
+            crate::binfo!("pty-route", "skipped (<3 cores or core2 not ComputeApp)");
+        }
+    }
+
     // C2d boot-check: parallelism gate. Proves that TWO `.cwasm` apps actually
     // EXECUTE on TWO DISTINCT ComputeApp cores AT THE SAME WALL TIME — the real
     // throughput win. Each probe now runs the CPU-heavy spin guest via the REAL

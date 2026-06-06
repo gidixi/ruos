@@ -1,9 +1,15 @@
-//! Cooperative async executor for ruos.
+//! Cooperative async executor for ruos — per-core edition (Step 3b).
 //!
 //! Built on `embassy-executor`'s low-level `raw::Executor` API because
 //! the `x86_64-unknown-none` target isn't covered by any built-in
 //! `arch-*` feature. We supply our own `__pender` (which sets a wake
-//! flag) and our own outer loop (which `hlt`s when no task is ready).
+//! flag + cross-core IPI) and our own outer loop (which `hlt`s when no
+//! task is ready).
+//!
+//! Each core owns a slot in `PER_CORE_EXECUTOR` and calls `run_core(cpu)`
+//! exactly once, becoming the sole writer and sole poller for that slot.
+//! Cross-core task injection goes through a per-core spawn queue + IPI
+//! (Step 3c) — never a direct touch of a remote `RawExecutor`.
 //!
 //! The outer loop uses `sti; hlt` (atomic IRQ-enable + halt) so that
 //! the window between checking the wake flag and halting is
@@ -25,78 +31,101 @@ static WAKE_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] = {
     [F; crate::cpu::MAX_CPUS]
 };
 
-/// Wrapper that allows `RawExecutor` to live in a `static`.
+/// Wrapper that allows `RawExecutor` to live in a `static` array.
 ///
 /// `RawExecutor` is `!Sync` because it carries a `PhantomData<*mut ()>`
-/// (the context pointer). Our kernel is single-CPU with no concurrent
-/// access; the `UnsafeCell<MaybeUninit<…>>` pattern is safe here.
+/// (the context pointer). The per-core executor model is safe here because
+/// each core touches ONLY its own `PER_CORE_EXECUTOR[cpu_id]` slot — it is
+/// the sole writer (in `run_core`) and the sole caller of `exec.poll()`.
+/// No core ever polls or spawns into another core's executor; cross-core
+/// task injection (Step 3c) goes through a per-core spawn queue + IPI,
+/// never a direct touch of a remote `RawExecutor`.
 struct ExecCell(UnsafeCell<MaybeUninit<RawExecutor>>);
-// SAFETY: exactly one core — the BSP — ever calls `run()` (from `kmain`),
-// and `run()` is the sole writer of the `UnsafeCell` and the sole caller of
-// `exec.poll()`. The cooperative executor is single-core BY DESIGN (the
-// 2026-05-28 pivot: concurrency = async cooperative on a single CPU, no
-// preemptive scheduler, no SMP run-queue). `crate::cpu::PER_CPU`/`this_cpu()`
-// provide per-core data for a FUTURE SMP phase, but the run-queue here is NOT
-// yet SMP-safe: `RawExecutor::poll` must be called serially and the spawn
-// queue is not cross-core-synchronized. A future SMP phase that brings up an
-// AP MUST revisit this `Sync` assertion before letting any second core touch
-// the executor (e.g. give each core its own executor, or add a real
-// SMP-safe run-queue). Today no AP is started, so no concurrent access exists.
+// SAFETY: see the doc comment above — single-writer per slot.
 unsafe impl Sync for ExecCell {}
 
-static EXECUTOR: ExecCell = ExecCell(UnsafeCell::new(MaybeUninit::uninit()));
+static PER_CORE_EXECUTOR: [ExecCell; crate::cpu::MAX_CPUS] = {
+    const E: ExecCell = ExecCell(UnsafeCell::new(MaybeUninit::uninit()));
+    [E; crate::cpu::MAX_CPUS]
+};
 
-/// Drive the kernel forever as a cooperative task system.
+/// Boot-check heartbeat counter for AP1's per-core executor (Step 3b gate).
+/// Incremented by `heartbeat_task` every ~20 ms; checked in the interrupts phase
+/// boot-check to prove AP1's executor + Delay + timer fire end-to-end.
+#[cfg(feature = "boot-checks")]
+pub static HEARTBEAT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Run this core's cooperative executor forever. `cpu` is the dense core id; it
+/// is encoded into the executor context so `__pender` (Step 2) wakes THIS core.
 ///
-/// Spawns the bootstrap task, then enters the idle loop: poll, check
-/// for pending wakes, halt with IRQs enabled, repeat.  Returns never.
-pub fn run() -> ! {
-    // SAFETY: called exactly once from kmain after init. The
-    // UnsafeCell is only written here; the `&'static` reference is
-    // valid for the remainder of the kernel's lifetime.
+/// The BSP (cpu 0) spawns the full I/O task set. APs spawn nothing by default
+/// here (Step 3c injects tasks later via a queue+IPI); under `boot-checks` AP1
+/// also spawns a heartbeat task to prove the per-core executor + Delay + timer
+/// chain end-to-end.
+pub fn run_core(cpu: u32) -> ! {
+    // SAFETY: called exactly once per core, on that core. This core is the sole
+    // writer of its `PER_CORE_EXECUTOR[cpu]` slot and the sole caller of poll().
     let exec: &'static RawExecutor = unsafe {
-        let slot = &mut *EXECUTOR.0.get();
-        slot.write(RawExecutor::new(0usize as *mut ())) // context = BSP owner id 0
+        let slot = &mut *PER_CORE_EXECUTOR[cpu as usize].0.get();
+        slot.write(RawExecutor::new(cpu as usize as *mut ())) // context = owner core id
     };
 
     let spawner = exec.spawner();
-    crate::binfo!("user", "executor: spawning tasks");
-    spawner.spawn(tick_task()).unwrap();
-    spawner.spawn(net_poll_task()).unwrap();
-    spawner.spawn(usb_poll_task()).unwrap();
-    spawner.spawn(console_drain_task()).unwrap();
-    // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
-    // and server/client.wasm live under /root/ as runnable demo blobs
-    // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
-    spawner.spawn(boot_shell_task()).unwrap();
-    spawner.spawn(exec_worker_task()).unwrap();
-    spawner.spawn(pipeline_worker_task()).unwrap();
-    spawner.spawn(ssh_serve_task()).unwrap();
-    spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
-    spawner.spawn(pty_watchdog_task()).unwrap();
-    spawner.spawn(service_dispatcher_task()).unwrap();
-    crate::binfo!("user", "executor: all tasks spawned, entering poll loop");
+    if cpu == 0 {
+        // BSP owns the I/O task set (unchanged from the old run()).
+        crate::binfo!("user", "executor: core 0 spawning tasks");
+        spawner.spawn(tick_task()).unwrap();
+        spawner.spawn(net_poll_task()).unwrap();
+        spawner.spawn(usb_poll_task()).unwrap();
+        spawner.spawn(console_drain_task()).unwrap();
+        // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
+        // and server/client.wasm live under /root/ as runnable demo blobs
+        // (e.g. `/init.wasm`, `/root/server.wasm`) for debug purposes.
+        spawner.spawn(boot_shell_task()).unwrap();
+        spawner.spawn(exec_worker_task()).unwrap();
+        spawner.spawn(pipeline_worker_task()).unwrap();
+        spawner.spawn(ssh_serve_task()).unwrap();
+        spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
+        spawner.spawn(pty_watchdog_task()).unwrap();
+        spawner.spawn(service_dispatcher_task()).unwrap();
+        crate::binfo!("user", "executor: core 0 tasks spawned");
+    }
+
+    // 3b test hook: AP 1 runs a heartbeat task to prove the per-core executor
+    // + per-core Delay + AP timer work end-to-end. Only under boot-checks.
+    #[cfg(feature = "boot-checks")]
+    if cpu == 1 {
+        spawner.spawn(heartbeat_task()).unwrap();
+    }
 
     loop {
         // Clear the wake flag *before* polling so any wakes raised
         // during this poll round are visible to the post-poll check.
-        WAKE_PENDING[0].store(false, Ordering::SeqCst);
-        // SAFETY: raw::Executor::poll must be called serially. The
-        // kernel is single-threaded and we call it only from here.
+        WAKE_PENDING[cpu as usize].store(false, Ordering::SeqCst);
+        // SAFETY: raw::Executor::poll must be called serially per core.
+        // Each core polls only its own executor — no concurrent access.
         let poll_start = crate::boot::clock::read_tsc();
         unsafe { exec.poll(); }
-        // Drain any inter-core messages addressed to the BSP (core 0).
-        crate::smp::inbox::drain_inbox(0);
+        // Drain any inter-core messages addressed to this core.
+        crate::smp::inbox::drain_inbox(cpu);
+        // Drain the compute pool so banded compositing keeps workers.
+        // Moved here from ap_worker_loop — any core may take pool jobs.
+        while let Some(slot) = crate::smp::pool::take() {
+            crate::smp::pool::run_slot(slot, cpu);
+        }
         crate::sched::cpustat::add_busy(
-            0, crate::boot::clock::read_tsc().saturating_sub(poll_start));
+            cpu as usize, crate::boot::clock::read_tsc().saturating_sub(poll_start));
 
-        // Disable IRQs to atomically check WAKE_PENDING and decide
+        // Disable IRQs to atomically check all wake sources and decide
         // between halt and re-poll. Without the disable, an ISR could
         // raise WAKE_PENDING after our load but before our hlt,
         // causing a missed wake.
         interrupts::disable();
-        // Halt only if no wake AND no inbox work pending (avoid missed inbox wake).
-        if WAKE_PENDING[0].load(Ordering::SeqCst) || crate::smp::inbox::is_pending(0) {
+        let more = WAKE_PENDING[cpu as usize].load(Ordering::SeqCst)
+            || crate::smp::inbox::is_pending(cpu)
+            || !crate::smp::pool::is_empty();
+        if more {
             interrupts::enable();
             // Re-poll immediately; some waker fired during poll().
         } else {
@@ -106,8 +135,24 @@ pub fn run() -> ! {
             let hlt_start = crate::boot::clock::read_tsc();
             interrupts::enable_and_hlt();
             crate::sched::cpustat::add_idle(
-                0, crate::boot::clock::read_tsc().saturating_sub(hlt_start));
+                cpu as usize, crate::boot::clock::read_tsc().saturating_sub(hlt_start));
         }
+    }
+}
+
+/// BSP entry (kept for call-site compatibility). Drives core 0's executor.
+pub fn run() -> ! { run_core(0) }
+
+/// 3b boot-check: AP1 heartbeat task. Increments `HEARTBEAT` every ~20 ms
+/// (Delay::ticks(2) at 100 Hz) to prove AP1's per-core executor is polling,
+/// its Delay future registers in AP1's per-core list, and AP1's LAPIC timer
+/// wakes it — the full 3a+3b chain.
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task]
+async fn heartbeat_task() {
+    loop {
+        HEARTBEAT.fetch_add(1, Ordering::SeqCst);
+        delay::Delay::ticks(2).await; // ~20 ms at 100 Hz; uses THIS core's Delay
     }
 }
 

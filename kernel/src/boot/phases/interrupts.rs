@@ -130,6 +130,41 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // Step 3c boot-check: BSP spawns a probe task onto core 1 via spawn_on().
+    // If the cross-core spawn + wake chain works, the probe runs on core 1
+    // and stores cpu_id()==1 into SPAWN_RAN_ON. `ran_on=core1` is the proof.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 2 {
+            // Retry until core 1 has published its SendSpawner (it enters run_core
+            // during bringup, so usually the very first attempt succeeds).
+            let mut spawned = false;
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(1, crate::executor::cross_spawn_probe()).is_ok() {
+                    spawned = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            // Wait for the probe to run on core 1 (woken via cross-core IPI).
+            let mut ran_on = u32::MAX;
+            for _ in 0..50_000_000u64 {
+                let v = crate::executor::SPAWN_RAN_ON
+                    .load(core::sync::atomic::Ordering::SeqCst);
+                if v != u32::MAX { ran_on = v; break; }
+                core::hint::spin_loop();
+            }
+            crate::binfo!(
+                "exec",
+                "cross-spawn ran_on=core{} (spawned={}, expect core1)",
+                ran_on,
+                spawned,
+            );
+        } else {
+            crate::binfo!("exec", "cross-spawn skipped (1 core)");
+        }
+    }
+
     #[cfg(feature = "boot-checks")]
     {
         let ok = crate::memory::exec::self_test();

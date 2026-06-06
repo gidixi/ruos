@@ -227,6 +227,37 @@ pub async fn cross_spawn_probe() {
     SPAWN_RAN_ON.store(crate::cpu::cpu_id(), core::sync::atomic::Ordering::SeqCst);
 }
 
+// ── C1: WASM-on-AP probe ──────────────────────────────────────────────────────
+
+/// C1 boot-check: which core the WASM AP probe task ran on.
+/// Starts at u32::MAX (unset). The probe stores `cpu_id()` here so the BSP
+/// can confirm the task ran on the expected ComputeApp core, not the BSP.
+#[cfg(feature = "boot-checks")]
+pub static WASM_AP_RAN_ON: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// C1 boot-check: result of `run_hello_demo()` on the AP.
+/// 2 = unset (initial), 1 = ok (demo returned true), 0 = fail.
+#[cfg(feature = "boot-checks")]
+pub static WASM_AP_OK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(2);
+
+/// C1 boot-check: probe task that runs `run_hello_demo()` (wasmtime AOT,
+/// hello.cwasm) on whichever core embassy schedules it on. Spawned onto core 2
+/// (a ComputeApp core) by the boot-check in `interrupts.rs`. Proves the
+/// wasmtime AOT runtime instantiates + executes correctly off the BSP —
+/// de-risking C2 before we wire real exec'd apps to AP cores.
+///
+/// Send-safe: `run_hello_demo` captures nothing non-Send (it uses only
+/// `'static` slices and the shared ENGINE spin::Once).
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task]
+pub async fn wasm_ap_probe() {
+    let ok = crate::wasm::wt::run_hello_demo();
+    WASM_AP_RAN_ON.store(crate::cpu::cpu_id(), core::sync::atomic::Ordering::SeqCst);
+    WASM_AP_OK.store(ok as u32, core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Runs child WASM processes on behalf of shell fibers that issue exec()
 /// calls. This task has its own embassy-allocated stack frame, so wasmi
 /// compilation (which is stack-heavy) doesn't overflow the shell fiber.

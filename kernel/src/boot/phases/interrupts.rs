@@ -391,6 +391,51 @@ pub fn init() -> Result<(), BootError> {
                 crate::binfo!("tlb", "remap test skipped (no ComputeApp AP)");
             }
         }
+
+        // C1 boot-check: spawn `wasm_ap_probe` onto core 2 (a ComputeApp core)
+        // and wait for it to complete. The probe calls `run_hello_demo()` (the
+        // embedded hello.cwasm via wasmtime AOT) ON THAT CORE — proving the
+        // runtime instantiates + executes correctly off the BSP.
+        //
+        // Skipped if there are fewer than 3 CPUs (core 2 does not exist) or
+        // core 2 is not a ComputeApp core (unexpected role assignment).
+        {
+            if crate::cpu::cpus_online() >= 3
+                && crate::cpu::core_role(2) == crate::cpu::CoreRole::ComputeApp
+            {
+                // Retry until core 2 has published its SendSpawner.
+                let mut spawned = false;
+                for _ in 0..1_000_000u64 {
+                    if crate::executor::spawn_on(2, crate::executor::wasm_ap_probe()).is_ok() {
+                        spawned = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                // Wait for the probe to finish (wasmtime instantiation is sync +
+                // heavier than the other probes — give it a generous spin budget).
+                let mut ok: u32 = 2;
+                let mut ran: u32 = u32::MAX;
+                for _ in 0..200_000_000u64 {
+                    let o = crate::executor::WASM_AP_OK
+                        .load(core::sync::atomic::Ordering::SeqCst);
+                    if o != 2 {
+                        ok  = o;
+                        ran = crate::executor::WASM_AP_RAN_ON
+                            .load(core::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::binfo!(
+                    "wasm-ap",
+                    "ran_on=core{} ok={} spawned={} (expect core2 ok=1)",
+                    ran, ok, spawned,
+                );
+            } else {
+                crate::binfo!("wasm-ap", "skipped (<3 cores or core2 not ComputeApp)");
+            }
+        }
     }
 
     Ok(())

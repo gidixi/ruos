@@ -152,6 +152,11 @@ pub fn calibrate(ms: u32, pm_timer: Option<(u16, bool)>) -> u32 {
 pub fn set_timer_periodic(vector: u8, initial_count: u32) {
     // SAFETY: init ran.
     unsafe {
+        // Divide config = 16 — MUST match calibrate()'s divider (set in init() on the
+        // BSP) so `initial_count` yields the calibrated rate. Set it HERE so the AP
+        // path is self-contained: init_ap() does NOT set the DCR, so without this an
+        // AP would arm its timer at the reset-default divider and tick ~16x too fast.
+        write_volatile(reg(REG_TIMER_DIV), 0x3);
         write_volatile(reg(REG_LVT_TIMER), TIMER_MODE_PERIODIC | vector as u32);
         write_volatile(reg(REG_TIMER_INIT), initial_count);
     }

@@ -118,29 +118,20 @@ $(WT_KDIR)/cat.cwasm: user-bin/cat.wasm $(WT_PRECOMPILE)
 .PHONY: wt-cwasm
 wt-cwasm: $(WT_KCWASMS)
 
-# The egui desktop: built from the ruos-desktop submodule (gui-core +
-# ruos-backend) as wasm32-wasip1, then AOT-precompiled to gui.cwasm.
+# ruos-desktop submodule: the egui desktop UI, grouped as crates/ (portable libs
+# gui-core + ruos-window) + apps/ (per-window cdylib wasm) + backends/ (PC dev).
+# Built wasm32-wasip1 and AOT-precompiled to .cwasm by the rules below. NOTE: the
+# old monolithic desktop (gui.cwasm from `ruos-backend`) was RETIRED with the
+# Model A pivot — each window is now its own app .cwasm (shell + about/files/
+# terminal/system + egui-demo). `ruos-backend` and its rule no longer exist.
 RUOS_DESKTOP ?= ruos-desktop
-# Rebuild gui.cwasm whenever a gui-core/ruos-backend source or manifest changes.
-# Without these prereqs the rule depends only on the precompiler, so Make reuses
-# a stale .cwasm after editing the submodule (had to `rm -f build/gui.cwasm`).
-# Enumerated by find at parse time; empty + safe if the submodule isn't checked
-# out. cargo stays incremental, so only the changed crate recompiles.
-RUOS_DESKTOP_SRCS := $(shell find $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-backend/src -name '*.rs' 2>/dev/null) \
-                     $(wildcard $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock \
-                                $(RUOS_DESKTOP)/gui-core/Cargo.toml $(RUOS_DESKTOP)/ruos-backend/Cargo.toml)
-build/gui.cwasm: $(WT_PRECOMPILE) $(RUOS_DESKTOP_SRCS)
-	@mkdir -p build
-	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && \
-		cargo build -p ruos-backend --target wasm32-wasip1 --release
-	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/gui.wasm build/gui.cwasm
 
 # egui CSD demo window (SP-B): compositor-app built wasm32-wasip1 (std, gui-core),
 # then AOT-precompiled to a CORE .cwasm embedded in the kernel (NOT a component).
-# The workspace puts the output under ruos-desktop/target/ (a shared target dir,
-# like ruos-backend), not under compositor-app/target/.
-EGUI_DEMO_SRCS := $(shell find $(RUOS_DESKTOP)/compositor-app/src $(RUOS_DESKTOP)/gui-core/src -name '*.rs' 2>/dev/null) \
-                  $(wildcard $(RUOS_DESKTOP)/compositor-app/Cargo.toml \
+# The workspace puts the output under ruos-desktop/target/ (a shared target dir),
+# not under apps/compositor-app/target/.
+EGUI_DEMO_SRCS := $(shell find $(RUOS_DESKTOP)/apps/compositor-app/src $(RUOS_DESKTOP)/crates/gui-core/src -name '*.rs' 2>/dev/null) \
+                  $(wildcard $(RUOS_DESKTOP)/apps/compositor-app/Cargo.toml \
                              $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock)
 kernel/src/wasm/wt/egui_demo.cwasm: $(WT_PRECOMPILE) $(EGUI_DEMO_SRCS)
 	@mkdir -p build
@@ -153,8 +144,8 @@ kernel/src/wasm/wt/egui_demo.cwasm: $(WT_PRECOMPILE) $(EGUI_DEMO_SRCS)
 # to a CORE .cwasm shipped at /bin/shell.cwasm. The compositor boots this as the
 # full-screen background window. Like egui-demo the output lands under the shared
 # ruos-desktop/target/ dir; the crate also pulls ruos-window, so its src is a prereq.
-SHELL_SRCS := $(shell find $(RUOS_DESKTOP)/shell/src $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-window/src -name '*.rs' 2>/dev/null) \
-              $(wildcard $(RUOS_DESKTOP)/shell/Cargo.toml $(RUOS_DESKTOP)/ruos-window/Cargo.toml \
+SHELL_SRCS := $(shell find $(RUOS_DESKTOP)/apps/shell/src $(RUOS_DESKTOP)/crates/gui-core/src $(RUOS_DESKTOP)/crates/ruos-window/src -name '*.rs' 2>/dev/null) \
+              $(wildcard $(RUOS_DESKTOP)/apps/shell/Cargo.toml $(RUOS_DESKTOP)/crates/ruos-window/Cargo.toml \
                          $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock)
 kernel/src/wasm/wt/shell.cwasm: $(WT_PRECOMPILE) $(SHELL_SRCS)
 	@mkdir -p build
@@ -167,21 +158,21 @@ kernel/src/wasm/wt/shell.cwasm: $(WT_PRECOMPILE) $(SHELL_SRCS)
 # shipped to /bin/<id>.cwasm and spawned by the shell launcher (wm.spawn(id)). Shared
 # prereqs = gui-core + ruos-window src + the workspace manifests; each app rule adds its
 # own crate's src/manifest. Note the underscore in the wasm output (about-app→about_app.wasm).
-APP_SRCS := $(shell find $(RUOS_DESKTOP)/gui-core/src $(RUOS_DESKTOP)/ruos-window/src -name '*.rs' 2>/dev/null) \
+APP_SRCS := $(shell find $(RUOS_DESKTOP)/crates/gui-core/src $(RUOS_DESKTOP)/crates/ruos-window/src -name '*.rs' 2>/dev/null) \
             $(wildcard $(RUOS_DESKTOP)/Cargo.toml $(RUOS_DESKTOP)/Cargo.lock)
-build/about.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/about-app/src/*.rs $(RUOS_DESKTOP)/about-app/Cargo.toml)
+build/about.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/about-app/src/*.rs $(RUOS_DESKTOP)/apps/about-app/Cargo.toml)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p about-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/about_app.wasm build/about.cwasm
-build/files.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/files-app/src/*.rs $(RUOS_DESKTOP)/files-app/Cargo.toml)
+build/files.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/files-app/src/*.rs $(RUOS_DESKTOP)/apps/files-app/Cargo.toml)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p files-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/files_app.wasm build/files.cwasm
-build/terminal.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/terminal-app/src/*.rs $(RUOS_DESKTOP)/terminal-app/Cargo.toml)
+build/terminal.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/terminal-app/src/*.rs $(RUOS_DESKTOP)/apps/terminal-app/Cargo.toml)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p terminal-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/terminal_app.wasm build/terminal.cwasm
-build/system.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/system-app/src/*.rs $(RUOS_DESKTOP)/system-app/Cargo.toml)
+build/system.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/system-app/src/*.rs $(RUOS_DESKTOP)/apps/system-app/Cargo.toml)
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p system-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/system_app.wasm build/system.cwasm

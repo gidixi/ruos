@@ -17,19 +17,110 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::memory::{allocate_frame, free_frame, map_page, unmap_page, set_flags};
 
 // ---------------------------------------------------------------------------
-// TLS — a single pointer (single-threaded executor).
+// TLS — one pointer PER CORE. Wasmtime stores per-activation CallThreadState
+// here; with concurrent execution on multiple cores a single global pointer
+// would be corrupted across cores, so index by cpu_id(). cpu_id() is the fast
+// RDTSCP path (~23 ns) — cheap enough for the tls_get/set hot path.
 // ---------------------------------------------------------------------------
+use crate::cpu::MAX_CPUS;
 
-static TLS: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static TLS: [AtomicPtr<u8>; MAX_CPUS] = {
+    const Z: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+    [Z; MAX_CPUS]
+};
 
 #[no_mangle]
 pub extern "C" fn wasmtime_tls_get() -> *mut u8 {
-    TLS.load(Ordering::SeqCst)
+    TLS[crate::cpu::cpu_id() as usize].load(Ordering::SeqCst)
 }
 
 #[no_mangle]
 pub extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
-    TLS.store(ptr, Ordering::SeqCst);
+    TLS[crate::cpu::cpu_id() as usize].store(ptr, Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------
+// Custom sync primitives (`custom-sync-primitives` feature). no_std Wasmtime's
+// default locks PANIC on contention; with this feature it calls these shims so
+// multiple cores can run wasm concurrently. State lives inline in the 8-byte
+// cell Wasmtime hands us (zero-init = unlocked). We spin with IRQs ENABLED so a
+// waiting core still services timer + TLB-shootdown IPIs (no `cli` here).
+// Locks are non-reentrant (matches std Mutex/RwLock semantics Wasmtime assumes).
+// ---------------------------------------------------------------------------
+use core::sync::atomic::AtomicUsize;
+
+#[inline]
+fn lock_cell(lock: *mut usize) -> &'static AtomicUsize {
+    // SAFETY: Wasmtime guarantees `lock` points to a live, 8-byte-aligned cell
+    // it zero-initialized and uses only via these shims for its lifetime.
+    unsafe { &*(lock as *const AtomicUsize) }
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_lock_acquire(lock: *mut usize) {
+    let a = lock_cell(lock); // 0 = unlocked (zero-init), 1 = locked
+    while a
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_lock_release(lock: *mut usize) {
+    lock_cell(lock).store(0, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_lock_free(_lock: *mut usize) {
+    // Inline state — nothing to free.
+}
+
+/// RwLock encoding in the cell: 0 = free, 1..=(MAX-1) = N readers,
+/// usize::MAX = one writer (exclusive). Reader count never approaches MAX
+/// (≤ MAX_CPUS concurrent readers), so the sentinel is unambiguous.
+const RW_WRITER: usize = usize::MAX;
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_rwlock_read(lock: *mut usize) {
+    let a = lock_cell(lock);
+    loop {
+        let s = a.load(Ordering::Relaxed);
+        if s != RW_WRITER
+            && a.compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_rwlock_read_release(lock: *mut usize) {
+    lock_cell(lock).fetch_sub(1, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_rwlock_write(lock: *mut usize) {
+    let a = lock_cell(lock);
+    while a
+        .compare_exchange_weak(0, RW_WRITER, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_rwlock_write_release(lock: *mut usize) {
+    lock_cell(lock).store(0, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_sync_rwlock_free(_lock: *mut usize) {
+    // Inline state — nothing to free.
 }
 
 // ---------------------------------------------------------------------------

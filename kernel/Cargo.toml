@@ -20,7 +20,7 @@ wasmi_core = { version = "1.0.9", default-features = false }
 # Wasmtime AOT runtime (no_std, runtime-only — no Cranelift/Winch). Spike for
 # the egui desktop: runs precompiled .cwasm at near-native speed. See
 # docs/superpowers/plans/2026-06-04-wasmtime-nostd-spike.md
-wasmtime = { version = "=45.0.0", default-features = false, features = ["runtime", "custom-virtual-memory", "component-model"] }
+wasmtime = { version = "=45.0.0", default-features = false, features = ["runtime", "custom-virtual-memory", "custom-sync-primitives", "component-model"] }
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ip", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-icmp"] }
 virtio-drivers = "0.13"
 rand_chacha = { version = "0.3", default-features = false }

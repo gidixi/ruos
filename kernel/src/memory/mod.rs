@@ -11,11 +11,7 @@ pub mod exec;
 #[cfg(feature = "boot-checks")]
 pub mod allocbench;
 
-#[cfg(feature = "alloc-magazine")]
 pub mod alloc_magazine;
-
-#[cfg(feature = "alloc-percore-talc")]
-pub mod alloc_percore_talc;
 
 pub use heap::{ALLOCATOR, HEAP_SIZE, HeapInfo, HeapInitError, init_heap, heap_region};
 pub use frames::{FrameCounts, FrameInitError, allocate_frame, free_frame, frame_counts,

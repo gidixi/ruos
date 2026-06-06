@@ -41,8 +41,10 @@ xhci = "0.9"
 [features]
 boot-checks = []
 wasm-trace = []
-alloc-magazine = []
-alloc-percore-talc = []
+# Escape hatch: build with plain global talc (no per-core magazine). Use as a
+# bisect baseline when investigating allocator-related regressions. The default
+# (no flag) uses MagazineAlloc.
+legacy-talc = []
 # When set, the USB boot phase synchronously drains enumeration, prints a
 # one-screen device summary, and halts — so a real machine with no serial can
 # be photographed to see WHERE USB enumeration breaks. Diagnostic only.

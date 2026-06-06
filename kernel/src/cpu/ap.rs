@@ -34,11 +34,12 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     ap_worker_loop()
 }
 
-/// AP worker loop: drain pure-CPU jobs from the pool, then `hlt` until a wake
-/// IPI arrives. The BSP sends the wake IPI on every `submit`. Anti-missed-wake:
-/// disable IRQs and re-check the queue before sleeping, so a job submitted
-/// between the drain and the `hlt` is not missed (the `sti; hlt` is atomic —
-/// the IPI cannot fire in the 1-instruction shadow of `sti`).
+/// AP worker loop: drain pure-CPU jobs from the pool + inter-core inbox messages,
+/// then `hlt` until a wake IPI arrives. The BSP sends the wake IPI on every
+/// `submit`. Anti-missed-wake: disable IRQs and re-check all queues before
+/// sleeping, so a job or message submitted between the drain and the `hlt` is not
+/// missed (the `sti; hlt` is atomic — the IPI cannot fire in the 1-instruction
+/// shadow of `sti`).
 fn ap_worker_loop() -> ! {
     let me = crate::cpu::cpu_id() as usize;
     loop {
@@ -49,16 +50,21 @@ fn ap_worker_loop() -> ! {
             crate::sched::cpustat::add_busy(
                 me, crate::boot::clock::read_tsc().saturating_sub(busy_start));
         }
+
+        // Run any inter-core messages addressed to this core.
+        crate::smp::inbox::drain_inbox(me as u32);
+
         // No work: sleep until woken, charging the halt as idle.
         x86_64::instructions::interrupts::disable();
-        if crate::smp::pool::is_empty() {
+        if crate::smp::pool::is_empty() && !crate::smp::inbox::is_pending(me as u32) {
             let idle_start = crate::boot::clock::read_tsc();
             // Atomic sti;hlt — the wake IPI cannot land between the two.
             x86_64::instructions::interrupts::enable_and_hlt();
             crate::sched::cpustat::add_idle(
                 me, crate::boot::clock::read_tsc().saturating_sub(idle_start));
         } else {
-            // A job arrived during the drain/disable window; re-enable and loop.
+            // A job or inbox message arrived during the drain/disable window;
+            // re-enable and loop.
             x86_64::instructions::interrupts::enable();
         }
     }

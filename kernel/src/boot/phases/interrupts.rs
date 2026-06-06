@@ -61,6 +61,39 @@ pub fn init() -> Result<(), BootError> {
         crate::memory::allocbench::run_multicore();
     }
 
+    // Step 2 boot-check: BSP→AP1 message round-trip. Proves targeted IPI delivery,
+    // AP inbox drain, op execution, reply publish, and future resolution on the BSP.
+    #[cfg(feature = "boot-checks")]
+    {
+        if crate::cpu::cpus_online() >= 2 {
+            // op: sum the input bytes; run it on core 1.
+            fn sum_op(input: &[u8]) -> u64 { input.iter().map(|&b| b as u64).sum() }
+            let input: alloc::boxed::Box<[u8]> = alloc::boxed::Box::from(&[1u8, 2, 3, 4][..]);
+            let mut fut = crate::smp::inbox::request(1, sum_op, input);
+            // Drive the future inline (no executor in this phase). A no-op waker is
+            // fine — we poll in a bounded spin; the AP completes the reply async.
+            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            fn noop(_: *const ()) {}
+            fn clone_waker(_: *const ()) -> RawWaker { RawWaker::new(core::ptr::null(), &VT) }
+            static VT: RawWakerVTable = RawWakerVTable::new(clone_waker, noop, noop, noop);
+            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+            let mut cx = Context::from_waker(&waker);
+            let mut result = None;
+            for _ in 0..50_000_000u64 {
+                if let Poll::Ready(v) = core::future::Future::poll(core::pin::Pin::new(&mut fut), &mut cx) {
+                    result = Some(v); break;
+                }
+                core::hint::spin_loop();
+            }
+            match result {
+                Some(v) => crate::binfo!("inbox", "roundtrip ok core1 sum={} (expect 10)", v),
+                None    => crate::binfo!("inbox", "roundtrip TIMEOUT"),
+            }
+        } else {
+            crate::binfo!("inbox", "roundtrip skipped (1 core)");
+        }
+    }
+
     #[cfg(feature = "boot-checks")]
     {
         let ok = crate::memory::exec::self_test();

@@ -34,7 +34,7 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test run-ssh-gui-test
 
 all: iso
 
@@ -309,6 +309,18 @@ run-dm-test:
 .PHONY: run-comp-smp-test
 run-comp-smp-test:
 	@bash tests/comp-smp-test.sh
+
+# Step 5 GOAL GATE — SSH alive while the compositor runs on a dedicated GUI core.
+# Builds the ISO with the compositor init script, boots with -smp 4 (so cpu 1
+# becomes the GuiCompositor core), waits for the hand-off marker, then SSHes.
+# PASS requires: "compositor handed off to gui core" in serial + "auth ok" in
+# serial + interactive "ruos:/$" prompt from the SSH client.
+# This directly proves the BSP executor (ssh_serve_task) stayed alive while the
+# compositor ran — i.e. THE GOAL of Step 5.
+.PHONY: run-ssh-gui-test
+run-ssh-gui-test: ssh-key-on-disk
+	@$(MAKE) iso INIT_SCRIPT=user-bin/compositor-init.sh
+	bash tests/ssh-during-gui-test.sh
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.

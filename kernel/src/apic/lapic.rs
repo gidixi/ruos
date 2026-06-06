@@ -84,6 +84,20 @@ pub fn send_ipi_all_but_self(vector: u8) {
     }
 }
 
+/// Send a fixed IPI with `vector` to a SINGLE target core, addressed by its
+/// xAPIC `lapic_id` (physical destination mode). Dest-shorthand bits 18-19
+/// are 0 (no shorthand) so the destination comes from ICR_HIGH bits 24-31.
+/// Used for targeted cross-core wake (VEC_WAKE) and inbox delivery (VEC_INBOX).
+pub fn send_ipi(lapic_id: u32, vector: u8) {
+    // No shorthand (bits 18-19 = 0) → use physical destination in ICR_HIGH.
+    let low = ICR_DELIVERY_FIXED | ICR_LEVEL_ASSERT | vector as u32;
+    // SAFETY: init ran. Write HIGH first (sets dest), then LOW (dispatches IPI).
+    unsafe {
+        write_volatile(reg(REG_ICR_HIGH), lapic_id << 24); // dest in bits 24-31 (xAPIC)
+        write_volatile(reg(REG_ICR_LOW), low);
+    }
+}
+
 /// Calibrate the LAPIC timer: run it at max count for `ms` milliseconds measured
 /// LAPIC ticks elapsed, measuring the `ms` window against the best reference.
 ///

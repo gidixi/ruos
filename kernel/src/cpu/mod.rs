@@ -139,6 +139,13 @@ pub fn init_bsp(kernel_stack_top: u64) -> bool {
     gs_ok
 }
 
+/// xAPIC id of dense core `cpu` (for targeted IPIs). Reads PER_CPU[cpu].lapic_id.
+/// SAFETY: PER_CPU[cpu] was filled at bring-up before that core ran; lapic_id is
+/// written once and read-only after. cpu < MAX_CPUS by construction.
+pub fn lapic_id_of(cpu: u32) -> u32 {
+    unsafe { (*core::ptr::addr_of!(PER_CPU.0[cpu as usize])).lapic_id }
+}
+
 /// Register `lapic_id -> cpu_id` and populate PER_CPU[cpu_id]'s identity.
 /// Called by the BSP for itself (id 0) and for each AP BEFORE the AP starts.
 pub fn set_cpu_mapping(lapic_id: u32, cpu_id: u8) {

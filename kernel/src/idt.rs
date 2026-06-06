@@ -12,6 +12,13 @@ pub const VEC_KEYBOARD:    u8 = 0x21;
 pub const VEC_MOUSE:       u8 = 0x22;
 /// IPI vector the BSP sends to wake sleeping AP worker cores (SMP Fase 2).
 pub const VEC_WAKE:        u8 = 0x40;
+/// IPI vector: inter-core inbox delivery (Step 2). Handler marks this core's
+/// inbox pending + EOIs; the core's run loop then drains its inbox.
+pub const VEC_INBOX:         u8 = 0x41;
+/// Reserved (Step 3 — cross-core TLB shootdown). No handler yet.
+pub const VEC_TLB_SHOOTDOWN: u8 = 0x42;
+/// Reserved (Step 6 — supervisor core reset). No handler yet.
+pub const VEC_RESET:         u8 = 0x43;
 pub const VEC_SPURIOUS:    u8 = 0xFF;
 
 static IDT: spin::Once<InterruptDescriptorTable> = spin::Once::new();
@@ -36,6 +43,7 @@ pub fn init() {
         idt[VEC_KEYBOARD].set_handler_fn(crate::keyboard::keyboard_handler);
         idt[VEC_MOUSE].set_handler_fn(crate::mouse::mouse_handler);
         idt[VEC_WAKE].set_handler_fn(wake_handler);
+        idt[VEC_INBOX].set_handler_fn(inbox_handler);
 
         idt
     });
@@ -90,6 +98,13 @@ extern "x86-interrupt" fn bp_handler(frame: InterruptStackFrame) {
 /// AP wake IPI handler. No-op beyond EOI — its only purpose is to pull a
 /// sleeping AP out of `hlt` so its worker loop re-checks the job queue.
 extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
+    crate::apic::lapic::eoi();
+}
+
+/// Inbox-delivery IPI handler. Marks this core's inbox as pending so its loop
+/// (executor poll / AP worker) drains it, then EOIs.
+extern "x86-interrupt" fn inbox_handler(_frame: InterruptStackFrame) {
+    crate::smp::inbox::mark_pending(crate::cpu::cpu_id());
     crate::apic::lapic::eoi();
 }
 

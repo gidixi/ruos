@@ -2,6 +2,7 @@
 //! MpRequest and wait until they're online. Fase 1 parks each AP in `hlt`
 //! (see `cpu::ap::ap_entry`); no scheduler/IRQs yet (Fase 2).
 
+pub mod inbox;
 pub mod pool;
 
 /// Start all non-BSP CPUs and wait (bounded) for them to register online.

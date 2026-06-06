@@ -484,8 +484,12 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
-    // C2c boot-check: parallelism gate. Proves that TWO `.cwasm` apps can run
-    // on TWO DISTINCT ComputeApp cores CONCURRENTLY (the C2c throughput win).
+    // C2d boot-check: parallelism gate. Proves that TWO `.cwasm` apps actually
+    // EXECUTE on TWO DISTINCT ComputeApp cores AT THE SAME WALL TIME — the real
+    // throughput win. Each probe now runs the CPU-heavy spin guest via the REAL
+    // `run_cwasm(spin.cwasm)` path (WASI linker + instantiate + execute), so the
+    // overlap measured here exercises wasmtime concurrency (custom-sync-primitives
+    // + per-core TLS), NOT a bare compute loop.
     //
     // Protocol (≥ 4 CPUs, cores 2+3 both ComputeApp):
     //   1. Run ONE `parallel_probe(0, N)` on core 2 alone and time it → single_ms.
@@ -494,8 +498,8 @@ pub fn init() -> Result<(), BootError> {
     //   3. concurrent_ms ≈ single_ms (not ≈ 2×single_ms) → overlap proven → PASS.
     //   4. Each probe also records `cpu_id()` → ran=[c0,c1] must be distinct.
     //
-    // N is kept small (3 iterations) to keep boot time low while still
-    // producing a measurable time difference on 3+ iteration runs.
+    // N is kept at 1 because each iteration is now a full ~300-800 ms
+    // run_cwasm(spin.cwasm), not cheap arithmetic — one run is plenty measurable.
     //
     // Skipped on < 4 CPUs (core 3 does not exist) or if cores 2/3 are not
     // ComputeApp (unexpected role assignment).
@@ -511,7 +515,7 @@ pub fn init() -> Result<(), BootError> {
             && crate::cpu::core_role(3) == crate::cpu::CoreRole::ComputeApp;
 
         if has_core2_compute && has_core3_compute {
-            const ITERS: u32 = 3; // 3 × run_echo_demo per probe
+            const ITERS: u32 = 1; // 1 × run_cwasm(spin.cwasm) per probe (~300-800 ms each)
 
             // ── Phase 0: single baseline ─────────────────────────────────────
             // Reset done counter + run ONE probe on core 2, timed.

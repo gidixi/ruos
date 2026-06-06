@@ -104,9 +104,11 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 # .wat/.wasm inputs so the (large) .cwasm need not be committed.
 WT_KDIR    := kernel/src/wasm/wt
 WT_KCWASMS := $(WT_KDIR)/hello.cwasm $(WT_KDIR)/gfxtest.cwasm \
-              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm
+              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/spin.cwasm: tools/wt-spin/spin.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/gfxtest.cwasm: tools/wt-gfxtest/gfx.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@

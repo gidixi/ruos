@@ -43,6 +43,19 @@ pub fn run_echo_demo() -> i32 {
     run_cwasm(ECHO_CWASM, alloc::vec![b"echo".to_vec(), b"WT-ECHO-OK".to_vec()], None)
 }
 
+/// Embedded CPU-heavy spin guest (`tools/wt-spin/spin.wat` precompiled). Busy-
+/// loops ~2e9 iterations (~300-800 ms on QEMU) then exits 0. Used by the C2d
+/// parallel-exec gate to put real, measurable wasm load on two cores at once.
+#[cfg(feature = "boot-checks")]
+static SPIN_CWASM: &[u8] = include_bytes!("spin.cwasm");
+
+/// Boot-check: run the CPU-heavy spin guest via the REAL run_cwasm path
+/// (WASI linker + instantiate + execute). Returns the guest exit code (0).
+#[cfg(feature = "boot-checks")]
+pub fn run_spin_demo() -> i32 {
+    run_cwasm(SPIN_CWASM, alloc::vec::Vec::new(), None)
+}
+
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]

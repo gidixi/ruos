@@ -396,35 +396,18 @@ pub static PARALLEL_ACC: [core::sync::atomic::AtomicU64; 2] = [
     core::sync::atomic::AtomicU64::new(0),
 ];
 
-/// C2c boot-check: each probe burns CPU doing pure computation (no wasmtime —
-/// wasmtime's no_std sync panics on concurrent Engine access, so we use a
-/// bare computation loop that is safe to run in parallel on multiple cores).
-/// Records its core id and bumps PARALLEL_DONE when done.
-///
-/// Two of these are spawned on core 2 and core 3 simultaneously; if both
-/// complete in ≈ single-run time, they ran in parallel on distinct cores.
-/// The loop count is tuned to be measurable (≥ 100 ms) on QEMU.
-///
-/// Uses a volatile write to prevent the optimizer from eliding the loop.
-///
-/// `pool_size = 2`: exactly two probes run concurrently.
+/// C2d parallelism probe: runs the CPU-heavy spin `.cwasm` via run_cwasm
+/// `iters` times on whatever core embassy scheduled it on. Two of these on
+/// cores 2 and 3 concurrently => if wall ≈ single-run, wasm ran in PARALLEL
+/// (custom-sync-primitives + per-core TLS working). This is THE real proof.
 #[cfg(feature = "boot-checks")]
 #[embassy_executor::task(pool_size = 2)]
 pub async fn parallel_probe(idx: u32, iters: u32) {
-    // Pure computation: xor/add/mul mix, no shared mutable state.
-    // ~200M ops per iteration. The result is stored to PARALLEL_ACC so the
-    // optimizer cannot elide the loop (observable side effect via atomic store).
-    let ops_per_iter: u64 = 200_000_000;
-    let total_ops = ops_per_iter * (iters as u64);
-    let mut acc: u64 = (idx as u64).wrapping_add(1) ^ 0xDEAD_BEEF_CAFE_1234;
-    for i in 0..total_ops {
-        acc = acc.wrapping_add(i)
-            .wrapping_mul(0x6C62272E07BB0142)
-            ^ (acc >> 17)
-            ^ (acc << 23);
+    let mut last: i32 = 0;
+    for _ in 0..iters {
+        last = crate::wasm::wt::run_spin_demo();
     }
-    // Commit the accumulator to a static so the loop is not elided.
-    PARALLEL_ACC[idx as usize].store(acc, core::sync::atomic::Ordering::SeqCst);
+    PARALLEL_ACC[idx as usize].store(last as u64, core::sync::atomic::Ordering::SeqCst);
     PARALLEL_RAN[idx as usize].store(
         crate::cpu::cpu_id(),
         core::sync::atomic::Ordering::SeqCst,

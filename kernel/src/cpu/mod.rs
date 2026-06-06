@@ -70,6 +70,18 @@ pub fn core_role(cpu: u32) -> CoreRole {
     }
 }
 
+/// First online ComputeApp core (dense id), or `None` if no such core exists
+/// (i.e. 1- or 2-core systems where only the BSP and/or the GuiCompositor AP
+/// are present). Used by C2b to route `.cwasm` exec off the BSP.
+///
+/// On ≥3 cores the layout is: core 0 = BspIo, core 1 = GuiCompositor, core 2+
+/// = ComputeApp. The total number of cores is `1 + cpus_online()` (the BSP
+/// always exists; `cpus_online()` counts APs that called `mark_online()`).
+pub fn first_compute_app_core() -> Option<u32> {
+    let total = 1 + cpus_online();
+    (1..total).find(|&c| core_role(c) == CoreRole::ComputeApp)
+}
+
 #[repr(C)]
 pub struct PerCpu {
     /// MUST be offset 0: a pointer to self, so `mov rax, gs:[0]` loads &PerCpu.

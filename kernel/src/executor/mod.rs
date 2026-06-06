@@ -20,12 +20,88 @@ pub mod delay;
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use embassy_executor::raw::Executor as RawExecutor;
 use embassy_executor::SendSpawner;
 use x86_64::instructions::interrupts;
 use crate::kprintln;
 use crate::sync::IrqMutex;
+
+// ── C2b: single-slot reply for routed .cwasm exec ────────────────────────────
+
+/// Single-slot completion channel for the routed `.cwasm` exec path (C2b).
+/// The exec_worker (BSP) arms it before `spawn_on`, then awaits `AppReplyFuture`.
+/// The AP task (`run_app_on_core`) calls `APP_REPLY.complete(code)` when done,
+/// which stores the code + sets done=true + wakes the BSP waiter.
+///
+/// Single-slot: exec is serialised by the single-slot EXEC_QUEUE, so only one
+/// routed app runs at a time. C2c will extend this to per-core slots.
+struct AppReply {
+    code:  AtomicI32,
+    done:  AtomicBool,
+    waker: IrqMutex<Option<core::task::Waker>>,
+}
+static APP_REPLY: AppReply = AppReply {
+    code:  AtomicI32::new(0),
+    done:  AtomicBool::new(false),
+    waker: IrqMutex::new(None),
+};
+impl AppReply {
+    /// Arm before spawning the AP task. Clears `done` so the future blocks until
+    /// the AP calls `complete`.
+    fn arm(&self) {
+        self.done.store(false, Ordering::SeqCst);
+    }
+    /// Called by the AP task when run_cwasm returns. Stores the exit code, marks
+    /// done, and wakes the BSP exec_worker future (cross-core wake via __pender).
+    fn complete(&self, code: i32) {
+        self.code.store(code, Ordering::SeqCst);
+        self.done.store(true, Ordering::SeqCst);  // release of code
+        if let Some(w) = self.waker.lock().take() { w.wake(); } // → BSP
+    }
+}
+
+/// Future that blocks the BSP exec_worker until the AP task completes. While
+/// pending, the BSP executor keeps polling all other tasks (net/usb/ssh) — THE GOAL.
+struct AppReplyFuture;
+impl core::future::Future for AppReplyFuture {
+    type Output = i32;
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>)
+        -> core::task::Poll<i32>
+    {
+        if APP_REPLY.done.load(Ordering::SeqCst) {
+            return core::task::Poll::Ready(APP_REPLY.code.load(Ordering::SeqCst));
+        }
+        // Register waker before the second check to avoid a missed-wake race:
+        // if the AP completes between the first load and here, it calls wake()
+        // on this waker and done becomes true.
+        *APP_REPLY.waker.lock() = Some(cx.waker().clone());
+        if APP_REPLY.done.load(Ordering::SeqCst) {
+            core::task::Poll::Ready(APP_REPLY.code.load(Ordering::SeqCst))
+        } else {
+            core::task::Poll::Pending
+        }
+    }
+}
+
+/// C2b: runs `run_cwasm` on whatever core it is spawned onto (always a ComputeApp
+/// core, chosen by `first_compute_app_core`). Owns the bytes and argv (moved in,
+/// Send). When done it calls `APP_REPLY.complete(code)` which wakes the BSP exec
+/// worker via the cross-core pender → IPI chain (Step 2 mechanism).
+///
+/// `pool_size=1`: exec is single-slot (EXEC_QUEUE is single-slot); only one
+/// routed app runs at a time. C2c bumps pool_size + adds per-core slots.
+#[embassy_executor::task(pool_size = 1)]
+async fn run_app_on_core(
+    bytes: alloc::boxed::Box<[u8]>,
+    argv:  alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    pts:   usize,
+) {
+    let cpu  = crate::cpu::cpu_id();
+    let code = crate::wasm::wt::run_cwasm(&bytes, argv, Some(pts));
+    crate::binfo!("exec-ap", "ran_on=core{} code={}", cpu, code);
+    APP_REPLY.complete(code);
+}
 
 /// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
 /// core's run loop before each poll. (Was a single global AtomicBool — single-core.)
@@ -341,10 +417,42 @@ async fn exec_worker_task() {
                     let pid = crate::proc::register(
                         alloc::string::String::from(slot.path.trim_start_matches('/')),
                     );
-                    // stdout/stderr bound to the caller's PTY slave (reaches the
-                    // terminal / SSH channel, like a rebound wasmi tool). stdin
-                    // is EOF for now (blocking PTY reads need epoch/async — TODO).
-                    let c = crate::wasm::wt::run_cwasm(&bytes, slot.argv, Some(slot.term_pts));
+                    // C2b: route .cwasm exec to the first ComputeApp core so the
+                    // BSP executor stays free for I/O (net/usb/ssh) while the app
+                    // runs. VFS read + proc::register stay on the BSP (stack kept
+                    // small); the AP task only runs run_cwasm (≈ C2a profile).
+                    //
+                    // Borrow discipline: compute the target core FIRST, THEN either:
+                    //   Some(core) → move bytes into the AP task (Box<[u8]> + await)
+                    //   None       → run inline with &bytes (1–2 core fallback)
+                    // This avoids moving bytes before the decision, which would
+                    // leave the inline arm without access to them.
+                    let c = match crate::cpu::first_compute_app_core() {
+                        Some(core) => {
+                            APP_REPLY.arm();
+                            let boxed = bytes.into_boxed_slice();
+                            match spawn_on(core, run_app_on_core(boxed, slot.argv, slot.term_pts)) {
+                                Ok(()) => {
+                                    // BSP exec_worker yields here; the BSP executor
+                                    // keeps polling net/usb/ssh while the AP runs.
+                                    AppReplyFuture.await
+                                }
+                                Err(_) => {
+                                    // Pool busy (should not happen with single-slot
+                                    // EXEC_QUEUE + pool_size=1, but be safe).
+                                    crate::bwarn!("exec-ap", "spawn_on({}) failed — pool busy; return 127", core);
+                                    127
+                                }
+                            }
+                        }
+                        None => {
+                            // 1-2 core system: no ComputeApp AP — run inline on BSP.
+                            // stdout/stderr bound to the caller's PTY slave (reaches
+                            // the terminal / SSH channel, like a rebound wasmi tool).
+                            // stdin is EOF for now (blocking PTY reads need async).
+                            crate::wasm::wt::run_cwasm(&bytes, slot.argv, Some(slot.term_pts))
+                        }
+                    };
                     crate::proc::unregister(pid);
                     c
                 }

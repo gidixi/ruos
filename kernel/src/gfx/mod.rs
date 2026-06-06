@@ -226,13 +226,17 @@ static BTN_M: AtomicBool = AtomicBool::new(false);
 /// Drain the raw mouse queue, fold deltas into an absolute position (clamped to
 /// the screen), and emit MouseMove/MouseButton GUI events.
 ///
-/// Called by the GUI every frame. A sync GUI owns the executor and never yields,
-/// so the async `usb_poll_task` is starved while it runs — USB is polled, not
-/// interrupt-driven, so without this the USB keyboard/mouse go dead in the GUI
-/// (PS/2 keeps working because it is IRQ-driven). Pump the USB controller here so
-/// USB HID reports are serviced and injected before we fold them.
+/// Called by the compositor every frame (on the dedicated GUI core in Step 5).
+/// The BSP executor (alive because the compositor was handed off) runs
+/// `usb_poll_task` which keeps pumping USB, so the old `usb::poll()` band-aid
+/// is no longer needed here — removing it lets the BSP own USB completely.
+/// PS/2 was always IRQ-driven and unaffected.
+///
+/// 1-core fallback note: when the compositor falls back to inline (no GUI core),
+/// the BSP IS the GUI loop and `usb_poll_task` is starved again. That is an
+/// accepted degradation on the 1-core path (USB mouse/keyboard go dead in the
+/// GUI, exactly as before Step 5). The multi-core path — the target — is correct.
 pub fn fold_mouse() {
-    crate::usb::poll();
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
     let mut moved = false;

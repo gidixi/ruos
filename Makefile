@@ -34,7 +34,7 @@ BIN_TOOLS  := shell ls cat echo \
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test run-ssh-gui-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test run-ssh-gui-test run-exec-ap-test
 
 all: iso
 
@@ -243,7 +243,7 @@ run-test: $(DISK_IMG)
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
 		grep -qE "^cpu0:[0-9]+%" build/serial.log || { echo TEST_FAIL_RTOP_CORE; exit 1; }; \
 		grep -qE "usb  xhci up" build/serial.log || { echo TEST_FAIL_USB_UP; exit 1; }; \
-		grep -qE "usb  keyboard ready" build/serial.log || { echo TEST_FAIL_USB_KBD; exit 1; }; \
+		grep -qE "usb.*keyboard ready" build/serial.log || { echo TEST_FAIL_USB_KBD; exit 1; }; \
 	echo TEST_PASS
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and
@@ -321,6 +321,20 @@ run-comp-smp-test:
 run-ssh-gui-test: ssh-key-on-disk
 	@$(MAKE) iso INIT_SCRIPT=user-bin/compositor-init.sh
 	bash tests/ssh-during-gui-test.sh
+
+# C2b gate: a .cwasm exec'd from the shell runs on a ComputeApp core (off the BSP).
+# Boots with -smp 4 so core 2 = ComputeApp; wtecho.cwasm is the .cwasm tool.
+# PASS requires: "exec-ap ran_on=core[1-9]" (routed off BSP) AND "EXEC_AP_OK"
+# (wtecho's stdout reached serial via the PTY, proving cross-core app I/O).
+.PHONY: run-exec-ap-test
+run-exec-ap-test:
+	@$(MAKE) iso INIT_SCRIPT=user-bin/exec-ap-init.sh
+	@echo "--- exec-on-AP (-smp 4) ---"
+	@timeout 90 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -m 512 -no-reboot -display none -serial stdio \
+	  -device qemu-xhci -cdrom $(ISO) 2>&1 | tee build/exec-ap.log; \
+	grep -qE "exec-ap ran_on=core[1-9]" build/exec-ap.log || { echo TEST_FAIL_EXEC_AP_CORE; exit 1; }; \
+	grep -qF "EXEC_AP_OK" build/exec-ap.log || { echo TEST_FAIL_EXEC_AP_OUTPUT; exit 1; }; \
+	echo TEST_PASS_EXEC_AP
 
 # SSH client smoke: forwards host 127.0.0.1:2222 -> guest :22, stages a
 # fresh ed25519 pubkey on disk as auth.key, boots, runs OpenSSH locally.

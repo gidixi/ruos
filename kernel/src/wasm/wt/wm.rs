@@ -424,6 +424,11 @@ pub struct WmState {
     /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
     /// then clears it.
     pub bg_request: bool,
+    /// Damage flag: set by `wm.commit` (the guest drew a new surface this frame),
+    /// cleared by the run loop before each `frame_all`. The compositor presents a
+    /// frame only when SOME window committed (or geometry changed) — an idle app
+    /// that commits nothing keeps its last surface and costs no composite/blit.
+    pub committed: bool,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -465,6 +470,7 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
                 s.pixels = b;
                 s.win_w = w as u32;
                 s.win_h = h as u32;
+                s.committed = true; // damage: this window drew a new surface this frame
             }
         })?;
     // wm.app_id() -> u32: this instance's window id. (Import name is `app_id`
@@ -572,7 +578,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -648,6 +654,11 @@ pub struct Compositor {
     pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
     pub free_ids: Vec<u32>,        // SP5: window-ids returned by reaped windows (LIFO)
     pub next_id: u32,              // SP5: next never-used id (high-water mark)
+    /// Damage flag for GEOMETRY/window-set changes (raise, drag, spawn, reap,
+    /// bg-pin) — things that change the composite even when no window committed
+    /// new pixels. ORed with "any window committed" to decide whether `present`
+    /// runs this frame; reset after each present. Starts `true` (first frame).
+    pub dirty: bool,
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -688,6 +699,7 @@ impl Compositor {
             backbuf: Vec::new(),
             free_ids: Vec::new(),
             next_id: 0,
+            dirty: true,
         };
 
         // Initial window = the userspace desktop SHELL. Prefer the VFS
@@ -727,6 +739,7 @@ impl Compositor {
             backbuf: Vec::new(),
             free_ids: Vec::new(),
             next_id: 0,
+            dirty: true,
         }
     }
 
@@ -784,6 +797,7 @@ impl Compositor {
         if idx >= self.wins.len() { return idx; }
         let last = self.wins.len() - 1;
         if idx == last { return last; }
+        self.dirty = true; // z-order change → recomposite
         let w = self.wins.remove(idx);
         self.wins.push(w);
         // Keep `self.focused` pointing at the same window if it moved.
@@ -814,7 +828,10 @@ impl Compositor {
             let fh = h as i32;
             let nx = (cx - grab.0).clamp(0, (sw_screen - fw).max(0)) as u32;
             let ny = (cy - grab.1).clamp(0, (sh_screen - fh).max(0)) as u32;
-            self.wins[i].rect = (nx, ny, w, h);
+            if (nx, ny) != (self.wins[i].rect.0, self.wins[i].rect.1) {
+                self.dirty = true; // window moved → recomposite
+                self.wins[i].rect = (nx, ny, w, h);
+            }
         }
     }
 
@@ -825,6 +842,7 @@ impl Compositor {
     /// The SOLE place a window leaves `wins` (close + reap both route here).
     fn remove_at(&mut self, i: usize) {
         if i >= self.wins.len() { return; }
+        self.dirty = true; // a window left the set → recomposite
         let w = self.wins.remove(i); // Drop tears down Store+Instance (frees guest mem)
         crate::proc::unregister(w.pid);
         self.free_ids.push(w.id);
@@ -878,7 +896,7 @@ impl Compositor {
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
                                move_requested: false, spawn_request: VecDeque::new(),
-                               bg_request: false },
+                               bg_request: false, committed: false },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -963,16 +981,22 @@ impl Compositor {
     }
 
     /// CSD: the window IS its raw committed surface — no kernel decorations. Returns
-    /// `(pixels, x, y, w, h)`: the guest's last-committed RGBA8888 surface placed at
-    /// `Window.rect`'s origin, sized to the committed `win_w × win_h` (so the band
-    /// kernel's `src_stride = w*4` matches the committed buffer exactly). The app
-    /// draws its OWN title bar / [X] / content. Returns None if nothing committed yet.
-    fn compose_window(&self, idx: usize) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+    /// `(ptr, len, x, y, w, h)`: a BORROWED pointer to the guest's last-committed
+    /// RGBA8888 surface placed at `Window.rect`'s origin, sized to the committed
+    /// `win_w × win_h` (so the band kernel's `src_stride = w*4` matches the buffer
+    /// exactly). The app draws its OWN title bar / [X] / content. None if nothing
+    /// committed yet.
+    ///
+    /// Leva 0 (no per-frame clone): the pointer aliases `WmState.pixels` in the
+    /// window's Store. `present` does NOT mutate `self.wins` between calling this
+    /// and the `dispatch_bands` join, so the pixels are neither freed nor realloc'd
+    /// while the band jobs read them — the borrow outlives the parallel composite.
+    fn compose_window(&self, idx: usize) -> Option<(*const u8, usize, u32, u32, u32, u32)> {
         let win = &self.wins[idx];
         let s = win.store.data();
         if s.win.pixels.is_empty() { return None; }
         let (x, y, _, _) = win.rect;
-        Some((s.win.pixels.clone(), x, y, s.win.win_w, s.win.win_h))
+        Some((s.win.pixels.as_ptr(), s.win.pixels.len(), x, y, s.win.win_w, s.win.win_h))
     }
 
     /// Call `frame()` on every window's instance (the gate's get_typed_func loop,
@@ -1031,47 +1055,44 @@ impl Compositor {
             self.wins[bi].rect = (0, 0, sw, sh);
         }
 
-        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order),
+        // 1) BSP: build footprint descriptors bottom->top (z = `wins` Vec order),
         //    but with the `bg` window FIRST (z-bottom, forced to origin (0,0)).
-        //    Keep them ALIVE in `foots` across the join so the band jobs' raw
-        //    pointers (into each footprint buffer) stay valid for the whole
-        //    parallel composite.
-        let mut foots: alloc::vec::Vec<(alloc::vec::Vec<u8>, u32, u32, u32, u32)> =
+        //    Leva 0: each descriptor BORROWS the window's committed surface in
+        //    place (no clone). The pixels live in each window's Store and are NOT
+        //    mutated between here and the `dispatch_bands` join, so the raw
+        //    pointers stay valid for the whole parallel composite.
+        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32)> =
             alloc::vec::Vec::new();
         if let Some(bi) = bg_idx {
             // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
-            if let Some((px, _, _, fw, fh)) = self.compose_window(bi) {
-                foots.push((px, 0, 0, fw, fh));
+            if let Some((px, len, _, _, fw, fh)) = self.compose_window(bi) {
+                descs.push((px, len, 0, 0, fw, fh));
             }
         }
         for i in 0..self.wins.len() {
             if bg_idx == Some(i) { continue; } // bg already composited first
-            if let Some(f) = self.compose_window(i) { foots.push(f); }
+            if let Some(d) = self.compose_window(i) { descs.push(d); }
         }
-        let n = core::cmp::min(foots.len(), MAX_WINS);
+        let n = core::cmp::min(descs.len(), MAX_WINS);
         // SAFETY: BSP-only write of WIN_ARENA between joined frames (the previous
         // frame's jobs were joined inside dispatch_bands before we returned, so
         // no job is in flight while we mutate the arena here).
-        for (i, (buf, fx, fy, fw, fh)) in foots.iter().enumerate().take(n) {
+        for (i, (px, len, fx, fy, fw, fh)) in descs.iter().enumerate().take(n) {
             unsafe {
                 WIN_ARENA[i] = WinDesc {
-                    px: buf.as_ptr(),
-                    px_len: buf.len(),
-                    x: *fx,
-                    y: *fy,
-                    w: *fw,
-                    h: *fh,
+                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh,
                 };
             }
         }
 
-        // 2) Dispatch the banded composite into backbuf, then present.
+        // 2) Dispatch the banded composite into backbuf, then present. The borrowed
+        //    surfaces stay alive in their Stores (we don't touch `self.wins`) for
+        //    the entire parallel composite — dispatch_bands joins all jobs before
+        //    returning, so no band job outlives this call.
         let bg = u32::from_le_bytes(DESKTOP_BG);
         let back_ptr = self.backbuf.as_mut_ptr() as usize;
         dispatch_bands(back_ptr, stride, sw, sh, bg, n);
         crate::gfx::blit(&self.backbuf[..needed], 0, 0, sw, sh);
-        // `foots` drops here — AFTER dispatch_bands joined all jobs, so the
-        // footprint buffers were alive for the entire parallel composite.
     }
 
     /// Push a window-local MouseMove (kind 1) into window `idx`'s queue so the app's
@@ -1221,6 +1242,10 @@ impl Compositor {
                 }
             }
 
+            // Clear per-window damage flags; `wm.commit` re-sets `committed` for any
+            // window that draws a new surface during this `frame_all`.
+            for w in self.wins.iter_mut() { w.store.data_mut().win.committed = false; }
+
             self.frame_all();
 
             // SP-C: process deferred window→kernel requests raised during
@@ -1233,6 +1258,7 @@ impl Compositor {
                 if self.wins[i].store.data().win.bg_request {
                     self.wins[i].store.data_mut().win.bg_request = false;
                     self.wins[i].bg = true;
+                    self.dirty = true; // bg pin changes the composite → present
                     crate::binfo!("wm", "bg window win_id={}", self.wins[i].id);
                 }
             }
@@ -1277,7 +1303,24 @@ impl Compositor {
                 }
             }
 
-            self.present();
+            // Present only when something actually changed: any window committed a
+            // new surface this frame, OR geometry/window-set changed (`self.dirty`).
+            // An idle desktop (no commits, no moves) skips the whole composite+blit
+            // — the framebuffer already holds the last frame, and the software
+            // cursor is maintained independently by `gfx::fold_mouse`/`blit`.
+            //
+            // WARM-UP EXCEPTION: force a present for the first `WARMUP_FRAMES` loops
+            // so the SMP band pool warms up (APs need several composited frames to
+            // pick up jobs) and the "composite cores" boot-marker — which fires at
+            // frame 30, see below — observes real multi-core band activity. The
+            // comp-smp test's apps are static (they commit once), so without this
+            // the marker could see <2 cores. Idle-skipping kicks in after warm-up.
+            const WARMUP_FRAMES: u32 = 90;
+            let any_committed = self.wins.iter().any(|w| w.store.data().win.committed);
+            if self.dirty || any_committed || frame_no < WARMUP_FRAMES {
+                self.present();
+                self.dirty = false;
+            }
             frame_no += 1;
 
             // After 30 composited frames, report the distinct cores that ran
@@ -1297,8 +1340,14 @@ impl Compositor {
                 marker_done = true;
             }
 
-            // Crude pacing so the colour cycle + input feel responsive.
-            for _ in 0..2_000_000u32 { core::hint::spin_loop(); }
+            // Idle pacing: park the core until the next interrupt instead of busy-
+            // spinning (which pegged a core at 100% even with nothing on screen
+            // changing). The 100 Hz timer bounds the wake latency to ~10 ms; PS/2
+            // and USB input IRQs wake us sooner, so drag/click stay responsive. With
+            // present-gating above, an idle desktop now does ~zero work per tick.
+            // SAFETY: the compositor loop runs with IF=1 (entered from the executor,
+            // which enables interrupts), so `hlt` is guaranteed to be woken by an IRQ.
+            x86_64::instructions::hlt();
         }
     }
 }

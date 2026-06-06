@@ -18,10 +18,12 @@ use embassy_executor::raw::Executor as RawExecutor;
 use x86_64::instructions::interrupts;
 use crate::kprintln;
 
-/// Set by `__pender` whenever a waker is signalled. Cleared by the
-/// outer loop before each `poll()`. If set after `poll()` returns,
-/// the loop re-polls instead of halting.
-static WAKE_PENDING: AtomicBool = AtomicBool::new(true);
+/// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
+/// core's run loop before each poll. (Was a single global AtomicBool — single-core.)
+static WAKE_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] = {
+    const F: AtomicBool = AtomicBool::new(true);
+    [F; crate::cpu::MAX_CPUS]
+};
 
 /// Wrapper that allows `RawExecutor` to live in a `static`.
 ///
@@ -54,7 +56,7 @@ pub fn run() -> ! {
     // valid for the remainder of the kernel's lifetime.
     let exec: &'static RawExecutor = unsafe {
         let slot = &mut *EXECUTOR.0.get();
-        slot.write(RawExecutor::new(core::ptr::null_mut()))
+        slot.write(RawExecutor::new(0usize as *mut ())) // context = BSP owner id 0
     };
 
     let spawner = exec.spawner();
@@ -78,11 +80,13 @@ pub fn run() -> ! {
     loop {
         // Clear the wake flag *before* polling so any wakes raised
         // during this poll round are visible to the post-poll check.
-        WAKE_PENDING.store(false, Ordering::SeqCst);
+        WAKE_PENDING[0].store(false, Ordering::SeqCst);
         // SAFETY: raw::Executor::poll must be called serially. The
         // kernel is single-threaded and we call it only from here.
         let poll_start = crate::boot::clock::read_tsc();
         unsafe { exec.poll(); }
+        // Drain any inter-core messages addressed to the BSP (core 0).
+        crate::smp::inbox::drain_inbox(0);
         crate::sched::cpustat::add_busy(
             0, crate::boot::clock::read_tsc().saturating_sub(poll_start));
 
@@ -91,7 +95,8 @@ pub fn run() -> ! {
         // raise WAKE_PENDING after our load but before our hlt,
         // causing a missed wake.
         interrupts::disable();
-        if WAKE_PENDING.load(Ordering::SeqCst) {
+        // Halt only if no wake AND no inbox work pending (avoid missed inbox wake).
+        if WAKE_PENDING[0].load(Ordering::SeqCst) || crate::smp::inbox::is_pending(0) {
             interrupts::enable();
             // Re-poll immediately; some waker fired during poll().
         } else {
@@ -428,12 +433,23 @@ async fn tick_task() {
     }
 }
 
+/// Wake the owner core: set its WAKE_PENDING and, if we are NOT that core, send it a
+/// targeted VEC_WAKE IPI so it leaves `hlt`. Used by `__pender` and any cross-core
+/// signaller. ISR-safe: atomic store + (maybe) one IPI write, no locks/allocs.
+pub fn wake_core(owner: u32) {
+    WAKE_PENDING[owner as usize].store(true, Ordering::SeqCst);
+    if crate::cpu::cpu_id() != owner {
+        crate::apic::lapic::send_ipi(crate::cpu::lapic_id_of(owner), crate::idt::VEC_WAKE);
+    }
+}
+
 /// Embassy's "we have work, please poll" callback. Called from
-/// `Waker::wake()` — possibly from an ISR. Setting the atomic is the
-/// only signal the outer loop needs.
+/// `Waker::wake()` — possibly from an ISR. `context` carries the OWNER core id
+/// (encoded as a pointer when the executor was created). Wakes that core —
+/// including a cross-core IPI if the wake originated on a different core.
 ///
 /// MUST be ISR-safe: no locks, no allocations.
 #[no_mangle]
-extern "Rust" fn __pender(_context: *mut ()) {
-    WAKE_PENDING.store(true, Ordering::SeqCst);
+extern "Rust" fn __pender(context: *mut ()) {
+    wake_core(context as usize as u32);
 }

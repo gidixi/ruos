@@ -54,6 +54,40 @@ static mut PER_CPU: PerCpuArray = PerCpuArray([ZEROED; MAX_CPUS]);
 /// probe (not a bare MSR read-back — see init_bsp).
 static GS_USABLE: AtomicBool = AtomicBool::new(false);
 
+/// Set once on the BSP: true iff CPUID reports RDTSCP (CPUID.80000001h:EDX[27]).
+/// When true, `cpu_id()` uses the fast RDTSCP path (TSC_AUX holds the dense id);
+/// when false (exotic/old CPU), `cpu_id()` uses the LAPIC fallback. Robust by
+/// construction — never assumes RDTSCP exists.
+static RDTSCP_OK: AtomicBool = AtomicBool::new(false);
+
+/// IA32_TSC_AUX MSR.
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+/// Detect RDTSCP once (call on the BSP, after lapic init). Records the result;
+/// does NOT yet enable the fast path on its own — `set_tsc_aux` must run on a
+/// core before that core trusts RDTSCP.
+pub fn detect_rdtscp() -> bool {
+    let ok = (unsafe { core::arch::x86_64::__cpuid(0x8000_0001) }.edx >> 27) & 1 == 1;
+    RDTSCP_OK.store(ok, Ordering::SeqCst);
+    ok
+}
+
+/// Write this core's dense id into IA32_TSC_AUX so a later RDTSCP returns it in
+/// ECX. No-op if RDTSCP is unavailable. MUST be called on each core BEFORE that
+/// core calls `cpu_id()` on the fast path (BSP: in init path; AP: first thing in
+/// ap_entry). SAFETY: ring 0; WRMSR to a standard MSR.
+pub fn set_tsc_aux(dense_id: u32) {
+    if RDTSCP_OK.load(Ordering::SeqCst) {
+        unsafe {
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_TSC_AUX, in("eax") dense_id, in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 /// BSP per-CPU init. Call AFTER gdt::init (the GS segment-load done there zeroes
 /// the GS base) and AFTER lapic::init (the APIC ID register must be mapped).
 /// Fills PER_CPU[0] and writes the GS base.
@@ -90,6 +124,18 @@ pub fn init_bsp(kernel_stack_top: u64) -> bool {
     // (e.g. a guarded access with a recoverable #PF) before trusting gs-base.
     let gs_ok = GsBase::read().as_u64() == want;
     GS_USABLE.store(gs_ok, Ordering::SeqCst);
+
+    // Enable the fast `cpu_id()` path on this machine if the CPU supports RDTSCP,
+    // then prime THIS core's (the BSP's) IA32_TSC_AUX with its dense id 0. Order
+    // matters: `set_tsc_aux` only writes the MSR once RDTSCP_OK is set, so
+    // `detect_rdtscp()` must run first. There is no inconsistency window for the
+    // BSP: before this runs `cpu_id()` used the LAPIC fallback which returns 0
+    // for the BSP, exactly what TSC_AUX=0 yields on the fast path. Each AP primes
+    // its own TSC_AUX as the first statement of `ap_entry`, before it ever calls
+    // `cpu_id()`, so no AP can observe a stale TSC_AUX=0 once RDTSCP_OK is true.
+    detect_rdtscp();
+    set_tsc_aux(0);
+
     gs_ok
 }
 
@@ -119,12 +165,35 @@ pub fn cpus_online() -> u32 {
     CPUS_ONLINE.load(Ordering::SeqCst)
 }
 
-/// Dense cpu_id of the current core. Reads the LAPIC ID register (works on
-/// every core and every VMM — no `gs:[0]`, dodging VirtualBox's gs-base quirk)
-/// and maps it to a dense id. Returns 0 (BSP) if the LAPIC ID isn't mapped yet
-/// (e.g. very early boot before bring-up) — safe on a single CPU.
+/// Dense cpu_id of the current core. Two paths:
+///
+/// - FAST (RDTSCP_OK): a single `rdtscp` reads this core's IA32_TSC_AUX — the
+///   dense id we wrote at bring-up (`set_tsc_aux`) — into ECX. No MMIO, ~few
+///   cycles. Only enabled once CPUID confirmed RDTSCP *and* every core has set
+///   its TSC_AUX before any fast-path `cpu_id()` (BSP in `init_bsp`, AP as the
+///   first statement of `ap_entry`).
+/// - FALLBACK (RDTSCP unavailable): read the LAPIC ID register (works on every
+///   core and every VMM — no `gs:[0]`, dodging VirtualBox's gs-base quirk) and
+///   map it to a dense id. Returns 0 (BSP) if the LAPIC ID isn't mapped yet
+///   (e.g. very early boot before bring-up) — safe on a single CPU.
 #[inline]
 pub fn cpu_id() -> u32 {
+    if RDTSCP_OK.load(Ordering::Relaxed) {
+        // RDTSCP returns the per-core IA32_TSC_AUX (the dense id we wrote at
+        // bring-up) in ECX. Single instruction, no MMIO. SAFETY: only taken when
+        // CPUID confirmed RDTSCP; clobbers EAX/EDX/ECX which we discard. rdtscp
+        // does not touch RFLAGS, so `preserves_flags` is correct.
+        let id: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdtscp",
+                out("eax") _, out("edx") _, out("ecx") id,
+                options(nostack, preserves_flags),
+            );
+        }
+        return id;
+    }
+    // Fallback: LAPIC-ID based.
     let lapic = crate::apic::lapic::apic_id();
     if (lapic as usize) < 256 {
         let id = LAPIC_TO_CPU[lapic as usize].load(Ordering::SeqCst);
@@ -160,4 +229,44 @@ pub unsafe fn this_cpu_via_gs() -> &'static PerCpu {
 #[allow(dead_code)]
 pub fn gs_usable() -> bool {
     GS_USABLE.load(Ordering::SeqCst)
+}
+
+/// Diagnostic: probe the cheap per-core-id primitives in THIS environment
+/// (QEMU / VirtualBox / bare metal). The LAPIC-MMIO `cpu_id()` costs ~200 ns;
+/// a fast `cpu_id()` would use `RDPID` or `RDTSCP` (which returns IA32_TSC_AUX
+/// in ECX) — single instructions, no MMIO, no gs-base quirk. This prints which
+/// of those are available, and whether writing IA32_TSC_AUX then reading it back
+/// via RDTSCP round-trips (proving the VMM honours the MSR). Greppable marker.
+pub fn probe_fast_cpuid() {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // RDTSCP: CPUID.80000001h:EDX[27].
+    let rdtscp = (unsafe { __cpuid(0x8000_0001) }.edx >> 27) & 1;
+    // RDPID: CPUID.(EAX=7,ECX=0):ECX[22].
+    let rdpid = (unsafe { __cpuid_count(7, 0) }.ecx >> 22) & 1;
+    // Round-trip: WRMSR IA32_TSC_AUX(0xC000_0103)=0xABCD, then RDTSCP reads it
+    // back in ECX. Proves WRMSR+RDTSCP work (the basis of a fast cpu_id) here.
+    let mut tscaux_rw = 0u32;
+    if rdtscp == 1 {
+        unsafe {
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") 0xC000_0103u32, in("eax") 0xABCDu32, in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            let aux: u32;
+            core::arch::asm!(
+                "rdtscp",
+                out("eax") _, out("edx") _, out("ecx") aux,
+                options(nostack, preserves_flags),
+            );
+            if aux == 0xABCD { tscaux_rw = 1; }
+        }
+    }
+    crate::binfo!("cpuprobe", "rdtscp={} rdpid={} tscaux_rw={}", rdtscp, rdpid, tscaux_rw);
+    // CRITICAL: the round-trip above clobbered this core's IA32_TSC_AUX with the
+    // probe sentinel 0xABCD. The fast `cpu_id()` path now reads TSC_AUX, so leaving
+    // the sentinel in place would make `cpu_id()` return 43981 on the BSP and
+    // index per-core arrays out of bounds. `probe_fast_cpuid` only ever runs on
+    // the BSP (dense id 0), so restore TSC_AUX to 0. No-op if RDTSCP is absent.
+    set_tsc_aux(0);
 }

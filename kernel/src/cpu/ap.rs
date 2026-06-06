@@ -16,6 +16,13 @@ use limine::mp::MpInfo;
 /// LAPIC->cpu table entry exist before we run.
 pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let cpu_id = info.extra_argument() as usize;
+    // FIRST: prime this AP's IA32_TSC_AUX with its dense id so the fast RDTSCP
+    // `cpu_id()` path (already enabled globally by the BSP via RDTSCP_OK) returns
+    // the correct id on this core. Must precede ANY `cpu_id()` call here — a
+    // no-op if RDTSCP is unavailable, in which case `cpu_id()` uses the LAPIC
+    // fallback. Without this, an AP could read a stale TSC_AUX=0 and corrupt
+    // per-core state.
+    crate::cpu::set_tsc_aux(cpu_id as u32);
     // Load this core's GDT/TSS (slot cpu_id) and the shared IDT.
     crate::gdt::init(cpu_id);
     crate::idt::load();

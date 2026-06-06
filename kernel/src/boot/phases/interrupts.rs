@@ -51,6 +51,9 @@ pub fn init() -> Result<(), BootError> {
     // Start the enumerated APs (Limine MpRequest) and park them idle.
     crate::smp::bringup();
 
+    // Diagnostic: which cheap per-core-id primitives does this environment expose?
+    crate::cpu::probe_fast_cpuid();
+
     #[cfg(feature = "boot-checks")]
     {
         crate::memory::allocbench::run_cpuid_bench();

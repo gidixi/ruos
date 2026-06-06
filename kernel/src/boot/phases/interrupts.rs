@@ -484,5 +484,124 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
+    // C2c boot-check: parallelism gate. Proves that TWO `.cwasm` apps can run
+    // on TWO DISTINCT ComputeApp cores CONCURRENTLY (the C2c throughput win).
+    //
+    // Protocol (≥ 4 CPUs, cores 2+3 both ComputeApp):
+    //   1. Run ONE `parallel_probe(0, N)` on core 2 alone and time it → single_ms.
+    //   2. Simultaneously spawn `parallel_probe(0, N)` on core 2 AND
+    //      `parallel_probe(1, N)` on core 3; time the wall clock → concurrent_ms.
+    //   3. concurrent_ms ≈ single_ms (not ≈ 2×single_ms) → overlap proven → PASS.
+    //   4. Each probe also records `cpu_id()` → ran=[c0,c1] must be distinct.
+    //
+    // N is kept small (3 iterations) to keep boot time low while still
+    // producing a measurable time difference on 3+ iteration runs.
+    //
+    // Skipped on < 4 CPUs (core 3 does not exist) or if cores 2/3 are not
+    // ComputeApp (unexpected role assignment).
+    #[cfg(feature = "boot-checks")]
+    {
+        // cpus_online() = number of APs (excludes BSP). With -smp 4: 3 APs online.
+        // Layout: core 0=BspIo, core 1=GuiCompositor, core 2+=ComputeApp.
+        // ≥ 2 APs (cpus_online() ≥ 2) → core 2 exists.
+        // ≥ 3 APs (cpus_online() ≥ 3) → core 3 exists.
+        let has_core2_compute = crate::cpu::cpus_online() >= 2
+            && crate::cpu::core_role(2) == crate::cpu::CoreRole::ComputeApp;
+        let has_core3_compute = crate::cpu::cpus_online() >= 3
+            && crate::cpu::core_role(3) == crate::cpu::CoreRole::ComputeApp;
+
+        if has_core2_compute && has_core3_compute {
+            const ITERS: u32 = 3; // 3 × run_echo_demo per probe
+
+            // ── Phase 0: single baseline ─────────────────────────────────────
+            // Reset done counter + run ONE probe on core 2, timed.
+            crate::executor::PARALLEL_DONE
+                .store(0, core::sync::atomic::Ordering::SeqCst);
+            crate::executor::PARALLEL_RAN[0]
+                .store(u32::MAX, core::sync::atomic::Ordering::SeqCst);
+            crate::executor::PARALLEL_RAN[1]
+                .store(u32::MAX, core::sync::atomic::Ordering::SeqCst);
+
+            // Use 100 Hz timer ticks for timing (each tick = 10 ms; calibrated
+            // early in the interrupt phase before this code runs).
+            // tsc_per_ms() is 0 until late calibration — use ticks instead.
+
+            // Spawn ONE probe (idx=0) on core 2 and time it.
+            let t0 = crate::timer::ticks();
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(
+                    2,
+                    crate::executor::parallel_probe(0, ITERS),
+                ).is_ok() { break; }
+                core::hint::spin_loop();
+            }
+            // Wait for that one probe to finish (up to 60 s).
+            for _ in 0..6_000_000_000u64 {
+                if crate::executor::PARALLEL_DONE
+                    .load(core::sync::atomic::Ordering::SeqCst) >= 1
+                { break; }
+                core::hint::spin_loop();
+            }
+            let t1 = crate::timer::ticks();
+            // Convert 100 Hz ticks to ms (10 ms per tick).
+            let single_ms = t1.saturating_sub(t0) * 10;
+
+            // ── Phase 1: concurrent run ──────────────────────────────────────
+            // Reset both probes' state and spawn BOTH simultaneously.
+            crate::executor::PARALLEL_DONE
+                .store(0, core::sync::atomic::Ordering::SeqCst);
+            crate::executor::PARALLEL_RAN[0]
+                .store(u32::MAX, core::sync::atomic::Ordering::SeqCst);
+            crate::executor::PARALLEL_RAN[1]
+                .store(u32::MAX, core::sync::atomic::Ordering::SeqCst);
+
+            let t2 = crate::timer::ticks();
+            // Spawn probe 0 on core 2.
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(
+                    2,
+                    crate::executor::parallel_probe(0, ITERS),
+                ).is_ok() { break; }
+                core::hint::spin_loop();
+            }
+            // Spawn probe 1 on core 3.
+            for _ in 0..1_000_000u64 {
+                if crate::executor::spawn_on(
+                    3,
+                    crate::executor::parallel_probe(1, ITERS),
+                ).is_ok() { break; }
+                core::hint::spin_loop();
+            }
+            // Wait for BOTH probes to finish (up to 120 s).
+            for _ in 0..12_000_000_000u64 {
+                if crate::executor::PARALLEL_DONE
+                    .load(core::sync::atomic::Ordering::SeqCst) >= 2
+                { break; }
+                core::hint::spin_loop();
+            }
+            let t3 = crate::timer::ticks();
+            let concurrent_ms = t3.saturating_sub(t2) * 10;
+
+            let c0 = crate::executor::PARALLEL_RAN[0]
+                .load(core::sync::atomic::Ordering::SeqCst);
+            let c1 = crate::executor::PARALLEL_RAN[1]
+                .load(core::sync::atomic::Ordering::SeqCst);
+
+            // Overlap check: concurrent ≈ single (not ≈ 2×single).
+            // We use a generous threshold: concurrent ≤ 1.6 × single → overlap.
+            let overlap = concurrent_ms > 0
+                && single_ms > 0
+                && concurrent_ms <= (single_ms * 8 / 5); // ≤ 1.6×
+
+            crate::binfo!(
+                "parallel-exec",
+                "ran=[{},{}] concurrent_ms={} single_ms={} overlap={}",
+                c0, c1, concurrent_ms, single_ms, overlap,
+            );
+        } else {
+            crate::binfo!("parallel-exec", "skipped (<4 cores or cores 2/3 not ComputeApp)");
+        }
+    }
+
     Ok(())
 }

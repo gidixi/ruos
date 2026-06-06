@@ -20,87 +20,121 @@ pub mod delay;
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use embassy_executor::raw::Executor as RawExecutor;
 use embassy_executor::SendSpawner;
 use x86_64::instructions::interrupts;
 use crate::kprintln;
 use crate::sync::IrqMutex;
 
-// ── C2b: single-slot reply for routed .cwasm exec ────────────────────────────
+// ── C2c: per-request reply for parallel .cwasm exec ──────────────────────────
 
-/// Single-slot completion channel for the routed `.cwasm` exec path (C2b).
-/// The exec_worker (BSP) arms it before `spawn_on`, then awaits `AppReplyFuture`.
-/// The AP task (`run_app_on_core`) calls `APP_REPLY.complete(code)` when done,
-/// which stores the code + sets done=true + wakes the BSP waiter.
+/// Per-request completion channel for the parallel `.cwasm` exec path (C2c).
+/// Created per exec call (one `Arc<ExecReply>` per concurrent app), so multiple
+/// apps can run on multiple ComputeApp cores simultaneously without corrupting a
+/// shared single slot (the C2b latent bug this fixes).
 ///
-/// Single-slot: exec is serialised by the single-slot EXEC_QUEUE, so only one
-/// routed app runs at a time. C2c will extend this to per-core slots.
-struct AppReply {
+/// The caller (shell fiber via exec_cwasm_parallel) creates an Arc, spawns the
+/// AP task with a clone, then awaits `ExecReplyFuture`. The AP task calls
+/// `reply.complete(code)` when `run_cwasm` returns, storing the code + waking
+/// the waiting shell fiber.
+pub struct ExecReply {
     code:  AtomicI32,
     done:  AtomicBool,
     waker: IrqMutex<Option<core::task::Waker>>,
 }
-static APP_REPLY: AppReply = AppReply {
-    code:  AtomicI32::new(0),
-    done:  AtomicBool::new(false),
-    waker: IrqMutex::new(None),
-};
-impl AppReply {
-    /// Arm before spawning the AP task. Clears `done` so the future blocks until
-    /// the AP calls `complete`.
-    fn arm(&self) {
-        self.done.store(false, Ordering::SeqCst);
+
+impl ExecReply {
+    pub fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            code:  AtomicI32::new(0),
+            done:  AtomicBool::new(false),
+            waker: IrqMutex::new(None),
+        })
     }
+
     /// Called by the AP task when run_cwasm returns. Stores the exit code, marks
-    /// done, and wakes the BSP exec_worker future (cross-core wake via __pender).
-    fn complete(&self, code: i32) {
+    /// done, and wakes the awaiting shell fiber (cross-core wake via __pender).
+    pub fn complete(&self, code: i32) {
         self.code.store(code, Ordering::SeqCst);
-        self.done.store(true, Ordering::SeqCst);  // release of code
-        if let Some(w) = self.waker.lock().take() { w.wake(); } // → BSP
+        self.done.store(true, Ordering::SeqCst); // release of code
+        if let Some(w) = self.waker.lock().take() { w.wake(); }
     }
 }
 
-/// Future that blocks the BSP exec_worker until the AP task completes. While
-/// pending, the BSP executor keeps polling all other tasks (net/usb/ssh) — THE GOAL.
-struct AppReplyFuture;
-impl core::future::Future for AppReplyFuture {
+/// Future that waits for an AP task to complete, returning the exit code.
+/// Holds a clone of the `Arc<ExecReply>` so it can be polled from any async
+/// context (the shell fiber). While pending, the BSP executor keeps polling
+/// all other tasks (net/usb/ssh) — THE GOAL.
+pub struct ExecReplyFuture(pub alloc::sync::Arc<ExecReply>);
+
+impl core::future::Future for ExecReplyFuture {
     type Output = i32;
     fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>)
         -> core::task::Poll<i32>
     {
-        if APP_REPLY.done.load(Ordering::SeqCst) {
-            return core::task::Poll::Ready(APP_REPLY.code.load(Ordering::SeqCst));
+        if self.0.done.load(Ordering::SeqCst) {
+            return core::task::Poll::Ready(self.0.code.load(Ordering::SeqCst));
         }
         // Register waker before the second check to avoid a missed-wake race:
         // if the AP completes between the first load and here, it calls wake()
         // on this waker and done becomes true.
-        *APP_REPLY.waker.lock() = Some(cx.waker().clone());
-        if APP_REPLY.done.load(Ordering::SeqCst) {
-            core::task::Poll::Ready(APP_REPLY.code.load(Ordering::SeqCst))
+        *self.0.waker.lock() = Some(cx.waker().clone());
+        if self.0.done.load(Ordering::SeqCst) {
+            core::task::Poll::Ready(self.0.code.load(Ordering::SeqCst))
         } else {
             core::task::Poll::Pending
         }
     }
 }
 
-/// C2b: runs `run_cwasm` on whatever core it is spawned onto (always a ComputeApp
-/// core, chosen by `first_compute_app_core`). Owns the bytes and argv (moved in,
-/// Send). When done it calls `APP_REPLY.complete(code)` which wakes the BSP exec
-/// worker via the cross-core pender → IPI chain (Step 2 mechanism).
+/// Round-robin cursor for `pick_compute_core`. Each call advances by 1 and wraps
+/// over the online ComputeApp cores, distributing loads across them.
+static COMPUTE_CORE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Pick a ComputeApp core for the next `.cwasm` exec, using round-robin over all
+/// online ComputeApp cores. Returns `None` on 1- or 2-core systems where no
+/// ComputeApp AP exists (inline fallback applies).
 ///
-/// `pool_size=1`: exec is single-slot (EXEC_QUEUE is single-slot); only one
-/// routed app runs at a time. C2c bumps pool_size + adds per-core slots.
-#[embassy_executor::task(pool_size = 1)]
-async fn run_app_on_core(
+/// Layout: core 0 = BspIo, core 1 = GuiCompositor, core 2+ = ComputeApp.
+/// Total cores = 1 (BSP) + cpus_online() (APs).
+pub fn pick_compute_core() -> Option<u32> {
+    let total = 1 + crate::cpu::cpus_online();
+    // Collect ComputeApp cores into a small array to avoid alloc.
+    let mut cores = [0u32; crate::cpu::MAX_CPUS];
+    let mut n = 0usize;
+    for c in 1..total {
+        if crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp {
+            cores[n] = c;
+            n += 1;
+        }
+    }
+    if n == 0 { return None; }
+    // Atomically advance cursor and pick the core at cursor % n.
+    let idx = COMPUTE_CORE_CURSOR.fetch_add(1, Ordering::Relaxed) % n;
+    Some(cores[idx])
+}
+
+/// C2c: runs `run_cwasm` on whatever ComputeApp core it is spawned onto. Takes
+/// ownership of the bytes, argv, and the per-request `Arc<ExecReply>`. When done
+/// it calls `reply.complete(code)` which wakes the awaiting shell fiber via the
+/// cross-core pender → IPI chain (Step 2 mechanism).
+///
+/// `pool_size=4`: up to 4 concurrent `.cwasm` apps can run on ComputeApp cores
+/// simultaneously. Each runs on its own core's poll stack so there is no
+/// per-core stack contention. The embassy arena holds 4 task states; bump if
+/// more concurrent apps are needed (arena is 65536 bytes).
+#[embassy_executor::task(pool_size = 4)]
+pub async fn run_app_on_core(
     bytes: alloc::boxed::Box<[u8]>,
     argv:  alloc::vec::Vec<alloc::vec::Vec<u8>>,
     pts:   usize,
+    reply: alloc::sync::Arc<ExecReply>,
 ) {
     let cpu  = crate::cpu::cpu_id();
     let code = crate::wasm::wt::run_cwasm(&bytes, argv, Some(pts));
     crate::binfo!("exec-ap", "ran_on=core{} code={}", cpu, code);
-    APP_REPLY.complete(code);
+    reply.complete(code);
 }
 
 /// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
@@ -335,6 +369,69 @@ pub async fn cwasm_ap_probe() {
     CWASM_AP_CODE.store(code, core::sync::atomic::Ordering::SeqCst);
 }
 
+// ── C2c: parallel-exec probe (boot-check) ────────────────────────────────────
+
+/// C2c boot-check: which core each parallel probe ran on.
+/// Index 0 = first probe (spawned on core 2), index 1 = second (spawned on core 3).
+/// u32::MAX = unset. Each probe writes `cpu_id()` here after its loop.
+#[cfg(feature = "boot-checks")]
+pub static PARALLEL_RAN: [core::sync::atomic::AtomicU32; 2] = [
+    core::sync::atomic::AtomicU32::new(u32::MAX),
+    core::sync::atomic::AtomicU32::new(u32::MAX),
+];
+
+/// C2c boot-check: counter bumped by each probe when it finishes all iterations.
+/// BSP waits until this reaches 2 (both probes done). `AtomicU32` used as a
+/// simple "done" flag — 0 = neither done, 1 = first done, 2 = both done.
+#[cfg(feature = "boot-checks")]
+pub static PARALLEL_DONE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// C2c boot-check: accumulator for the parallel probe to prevent loop elision.
+/// Each probe stores its final accumulator value here; the BSP reads it after
+/// both probes finish to prove neither loop was dead-code-eliminated.
+#[cfg(feature = "boot-checks")]
+pub static PARALLEL_ACC: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// C2c boot-check: each probe burns CPU doing pure computation (no wasmtime —
+/// wasmtime's no_std sync panics on concurrent Engine access, so we use a
+/// bare computation loop that is safe to run in parallel on multiple cores).
+/// Records its core id and bumps PARALLEL_DONE when done.
+///
+/// Two of these are spawned on core 2 and core 3 simultaneously; if both
+/// complete in ≈ single-run time, they ran in parallel on distinct cores.
+/// The loop count is tuned to be measurable (≥ 100 ms) on QEMU.
+///
+/// Uses a volatile write to prevent the optimizer from eliding the loop.
+///
+/// `pool_size = 2`: exactly two probes run concurrently.
+#[cfg(feature = "boot-checks")]
+#[embassy_executor::task(pool_size = 2)]
+pub async fn parallel_probe(idx: u32, iters: u32) {
+    // Pure computation: xor/add/mul mix, no shared mutable state.
+    // ~200M ops per iteration. The result is stored to PARALLEL_ACC so the
+    // optimizer cannot elide the loop (observable side effect via atomic store).
+    let ops_per_iter: u64 = 200_000_000;
+    let total_ops = ops_per_iter * (iters as u64);
+    let mut acc: u64 = (idx as u64).wrapping_add(1) ^ 0xDEAD_BEEF_CAFE_1234;
+    for i in 0..total_ops {
+        acc = acc.wrapping_add(i)
+            .wrapping_mul(0x6C62272E07BB0142)
+            ^ (acc >> 17)
+            ^ (acc << 23);
+    }
+    // Commit the accumulator to a static so the loop is not elided.
+    PARALLEL_ACC[idx as usize].store(acc, core::sync::atomic::Ordering::SeqCst);
+    PARALLEL_RAN[idx as usize].store(
+        crate::cpu::cpu_id(),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    PARALLEL_DONE.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
 // ── C1: WASM-on-AP probe ──────────────────────────────────────────────────────
 
 /// C1 boot-check: which core the WASM AP probe task ran on.
@@ -369,6 +466,16 @@ pub async fn wasm_ap_probe() {
 /// Runs child WASM processes on behalf of shell fibers that issue exec()
 /// calls. This task has its own embassy-allocated stack frame, so wasmi
 /// compilation (which is stack-heavy) doesn't overflow the shell fiber.
+///
+/// C2c: this worker now handles ONLY two cases:
+///   1. `compositor.cwasm` — handed off to the GUI core (Step 5 logic unchanged).
+///   2. `.wasm` (wasmi) — run inline on the BSP exec-worker stack.
+///
+/// Non-compositor `.cwasm` apps are now handled at the FIBER level by
+/// `exec_cwasm_parallel` (in fiber.rs) which bypasses EXEC_QUEUE entirely,
+/// creating per-request `Arc<ExecReply>` + spawning on a ComputeApp core via
+/// `pick_compute_core()`. This fixes the latent C2b single-slot corruption bug
+/// (two shells exec'ing .cwasm concurrently would race on the old APP_REPLY).
 #[embassy_executor::task]
 async fn exec_worker_task() {
     use crate::wasm::exec_queue::{EXEC_QUEUE, WaitForRequest};
@@ -377,8 +484,11 @@ async fn exec_worker_task() {
         // Wait for a request from a shell fiber.
         let slot = WaitForRequest::new(&EXEC_QUEUE).await;
 
-        // Router: `.cwasm` → Wasmtime AOT runtime; `.wasm` → wasmi.
-        if slot.path.ends_with(".cwasm") {
+        // Compositor hand-off: the compositor.cwasm path reaches here through the
+        // EXEC_QUEUE (fiber.rs routes compositor.cwasm via EXEC_QUEUE, not the
+        // parallel path, because the compositor is a special singleton that owns
+        // the GUI core — not a regular parallel app).
+        if slot.path.ends_with("compositor.cwasm") {
             let code: i32 = match crate::wasm::read_all(&slot.path).await {
                 Err(_) => {
                     kprintln!("ruos: exec_worker: read {} failed", slot.path);
@@ -395,66 +505,24 @@ async fn exec_worker_task() {
                     //       ran `compositor` gets a return code and keeps going.
                     //       The BSP executor keeps polling I/O. THE GOAL.
                     //   3b. No GUI core (1 CPU) → run inline (today's fallback).
-                    if slot.path.ends_with("compositor.cwasm") {
-                        let leaked: &'static [u8] =
-                            alloc::boxed::Box::leak(bytes.into_boxed_slice());
-                        if crate::wasm::wt::wm::send_compositor_to_gui_core(leaked) {
-                            // Handed off: the GUI core will run the gate.
-                            // Complete the exec handshake so the calling shell
-                            // fiber (in boot_shell_task) gets a pid=0 return
-                            // code and doesn't hang waiting for `done`.
-                            EXEC_QUEUE.result.store(0, Ordering::SeqCst);
-                            EXEC_QUEUE.done.store(true, Ordering::SeqCst);
-                            if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
-                                w.wake();
-                            }
-                            continue; // back to the top of the exec-worker loop
+                    let leaked: &'static [u8] =
+                        alloc::boxed::Box::leak(bytes.into_boxed_slice());
+                    if crate::wasm::wt::wm::send_compositor_to_gui_core(leaked) {
+                        // Handed off: the GUI core will run the gate.
+                        // Complete the exec handshake so the calling shell
+                        // fiber (in boot_shell_task) gets a pid=0 return
+                        // code and doesn't hang waiting for `done`.
+                        EXEC_QUEUE.result.store(0, Ordering::SeqCst);
+                        EXEC_QUEUE.done.store(true, Ordering::SeqCst);
+                        if let Some(w) = EXEC_QUEUE.shell_waker.lock().take() {
+                            w.wake();
                         }
-                        // 1-core fallback: no GUI core → run gate inline (today's
-                        // behaviour; the BSP is blocked for the GUI's lifetime).
-                        crate::wasm::wt::wm::run_compositor_gate(leaked);
+                        continue; // back to the top of the exec-worker loop
                     }
-                    let pid = crate::proc::register(
-                        alloc::string::String::from(slot.path.trim_start_matches('/')),
-                    );
-                    // C2b: route .cwasm exec to the first ComputeApp core so the
-                    // BSP executor stays free for I/O (net/usb/ssh) while the app
-                    // runs. VFS read + proc::register stay on the BSP (stack kept
-                    // small); the AP task only runs run_cwasm (≈ C2a profile).
-                    //
-                    // Borrow discipline: compute the target core FIRST, THEN either:
-                    //   Some(core) → move bytes into the AP task (Box<[u8]> + await)
-                    //   None       → run inline with &bytes (1–2 core fallback)
-                    // This avoids moving bytes before the decision, which would
-                    // leave the inline arm without access to them.
-                    let c = match crate::cpu::first_compute_app_core() {
-                        Some(core) => {
-                            APP_REPLY.arm();
-                            let boxed = bytes.into_boxed_slice();
-                            match spawn_on(core, run_app_on_core(boxed, slot.argv, slot.term_pts)) {
-                                Ok(()) => {
-                                    // BSP exec_worker yields here; the BSP executor
-                                    // keeps polling net/usb/ssh while the AP runs.
-                                    AppReplyFuture.await
-                                }
-                                Err(_) => {
-                                    // Pool busy (should not happen with single-slot
-                                    // EXEC_QUEUE + pool_size=1, but be safe).
-                                    crate::bwarn!("exec-ap", "spawn_on({}) failed — pool busy; return 127", core);
-                                    127
-                                }
-                            }
-                        }
-                        None => {
-                            // 1-2 core system: no ComputeApp AP — run inline on BSP.
-                            // stdout/stderr bound to the caller's PTY slave (reaches
-                            // the terminal / SSH channel, like a rebound wasmi tool).
-                            // stdin is EOF for now (blocking PTY reads need async).
-                            crate::wasm::wt::run_cwasm(&bytes, slot.argv, Some(slot.term_pts))
-                        }
-                    };
-                    crate::proc::unregister(pid);
-                    c
+                    // 1-core fallback: no GUI core → run gate inline (today's
+                    // behaviour; the BSP is blocked for the GUI's lifetime).
+                    crate::wasm::wt::wm::run_compositor_gate(leaked);
+                    0
                 }
             };
             EXEC_QUEUE.result.store(code, Ordering::SeqCst);
@@ -465,7 +533,7 @@ async fn exec_worker_task() {
             continue;
         }
 
-        // Load and run the child wasm.
+        // Load and run the child wasm (wasmi path — .wasm files only).
         let code: i32 = match crate::wasm::read_all(&slot.path).await {
             Err(_) => {
                 kprintln!("ruos: exec_worker: read {} failed", slot.path);

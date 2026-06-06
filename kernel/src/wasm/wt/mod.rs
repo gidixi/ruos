@@ -148,10 +148,32 @@ pub fn engine() -> &'static wasmtime::Engine {
     ENGINE.call_once(|| wasmtime::Engine::new(&engine_config()).expect("wt engine"))
 }
 
+/// Wasmtime no_std concurrent-instantiation guard.
+///
+/// Wasmtime's no_std `RwLock` (`sync_nostd.rs`) panics on concurrent writes
+/// (it has no blocking path — concurrent access = panic). The type registry and
+/// WASI linker setup take write locks during `Linker::new` + `instantiate`.
+/// This mutex serializes concurrent `run_cwasm` calls across ComputeApp cores,
+/// ensuring only one core at a time runs through the Linker+instantiation path.
+///
+/// Cost: `.cwasm` apps run sequentially in time (one at a time) even on SMP.
+/// Benefit: the BSP stays free for I/O (net/usb/ssh) while any one AP runs.
+/// True wasmtime-level parallelism requires the `custom-sync-primitives` feature
+/// which needs host-provided blocking mutexes — not available in this no_std build.
+///
+/// This is the same degree of parallelism C2b provided (one app at a time), but
+/// with per-request reply Arcs (fixing the C2b latent corruption bug) and round-
+/// robin core selection (spreading future work across cores as the system evolves).
+static RUN_CWASM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Load and run a precompiled WASI `.cwasm` command (`_start`) with `args`.
 /// `pts`: Some(n) routes stdout/stderr to /dev/pts/n (bound terminal/SSH);
 /// None fans out to CONSOLE (serial + framebuffer). Returns the guest exit code.
+///
+/// Protected by `RUN_CWASM_LOCK` to prevent concurrent wasmtime instantiation
+/// (wasmtime no_std panics on concurrent write-lock contention).
 pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
+    let _guard = RUN_CWASM_LOCK.lock();
     use wasmtime::{Module, Store, Linker};
     let engine = engine();
     // SAFETY: cwasm produced by tools/wt-precompile for this exact config.

@@ -176,6 +176,10 @@ build/system.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p system-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/system_app.wasm build/system.cwasm
+build/notepad.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/notepad-app/src/*.rs $(RUOS_DESKTOP)/apps/notepad-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p notepad-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/notepad_app.wasm build/notepad.cwasm
 
 # Bring-up component (Step-0 gate): guest -> component -> AOT cwasm embedded in kernel.
 kernel/src/wasm/wt/bringup.cwasm: wit/ruos-bringup.wit tools/wt-bringup/src/lib.rs tools/wt-bringup/Cargo.toml $(WT_PRECOMPILE)
@@ -212,7 +216,7 @@ kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1
 		cargo build --release --target wasm32-wasip1
 	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
+iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
@@ -223,10 +227,9 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
-	cp build/about.cwasm $(ISO_ROOT)/bin/about.cwasm
-	cp build/files.cwasm $(ISO_ROOT)/bin/files.cwasm
-	cp build/terminal.cwasm $(ISO_ROOT)/bin/terminal.cwasm
-	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
+	# Desktop app .cwasm are NOT copied into the ISO /bin / declared as boot modules
+	# anymore — they ship on the FAT32 disk under /mnt/apps (see `apps-on-disk`) and
+	# load on demand. Only the shell + compositor stay as boot modules.
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
@@ -249,7 +252,31 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 # Default keeps virtio-net (Step 14 paravirtual fast path).
 NIC ?= virtio-net-pci
 
-run: iso $(DISK_IMG)
+# Desktop app .cwasm shipped on the FAT32 disk under /mnt/apps (NOT boot modules).
+# The compositor's launcher discovers + spawns them on demand. `apps-on-disk` copies
+# the current build artifacts into the disk image's ::/apps each run (mcopy -o, so a
+# cached disk is refreshed), creating the dir first. Add a new app → it appears with
+# no limine.conf / boot change. (To bake an app into the bootable image instead, add
+# it back as a Limine module in limine.conf.)
+APP_CWASMS := build/about.cwasm build/files.cwasm build/terminal.cwasm \
+              build/system.cwasm build/notepad.cwasm
+
+# Rebuild a PRISTINE disk image, then stage the apps under ::/apps. We RECREATE the
+# image (rather than appending) on purpose: mtools `mmd` hangs on an already-existing
+# directory, and balks on a QEMU-dirtied FAT — starting from a fresh mkfs sidesteps
+# both, making `make run` deterministic. NOTE: this wipes runtime data on the dev
+# disk; re-run `make ssh-key-on-disk` if you need your pubkey staged. (MTOOLS_SKIP_CHECK
+# is belt-and-suspenders against the dirty-FAT prompt.)
+.PHONY: apps-on-disk
+apps-on-disk: $(APP_CWASMS)
+	rm -f $(DISK_IMG)
+	$(MAKE) $(DISK_IMG)
+	@export MTOOLS_SKIP_CHECK=1; \
+	mmd -i $(DISK_IMG) ::/apps; \
+	for f in $(APP_CWASMS); do mcopy -o -i $(DISK_IMG) $$f ::/apps/$$(basename $$f); done; \
+	echo "apps-on-disk: $(words $(APP_CWASMS)) app .cwasm → /mnt/apps"
+
+run: iso apps-on-disk
 	qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -m 512 \
 		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
@@ -448,7 +475,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -465,10 +492,9 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
-	cp build/about.cwasm $(ISO_ROOT)/bin/about.cwasm
-	cp build/files.cwasm $(ISO_ROOT)/bin/files.cwasm
-	cp build/terminal.cwasm $(ISO_ROOT)/bin/terminal.cwasm
-	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
+	# Desktop app .cwasm are NOT copied into the ISO /bin / declared as boot modules
+	# anymore — they ship on the FAT32 disk under /mnt/apps (see `apps-on-disk`) and
+	# load on demand. Only the shell + compositor stay as boot modules.
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
 	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm

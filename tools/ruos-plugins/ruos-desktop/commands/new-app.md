@@ -124,13 +124,23 @@ build/<id>.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/<
 	cp build/<id>.cwasm $(ISO_ROOT)/bin/<id>.cwasm
 ```
 
-### 6. Shell launcher — `ruos-desktop/apps/shell/src/lib.rs`
+### 6. Declare the module in `limine.conf` (ruos repo root) — REQUIRED
+The VFS `/bin` is populated ONLY from the Limine modules declared in `limine.conf`;
+the Step 5 `cp` puts the file on the ISO but Limine won't load it unless it's
+declared here, so `wm.spawn` would fail with "/bin/<id>.cwasm not found/bad". Add
+the pair next to the `system.cwasm` entry:
+```
+    module_path: boot():/bin/<id>.cwasm
+    module_cmdline: /bin/<id>.cwasm
+```
+
+### 7. Shell launcher — `ruos-desktop/apps/shell/src/lib.rs`
 Add to `CATALOG`:
 ```rust
     ShellAppEntry { id: "<id>", title: "<Title>" },
 ```
 
-### 7. Build & report
+### 8. Build & report
 Build via WSL (the only toolchain host):
 ```bash
 wsl -d Ubuntu -u root -e bash -lc 'source $HOME/.cargo/env && cd /mnt/c/SVILUPPO/Github.com/ruos && make iso'

@@ -104,7 +104,28 @@ fn module_for(cwasm: &'static [u8]) -> Option<Module> {
 /// `String`-keyed cache. `Module` is Arc-backed: a cached `clone` is cheap.
 static NAME_CACHE: Mutex<BTreeMap<String, Module>> = Mutex::new(BTreeMap::new());
 
-/// Load `/bin/<name>.cwasm` from the VFS and deserialize it (cached by name).
+/// App directories searched (in priority order) for a `<name>.cwasm`: the
+/// ISO-baked `/bin` (Limine modules — core apps, available diskless) first, then
+/// the persistent FAT32 `/mnt/apps` DROP FOLDER (copy a `.cwasm` here at runtime —
+/// no rebuild — and it becomes spawnable + appears in the launcher). `/mnt/apps`
+/// is skipped when no disk is mounted.
+const APP_DIRS: &[&str] = &["/bin", "/mnt/apps"];
+
+/// Read `<dir>/<name>.cwasm` bytes, trying each [`APP_DIRS`] entry in order.
+/// `/bin` wins over `/mnt/apps` on a name clash (a system app can't be shadowed).
+fn read_app_bytes(name: &str) -> Option<Vec<u8>> {
+    for dir in APP_DIRS {
+        if *dir == "/mnt/apps" && !crate::vfs::is_mounted("/mnt") { continue; }
+        let path = alloc::format!("{}/{}.cwasm", dir, name);
+        if let Ok(b) = crate::vfs::block_on(crate::wasm::read_all(&path)) {
+            return Some(b);
+        }
+    }
+    None
+}
+
+/// Load `<name>.cwasm` from the VFS (see [`read_app_bytes`] for the search path)
+/// and deserialize it (cached by name).
 /// Returns None on any failure (missing file / bad bytes / deserialize error).
 ///
 /// Synchronous: the compositor loop owns the CPU (it is NOT inside the async
@@ -113,12 +134,164 @@ static NAME_CACHE: Mutex<BTreeMap<String, Module>> = Mutex::new(BTreeMap::new())
 /// outlives `deserialize`; `Module` owns its code afterward.
 fn module_by_name(name: &str) -> Option<Module> {
     if let Some(m) = NAME_CACHE.lock().get(name) { return Some(m.clone()); }
-    let path = alloc::format!("/bin/{}.cwasm", name);
-    let bytes = crate::vfs::block_on(crate::wasm::read_all(&path)).ok()?;
+    let bytes = read_app_bytes(name)?;
     // SAFETY: wt-precompile output for this exact engine Config.
     let m = unsafe { Module::deserialize(engine(), &bytes) }.ok()?;
     NAME_CACHE.lock().insert(String::from(name), m.clone());
     Some(m)
+}
+
+// --- Dynamic launcher catalog (self-describing apps) -----------------------
+//
+// Instead of a hard-coded launcher list, the compositor SCANS `APP_DIRS` for
+// `*.cwasm` and asks each one to describe itself: an app appears in the launcher
+// IFF it exports `manifest() -> i64` (see ruos-window `declare_manifest!`). The
+// export returns `(ptr<<32)|len` of a UTF-8 record `id\u{1f}title[\u{1f}w\u{1f}h]`
+// in the guest's own linear memory. Apps that don't export it (shell, compositor,
+// plain WASI commands) are simply absent from the launcher — the export IS the
+// opt-in. Drop a manifest-bearing `.cwasm` into `/mnt/apps` and it shows up live.
+
+/// A launcher entry parsed from an app's `manifest()` export. `id` is the spawn
+/// key (`<id>.cwasm`); `title` is the display label.
+#[derive(Clone)]
+pub struct Manifest {
+    pub id: String,
+    pub title: String,
+}
+
+/// Stems never treated as launcher apps even if scanned (the desktop shell and the
+/// compositor itself are infrastructure, not user apps). They export no manifest
+/// anyway; listing them here just skips the wasted instantiate during a scan.
+const EXCLUDE: &[&str] = &["shell", "compositor"];
+
+/// The current launcher catalog, published by the compositor's throttled scan and
+/// read by the `wm.app_list` host fn. Single producer (the run loop between frames)
+/// + single consumer (the shell's `app_list` during `frame_all`).
+static APP_CATALOG: crate::sync::IrqMutex<Vec<Manifest>> =
+    crate::sync::IrqMutex::new(Vec::new());
+
+/// Per-stem manifest memo: `Some(m)` = a launcher app, `None` = scanned and has no
+/// manifest (don't re-instantiate it every scan). Keyed by `.cwasm` stem.
+static MANIFEST_CACHE: crate::sync::IrqMutex<BTreeMap<String, Option<Manifest>>> =
+    crate::sync::IrqMutex::new(BTreeMap::new());
+
+/// Wall-clock seconds of the last catalog scan (throttle). Sentinel forces a scan
+/// on the first frame.
+static LAST_SCAN: crate::sync::IrqMutex<f64> = crate::sync::IrqMutex::new(-1.0e9);
+
+/// Deserialize `<stem>.cwasm` fresh (uncached) for a manifest probe.
+fn module_at_stem(stem: &str) -> Option<Module> {
+    let bytes = read_app_bytes(stem)?;
+    // SAFETY: wt-precompile output for this exact engine Config.
+    unsafe { Module::deserialize(engine(), &bytes) }.ok()
+}
+
+/// Instantiate `module` on a THROWAWAY store and call its `manifest()` export to
+/// learn its launcher id/title. Returns None if the module has no `manifest`
+/// export (→ not a launcher app) or anything goes wrong. The manifest record is
+/// const data in the guest's data segment (no heap), so it is valid right after
+/// instantiation without running `_initialize`. The store is dropped on return.
+fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manifest> {
+    let mut store = Store::new(
+        engine(),
+        AppState {
+            wasi: WtState::new(alloc::vec![b"app".to_vec()]),
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
+                           events: VecDeque::new(), close_requested: false,
+                           move_requested: false, spawn_request: VecDeque::new(),
+                           bg_request: false, committed: false,
+                           minimize_request: false, maximize_request: false,
+                           activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
+        },
+    );
+    // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cld", options(nostack)); }
+    let inst = linker.instantiate(&mut store, module).ok()?;
+    // The `manifest` export is OPTIONAL — its absence is the normal "not a launcher
+    // app" case, so a missing-export error here is not logged.
+    let f = inst.get_typed_func::<(), i64>(&mut store, "manifest").ok()?;
+    let packed = f.call(&mut store, ()).ok()?;
+    let ptr = ((packed >> 32) & 0xffff_ffff) as u32;
+    let len = (packed & 0xffff_ffff) as u32;
+    if len == 0 || len > 4096 { return None; }
+    let mem = match inst.get_export(&mut store, "memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return None,
+    };
+    let mut buf = alloc::vec![0u8; len as usize];
+    // SAFETY-equivalent of mem::read but on a Store (the audited Caller path is for
+    // host fns); bounds are checked by `Memory::read`.
+    mem.read(&store, ptr as usize, &mut buf).ok()?;
+    let s = core::str::from_utf8(&buf).ok()?;
+    // Record: id \u{1f} title [\u{1f} w \u{1f} h] — only id+title are used here.
+    let mut it = s.split('\u{1f}');
+    let id = it.next()?.trim();
+    if id.is_empty() { return None; }
+    let title = it.next().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(id);
+    Some(Manifest { id: String::from(id), title: String::from(title) })
+}
+
+/// Scan `APP_DIRS` for `*.cwasm`, extract any newly-seen app's manifest (memoised),
+/// and rebuild [`APP_CATALOG`] from the CURRENTLY-present manifest-bearing files
+/// (so deleting a `.cwasm` drops it from the launcher next scan). Runs between
+/// frames (never inside a guest call) so the throwaway instantiate is safe.
+fn scan_apps() {
+    let engine = engine();
+    let mut linker: Linker<AppState> = Linker::new(engine);
+    if crate::wasm::wt::wasi::add_to_linker(&mut linker).is_err() { return; }
+    if add_to_linker(&mut linker).is_err() { return; }
+
+    // Present `.cwasm` stems across the app dirs, in priority order, de-duped.
+    let mut present: Vec<String> = Vec::new();
+    for dir in APP_DIRS {
+        if *dir == "/mnt/apps" && !crate::vfs::is_mounted("/mnt") { continue; }
+        let entries = match crate::vfs::block_on(crate::vfs::readdir(dir)) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries {
+            if let Some(stem) = e.name.strip_suffix(".cwasm") {
+                if EXCLUDE.contains(&stem) { continue; }
+                if !present.iter().any(|p| p == stem) {
+                    present.push(String::from(stem));
+                }
+            }
+        }
+    }
+
+    // Extract + memoise the manifest for any stem not seen before.
+    {
+        let mut cache = MANIFEST_CACHE.lock();
+        for stem in &present {
+            if cache.contains_key(stem) { continue; }
+            let m = module_at_stem(stem).and_then(|module| extract_manifest(&linker, &module));
+            cache.insert(stem.clone(), m);
+        }
+    }
+
+    // Rebuild the visible catalog from the present, manifest-bearing files.
+    let cache = MANIFEST_CACHE.lock();
+    let mut cat: Vec<Manifest> = Vec::new();
+    for stem in &present {
+        if let Some(Some(m)) = cache.get(stem) {
+            if !cat.iter().any(|c| c.id == m.id) { cat.push(m.clone()); }
+        }
+    }
+    cat.sort_by(|a, b| a.title.cmp(&b.title));
+    *APP_CATALOG.lock() = cat;
+}
+
+/// Refresh the launcher catalog at most once per second (a `.cwasm` dropped into
+/// `/mnt/apps` thus appears within ~1 s). Called from the run loop between frames.
+fn refresh_app_catalog() {
+    let now = crate::wasm::wt::gfx::wall_secs();
+    {
+        let mut last = LAST_SCAN.lock();
+        if now - *last < 1.0 { return; }
+        *last = now;
+    }
+    scan_apps();
 }
 
 /// Boot self-test: every registry entry deserialises to a usable Module.
@@ -605,6 +778,35 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
                 }
             } // drop the lock before touching guest memory
             let count = buf.len() / 32;
+            crate::wasm::wt::mem::write(&mut caller, ptr as u32, &buf);
+            count as i32
+        })?;
+    // wm.app_list(ptr, max) -> u32: write up to `max` launcher records of the
+    // current app catalog (built by the compositor's `scan_apps`) into guest memory
+    // at `ptr`, return the count. Each record is 64 bytes: id(24 bytes UTF-8,
+    // NUL-padded) + title(40 bytes UTF-8, NUL-padded). The shell calls this each
+    // frame to build its launcher menu — so dropping a manifest-bearing `.cwasm`
+    // into `/mnt/apps` makes it appear without any rebuild.
+    linker.func_wrap("wm", "app_list",
+        |mut caller: Caller<'_, T>, ptr: i32, max: i32| -> i32 {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let cat = APP_CATALOG.lock();
+                let n = core::cmp::min(cat.len(), (max.max(0)) as usize);
+                for m in cat.iter().take(n) {
+                    let mut id = [0u8; 24];
+                    let ib = m.id.as_bytes();
+                    let k = core::cmp::min(ib.len(), 24);
+                    id[..k].copy_from_slice(&ib[..k]);
+                    let mut title = [0u8; 40];
+                    let tb = m.title.as_bytes();
+                    let k = core::cmp::min(tb.len(), 40);
+                    title[..k].copy_from_slice(&tb[..k]);
+                    buf.extend_from_slice(&id);
+                    buf.extend_from_slice(&title);
+                }
+            } // drop the lock before touching guest memory
+            let count = buf.len() / 64;
             crate::wasm::wt::mem::write(&mut caller, ptr as u32, &buf);
             count as i32
         })?;
@@ -1335,6 +1537,10 @@ impl Compositor {
             // SP5: reap any window that requested close (guest wm.close or the [X]
             // path) on its last frame BEFORE we fold input or drive frames.
             self.reap();
+            // Refresh the dynamic launcher catalog (throttled to ~1 Hz). Runs HERE,
+            // between frames — never inside a guest call — so the per-app manifest
+            // probe (a throwaway instantiate) can't nest inside another guest call.
+            refresh_app_catalog();
             crate::gfx::fold_mouse();
             while let Some(ev) = crate::gfx::pop() {
                 let (cx, cy) = crate::gfx::mouse_pos();

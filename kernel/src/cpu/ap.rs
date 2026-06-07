@@ -26,6 +26,13 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Load this core's GDT/TSS (slot cpu_id) and the shared IDT.
     crate::gdt::init(cpu_id);
     crate::idt::load();
+    // Enable SSE/AVX on THIS core. CR0/CR4 SIMD-enable bits are PER-CPU; the BSP
+    // set them in `arch::init` but each AP boots with SIMD disabled (CR0.EM set).
+    // Without this, the first SSE instruction in AOT cranelift float code (e.g.
+    // egui rendering on the GUI core) faults with #UD and the core dies. Mirror
+    // the BSP exactly. Done AFTER the IDT so any #GP here is reported, not a triple
+    // fault.
+    crate::boot::phases::arch::enable_simd();
     // Enable this core's LAPIC (SVR bit 8; init_ap masks the timer LVT).
     crate::apic::lapic::init_ap(crate::idt::VEC_SPURIOUS);
     // Arm this AP's LAPIC timer in periodic mode with the BSP-calibrated count.
@@ -36,11 +43,36 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Register online. cpu_id() now resolves correctly on this core via the
     // LAPIC ID (mapped by the BSP before bootstrap).
     crate::cpu::mark_online();
-    // Step 5: dispatch on the role assigned to this core in smp::bringup.
-    // GuiCompositor → dedicated GUI spinner (waits for compositor hand-off, then
-    //   runs run_compositor_gate forever — never returns to the executor).
-    // All others → per-core cooperative executor (Step 3b), which drains async
-    //   tasks, the inbox, and the compute pool (banded compositing workers).
+    // Limine hands each AP a SMALL stack (~64 KiB default); the BSP runs on a
+    // 16 MiB stack (`limine.conf` `stack_size: 0x1000000`). The GUI core runs the
+    // egui compositor via `run_cwasm`, whose render call chain (egui PassState /
+    // tessellation) is deep enough to overflow the tiny Limine AP stack → silent
+    // memory corruption → a bad jump → `#UD` mid-instruction (observed on the GUI
+    // core only; the BSP, with its 16 MiB stack, runs the same compositor fine).
+    // Compute APs run `run_cwasm` for exec'd apps too, so give EVERY AP a large
+    // heap-backed stack and switch to it before entering the worker (which never
+    // returns — the leaked stack lives for the core's lifetime).
+    const AP_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB, generous headroom
+    let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
+    // 16-byte aligned top; SysV requires RSP%16==0 before a `call`.
+    let top = (stack.as_mut_ptr() as u64 + AP_STACK_SIZE as u64) & !0xF;
+    core::arch::asm!(
+        "mov rsp, {top}",
+        "call {run}",
+        top = in(reg) top,
+        run = in(reg) ap_run as unsafe extern "C" fn(u64) -> !,
+        in("rdi") cpu_id as u64,   // SysV first arg → ap_run(cpu_id)
+        options(noreturn),
+    );
+}
+
+/// AP worker, entered on the large heap stack set up by `ap_entry`.
+/// Dispatches on this core's role; neither arm returns.
+///
+/// GuiCompositor → dedicated GUI spinner (waits for compositor hand-off, then
+///   runs run_compositor_gate forever). All others → per-core cooperative
+///   executor (Step 3b): async tasks, inbox, compute pool (banded compositing).
+unsafe extern "C" fn ap_run(cpu_id: u64) -> ! {
     match crate::cpu::core_role(cpu_id as u32) {
         crate::cpu::CoreRole::GuiCompositor =>
             crate::wasm::wt::wm::gui_worker_loop(),

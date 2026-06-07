@@ -26,7 +26,7 @@ pub fn init() -> Result<(), BootError> {
 /// code can use them. The integer-only kernel never needed SIMD, so it was left
 /// disabled. cranelift's SSE-only float codegen renders egui text garbled in
 /// ruos (works on PC where AVX is used) → enable AVX to match the working path.
-fn enable_simd() {
+pub(crate) fn enable_simd() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
     unsafe {
         let mut cr0 = Cr0::read();

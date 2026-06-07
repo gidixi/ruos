@@ -10,6 +10,7 @@ pub mod gfx;
 pub mod gui;
 pub mod component;
 pub mod wm;
+pub mod term;
 pub mod compose;
 
 use crate::kprintln;

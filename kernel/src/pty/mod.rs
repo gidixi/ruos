@@ -52,6 +52,30 @@ pub fn foreground_pid(idx: usize) -> Option<u32> {
     }
 }
 
+/// Per-pair window size (cols<<16 | rows), 0 = unset. Stored OUT of `Termios`
+/// (which is ABI-locked: memcpy'd verbatim to wasi-libc's `__wasi_termios_t`, so
+/// adding fields there would corrupt tcgetattr/tcsetattr). A GUI terminal sets
+/// this on resize; the shell (or a future SIGWINCH path) can read it to size its
+/// editing. Plain atomics → readable/writable without the pair lock.
+static WINSIZE: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+];
+
+/// Set pair `idx`'s window size (in character cells). No-op for a bad index.
+pub fn set_winsize(idx: usize, cols: u16, rows: u16) {
+    if idx >= NUM_PAIRS { return; }
+    let packed = ((cols as u32) << 16) | (rows as u32);
+    WINSIZE[idx].store(packed, Ordering::SeqCst);
+}
+
+/// Pair `idx`'s window size as `(cols, rows)`; `(0, 0)` if never set.
+pub fn winsize(idx: usize) -> (u16, u16) {
+    if idx >= NUM_PAIRS { return (0, 0); }
+    let p = WINSIZE[idx].load(Ordering::SeqCst);
+    ((p >> 16) as u16, (p & 0xffff) as u16)
+}
+
 /// Per-pair slave-input consumer waker. The consumer (app core) registers its
 /// `Waker` here; the producer (owner) wakes it after `push`. Lives outside the
 /// pair lock so producer + consumer never share the pair lock just for the

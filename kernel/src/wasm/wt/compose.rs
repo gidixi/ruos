@@ -28,6 +28,46 @@ pub struct WinDesc {
     pub y: u32,        // on-screen top-left y
     pub w: u32,        // footprint width  (px)
     pub h: u32,        // footprint height (px)
+    pub shadow: bool,  // cast a drop shadow under this window (false for the bg)
+}
+
+/// Drop-shadow parameters (global v1; the same soft shadow under every non-bg
+/// window). The shadow is the window rect OFFSET by `(SHADOW_DX, SHADOW_DY)` and
+/// feathered `SHADOW_R` px outward; only the part outside the window's own opaque
+/// rect is visible (the surface overwrites the interior). All-integer falloff so
+/// the parallel band composite is bit-identical to the serial reference (no f32
+/// divergence across cores — see the SP4 equivalence test).
+const SHADOW_R: usize = 10;       // feather radius (px) — tight, not a wide halo
+const SHADOW_DX: i32 = 4;         // shadow x offset (cast down-right, hugging the window)
+const SHADOW_DY: i32 = 6;         // shadow y offset
+const SHADOW_MAX: u32 = 70;       // peak shadow alpha (0..=255) — subtle, not heavy
+
+/// Cubic falloff LUT: `LUT[d] = round(255 * (1 - d/R)^3)` for `d` in `0..=R`.
+/// `LUT[0] = 255` (full, at the rect edge), `LUT[R] = 0`. The cube concentrates the
+/// shadow near the edge (a defined contact shadow that fades fast) instead of the
+/// wide, soft glow a quadratic/gaussian gives — reads more like a real cast shadow.
+const SHADOW_LUT: [u8; SHADOW_R + 1] = {
+    let mut t = [0u8; SHADOW_R + 1];
+    let r3 = (SHADOW_R * SHADOW_R * SHADOW_R) as u32;
+    let mut d = 0usize;
+    while d <= SHADOW_R {
+        let k = (SHADOW_R - d) as u32; // R - d
+        t[d] = ((255 * k * k * k) / r3) as u8;
+        d += 1;
+    }
+    t
+};
+
+/// Shadow alpha (0..=255) for a pixel `dx_out`/`dy_out` px OUTSIDE the (offset)
+/// shadow rect along each axis (0 = inside that axis' span). Separable product of
+/// the per-axis falloff, scaled by `SHADOW_MAX`. Returns 0 past the feather radius.
+#[inline]
+fn shadow_alpha(dx_out: usize, dy_out: usize) -> u32 {
+    if dx_out > SHADOW_R || dy_out > SHADOW_R { return 0; }
+    let fx = SHADOW_LUT[dx_out] as u32;
+    let fy = SHADOW_LUT[dy_out] as u32;
+    // SHADOW_MAX * fx/255 * fy/255, integer.
+    (SHADOW_MAX * fx * fy) / (255 * 255)
 }
 
 // SAFETY: WinDesc only carries a raw pointer + plain integers. It is read-only
@@ -71,6 +111,13 @@ pub unsafe fn composite_band(
     }
     // 2) Painter's algorithm: blit each footprint's overlap with this band.
     for win in wins {
+        // Drop shadow FIRST: blend it over everything already painted (bg + lower
+        // windows), then the opaque surface below covers the shadow's interior.
+        // Painter order (bottom->top) makes a window's shadow land on the windows
+        // beneath it and never on the ones above (those paint later).
+        if win.shadow {
+            blend_shadow_band(back, stride, screen_w, band_y0, band_y1, win);
+        }
         let wx = win.x as usize;
         let wy = win.y as usize;
         let ww = win.w as usize;
@@ -99,5 +146,74 @@ pub unsafe fn composite_band(
             core::ptr::copy_nonoverlapping(src, dst, vis_w * 4);
             sy += 1;
         }
+    }
+}
+
+/// Blend one window's drop shadow into rows `[band_y0, band_y1)` of the RGBX
+/// back-buffer. The shadow is the window rect offset by `(SHADOW_DX, SHADOW_DY)`,
+/// feathered `SHADOW_R` px outward; pixels under the window's OWN opaque rect are
+/// skipped (the surface copy overwrites them). Darken-only blend toward black:
+/// `out = dst * (255 - alpha) / 255` per channel — all integer, so the parallel
+/// band composite stays bit-identical to the serial reference.
+///
+/// SAFETY: same contract as `composite_band` — `back .. back + band_y1*stride` is
+/// a valid, uniquely-owned (for this band's rows) writable region, and every write
+/// lands in `[band_y0, band_y1)`.
+unsafe fn blend_shadow_band(
+    back: *mut u8,
+    stride: usize,
+    screen_w: u32,
+    band_y0: u32,
+    band_y1: u32,
+    win: &WinDesc,
+) {
+    if win.w == 0 || win.h == 0 { return; }
+    let sw = screen_w as i32;
+    let r = SHADOW_R as i32;
+    // Window's own opaque rect (un-offset) — skip; the surface covers it.
+    let wx0 = win.x as i32;
+    let wy0 = win.y as i32;
+    let wx1 = wx0 + win.w as i32;
+    let wy1 = wy0 + win.h as i32;
+    // Offset shadow rect (the falloff is measured from this rect's edges).
+    let ox0 = wx0 + SHADOW_DX;
+    let oy0 = wy0 + SHADOW_DY;
+    let ox1 = ox0 + win.w as i32;
+    let oy1 = oy0 + win.h as i32;
+    // Shadow bounding box = offset rect grown by R, clipped to screen + this band.
+    let bx0 = core::cmp::max(ox0 - r, 0);
+    let bx1 = core::cmp::min(ox1 + r, sw);
+    let by0 = core::cmp::max(oy0 - r, band_y0 as i32);
+    let by1 = core::cmp::min(oy1 + r, band_y1 as i32);
+    if bx0 >= bx1 || by0 >= by1 { return; }
+
+    let mut py = by0;
+    while py < by1 {
+        // Distance of this row outside the offset rect's y-span (0 = inside).
+        let dy_out = if py < oy0 { (oy0 - py) as usize }
+                     else if py >= oy1 { (py - oy1 + 1) as usize }
+                     else { 0 };
+        if dy_out > SHADOW_R { py += 1; continue; }
+        let inside_win_y = py >= wy0 && py < wy1;
+        let row = back.add(py as usize * stride);
+        let mut px = bx0;
+        while px < bx1 {
+            // Skip the window's own opaque interior (overwritten by its surface).
+            if inside_win_y && px >= wx0 && px < wx1 { px += 1; continue; }
+            let dx_out = if px < ox0 { (ox0 - px) as usize }
+                         else if px >= ox1 { (px - ox1 + 1) as usize }
+                         else { 0 };
+            let a = shadow_alpha(dx_out, dy_out);
+            if a != 0 {
+                let inv = 255 - a;
+                let o = px as usize * 4;
+                *row.add(o)     = ((*row.add(o)     as u32 * inv) / 255) as u8;
+                *row.add(o + 1) = ((*row.add(o + 1) as u32 * inv) / 255) as u8;
+                *row.add(o + 2) = ((*row.add(o + 2) as u32 * inv) / 255) as u8;
+                // o+3 is the ignored X byte of the RGBX back-buffer — leave it.
+            }
+            px += 1;
+        }
+        py += 1;
     }
 }

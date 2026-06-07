@@ -1,0 +1,10 @@
+{
+  "name": "ruos-desktop",
+  "displayName": "ruos-desktop tools",
+  "version": "1.0.0",
+  "description": "Tooling per il desktop ruos: scaffolding di nuove app (DeskApp + crate cdylib + wiring Makefile/launcher).",
+  "author": {
+    "name": "Giuseppe De Solda"
+  },
+  "keywords": ["ruos", "egui", "desktop", "scaffold"]
+}

@@ -170,7 +170,7 @@ static mut BAND_ARENA: [BandArg; MAX_BANDS] = [BandArg {
 /// jobs read the same list (painter order). The BSP fills `[0, n)` then submits;
 /// the footprint backing buffers are kept alive on the BSP across the join.
 static mut WIN_ARENA: [WinDesc; MAX_WINS] = [WinDesc {
-    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0,
+    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0, shadow: false,
 }; MAX_WINS];
 
 /// Distinct cores that ran a composite job in the most recent frame (bitset by
@@ -424,6 +424,25 @@ pub struct WmState {
     /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
     /// then clears it.
     pub bg_request: bool,
+    /// Damage flag: set by `wm.commit` (the guest drew a new surface this frame),
+    /// cleared by the run loop before each `frame_all`. The compositor presents a
+    /// frame only when SOME window committed (or geometry changed) — an idle app
+    /// that commits nothing keeps its last surface and costs no composite/blit.
+    pub committed: bool,
+    /// Set by `wm.minimize()`; the run loop hides this window (Window.minimized).
+    pub minimize_request: bool,
+    /// Set by `wm.toggle_maximize()`; the run loop maximizes/restores this window.
+    pub maximize_request: bool,
+    /// Window-ids the guest asked to activate via `wm.activate(id)` (the shell's
+    /// taskbar): un-minimize + raise + focus. A queue so several clicks in one frame
+    /// are all honoured. Drained by the run loop.
+    pub activate_request: VecDeque<u32>,
+    /// Configure channel (kernel→app size authority): the size the kernel wants this
+    /// window to render at, packed by `wm.window_size()` as `(w<<32)|h`. `(0,0)` =
+    /// not yet established → the app uses its own default and the kernel adopts the
+    /// first committed size. Maximize/restore/resize update these.
+    pub target_w: u32,
+    pub target_h: u32,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -465,6 +484,7 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
                 s.pixels = b;
                 s.win_w = w as u32;
                 s.win_h = h as u32;
+                s.committed = true; // damage: this window drew a new surface this frame
             }
         })?;
     // wm.app_id() -> u32: this instance's window id. (Import name is `app_id`
@@ -540,8 +560,63 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             let g = crate::gfx::geom();
             ((g.width as i64) << 32) | (g.height as i64)
         })?;
+    // wm.window_size() -> i64: THIS window's kernel-assigned size, packed (w<<32)|h
+    // (the "configure" the app renders to). `(0,0)` until established — the app then
+    // uses its own default and the kernel adopts the first committed size. Maximize/
+    // restore/resize change it; the app reads it each frame and re-rasters.
+    linker.func_wrap("wm", "window_size",
+        |caller: Caller<'_, T>| -> i64 {
+            let s = caller.data().win_ref();
+            ((s.target_w as i64) << 32) | (s.target_h as i64)
+        })?;
+    // wm.minimize(): the guest (yellow titlebar dot) asks to be hidden into the
+    // taskbar. Deferred to the run loop (sets Window.minimized).
+    linker.func_wrap("wm", "minimize",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().minimize_request = true; })?;
+    // wm.toggle_maximize(): the guest (green dot) asks to maximize to the work-area
+    // or restore. Deferred to the run loop (toggles Window.maximized + geometry).
+    linker.func_wrap("wm", "toggle_maximize",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().maximize_request = true; })?;
+    // wm.activate(id): the guest (the shell's taskbar) asks the kernel to un-minimize
+    // + raise + focus the window with that id. Deferred to the run loop.
+    linker.func_wrap("wm", "activate",
+        |mut caller: Caller<'_, T>, id: i32| {
+            caller.data_mut().win().activate_request.push_back(id as u32);
+        })?;
+    // wm.window_list(ptr, max) -> u32: write up to `max` taskbar records of the
+    // current non-bg windows into guest memory at `ptr`, return the count. Each
+    // record is 32 bytes: id(u32 LE) + flags(u32 LE: bit0=minimized, bit1=focused)
+    // + title(24 bytes UTF-8, NUL-padded). Reads the compositor's per-frame snapshot
+    // (the host fn cannot reach `wins`, so the run loop publishes it each frame).
+    linker.func_wrap("wm", "window_list",
+        |mut caller: Caller<'_, T>, ptr: i32, max: i32| -> i32 {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let snap = WINDOW_SNAPSHOT.lock();
+                let n = core::cmp::min(snap.len(), (max.max(0)) as usize);
+                for (id, flags, title) in snap.iter().take(n) {
+                    buf.extend_from_slice(&id.to_le_bytes());
+                    buf.extend_from_slice(&flags.to_le_bytes());
+                    let mut t = [0u8; 24];
+                    let tb = title.as_bytes();
+                    let k = core::cmp::min(tb.len(), 24);
+                    t[..k].copy_from_slice(&tb[..k]);
+                    buf.extend_from_slice(&t);
+                }
+            } // drop the lock before touching guest memory
+            let count = buf.len() / 32;
+            crate::wasm::wt::mem::write(&mut caller, ptr as u32, &buf);
+            count as i32
+        })?;
     Ok(())
 }
+
+/// Per-frame taskbar snapshot of the non-bg windows (id, flags, title), published
+/// by the run loop and read by `wm.window_list`. flags: bit0 = minimized, bit1 =
+/// focused. Single producer (the compositor loop) + single consumer (the shell's
+/// `window_list` call during `frame_all`), but guarded for safety.
+static WINDOW_SNAPSHOT: crate::sync::IrqMutex<Vec<(u32, u32, String)>> =
+    crate::sync::IrqMutex::new(Vec::new());
 
 /// Run a reactor instance's `_initialize` export ONCE, if it has one.
 ///
@@ -572,7 +647,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -635,6 +710,18 @@ pub struct Window {
     /// forced to the full framebuffer, undecorated, never raised/focused/moved/
     /// closed; it only receives input where no non-`bg` window covers the point.
     pub bg: bool,
+    /// SP6 window controls: minimized windows are kept in `wins` but skipped by the
+    /// composite + input hit-test (the taskbar restores them via `wm.activate`).
+    pub minimized: bool,
+    /// Maximized to the work-area; `saved_rect` holds the pre-maximize geometry to
+    /// restore on toggle-off.
+    pub maximized: bool,
+    pub saved_rect: Option<(u32, u32, u32, u32)>,
+    /// Configure (kernel→app size authority): false until the window's size is
+    /// established. We bootstrap `rect.w/h` from the app's FIRST committed surface,
+    /// then the kernel owns the size (`wm.window_size()` reports it; maximize/resize
+    /// change it) and stops blindly adopting the committed size.
+    pub sized: bool,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -648,12 +735,22 @@ pub struct Compositor {
     pub backbuf: alloc::vec::Vec<u8>, // SP3 screen back-buffer (lazily sized in present)
     pub free_ids: Vec<u32>,        // SP5: window-ids returned by reaped windows (LIFO)
     pub next_id: u32,              // SP5: next never-used id (high-water mark)
+    /// Damage flag for GEOMETRY/window-set changes (raise, drag, spawn, reap,
+    /// bg-pin) — things that change the composite even when no window committed
+    /// new pixels. ORed with "any window committed" to decide whether `present`
+    /// runs this frame; reset after each present. Starts `true` (first frame).
+    pub dirty: bool,
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
 /// this size in SP2; SP3 will make them resizable.
 const WIN_W: u32 = 320;
 const WIN_H: u32 = 240;
+
+/// Top inset reserved for the shell's panel/taskbar (the bg window's top strip).
+/// A maximized window fills the work-area BELOW this, so the panel/taskbar stays
+/// visible. Approximate the shell panel height; refine if the panel grows.
+const WORKAREA_TOP: u32 = 32;
 
 /// Desktop background (RGBA8888 [r,g,b,a]) shown where no window covers.
 const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
@@ -688,6 +785,7 @@ impl Compositor {
             backbuf: Vec::new(),
             free_ids: Vec::new(),
             next_id: 0,
+            dirty: true,
         };
 
         // Initial window = the userspace desktop SHELL. Prefer the VFS
@@ -727,6 +825,7 @@ impl Compositor {
             backbuf: Vec::new(),
             free_ids: Vec::new(),
             next_id: 0,
+            dirty: true,
         }
     }
 
@@ -747,7 +846,7 @@ impl Compositor {
     /// non-`bg` window falls through to the `bg` window via `bg_index`).
     pub fn window_at(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.wins.len()).rev() {
-            if self.wins[i].bg { continue; }
+            if self.wins[i].bg || self.wins[i].minimized { continue; }
             let (rx, ry, rw, rh) = self.wins[i].rect;
             let (rx, ry) = (rx as i32, ry as i32);
             if px >= rx && px < rx + rw as i32 && py >= ry && py < ry + rh as i32 {
@@ -784,6 +883,7 @@ impl Compositor {
         if idx >= self.wins.len() { return idx; }
         let last = self.wins.len() - 1;
         if idx == last { return last; }
+        self.dirty = true; // z-order change → recomposite
         let w = self.wins.remove(idx);
         self.wins.push(w);
         // Keep `self.focused` pointing at the same window if it moved.
@@ -814,7 +914,64 @@ impl Compositor {
             let fh = h as i32;
             let nx = (cx - grab.0).clamp(0, (sw_screen - fw).max(0)) as u32;
             let ny = (cy - grab.1).clamp(0, (sh_screen - fh).max(0)) as u32;
-            self.wins[i].rect = (nx, ny, w, h);
+            if (nx, ny) != (self.wins[i].rect.0, self.wins[i].rect.1) {
+                self.dirty = true; // window moved → recomposite
+                self.wins[i].rect = (nx, ny, w, h);
+            }
+        }
+    }
+
+    /// Publish the kernel's desired size for window `i` into its guest WmState, so
+    /// `wm.window_size()` reports it and the app re-rasters to match (configure).
+    fn set_target(&mut self, i: usize, w: u32, h: u32) {
+        let s = self.wins[i].store.data_mut();
+        s.win.target_w = w;
+        s.win.target_h = h;
+    }
+
+    /// Toggle window `i` between maximized (filling the work-area below the panel)
+    /// and its saved geometry. Sets the configure target so the app re-rasters at
+    /// the new size; marks the window `sized` so `frame_all` stops adopting the
+    /// committed size (the kernel now owns it).
+    fn toggle_maximize(&mut self, i: usize) {
+        if i >= self.wins.len() || self.wins[i].bg { return; }
+        if self.wins[i].maximized {
+            if let Some(r) = self.wins[i].saved_rect.take() {
+                self.wins[i].rect = r;
+                self.set_target(i, r.2, r.3);
+            }
+            self.wins[i].maximized = false;
+        } else {
+            self.wins[i].saved_rect = Some(self.wins[i].rect);
+            let g = crate::gfx::geom();
+            let wa = (0u32, WORKAREA_TOP, g.width, g.height.saturating_sub(WORKAREA_TOP));
+            self.wins[i].rect = wa;
+            self.set_target(i, wa.2, wa.3);
+            self.wins[i].maximized = true;
+        }
+        self.wins[i].sized = true;
+        self.dirty = true;
+    }
+
+    /// Restore (un-minimize) + raise + focus the window with `id` (the taskbar's
+    /// `wm.activate`). No-op for an unknown id.
+    fn activate(&mut self, id: u32) {
+        if let Some(i) = self.index_of(id) {
+            self.wins[i].minimized = false;
+            let top = self.raise(i);
+            self.set_focus(top);
+            self.dirty = true;
+        }
+    }
+
+    /// Move focus to the topmost visible (non-bg, non-minimized) window, if any.
+    /// Used after minimizing the focused window so focus never sticks on a hidden one.
+    fn focus_topmost_visible(&mut self) {
+        for i in (0..self.wins.len()).rev() {
+            if !self.wins[i].bg && !self.wins[i].minimized {
+                self.set_focus(i);
+                return;
+            }
         }
     }
 
@@ -825,6 +982,7 @@ impl Compositor {
     /// The SOLE place a window leaves `wins` (close + reap both route here).
     fn remove_at(&mut self, i: usize) {
         if i >= self.wins.len() { return; }
+        self.dirty = true; // a window left the set → recomposite
         let w = self.wins.remove(i); // Drop tears down Store+Instance (frees guest mem)
         crate::proc::unregister(w.pid);
         self.free_ids.push(w.id);
@@ -878,7 +1036,9 @@ impl Compositor {
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
                                move_requested: false, spawn_request: VecDeque::new(),
-                               bg_request: false },
+                               bg_request: false, committed: false,
+                               minimize_request: false, maximize_request: false,
+                               activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -913,6 +1073,10 @@ impl Compositor {
             alive: true,
             pid,
             bg: false,
+            minimized: false,
+            maximized: false,
+            saved_rect: None,
+            sized: false,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order
@@ -963,16 +1127,22 @@ impl Compositor {
     }
 
     /// CSD: the window IS its raw committed surface — no kernel decorations. Returns
-    /// `(pixels, x, y, w, h)`: the guest's last-committed RGBA8888 surface placed at
-    /// `Window.rect`'s origin, sized to the committed `win_w × win_h` (so the band
-    /// kernel's `src_stride = w*4` matches the committed buffer exactly). The app
-    /// draws its OWN title bar / [X] / content. Returns None if nothing committed yet.
-    fn compose_window(&self, idx: usize) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+    /// `(ptr, len, x, y, w, h)`: a BORROWED pointer to the guest's last-committed
+    /// RGBA8888 surface placed at `Window.rect`'s origin, sized to the committed
+    /// `win_w × win_h` (so the band kernel's `src_stride = w*4` matches the buffer
+    /// exactly). The app draws its OWN title bar / [X] / content. None if nothing
+    /// committed yet.
+    ///
+    /// Leva 0 (no per-frame clone): the pointer aliases `WmState.pixels` in the
+    /// window's Store. `present` does NOT mutate `self.wins` between calling this
+    /// and the `dispatch_bands` join, so the pixels are neither freed nor realloc'd
+    /// while the band jobs read them — the borrow outlives the parallel composite.
+    fn compose_window(&self, idx: usize) -> Option<(*const u8, usize, u32, u32, u32, u32)> {
         let win = &self.wins[idx];
         let s = win.store.data();
         if s.win.pixels.is_empty() { return None; }
         let (x, y, _, _) = win.rect;
-        Some((s.win.pixels.clone(), x, y, s.win.win_w, s.win.win_h))
+        Some((s.win.pixels.as_ptr(), s.win.pixels.len(), x, y, s.win.win_w, s.win.win_h))
     }
 
     /// Call `frame()` on every window's instance (the gate's get_typed_func loop,
@@ -996,10 +1166,20 @@ impl Compositor {
             // this, `window_at` / drag clamp use the stale placeholder size and a
             // click on the app's [X] (past the placeholder right/bottom edge) is
             // never routed. Keep the rect ORIGIN (x,y); only adopt the real w/h.
-            let (rx, ry, _, _) = w.rect;
             let (cw, ch) = { let s = w.store.data(); (s.win.win_w, s.win.win_h) };
-            if cw != 0 && ch != 0 {
+            if cw != 0 && ch != 0 && !w.sized {
+                // Configure bootstrap: the FIRST committed surface establishes the
+                // window's size. Keep the rect ORIGIN (x,y); adopt the committed
+                // w/h, publish it as the configure target, and mark `sized` — from
+                // now the kernel owns the size (maximize/resize set rect + target;
+                // the app renders to `wm.window_size()`, so the committed size
+                // already matches rect.w/h and we must NOT re-adopt it).
+                let (rx, ry, _, _) = w.rect;
                 w.rect = (rx, ry, cw, ch);
+                let s = w.store.data_mut();
+                s.win.target_w = cw;
+                s.win.target_h = ch;
+                w.sized = true;
             }
         }
     }
@@ -1031,47 +1211,49 @@ impl Compositor {
             self.wins[bi].rect = (0, 0, sw, sh);
         }
 
-        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order),
+        // 1) BSP: build footprint descriptors bottom->top (z = `wins` Vec order),
         //    but with the `bg` window FIRST (z-bottom, forced to origin (0,0)).
-        //    Keep them ALIVE in `foots` across the join so the band jobs' raw
-        //    pointers (into each footprint buffer) stay valid for the whole
-        //    parallel composite.
-        let mut foots: alloc::vec::Vec<(alloc::vec::Vec<u8>, u32, u32, u32, u32)> =
+        //    Leva 0: each descriptor BORROWS the window's committed surface in
+        //    place (no clone). The pixels live in each window's Store and are NOT
+        //    mutated between here and the `dispatch_bands` join, so the raw
+        //    pointers stay valid for the whole parallel composite.
+        // Each desc carries a `shadow` flag: the bg window casts none (it's the
+        // full-screen backdrop), every normal window does.
+        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32, bool)> =
             alloc::vec::Vec::new();
         if let Some(bi) = bg_idx {
             // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
-            if let Some((px, _, _, fw, fh)) = self.compose_window(bi) {
-                foots.push((px, 0, 0, fw, fh));
+            if let Some((px, len, _, _, fw, fh)) = self.compose_window(bi) {
+                descs.push((px, len, 0, 0, fw, fh, false));
             }
         }
         for i in 0..self.wins.len() {
             if bg_idx == Some(i) { continue; } // bg already composited first
-            if let Some(f) = self.compose_window(i) { foots.push(f); }
+            if self.wins[i].minimized { continue; } // hidden → not composited
+            if let Some((px, len, x, y, w, h)) = self.compose_window(i) {
+                descs.push((px, len, x, y, w, h, true));
+            }
         }
-        let n = core::cmp::min(foots.len(), MAX_WINS);
+        let n = core::cmp::min(descs.len(), MAX_WINS);
         // SAFETY: BSP-only write of WIN_ARENA between joined frames (the previous
         // frame's jobs were joined inside dispatch_bands before we returned, so
         // no job is in flight while we mutate the arena here).
-        for (i, (buf, fx, fy, fw, fh)) in foots.iter().enumerate().take(n) {
+        for (i, (px, len, fx, fy, fw, fh, sh)) in descs.iter().enumerate().take(n) {
             unsafe {
                 WIN_ARENA[i] = WinDesc {
-                    px: buf.as_ptr(),
-                    px_len: buf.len(),
-                    x: *fx,
-                    y: *fy,
-                    w: *fw,
-                    h: *fh,
+                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh, shadow: *sh,
                 };
             }
         }
 
-        // 2) Dispatch the banded composite into backbuf, then present.
+        // 2) Dispatch the banded composite into backbuf, then present. The borrowed
+        //    surfaces stay alive in their Stores (we don't touch `self.wins`) for
+        //    the entire parallel composite — dispatch_bands joins all jobs before
+        //    returning, so no band job outlives this call.
         let bg = u32::from_le_bytes(DESKTOP_BG);
         let back_ptr = self.backbuf.as_mut_ptr() as usize;
         dispatch_bands(back_ptr, stride, sw, sh, bg, n);
         crate::gfx::blit(&self.backbuf[..needed], 0, 0, sw, sh);
-        // `foots` drops here — AFTER dispatch_bands joined all jobs, so the
-        // footprint buffers were alive for the entire parallel composite.
     }
 
     /// Push a window-local MouseMove (kind 1) into window `idx`'s queue so the app's
@@ -1226,6 +1408,10 @@ impl Compositor {
                 }
             }
 
+            // Clear per-window damage flags; `wm.commit` re-sets `committed` for any
+            // window that draws a new surface during this `frame_all`.
+            for w in self.wins.iter_mut() { w.store.data_mut().win.committed = false; }
+
             self.frame_all();
 
             // SP-C: process deferred window→kernel requests raised during
@@ -1238,6 +1424,7 @@ impl Compositor {
                 if self.wins[i].store.data().win.bg_request {
                     self.wins[i].store.data_mut().win.bg_request = false;
                     self.wins[i].bg = true;
+                    self.dirty = true; // bg pin changes the composite → present
                     crate::binfo!("wm", "bg window win_id={}", self.wins[i].id);
                 }
             }
@@ -1282,7 +1469,66 @@ impl Compositor {
                 }
             }
 
-            self.present();
+            // SP6 window controls (deferred, like spawn/move): the traffic-light dots.
+            // Minimize (yellow) → hide into the taskbar; toggle-maximize (green) →
+            // work-area / restore. (Close = red is the existing `close_requested`.)
+            for i in 0..self.wins.len() {
+                if self.wins[i].store.data().win.minimize_request {
+                    self.wins[i].store.data_mut().win.minimize_request = false;
+                    if !self.wins[i].bg {
+                        self.wins[i].minimized = true;
+                        self.dirty = true;
+                        crate::binfo!("wm", "minimize win_id={}", self.wins[i].id);
+                        if self.focused == i { self.focus_topmost_visible(); }
+                    }
+                }
+                if self.wins[i].store.data().win.maximize_request {
+                    self.wins[i].store.data_mut().win.maximize_request = false;
+                    self.toggle_maximize(i);
+                }
+            }
+            // Taskbar activate requests (`wm.activate`): drain each window's queue,
+            // then apply (un-minimize + raise + focus the target id).
+            let mut to_activate: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            for w in self.wins.iter_mut() {
+                while let Some(id) = w.store.data_mut().win.activate_request.pop_front() {
+                    to_activate.push(id);
+                }
+            }
+            for id in to_activate { self.activate(id); }
+
+            // Publish the taskbar snapshot (non-bg windows) for the shell's
+            // `wm.window_list`. flags: bit0 = minimized, bit1 = focused.
+            {
+                let mut snap = WINDOW_SNAPSHOT.lock();
+                snap.clear();
+                for (i, w) in self.wins.iter().enumerate() {
+                    if w.bg { continue; }
+                    let mut flags = 0u32;
+                    if w.minimized { flags |= 1; }
+                    if i == self.focused { flags |= 2; }
+                    snap.push((w.id, flags, w.title.clone()));
+                }
+            }
+
+            // Present only when something actually changed: any window committed a
+            // new surface this frame, OR geometry/window-set changed (`self.dirty`).
+            // An idle desktop (no commits, no moves) skips the whole composite+blit
+            // — the framebuffer already holds the last frame, and the software
+            // cursor is maintained independently by `gfx::fold_mouse`/`blit`.
+            //
+            // WARM-UP EXCEPTION: force a present for the first `WARMUP_FRAMES` loops
+            // so the SMP band pool warms up (APs need several composited frames to
+            // pick up jobs) and the "composite cores" boot-marker — which fires at
+            // frame 30, see below — observes real multi-core band activity. The
+            // comp-smp test's apps are static (they commit once), so without this
+            // the marker could see <2 cores. Idle-skipping kicks in after warm-up.
+            const WARMUP_FRAMES: u32 = 90;
+            let any_committed = self.wins.iter().any(|w| w.store.data().win.committed);
+            if self.dirty || any_committed || frame_no < WARMUP_FRAMES {
+                self.present();
+                self.dirty = false;
+            }
             frame_no += 1;
 
             // After 30 composited frames, report the distinct cores that ran
@@ -1302,8 +1548,14 @@ impl Compositor {
                 marker_done = true;
             }
 
-            // Crude pacing so the colour cycle + input feel responsive.
-            for _ in 0..2_000_000u32 { core::hint::spin_loop(); }
+            // Idle pacing: park the core until the next interrupt instead of busy-
+            // spinning (which pegged a core at 100% even with nothing on screen
+            // changing). The 100 Hz timer bounds the wake latency to ~10 ms; PS/2
+            // and USB input IRQs wake us sooner, so drag/click stay responsive. With
+            // present-gating above, an idle desktop now does ~zero work per tick.
+            // SAFETY: the compositor loop runs with IF=1 (entered from the executor,
+            // which enables interrupts), so `hlt` is guaranteed to be woken by an IRQ.
+            x86_64::instructions::hlt();
         }
     }
 }

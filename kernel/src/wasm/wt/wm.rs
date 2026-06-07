@@ -241,6 +241,7 @@ fn scan_apps() {
     let mut linker: Linker<AppState> = Linker::new(engine);
     if crate::wasm::wt::wasi::add_to_linker(&mut linker).is_err() { return; }
     if add_to_linker(&mut linker).is_err() { return; }
+    if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return; }
 
     // Present `.cwasm` stems across the app dirs, in priority order, de-duped.
     let mut present: Vec<String> = Vec::new();
@@ -855,6 +856,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     let mut linker: Linker<AppState> = Linker::new(engine);
     crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
     if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
+    if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
     // BACKWARD if DF=1, silently corrupting copied data.
     #[cfg(target_arch = "x86_64")]
@@ -977,6 +979,7 @@ impl Compositor {
         let mut linker: Linker<AppState> = Linker::new(engine);
         crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
+        crate::wasm::wt::term::add_to_linker(&mut linker).expect("term linker");
 
         let mut c = Compositor {
             wins: Vec::new(),
@@ -1017,6 +1020,7 @@ impl Compositor {
         let mut linker: Linker<AppState> = Linker::new(engine);
         crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
+        crate::wasm::wt::term::add_to_linker(&mut linker).expect("term linker");
         let module = module_for(REACTOR_CWASM).expect("reactor module");
         Compositor {
             wins: Vec::new(),

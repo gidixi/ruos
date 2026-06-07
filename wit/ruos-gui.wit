@@ -14,7 +14,20 @@ interface power {
   poweroff: func();
   reboot: func();
 }
+// Terminal sessions: a window attaches to a kernel PTY pair + shell. Handle =
+// PTY pair index; -1 = no free pair. The concrete ABI is raw (the `term` host
+// module): `read` writes the bytes into the guest buffer and returns the count
+// (more efficient than an allocating `list<u8>`); this WIT documents the
+// contract, like the same raw-vs-WIT split already noted for `wm.poll_event`.
+interface term {
+  open: func() -> s32;
+  read: func(handle: s32, cap: u32) -> list<u8>;
+  write: func(handle: s32, bytes: list<u8>);
+  resize: func(handle: s32, cols: u32, rows: u32);
+  close: func(handle: s32);
+}
 world ruos-gui {
   import gfx;
   import power;
+  import term;
 }

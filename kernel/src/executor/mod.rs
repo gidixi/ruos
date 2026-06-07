@@ -659,45 +659,61 @@ async fn boot_shell_task() {
     }
 }
 
-/// SSH PTY dispatcher: drains PTY_QUEUE entries posted by the SSH server
-/// when a client opens an interactive shell channel. Each entry spawns
-/// `shell.wasm` on the requested PTY pair, binding FDs 0/1/2 to its slave.
+/// Run ONE `shell.wasm` on PTY pair `idx` to completion, then release the pair.
+/// Pooled so several PTY shells run CONCURRENTLY — an SSH session and a GUI
+/// terminal window (and the next SSH client) each get their own instance. This
+/// is what makes SSH and the UI terminal coexist: previously the single
+/// dispatcher `await`ed each shell to exit before starting the next, so only one
+/// PTY shell could be alive at a time. `pool_size` ≥ usable pairs (`NUM_PAIRS`).
+#[embassy_executor::task(pool_size = 4)]
+async fn pty_shell_task(idx: usize, path: alloc::string::String) {
+    let bytes = match crate::wasm::read_all(&path).await {
+        Ok(b)  => b,
+        Err(_) => {
+            kprintln!("pty shell spawn: read {} failed", path);
+            crate::pty::release(idx); // free the pair so the bridge/window closes
+            return;
+        }
+    };
+    let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
+        Ok(f)  => f,
+        Err(e) => {
+            kprintln!("pty shell spawn: instantiate {}: {}", path, e);
+            crate::pty::release(idx);
+            return;
+        }
+    };
+    fb.rebind_stdio_pty(idx);
+    // argv = ["shell", "--no-init"] so the shell skips replaying /etc/init.sh +
+    // the boot banner (it's not the boot console).
+    fb.set_args(alloc::vec![
+        b"shell".to_vec(),
+        b"--no-init".to_vec(),
+    ]);
+    let pid = crate::proc::register(
+        alloc::string::String::from(path.trim_start_matches('/')),
+    );
+    fb.set_pid(pid);
+    let code = fb.run().await;
+    crate::proc::unregister(pid);
+    crate::binfo!("pty", "shell on pty {} exited code={}", idx, code);
+    crate::pty::release(idx);
+}
+
+/// PTY shell dispatcher: drains PTY_QUEUE entries posted by the SSH server (a
+/// client opened an interactive shell channel) and by the GUI terminal window
+/// (`term.open`). Each entry SPAWNS its own `pty_shell_task` and loops on —
+/// shells run concurrently, so SSH and the UI terminal no longer block each other.
 #[embassy_executor::task]
 async fn ssh_pty_dispatcher_task() {
+    let spawner = embassy_executor::Spawner::for_current_executor().await;
     loop {
         let next = PTY_QUEUE.lock().pop_front();
         if let Some((idx, path)) = next {
-            let bytes = match crate::wasm::read_all(&path).await {
-                Ok(b)  => b,
-                Err(_) => {
-                    kprintln!("ssh shell spawn: read {} failed", path);
-                    crate::pty::release(idx); // free the pair so the bridge closes
-                    continue;
-                }
-            };
-            let mut fb = match crate::wasm::fiber::Fiber::new(&bytes) {
-                Ok(f)  => f,
-                Err(e) => {
-                    kprintln!("ssh shell spawn: instantiate {}: {}", path, e);
-                    crate::pty::release(idx);
-                    continue;
-                }
-            };
-            fb.rebind_stdio_pty(idx);
-            // argv = ["shell", "--no-init"] so the SSH shell skips replaying
-            // /etc/init.sh + the boot banner.
-            fb.set_args(alloc::vec![
-                b"shell".to_vec(),
-                b"--no-init".to_vec(),
-            ]);
-            let pid = crate::proc::register(
-                alloc::string::String::from(path.trim_start_matches('/')),
-            );
-            fb.set_pid(pid);
-            let code = fb.run().await;
-            crate::proc::unregister(pid);
-            crate::binfo!("ssh", "shell on pty {} exited code={}", idx, code);
-            crate::pty::release(idx);
+            if spawner.spawn(pty_shell_task(idx, path)).is_err() {
+                crate::bwarn!("pty", "shell task pool full; dropping pair {}", idx);
+                crate::pty::release(idx);
+            }
         } else {
             delay::Delay::ticks(2).await;
         }

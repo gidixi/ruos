@@ -656,6 +656,20 @@ pub fn init() -> Result<(), BootError> {
         } else {
             crate::binfo!("parallel-exec", "skipped (<4 cores or cores 2/3 not ComputeApp)");
         }
+        // SP-C: prove the wm.spawn deferred-spawn mechanism grows the window list
+        // to 2 (bit0) AND the wm.set_background mechanism forces a window to the
+        // full framebuffer (bit1). Embedded module (VFS /bin not mounted yet); the
+        // real VFS wm.spawn is covered visually. Expect flags=0b11.
+        let spc = crate::wasm::wt::run_spc_demo();
+        crate::binfo!("wm", "spc flags=0b{:02b}", spc);
+        // SP-D: prove the desktop-shell boot wiring headlessly — the new
+        // wm.poweroff/wm.surface_size host fns register (the empty compositor
+        // builds past add_to_linker) AND the wm.set_background full-screen
+        // mechanism the shell self-flags with still pins a window to the whole
+        // framebuffer. Returns the forced bg size packed (w<<32)|h. The shell
+        // booting AS the bg desktop (+ launcher → wm.spawn) is verified visually.
+        let spd = crate::wasm::wt::run_spd_demo();
+        crate::binfo!("wm", "spd: hostfns ok bg={}x{}", spd >> 32, spd & 0xffff_ffff);
     }
 
     Ok(())

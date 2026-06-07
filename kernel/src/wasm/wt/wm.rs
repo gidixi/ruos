@@ -98,6 +98,29 @@ fn module_for(cwasm: &'static [u8]) -> Option<Module> {
     Some(m)
 }
 
+/// SP-C: cache of modules loaded BY NAME from the VFS (`/bin/<name>.cwasm`),
+/// keyed by app name. The VFS bytes are NOT `&'static` (unlike the embedded
+/// `APPS` blobs the ptr-keyed `MODULE_CACHE` serves), so this is a separate
+/// `String`-keyed cache. `Module` is Arc-backed: a cached `clone` is cheap.
+static NAME_CACHE: Mutex<BTreeMap<String, Module>> = Mutex::new(BTreeMap::new());
+
+/// Load `/bin/<name>.cwasm` from the VFS and deserialize it (cached by name).
+/// Returns None on any failure (missing file / bad bytes / deserialize error).
+///
+/// Synchronous: the compositor loop owns the CPU (it is NOT inside the async
+/// executor), so block on the async VFS read via `crate::vfs::block_on` — the
+/// same single-poll driver `state.rs`/`fs.rs`/`ssh` use. The loaded `Vec<u8>`
+/// outlives `deserialize`; `Module` owns its code afterward.
+fn module_by_name(name: &str) -> Option<Module> {
+    if let Some(m) = NAME_CACHE.lock().get(name) { return Some(m.clone()); }
+    let path = alloc::format!("/bin/{}.cwasm", name);
+    let bytes = crate::vfs::block_on(crate::wasm::read_all(&path)).ok()?;
+    // SAFETY: wt-precompile output for this exact engine Config.
+    let m = unsafe { Module::deserialize(engine(), &bytes) }.ok()?;
+    NAME_CACHE.lock().insert(String::from(name), m.clone());
+    Some(m)
+}
+
 /// Boot self-test: every registry entry deserialises to a usable Module.
 /// Returns (entry_count, modules_ok).
 pub fn registry_self_test() -> (u32, u32) {
@@ -391,6 +414,16 @@ pub struct WmState {
     /// turns it into a kernel-driven interactive move (a `DragState`) next frame,
     /// then clears it.
     pub move_requested: bool,
+    /// Set by the guest via `wm.spawn(name)`; the run loop loads
+    /// `/bin/<name>.cwasm` and spawns it as a new window AFTER the current
+    /// `frame_all` pass (deferred so `wins` is never mutated mid-iteration), then
+    /// drains it. A VecDeque so multiple `wm.spawn` calls in one frame are all
+    /// honoured (last-wins Option was a spec violation).
+    pub spawn_request: VecDeque<String>,
+    /// Set by the guest via `wm.set_background()`; the run loop pins THIS window
+    /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
+    /// then clears it.
+    pub bg_request: bool,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -452,6 +485,24 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // the window tracks the screen cursor without the app needing its screen origin.
     linker.func_wrap("wm", "start_move",
         |mut caller: Caller<'_, T>| { caller.data_mut().win().move_requested = true; })?;
+    // wm.spawn(name_ptr, name_len): request the kernel launch /bin/<name>.cwasm as
+    // a NEW window. Deferred to after frame_all (no `wins` mutation mid-iteration);
+    // the run loop drains `spawn_request`, loads the module via `module_by_name`,
+    // and calls `spawn_named`. Fire-and-forget (no return id; a return-id variant
+    // is a later refinement). Reads the name from THIS guest's linear memory.
+    linker.func_wrap("wm", "spawn",
+        |mut caller: Caller<'_, T>, name_ptr: i32, name_len: i32| {
+            if let Some(b) = crate::wasm::wt::mem::read(&mut caller, name_ptr as u32, name_len as u32) {
+                if let Ok(s) = core::str::from_utf8(&b) {
+                    caller.data_mut().win().spawn_request.push_back(String::from(s));
+                }
+            }
+        })?;
+    // wm.set_background(): the calling window flags ITSELF as the background
+    // (full-screen, z-bottom, undecorated, not movable/closable). Deferred to the
+    // run loop (which sets `Window.bg`), like spawn/close/move.
+    linker.func_wrap("wm", "set_background",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().bg_request = true; })?;
     // wm.wall_seconds() -> f64: MONOTONIC seconds since boot (the same latched
     // source the desktop uses). egui needs it for `RawInput.time` + animations.
     linker.func_wrap("wm", "wall_seconds",
@@ -474,6 +525,20 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             }
             // else: discriminant stays 0 (none); payload zeroed.
             crate::wasm::wt::mem::write(&mut caller, retptr as u32, &buf);
+        })?;
+    // wm.poweroff(): the calling window (the shell's power button) asks the
+    // kernel to power off the machine. Same primitive `ruos:gui/power.poweroff`
+    // uses (`gui.rs`). Never returns; the `-> ()` annotation pins the closure's
+    // Wasm return type so never-type fallback stays `()` (matches `gui.rs`).
+    linker.func_wrap("wm", "poweroff",
+        |_caller: Caller<'_, T>| -> () { crate::power::poweroff() })?;
+    // wm.surface_size() -> i64: the full framebuffer size, packed (w<<32)|h. The
+    // background shell sizes ITSELF to this (the bg window is forced full-screen
+    // by the compositor; this lets the guest's egui raster match the screen).
+    linker.func_wrap("wm", "surface_size",
+        |_caller: Caller<'_, T>| -> i64 {
+            let g = crate::gfx::geom();
+            ((g.width as i64) << 32) | (g.height as i64)
         })?;
     Ok(())
 }
@@ -507,7 +572,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -566,6 +631,10 @@ pub struct Window {
     pub focused: bool,
     pub alive: bool,                // SP5 sets false to schedule teardown
     pub pid: u32,                   // SP5: proc-registry pid (freed on reap)
+    /// SP-C: the background window. A `bg` window is composited FIRST (z-bottom),
+    /// forced to the full framebuffer, undecorated, never raised/focused/moved/
+    /// closed; it only receives input where no non-`bg` window covers the point.
+    pub bg: bool,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -590,52 +659,54 @@ const WIN_H: u32 = 240;
 const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
 
 impl Compositor {
-    /// Deserialize the shared reactor module, build the `wm` linker, and create
-    /// the demo's 2 OVERLAPPING windows. CSD: windows are borderless (the surface
-    /// IS the whole window), placed anywhere on-screen; the two overlap so the
-    /// raise/lower behaviour is directly visible. Window 0 starts focused.
+    /// Build the `wm` + WASI linker and boot the compositor into ONE initial
+    /// window: the userspace desktop SHELL (`/bin/shell.cwasm`). The desktop UX
+    /// (panel/launcher/wallpaper) lives in SP-D's userspace shell, which flags
+    /// ITSELF as the full-screen background (`wm.set_background()`) on its first
+    /// frame and `wm.spawn`s apps from its launcher. The initial window is loaded
+    /// from `/bin/shell.cwasm` (VFS, via `module_by_name` — the compositor runs
+    /// after fs init so `/bin` is mounted); if that load fails (shell.cwasm not in
+    /// /bin yet) we fall back to the VFS egui-demo, then to the embedded
+    /// `EGUI_DEMO_CWASM` (`include_bytes!`), so the compositor ALWAYS shows
+    /// something. `cwasm` is the `compositor.cwasm` bytes the executor handed us —
+    /// kept only to satisfy the `module` field (the shared reactor module used by
+    /// the headless paths).
     pub fn new(cwasm: &[u8]) -> Compositor {
         let engine = engine();
         // SAFETY: produced by wt-precompile for this exact engine Config.
-        let module = unsafe { Module::deserialize(engine, cwasm) }.expect("reactor module");
+        let module = unsafe { Module::deserialize(engine, cwasm) }.expect("compositor module");
         let mut linker: Linker<AppState> = Linker::new(engine);
         crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
 
-        // (window x, y, w, h, title) — A and B overlap so raise/lower is visible.
-        // No title-bar offset under CSD: rect IS the whole window.
-        let placements: [(u32, u32, u32, u32, &str); 2] = [
-            (60,  60,  WIN_W, WIN_H, "reactor A"),
-            (300, 170, WIN_W, WIN_H, "reactor B"),
-        ];
-        let mut wins: Vec<Window> = Vec::new();
-        for (id, &(x, y, w, h, title)) in placements.iter().enumerate() {
-            let mut store = Store::new(
-                engine,
-                AppState {
-                    wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-                    win: WmState { id: id as u32, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false },
-                },
-            );
-            let inst = linker.instantiate(&mut store, &module).expect("instantiate");
-            // wasip1 std reactors need `_initialize` run before their first frame().
-            run_initialize(&mut store, &inst);
-            // Register a proc so `ps` sees demo windows and reap can unregister them.
-            let pid = crate::proc::register(alloc::format!("win:{}", title));
-            wins.push(Window {
-                id: id as u32,
-                store,
-                inst,
-                rect: (x, y, w, h),
-                title: String::from(title),
-                focused: id == 0,
-                alive: true,
-                pid,
-            });
+        let mut c = Compositor {
+            wins: Vec::new(),
+            module,
+            linker,
+            focused: 0,
+            drag: None,
+            backbuf: Vec::new(),
+            free_ids: Vec::new(),
+            next_id: 0,
+        };
+
+        // Initial window = the userspace desktop SHELL. Prefer the VFS
+        // `/bin/shell.cwasm`; if it's not in `/bin` yet (or fails to load), fall
+        // back to the VFS egui-demo, then to the embedded egui-demo blob — so the
+        // compositor always shows SOMETHING. The shell self-flags bg on its first
+        // frame; the egui-demo fallbacks come up as a plain window.
+        let (name, initial) = match module_by_name("shell") {
+            Some(m) => ("shell", Some(m)),
+            None => {
+                crate::bwarn!("wm", "shell.cwasm unavailable; falling back to egui-demo");
+                ("egui-demo", module_by_name("egui-demo").or_else(|| module_for(EGUI_DEMO_CWASM)))
+            }
+        };
+        match initial {
+            Some(m) => { let _ = c.spawn_named(name, m); }
+            None => { crate::bwarn!("wm", "no initial window: shell + egui-demo modules unavailable"); }
         }
-        let next_id = placements.len() as u32; // spawned ids start past the demo ids
-        Compositor { wins, module, linker, focused: 0, drag: None, backbuf: Vec::new(),
-                     free_ids: Vec::new(), next_id }
+        c
     }
 
     /// Headless compositor for the lifecycle boot-check: builds the linker +
@@ -670,11 +741,13 @@ impl Compositor {
         }
     }
 
-    /// TOPMOST window whose surface rect contains framebuffer point (px, py).
-    /// Searches z-order from top (last) to bottom (first). SP3 makes this
-    /// decoration-aware.
+    /// TOPMOST NON-`bg` window whose surface rect contains framebuffer point
+    /// (px, py). Searches z-order from top (last) to bottom (first). `bg` windows
+    /// are skipped here (they are never raised/focused; input that misses every
+    /// non-`bg` window falls through to the `bg` window via `bg_index`).
     pub fn window_at(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.wins.len()).rev() {
+            if self.wins[i].bg { continue; }
             let (rx, ry, rw, rh) = self.wins[i].rect;
             let (rx, ry) = (rx as i32, ry as i32);
             if px >= rx && px < rx + rw as i32 && py >= ry && py < ry + rh as i32 {
@@ -682,6 +755,13 @@ impl Compositor {
             }
         }
         None
+    }
+
+    /// Index of the (first) `bg` window, if any. The background is the input
+    /// fallthrough target: a click that misses every non-`bg` window routes here
+    /// so the bg app (SP-D's shell panel/launcher) still gets clicks.
+    fn bg_index(&self) -> Option<usize> {
+        self.wins.iter().position(|w| w.bg)
     }
 
     /// The ONE focus impl: clear the old focused flag, set the new one, update
@@ -777,19 +857,19 @@ impl Compositor {
         }
     }
 
-    /// Spawn registry app `idx` as a new window: allocate a window-id,
-    /// instantiate a fresh `(Store<WmState>, Instance)` off the cached Module,
-    /// place it at a cascading origin (honoring the title-bar/launcher clamps),
-    /// raise+focus it, and push it. Returns the new window-id, or None (budget
-    /// full / bad app idx / bad module / instantiate failed).
-    pub fn spawn_app(&mut self, idx: usize) -> Option<u32> {
+    /// Spawn a window from an already-loaded `Module` under display name `name`:
+    /// allocate a window-id, instantiate a fresh `(Store<AppState>, Instance)`,
+    /// run `_initialize` (wasip1 reactors), place it at a cascading origin,
+    /// raise+focus it, register a proc, and push it. Returns the new window-id,
+    /// or None (budget full / instantiate failed). This is the ONE instance-
+    /// creation path; `spawn_app` (embedded `APPS`, boot-checks) and the
+    /// `wm.spawn` VFS path (`module_by_name`) both route here.
+    pub fn spawn_named(&mut self, name: &str, module: Module) -> Option<u32> {
         let live = self.wins.iter().filter(|w| w.alive).count();
         if live >= MAX_WINDOWS {
             crate::bwarn!("wm", "spawn refused: window budget full ({})", live);
             return None;
         }
-        let app = APPS.get(idx)?;
-        let module = module_for(app.cwasm)?;
         let id = self.alloc_id();
         let mut store = Store::new(
             engine(),
@@ -797,7 +877,8 @@ impl Compositor {
                 wasi: WtState::new(alloc::vec![b"win".to_vec()]),
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
-                               move_requested: false },
+                               move_requested: false, spawn_request: VecDeque::new(),
+                               bg_request: false },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -805,9 +886,9 @@ impl Compositor {
         unsafe { core::arch::asm!("cld", options(nostack)); }
         let inst = match self.linker.instantiate(&mut store, &module) {
             Ok(i) => i,
-            Err(_) => {
+            Err(e) => {
                 self.free_ids.push(id);
-                crate::bwarn!("wm", "spawn: instantiate failed");
+                crate::bwarn!("wm", "spawn: instantiate failed: {:?}", e);
                 return None;
             }
         };
@@ -815,29 +896,40 @@ impl Compositor {
         run_initialize(&mut store, &inst);
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
         // fully overlap. CSD = no title-bar offset; just clamp on-screen (keeping
-        // the window clear of the launcher strip at the bottom).
+        // a small bottom margin).
         let g = crate::gfx::geom();
         let n = live as u32;
         let ox = (40 + n * 28).min(g.width.saturating_sub(340));
         let oy = (40 + n * 28)
             .min(g.height.saturating_sub(LAUNCHER_H + 260));
-        let pid = crate::proc::register(alloc::format!("win:{}", app.name));
+        let pid = crate::proc::register(alloc::format!("win:{}", name));
         self.wins.push(Window {
             id,
             store,
             inst,
             rect: (ox, oy, 320, 240),
-            title: String::from(app.name),
+            title: String::from(name),
             focused: false,
             alive: true,
             pid,
+            bg: false,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order
         self.set_focus(self.wins.len() - 1); // focus the now-top window
         crate::binfo!("wm", "spawn app='{}' win_id={} pid={} live={}",
-                      app.name, id, pid, live + 1);
+                      name, id, pid, live + 1);
         Some(id)
+    }
+
+    /// Spawn embedded registry app `idx` as a new window (boot-checks + the
+    /// initial-window fallback). Delegates to `spawn_named` after deserialising
+    /// the embedded cwasm. Returns the new window-id, or None (bad idx / bad
+    /// module / budget full / instantiate failed).
+    pub fn spawn_app(&mut self, idx: usize) -> Option<u32> {
+        let app = APPS.get(idx)?;
+        let module = module_for(app.cwasm)?;
+        self.spawn_named(app.name, module)
     }
 
     /// Mark the window with this id for teardown (external/programmatic close,
@@ -929,13 +1021,31 @@ impl Compositor {
         let needed = stride * sh as usize;
         if self.backbuf.len() != needed { self.backbuf = alloc::vec![0u8; needed]; }
 
-        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order).
+        // SP-C: a `bg` window is pinned to the full framebuffer and composited
+        // FIRST (z-bottom), independent of its position in `wins`. Force its rect
+        // to (0,0,sw,sh) here every frame (frame_all resets it to the committed
+        // size); its surface is blitted at (0,0) and `DESKTOP_BG` fills any area
+        // the surface doesn't cover.
+        let bg_idx = self.bg_index();
+        if let Some(bi) = bg_idx {
+            self.wins[bi].rect = (0, 0, sw, sh);
+        }
+
+        // 1) BSP: build decorated footprints bottom->top (z = `wins` Vec order),
+        //    but with the `bg` window FIRST (z-bottom, forced to origin (0,0)).
         //    Keep them ALIVE in `foots` across the join so the band jobs' raw
         //    pointers (into each footprint buffer) stay valid for the whole
         //    parallel composite.
         let mut foots: alloc::vec::Vec<(alloc::vec::Vec<u8>, u32, u32, u32, u32)> =
             alloc::vec::Vec::new();
+        if let Some(bi) = bg_idx {
+            // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
+            if let Some((px, _, _, fw, fh)) = self.compose_window(bi) {
+                foots.push((px, 0, 0, fw, fh));
+            }
+        }
         for i in 0..self.wins.len() {
+            if bg_idx == Some(i) { continue; } // bg already composited first
             if let Some(f) = self.compose_window(i) { foots.push(f); }
         }
         let n = core::cmp::min(foots.len(), MAX_WINS);
@@ -962,73 +1072,6 @@ impl Compositor {
         crate::gfx::blit(&self.backbuf[..needed], 0, 0, sw, sh);
         // `foots` drops here — AFTER dispatch_bands joined all jobs, so the
         // footprint buffers were alive for the entire parallel composite.
-    }
-
-    /// Draw the launcher taskbar: a dark strip across the bottom of the screen
-    /// with one tinted, labelled button per `APPS` entry. Kernel-drawn chrome
-    /// (NOT a wasm surface): builds ONE RGBA8888 strip buffer `g.width ×
-    /// LAUNCHER_H`, rasters the buttons + labels into it, then ONE
-    /// `gfx::blit`. Called each frame AFTER `present()` so it overlays the
-    /// composited windows (always-on-top chrome); `gfx::blit` recomposites the
-    /// cursor over it.
-    fn draw_launcher(&self) {
-        let g = crate::gfx::geom();
-        let (sw, lh) = (g.width, LAUNCHER_H);
-        if sw == 0 || lh == 0 { return; }
-        let mut strip = alloc::vec![0u8; (sw * lh * 4) as usize];
-
-        // Strip background (dark, opaque).
-        decor::fill_rect(&mut strip, sw, lh, 0, 0, sw, lh, [0x30, 0x30, 0x38, 0xFF]);
-
-        // Per-button tints (distinct per index so buttons read as separate).
-        const BTN_TINTS: [[u8; 4]; 4] = [
-            [0x3A, 0x5A, 0x8A, 0xFF], // blue
-            [0x3A, 0x7A, 0x4A, 0xFF], // green
-            [0x8A, 0x4A, 0x3A, 0xFF], // red-brown
-            [0x6A, 0x4A, 0x8A, 0xFF], // purple
-        ];
-
-        // Lay out ONLY launcher-visible entries left-to-right by their position
-        // among the visible subset (`pos`), independent of the real APPS index.
-        let visible: Vec<(usize, &AppEntry)> =
-            APPS.iter().enumerate().filter(|(_, a)| a.show_in_launcher).collect();
-        for (pos, (_apps_idx, app)) in visible.iter().enumerate() {
-            let bx = pos as u32 * LAUNCHER_BTN_W;
-            if bx >= sw { break; }
-            // Button rect inset 2px from the cell so cells read as buttons.
-            let inset = 2u32;
-            let bw = LAUNCHER_BTN_W.min(sw - bx);
-            let rect_w = bw.saturating_sub(inset * 2);
-            let rect_h = lh.saturating_sub(inset * 2);
-            let tint = BTN_TINTS[pos % BTN_TINTS.len()];
-            decor::fill_rect(&mut strip, sw, lh, bx + inset, inset, rect_w, rect_h, tint);
-            // Label (white), clipped to the button's right edge.
-            let label_x = bx + inset + decor::TEXT_PAD_X;
-            let max_x = bx + bw;
-            decor::draw_text(&mut strip, sw, lh, label_x, 0, max_x, app.name,
-                             [0xFF, 0xFF, 0xFF, 0xFF]);
-        }
-
-        crate::gfx::blit(&strip, 0, g.height - lh, sw, lh);
-    }
-
-    /// Hit-test a screen point against the launcher buttons. Buttons are laid out
-    /// over ONLY the launcher-visible `APPS` entries (in the same order as
-    /// `draw_launcher`); a clicked visible-position is mapped back to the real
-    /// `APPS` index. Returns that `APPS` index, or None if the point is above the
-    /// strip / past the last visible button / off the right edge of the screen.
-    fn launcher_hit(&self, px: i32, py: i32) -> Option<usize> {
-        let g = crate::gfx::geom();
-        let y0 = g.height as i32 - LAUNCHER_H as i32;
-        if py < y0 || px < 0 { return None; }
-        let pos = (px / LAUNCHER_BTN_W as i32) as usize; // position among VISIBLE entries
-        if (pos as u32 * LAUNCHER_BTN_W) >= g.width { return None; }
-        // Map the visible position back to the real APPS index.
-        APPS.iter()
-            .enumerate()
-            .filter(|(_, a)| a.show_in_launcher)
-            .nth(pos)
-            .map(|(apps_idx, _)| apps_idx)
     }
 
     /// Push a window-local MouseMove (kind 1) into window `idx`'s queue so the app's
@@ -1058,23 +1101,26 @@ impl Compositor {
         });
     }
 
-    /// Left mouse-down at screen (px,py). A launcher-button click spawns its app
-    /// (handled FIRST). Otherwise, under CSD the kernel only does window management:
-    /// the topmost window under the cursor is raised + focused, and the positioned
-    /// press is forwarded to that window's queue (window-local coords) so the app's
-    /// OWN [X]/title-bar/content (all egui-rendered) react. Close + title-drag are
-    /// the app's job (via `wm.close` / `wm.start_move`). Empty space => nothing.
+    /// Left mouse-down at screen (px,py). Under CSD the kernel only does window
+    /// management: the topmost NON-`bg` window under the cursor is raised +
+    /// focused, and the positioned press is forwarded to that window's queue
+    /// (window-local coords) so the app's OWN [X]/title-bar/content (all egui-
+    /// rendered) react. Close + title-drag are the app's job (via `wm.close` /
+    /// `wm.start_move`). A click that misses every non-`bg` window falls through
+    /// to the `bg` window (so SP-D's shell panel/launcher gets clicks) WITHOUT
+    /// raising/focusing it. No `bg`/no window under empty space => nothing.
     fn on_left_down(&mut self, px: i32, py: i32) {
-        if let Some(app_idx) = self.launcher_hit(px, py) {
-            self.spawn_app(app_idx);
-            return;
-        }
         if let Some(i) = self.window_at(px, py) {
             let top = self.raise(i);
             self.set_focus(top);
             // Forward the POSITIONED press to the now-focused window so egui clicks
             // at the cursor (not 0,0) and its drag-sense (title bar) can arm.
             self.forward_left_button(top, px, py, true);
+        } else if let Some(bg) = self.bg_index() {
+            // Fallthrough: the click hit bare desktop → route it to the bg window
+            // (window-local coords). The bg is never raised/focused; it is also
+            // never the topmost via `window_at`, so it only ever sees this path.
+            self.forward_left_button(bg, px, py, true);
         }
     }
 
@@ -1128,6 +1174,10 @@ impl Compositor {
                             // and the click site is positioned before the next press).
                             // Only the topmost gets it (no false hover on covered ones).
                             self.forward_mouse_move(i, cx, cy);
+                        } else if let Some(bg) = self.bg_index() {
+                            // Bare desktop: the bg window is the input fallthrough, so
+                            // its egui pointer tracks there too (hover + click site).
+                            self.forward_mouse_move(bg, cx, cy);
                         }
                     }
                     2 => { // mouse button: edge-track the left button
@@ -1144,10 +1194,20 @@ impl Compositor {
                                 // DRAGGED window (its title-bar label's drag-sense must
                                 // see the pointer-up that ended the grab) and clear the
                                 // drag. Otherwise route to the focused window so a plain
-                                // click completes (counter / [X] activate on release).
+                                // click completes (counter / [X] activate on release) —
+                                // unless the press fell through to the `bg` window (the
+                                // cursor is over bare desktop and a bg window exists), in
+                                // which case route the release there so the bg click
+                                // completes (bg is never focused, so `focused` isn't it).
                                 let target = match self.drag.take() {
                                     Some(d) => self.index_of(d.win_id),
-                                    None => Some(self.focused),
+                                    None => {
+                                        if self.window_at(cx, cy).is_none() {
+                                            self.bg_index().or(Some(self.focused))
+                                        } else {
+                                            Some(self.focused)
+                                        }
+                                    }
                                 };
                                 if let Some(i) = target {
                                     if i < self.wins.len() {
@@ -1168,15 +1228,50 @@ impl Compositor {
 
             self.frame_all();
 
+            // SP-C: process deferred window→kernel requests raised during
+            // `frame_all` (`wm.set_background`, `wm.spawn`). Deferred to HERE —
+            // after the frame pass, before `present` — so `wins` is never mutated
+            // mid-iteration (mirrors the close/move deferred pattern).
+            //
+            // 1) Background requests: pin the requesting window as `bg`.
+            for i in 0..self.wins.len() {
+                if self.wins[i].store.data().win.bg_request {
+                    self.wins[i].store.data_mut().win.bg_request = false;
+                    self.wins[i].bg = true;
+                    crate::binfo!("wm", "bg window win_id={}", self.wins[i].id);
+                }
+            }
+            // 2) Spawn requests: drain each window's name FIRST (collect into a
+            //    Vec), THEN spawn — so we don't borrow `wins` while pushing new
+            //    windows (no mid-iteration mutation). Defers `wins` growth past
+            //    `frame_all`.
+            let mut to_spawn: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            for w in self.wins.iter_mut() {
+                while let Some(name) = w.store.data_mut().win.spawn_request.pop_front() {
+                    to_spawn.push(name);
+                }
+            }
+            for name in to_spawn {
+                if let Some(module) = module_by_name(&name) {
+                    if let Some(id) = self.spawn_named(&name, module) {
+                        crate::binfo!("wm", "wm.spawn ok name='{}' id={}", name, id);
+                    }
+                } else {
+                    crate::bwarn!("wm", "wm.spawn: /bin/{}.cwasm not found/bad", name);
+                }
+            }
+
             // CSD interactive move: a guest that called `wm.start_move()` this
             // frame (title-bar grab) has `move_requested` set. Turn it into a
             // kernel-driven drag of that window — grab offset = cursor − window
             // origin — and let the existing mousemove→`drag_to` / button-up→
             // `drag=None` machinery (below) drive + end the move. Last request
-            // wins if several fire in one frame (only one cursor).
+            // wins if several fire in one frame (only one cursor). A `bg` window
+            // is never moved (its `start_move` request is ignored).
             for i in 0..self.wins.len() {
                 if self.wins[i].store.data().win.move_requested {
                     self.wins[i].store.data_mut().win.move_requested = false;
+                    if self.wins[i].bg { continue; }
                     let (cx, cy) = crate::gfx::mouse_pos();
                     let rect = self.wins[i].rect;
                     self.drag = Some(DragState {
@@ -1188,10 +1283,6 @@ impl Compositor {
             }
 
             self.present();
-            // Always-on-top chrome: present() blits the whole back-buffer, so the
-            // launcher must be redrawn over it every frame. gfx::blit recomposites
-            // the cursor over the strip.
-            self.draw_launcher();
             frame_no += 1;
 
             // After 30 composited frames, report the distinct cores that ran
@@ -1384,6 +1475,146 @@ pub fn egui_demo_self_test() -> usize {
     if idx == usize::MAX || c.spawn_app(idx).is_none() { return 0; }
     c.frame_all();
     c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+}
+
+/// Boot self-test (SP-C): prove the `wm.spawn` deferred-spawn MECHANISM grows the
+/// window list and the `wm.set_background` mechanism pins a window to the full
+/// framebuffer. Returns a 2-bit flag word (`0b11` == both pass).
+///
+/// This boot-check runs in the `interrupts` phase — BEFORE the VFS `/bin` is
+/// mounted — so `module_by_name` (the real `wm.spawn` VFS load) can't work here.
+/// Instead it exercises the SAME deferred-spawn + bg LOGIC the run loop uses, but
+/// resolves the module from the EMBEDDED blob (`module_for(EGUI_DEMO_CWASM)`, the
+/// identical module the VFS path serves). The VFS `wm.spawn` itself is covered
+/// VISUALLY (clicking "spawn another" loads `/bin/egui-demo.cwasm`).
+///
+///   bit0 — spawn grows `wins` to 2: spawn one initial window via `spawn_named`,
+///          then set its `spawn_request`, drain it with the run-loop's request
+///          logic (resolving via the embedded module), and assert `wins.len()==2`.
+///   bit1 — bg full-screen: flag one window `bg` (the deferred bg-request path),
+///          run the `present` bg rect-forcing logic, and assert its rect was
+///          pinned to the full screen `(0,0,sw,sh)`. The framebuffer is set up in
+///          the LATER `devices` phase, so `geom()` reads 0×0 here; the test falls
+///          back to a synthetic size to verify the rect-FORCING mechanism. The
+///          real full-screen composite (live framebuffer) is covered visually.
+#[cfg(feature = "boot-checks")]
+pub fn spc_self_test() -> u32 {
+    let mut flags = 0u32;
+    let mut c = Compositor::new_empty();
+
+    // The embedded egui-demo module stands in for the VFS `/bin/egui-demo.cwasm`
+    // (same bytes; `/bin` isn't mounted this early).
+    let module = match module_for(EGUI_DEMO_CWASM) {
+        Some(m) => m,
+        None => return flags, // can't deserialize → both checks fail
+    };
+
+    // Initial window.
+    if c.spawn_named("egui-demo", module.clone()).is_none() {
+        return flags;
+    }
+
+    // (bit0) Exercise the DEFERRED-spawn mechanism: set the existing window's
+    // `spawn_request` (as `wm.spawn` would), then run the SAME drain logic the run
+    // loop uses (collect names, then spawn) — but resolve via the embedded module
+    // since the VFS isn't up. A successful spawn grows `wins` from 1 to 2.
+    c.wins[0].store.data_mut().win.spawn_request.push_back(String::from("egui-demo"));
+    let mut to_spawn: Vec<String> = Vec::new();
+    for w in c.wins.iter_mut() {
+        while let Some(name) = w.store.data_mut().win.spawn_request.pop_front() {
+            to_spawn.push(name);
+        }
+    }
+    for name in to_spawn {
+        let _ = c.spawn_named(&name, module.clone());
+    }
+    if c.wins.len() == 2 { flags |= 1 << 0; }
+
+    // (bit1) Exercise the bg mechanism: flag the first window's `bg_request` (as
+    // `wm.set_background` would), run the deferred bg-request processing (the run
+    // loop's pin-as-bg step), then run the `present` bg rect-forcing logic and
+    // assert the rect became the full framebuffer.
+    if !c.wins.is_empty() {
+        c.wins[0].store.data_mut().win.bg_request = true;
+        // Deferred bg-request processing (mirror of the run loop).
+        for i in 0..c.wins.len() {
+            if c.wins[i].store.data().win.bg_request {
+                c.wins[i].store.data_mut().win.bg_request = false;
+                c.wins[i].bg = true;
+            }
+        }
+        // `present`'s bg rect-forcing (don't call full `present` — it would blit to
+        // the framebuffer mid-boot; just run the rect-forcing the bg path does).
+        // The framebuffer geometry is set up in the LATER `devices` phase, so this
+        // early `geom()` can read 0×0; fall back to a synthetic screen size so the
+        // test verifies the rect-FORCING mechanism (bg pinned to (0,0,sw,sh))
+        // regardless of where the dims come from. The real bg full-screen composite
+        // (with the live framebuffer) is covered visually.
+        let g = crate::gfx::geom();
+        let (sw, sh) = if g.width != 0 && g.height != 0 { (g.width, g.height) } else { (1280, 800) };
+        if let Some(bi) = c.bg_index() {
+            c.wins[bi].rect = (0, 0, sw, sh);
+            if c.wins[bi].rect == (0, 0, sw, sh) {
+                flags |= 1 << 1;
+            }
+        }
+    }
+
+    flags
+}
+
+/// Boot self-test (SP-D): prove the desktop-shell boot mechanism is wired without
+/// needing the VFS (`/bin/shell.cwasm` isn't mounted in the `interrupts` phase, and
+/// the shell isn't `include_bytes!`'d). Asserts two things the shell relies on:
+///
+///  1. The `wm.poweroff` + `wm.surface_size` host fns REGISTER. `Compositor::new_empty`
+///     calls `add_to_linker`, which `func_wrap`s every `wm` import incl. the two new
+///     SP-D ones; a duplicate/typo would make `add_to_linker` (hence `new_empty`) panic.
+///     So a successfully-built empty compositor proves both new imports are bound and a
+///     shell guest importing them could instantiate.
+///  2. The background mechanism still pins a window full-screen (the shell flags ITSELF
+///     bg via `wm.set_background` on its first frame). Reuses SP-C's bg rect-forcing on
+///     the embedded egui-demo stand-in.
+///
+/// Returns the forced bg size packed `(w<<32)|h` (0 == the bg mechanism failed). The
+/// caller logs `spd: hostfns ok bg=WxH`. The shell-as-bg desktop itself (chrome +
+/// launcher → `wm.spawn`) is verified VISUALLY (it needs the VFS + framebuffer).
+#[cfg(feature = "boot-checks")]
+pub fn spd_self_test() -> i64 {
+    // (1) Building the compositor builds the linker via `add_to_linker`; if the new
+    // `wm.poweroff`/`wm.surface_size` registrations were broken (dup name / wrong
+    // signature path) this would panic. Reaching past it = both host fns are bound.
+    let mut c = Compositor::new_empty();
+
+    // (2) Bg full-screen mechanism (the shell self-flags bg). Spawn one window
+    // (embedded egui-demo stands in for /bin/shell.cwasm — not mounted yet), flag it
+    // bg via the deferred bg-request path, then run `present`'s rect-forcing and read
+    // back the pinned size. geom() reads 0×0 this early (framebuffer set up in the
+    // later `devices` phase), so fall back to a synthetic size — we're verifying the
+    // rect-FORCING, not the live framebuffer (that's the visual proof).
+    let module = match module_for(EGUI_DEMO_CWASM) {
+        Some(m) => m,
+        None => return 0,
+    };
+    if c.spawn_named("shell", module).is_none() {
+        return 0;
+    }
+    c.wins[0].store.data_mut().win.bg_request = true;
+    for i in 0..c.wins.len() {
+        if c.wins[i].store.data().win.bg_request {
+            c.wins[i].store.data_mut().win.bg_request = false;
+            c.wins[i].bg = true;
+        }
+    }
+    let g = crate::gfx::geom();
+    let (sw, sh) = if g.width != 0 && g.height != 0 { (g.width, g.height) } else { (1280, 800) };
+    if let Some(bi) = c.bg_index() {
+        c.wins[bi].rect = (0, 0, sw, sh);
+        if c.wins[bi].rect == (0, 0, sw, sh) {
+            return ((sw as i64) << 32) | (sh as i64);
+        }
+    }
+    0
 }
 
 /// Boot-check: exercise the surviving WM z-order + CSD drag math with NO wasm

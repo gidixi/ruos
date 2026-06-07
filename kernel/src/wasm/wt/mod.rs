@@ -131,6 +131,26 @@ pub fn run_egui_demo_demo() -> usize {
     crate::wasm::wt::wm::egui_demo_self_test()
 }
 
+/// Boot self-test (egui SP-C): exercise the `wm.spawn` deferred-spawn mechanism +
+/// the `wm.set_background` full-screen-bg mechanism headlessly (embedded module,
+/// since `/bin` isn't mounted this early). Returns a 2-bit flag word (`0b11` ==
+/// spawn grew the window list to 2 AND a bg window was forced full-screen). The
+/// VFS `wm.spawn` (loading `/bin/egui-demo.cwasm`) is covered visually.
+#[cfg(feature = "boot-checks")]
+pub fn run_spc_demo() -> u32 {
+    crate::wasm::wt::wm::spc_self_test()
+}
+
+/// Boot self-test (egui SP-D): prove the desktop-shell boot wiring without the VFS —
+/// the `wm.poweroff`/`wm.surface_size` host fns register (the empty compositor builds)
+/// AND the `wm.set_background` full-screen mechanism the shell uses still works.
+/// Returns the forced bg size packed `(w<<32)|h` (0 == failed). The shell-as-bg
+/// desktop + launcher→`wm.spawn` is verified visually.
+#[cfg(feature = "boot-checks")]
+pub fn run_spd_demo() -> i64 {
+    crate::wasm::wt::wm::spd_self_test()
+}
+
 /// Boot self-test: run the embedded gfx test; returns its exit code. The caller
 /// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
 /// not cleared by the console restore) to confirm the host-fn path ran.

@@ -48,7 +48,14 @@ pub fn init() -> Result<(), BootError> {
     // Walk Ports-Implemented; bring up every populated SATA port.
     for idx in 0..32 {
         if (hba.pi & (1 << idx)) == 0 { continue; }
+        // Skip the port already owned by the live-CD `/bin` ISO9660 mount: a
+        // second bringup here would reprogram that live port's command list base
+        // and corrupt the in-flight CD reads (VirtualBox: CD on boot-HBA port 0).
+        if crate::ahci::boot_cd_port() == Some(idx as usize) { continue; }
         if let Some(mut port) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
+            // An ATAPI device (CD-ROM) is not a FAT disk — never try to /mnt it
+            // (its 2048 B blocks also reject the 512 B sector-0 read below).
+            if port.is_atapi { continue; }
             // Smoke: read sector 0 (FAT BPB) + confirm 0x55AA boot signature
             // at bytes 510..512. End-to-end proof that READ DMA EXT works
             // against the QEMU disk we formatted with mkfs.vfat.

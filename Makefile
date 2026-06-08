@@ -276,6 +276,8 @@ run-test: $(DISK_IMG)
 	grep -qF "ahci HBA up" build/serial.log || { echo TEST_FAIL_AHCI; exit 1; }; \
 	grep -qE "ahci port [0-9]+ sata sectors=" build/serial.log || { echo TEST_FAIL_AHCI_IDENTIFY; exit 1; }; \
 	grep -qF "disk read OK sector 0" build/serial.log || { echo TEST_FAIL_AHCI_READ; exit 1; }; \
+	grep -qE "ahci port [0-9]+ atapi sectors=" build/serial.log || { echo TEST_FAIL_ATAPI; exit 1; }; \
+	grep -qF "/bin overlaid from ISO9660" build/serial.log || { echo TEST_FAIL_LIVECD_BIN; exit 1; }; \
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \

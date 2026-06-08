@@ -28,6 +28,15 @@ static PORT0: Mutex<Option<AhciPort>> = Mutex::new(None);
 /// HBA WITHOUT a second `GHC_HR`, which on real HW would orphan a live `/mnt`.
 static BOOT_HBA: Mutex<Option<(VirtAddr, u32)>> = Mutex::new(None); // (abar, pi)
 
+/// Boot-HBA port index consumed by the live-CD `/bin` ISO9660 mount, if the CD
+/// sits on the boot HBA (e.g. VirtualBox: single AHCI, CD on port 0). The SATA
+/// `/mnt` loop MUST skip this port: a second `bringup` on it would reprogram the
+/// live CD port's PxCLB/PxFB and corrupt the in-flight ISO9660 reads.
+static BOOT_CD_PORT: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Index of the boot-HBA port owned by the live-CD `/bin` mount, if any.
+pub fn boot_cd_port() -> Option<usize> { *BOOT_CD_PORT.lock() }
+
 /// Per-port cache of `(model, sectors)` learned from IDENTIFY the first (and,
 /// for a mounted port, ONLY) time the port is brought up. `AhciPort::bringup`
 /// populates this on every success — including the boot-time bringup of the
@@ -111,13 +120,24 @@ pub fn sata_ports() -> alloc::vec::Vec<usize> {
 pub fn acquire_atapi_port() -> Option<AhciPort> {
     let boot = *BOOT_HBA.lock();
 
-    // 1. Boot HBA (already init'd by `init()`) — no re-init / reset.
+    // 1. Boot HBA (already init'd by `init()`) — no re-init / reset. Record the
+    //    port index so the SATA /mnt loop skips it (re-bringup would corrupt the
+    //    live CD mount — the VirtualBox single-AHCI / CD-on-port-0 case).
     if let Some((abar, pi)) = boot {
-        if let Some(p) = scan_atapi(abar, pi) { return Some(p); }
+        for idx in 0..32 {
+            if pi & (1 << idx) == 0 { continue; }
+            if let Some(port) = AhciPort::bringup(abar, idx) {
+                if port.is_atapi {
+                    *BOOT_CD_PORT.lock() = Some(idx);
+                    return Some(port);
+                }
+            }
+        }
     }
 
     // 2. Any other AHCI controllers (init each; their reset doesn't touch the
-    //    boot HBA, so the SATA /mnt bringup that follows is unaffected).
+    //    boot HBA, so the SATA /mnt bringup that follows is unaffected). A CD on
+    //    a different controller can't collide with the boot HBA's SATA loop.
     for h in hba::Hba::find_all_except(boot.map(|(a, _)| a)) {
         if let Some(p) = scan_atapi(h.abar, h.pi) { return Some(p); }
     }

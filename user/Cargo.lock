@@ -371,10 +371,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "readdirtest"
-version = "0.1.0"
-
-[[package]]
 name = "rm"
 version = "0.1.0"
 
@@ -414,15 +410,7 @@ name = "shell"
 version = "0.1.0"
 
 [[package]]
-name = "smptest"
-version = "0.1.0"
-
-[[package]]
 name = "sort"
-version = "0.1.0"
-
-[[package]]
-name = "spinloop"
 version = "0.1.0"
 
 [[package]]

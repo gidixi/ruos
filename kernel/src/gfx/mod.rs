@@ -31,8 +31,8 @@ pub fn init(info: FbInfo) {
     GFX_W.store(info.width, Ordering::Release);
     GFX_H.store(info.height, Ordering::Release);
     GFX_FMT.store(match info.pixel { PixelLayout::Rgb => 0, PixelLayout::Bgr => 1 }, Ordering::Release);
-    crate::kprintln!(
-        "ruos: gfx init {}x{} pitch={} bpp={} fmt={}",
+    crate::binfo!(
+        "gfx", "init {}x{} pitch={} bpp={} fmt={}",
         info.width, info.height, info.pitch, info.bpp,
         match info.pixel { PixelLayout::Rgb => "RGB", PixelLayout::Bgr => "BGR" },
     );

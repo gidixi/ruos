@@ -45,6 +45,15 @@ impl MultiConsole {
     pub fn write_serial_only(&mut self, s: &str) {
         Console::write_str(&mut self.serial, s);
     }
+
+    /// Write to the framebuffer only, skipping the serial port. Used to
+    /// re-paint the boot banner on screen after the framebuffer attaches
+    /// without duplicating it on the serial wire (serial got it pre-fb).
+    pub fn write_fb_only(&mut self, s: &str) {
+        if let Some(fb) = &mut self.fb {
+            Console::write_str(fb, s);
+        }
+    }
 }
 
 impl fmt::Write for MultiConsole {

@@ -73,7 +73,7 @@ impl Write for LineBuf {
 
 fn render<W: Write>(w: &mut W, version: &str, sha: &str, date: &str, ram_mib: u64) {
     let mut l1 = LineBuf::new();
-    let _ = write!(l1, "ruos v{}-dev ({}, {})", version, sha, date);
+    let _ = write!(l1, "ruOS v{}-dev ({}, {})", version, sha, date);
     let mut l3 = LineBuf::new();
     let _ = write!(l3, "{} MiB RAM / 1 CPU / WASIX-bootstrap", ram_mib);
 

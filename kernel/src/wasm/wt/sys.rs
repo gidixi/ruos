@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 /// Register `sys.{cpustat,proc_stat,meminfo,uptime}` on a window linker. Generic
 /// over `T` (these fns never touch the store data — only global kernel state +
 /// guest memory), so the same call works for `Linker<AppState>` and any other.
-pub fn add_to_linker<T>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
+pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
     // sys.cpustat(buf_ptr, buf_len) -> i32: u32 ncores, u64 tsc_per_ms, then
     // ncores × (u64 busy, u64 idle). 8 = ERANGE if the buffer is too small.
     linker.func_wrap("sys", "cpustat",

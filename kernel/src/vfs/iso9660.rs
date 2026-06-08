@@ -71,25 +71,59 @@ fn parse_dir(extent: &[u8]) -> Vec<IsoEntry> {
             off = next;
             continue;
         }
-        if off + len > extent.len() { break; }
+        if off + len > extent.len() || len < 33 { break; }
         let rec = &extent[off..off + len];
         let extent_lba = u32::from_le_bytes([rec[2], rec[3], rec[4], rec[5]]);
         let size = u32::from_le_bytes([rec[10], rec[11], rec[12], rec[13]]);
         let flags = rec[25];
         let is_dir = flags & 0x02 != 0;
         let name_len = rec[32] as usize;
-        let raw = &rec[33..33 + name_len.min(rec.len() - 33)];
+        if 33 + name_len > len { off += len; continue; }
+        let raw = &rec[33..33 + name_len];
         if name_len == 1 && (raw[0] == 0 || raw[0] == 1) {
             off += len;
             continue;
         }
-        let mut name = String::from_utf8_lossy(raw).into_owned();
-        if let Some(p) = name.find(';') { name.truncate(p); }
-        let name = name.to_ascii_lowercase();
+        // Limine's xorriso writes Rock Ridge (SUSP): the on-disk ISO9660 name is
+        // a mangled 8.3 (`SHELL.WAS;1`, `.wasm` ext > 3 chars breaks level 1),
+        // while the real POSIX name (`shell.wasm`) lives in the Rock Ridge `NM`
+        // entry of the System Use Area. Prefer NM; fall back to the 8.3 name.
+        let sua_start = 33 + name_len + (1 - (name_len & 1));
+        let rr = if sua_start <= len { rock_ridge_name(&rec[sua_start..]) } else { None };
+        let name = rr.unwrap_or_else(|| {
+            let mut n = String::from_utf8_lossy(raw).into_owned();
+            if let Some(p) = n.find(';') { n.truncate(p); }
+            n.to_ascii_lowercase()
+        });
         out.push(IsoEntry { name, is_dir, extent_lba, size });
         off += len;
     }
     out
+}
+
+/// Extract the Rock Ridge alternate name ("NM" SUSP entries) from a directory
+/// record's System Use Area. Concatenates split NM entries. Returns `None` when
+/// no usable NM entry is present (caller falls back to the 8.3 name).
+fn rock_ridge_name(sua: &[u8]) -> Option<String> {
+    let mut name = String::new();
+    let mut found = false;
+    let mut i = 0usize;
+    while i + 4 <= sua.len() {
+        let (s0, s1) = (sua[i], sua[i + 1]);
+        let elen = sua[i + 2] as usize;
+        if elen < 4 || i + elen > sua.len() { break; }
+        if s0 == b'S' && s1 == b'T' { break; } // SUSP terminator
+        if s0 == b'N' && s1 == b'M' {
+            let nm_flags = sua[i + 4];
+            // Skip CURRENT (0x02) / PARENT (0x04) self/parent name entries.
+            if nm_flags & 0x06 == 0 && elen > 5 {
+                name.push_str(&String::from_utf8_lossy(&sua[i + 5..i + elen]));
+                found = true;
+            }
+        }
+        i += elen;
+    }
+    if found { Some(name.to_ascii_lowercase()) } else { None }
 }
 
 fn map_block_err(_e: BlockError) -> VfsError { VfsError::IoError }

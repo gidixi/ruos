@@ -7,48 +7,43 @@ use crate::boot::BootError;
 use crate::blockdev::BlockDevice;
 
 pub fn init() -> Result<(), BootError> {
-    // Monta `/bin`: dal CD live (ATAPI/ISO9660) se c'è, altrimenti fallback ai
-    // moduli Limine in tmpfs. Va eseguito in OGNI caso, anche quando non c'è
-    // alcun HBA AHCI (quindi nessun CD): il fallback deve comunque popolare
-    // `/bin`. Definito come closure così da chiamarlo sia nel path "HBA assente"
-    // sia DOPO `ahci::init()` quando l'HBA esiste.
-    let mount_bin = || {
-        // Live-CD: prova a montare `/bin` dal CD-ROM (ATAPI/ISO9660). Se riesce, i
-        // bin arrivano on-demand dal CD e NON serve copiare i moduli Limine in RAM.
-        let mut bin_mounted = false;
+    // Popola lo userspace e poi sovrappone `/bin` dal CD live, se presente.
+    // Eseguito in OGNI caso (anche senza HBA AHCI), come closure così da poterlo
+    // chiamare sia nel path "HBA assente" sia DOPO `ahci::init()`.
+    let mount_userspace = || {
+        // 1. Carica SEMPRE i moduli Limine in tmpfs: init.sh, init.wasm, /root e
+        //    — finché non sono spostati off-boot — i tool /bin. Questi sono
+        //    piccoli (config + bootstrap), non i ~45 MB di app che vanno sul CD.
+        let n = crate::modules::mount_all();
+        crate::binfo!("storage", "mounted {} boot modules into tmpfs", n);
+
+        // 2. Live-CD: sovrapponi `/bin` dal CD-ROM (ATAPI/ISO9660) se c'è. I bin
+        //    vengono letti on-demand dal CD; questo mount SHADOWA il /bin tmpfs
+        //    (longest-prefix-match), quindi una volta tolti i moduli /bin dalla
+        //    limine.conf nessun bin resta pre-caricato in RAM.
         if let Some(cd) = crate::ahci::acquire_atapi_port() {
             match crate::vfs::iso9660::mount_from_blockdev(
                 alloc::boxed::Box::new(cd), "/bin", "/bin",
             ) {
-                Ok(()) => {
-                    crate::binfo!("storage", "live-cd: /bin mounted from ISO9660 (ATAPI)");
-                    bin_mounted = true;
-                }
+                Ok(()) => crate::binfo!("storage", "live-cd: /bin overlaid from ISO9660 (ATAPI)"),
                 Err(e) => crate::bwarn!("storage", "ISO9660 mount /bin failed: {}", e),
             }
-        }
-
-        // Fallback: nessun CD utilizzabile → i bin vengono dai moduli Limine (boot
-        // installato su SSD o ISO legacy). Comportamento storico invariato.
-        if !bin_mounted {
-            let n = crate::modules::mount_all();
-            crate::binfo!("storage", "no live-cd: mounted {} boot modules into tmpfs /bin", n);
         }
     };
 
     let hba = match crate::ahci::init() {
         Some(h) => h,
-        // Nessun HBA AHCI: niente SATA e niente CD. Esegui comunque il mount di
-        // `/bin` (fallback ai moduli Limine) prima di uscire.
+        // Nessun HBA AHCI: niente SATA e niente CD. Popola comunque lo userspace
+        // (moduli Limine) prima di uscire.
         None    => {
-            mount_bin();
+            mount_userspace();
             return Ok(());
         }
     };
 
-    // HBA presente e `BOOT_HBA` popolato da `ahci::init()`: ora possiamo provare
-    // l'ATAPI (che legge `BOOT_HBA`) per montare `/bin` dal CD live.
-    mount_bin();
+    // HBA presente e `BOOT_HBA` popolato da `ahci::init()`: ora `acquire_atapi_port`
+    // (che legge `BOOT_HBA` + scan multi-HBA) può trovare il CD.
+    mount_userspace();
 
     // Walk Ports-Implemented; bring up every populated SATA port.
     for idx in 0..32 {

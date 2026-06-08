@@ -102,11 +102,30 @@ pub fn sata_ports() -> alloc::vec::Vec<usize> {
     v
 }
 
-/// Porta su (bringup) la prima porta ATAPI (CD-ROM) trovata sul boot HBA.
-/// `None` se nessuna porta presenta la signature ATAPI. Usato da
-/// `boot::phases::storage` per montare `/bin` dal CD live.
+/// Bring up the first ATAPI (CD-ROM) port reachable from ANY AHCI controller.
+/// First scans the boot HBA (already initialized), then any OTHER AHCI
+/// controllers — the live CD can sit on a different HBA than the boot disk
+/// (e.g. QEMU q35: CD on the builtin ICH9, disk on an added `-device ahci`).
+/// `None` if no ATAPI device is found anywhere. Used by `boot::phases::storage`
+/// to mount `/bin` from the live CD.
 pub fn acquire_atapi_port() -> Option<AhciPort> {
-    let (abar, pi) = (*BOOT_HBA.lock())?;
+    let boot = *BOOT_HBA.lock();
+
+    // 1. Boot HBA (already init'd by `init()`) — no re-init / reset.
+    if let Some((abar, pi)) = boot {
+        if let Some(p) = scan_atapi(abar, pi) { return Some(p); }
+    }
+
+    // 2. Any other AHCI controllers (init each; their reset doesn't touch the
+    //    boot HBA, so the SATA /mnt bringup that follows is unaffected).
+    for h in hba::Hba::find_all_except(boot.map(|(a, _)| a)) {
+        if let Some(p) = scan_atapi(h.abar, h.pi) { return Some(p); }
+    }
+    None
+}
+
+/// Bring up every implemented port of one HBA; return the first ATAPI one.
+fn scan_atapi(abar: VirtAddr, pi: u32) -> Option<AhciPort> {
     for idx in 0..32 {
         if pi & (1 << idx) == 0 { continue; }
         if let Some(port) = AhciPort::bringup(abar, idx) {

@@ -71,7 +71,36 @@ impl Hba {
         let dev = crate::pci::devices().into_iter().find(|d|
             d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01
         ).ok_or(AhciError::NotFound)?;
+        Self::init_dev(dev)
+    }
 
+    /// Every AHCI controller present on the PCI bus, initialized, EXCEPT the one
+    /// whose ABAR equals `skip` (the already-initialized boot HBA — we don't want
+    /// to reset it again here). Used to find an ATAPI CD-ROM that may live on a
+    /// different HBA than the boot one (e.g. QEMU q35 builtin ICH9 vs an added
+    /// `-device ahci`). On real single-HBA hardware this returns nothing extra.
+    pub fn find_all_except(skip: Option<VirtAddr>) -> alloc::vec::Vec<Self> {
+        let mut out = alloc::vec::Vec::new();
+        for dev in crate::pci::devices().into_iter().filter(|d|
+            d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01
+        ) {
+            // Compute this controller's ABAR WITHOUT initializing, so we can skip
+            // the boot HBA (re-resetting it would disturb the SATA /mnt bringup).
+            let phys = match dev.bar(5) {
+                Some(Bar::Memory32 { address, .. }) => address as u64,
+                Some(Bar::Memory64 { address, .. }) => address,
+                _ => continue,
+            };
+            if Some(crate::memory::mapper::hhdm_virt(PhysAddr::new(phys))) == skip {
+                continue;
+            }
+            if let Ok(h) = Self::init_dev(dev) { out.push(h); }
+        }
+        out
+    }
+
+    /// Initialize a specific AHCI controller: map ABAR, enable AHCI mode, reset.
+    pub fn init_dev(dev: crate::pci::PciDevice) -> Result<Self, AhciError> {
         dev.enable_mmio();
         dev.enable_bus_master();
 

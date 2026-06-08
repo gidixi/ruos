@@ -7,10 +7,48 @@ use crate::boot::BootError;
 use crate::blockdev::BlockDevice;
 
 pub fn init() -> Result<(), BootError> {
+    // Monta `/bin`: dal CD live (ATAPI/ISO9660) se c'è, altrimenti fallback ai
+    // moduli Limine in tmpfs. Va eseguito in OGNI caso, anche quando non c'è
+    // alcun HBA AHCI (quindi nessun CD): il fallback deve comunque popolare
+    // `/bin`. Definito come closure così da chiamarlo sia nel path "HBA assente"
+    // sia DOPO `ahci::init()` quando l'HBA esiste.
+    let mount_bin = || {
+        // Live-CD: prova a montare `/bin` dal CD-ROM (ATAPI/ISO9660). Se riesce, i
+        // bin arrivano on-demand dal CD e NON serve copiare i moduli Limine in RAM.
+        let mut bin_mounted = false;
+        if let Some(cd) = crate::ahci::acquire_atapi_port() {
+            match crate::vfs::iso9660::mount_from_blockdev(
+                alloc::boxed::Box::new(cd), "/bin", "/bin",
+            ) {
+                Ok(()) => {
+                    crate::binfo!("storage", "live-cd: /bin mounted from ISO9660 (ATAPI)");
+                    bin_mounted = true;
+                }
+                Err(e) => crate::bwarn!("storage", "ISO9660 mount /bin failed: {}", e),
+            }
+        }
+
+        // Fallback: nessun CD utilizzabile → i bin vengono dai moduli Limine (boot
+        // installato su SSD o ISO legacy). Comportamento storico invariato.
+        if !bin_mounted {
+            let n = crate::modules::mount_all();
+            crate::binfo!("storage", "no live-cd: mounted {} boot modules into tmpfs /bin", n);
+        }
+    };
+
     let hba = match crate::ahci::init() {
         Some(h) => h,
-        None    => return Ok(()),
+        // Nessun HBA AHCI: niente SATA e niente CD. Esegui comunque il mount di
+        // `/bin` (fallback ai moduli Limine) prima di uscire.
+        None    => {
+            mount_bin();
+            return Ok(());
+        }
     };
+
+    // HBA presente e `BOOT_HBA` popolato da `ahci::init()`: ora possiamo provare
+    // l'ATAPI (che legge `BOOT_HBA`) per montare `/bin` dal CD live.
+    mount_bin();
 
     // Walk Ports-Implemented; bring up every populated SATA port.
     for idx in 0..32 {

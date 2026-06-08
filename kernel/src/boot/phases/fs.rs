@@ -44,8 +44,10 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
-    crate::modules::mount_all();
-    crate::binfo!("fs", "modules mounted");
+    // I bin NON vengono più montati qui dai moduli Limine: la fase `storage`
+    // monta `/bin` dal CD live (ISO9660/ATAPI) e, SOLO se non c'è CD, fa il
+    // fallback a `modules::mount_all()`. Lasciamo intatti i `/dev` e la root.
+    crate::binfo!("fs", "bin mount deferred to storage phase");
 
     #[cfg(feature = "boot-checks")]
     {

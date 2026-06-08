@@ -1,4 +1,4 @@
-# 337 — Fix WM compositor deadlock on real hardware
+# 340 — Fix WM compositor deadlock on real hardware
 
 **Data:** 2026-06-08
 

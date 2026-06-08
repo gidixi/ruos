@@ -101,3 +101,17 @@ pub fn sata_ports() -> alloc::vec::Vec<usize> {
     }
     v
 }
+
+/// Porta su (bringup) la prima porta ATAPI (CD-ROM) trovata sul boot HBA.
+/// `None` se nessuna porta presenta la signature ATAPI. Usato da
+/// `boot::phases::storage` per montare `/bin` dal CD live.
+pub fn acquire_atapi_port() -> Option<AhciPort> {
+    let (abar, pi) = (*BOOT_HBA.lock())?;
+    for idx in 0..32 {
+        if pi & (1 << idx) == 0 { continue; }
+        if let Some(port) = AhciPort::bringup(abar, idx) {
+            if port.is_atapi { return Some(port); }
+        }
+    }
+    None
+}

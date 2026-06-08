@@ -12,6 +12,7 @@ pub mod component;
 pub mod wm;
 pub mod term;
 pub mod compose;
+pub mod sys;
 
 use crate::kprintln;
 use alloc::vec::Vec;

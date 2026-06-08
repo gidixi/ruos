@@ -11,6 +11,7 @@
 
 pub mod hba;
 pub mod port;
+pub mod atapi;
 
 pub use hba::{Hba, AhciError};
 pub use port::AhciPort;

@@ -61,8 +61,7 @@ pub fn author(dev: &mut dyn BlockDevice, esp_mib: u32) -> Result<Layout, DiskErr
 
 /// Modules that stay on the ESP as Limine bootstrap (init chain + shell + the
 /// network/SSH service). Everything else goes to the data partition (/mnt/bin).
-const BOOTSTRAP: &[&str] = &["/init.wasm", "/etc/init.sh", "/bin/shell.wasm",
-                             "/root/server.wasm", "/root/client.wasm"];
+const BOOTSTRAP: &[&str] = &["/init.wasm", "/etc/init.sh", "/bin/shell.wasm"];
 
 /// Write the boot tree onto a freshly-authored disk: the bootstrap (+ the slim
 /// limine.conf) to the ESP, the command-line tools to the data partition.

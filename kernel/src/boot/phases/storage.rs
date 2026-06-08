@@ -7,15 +7,55 @@ use crate::boot::BootError;
 use crate::blockdev::BlockDevice;
 
 pub fn init() -> Result<(), BootError> {
+    // Popola lo userspace e poi sovrappone `/bin` dal CD live, se presente.
+    // Eseguito in OGNI caso (anche senza HBA AHCI), come closure così da poterlo
+    // chiamare sia nel path "HBA assente" sia DOPO `ahci::init()`.
+    let mount_userspace = || {
+        // 1. Carica SEMPRE i moduli Limine in tmpfs: init.sh, init.wasm, /root e
+        //    — finché non sono spostati off-boot — i tool /bin. Questi sono
+        //    piccoli (config + bootstrap), non i ~45 MB di app che vanno sul CD.
+        let n = crate::modules::mount_all();
+        crate::binfo!("storage", "mounted {} boot modules into tmpfs", n);
+
+        // 2. Live-CD: sovrapponi `/bin` dal CD-ROM (ATAPI/ISO9660) se c'è. I bin
+        //    vengono letti on-demand dal CD; questo mount SHADOWA il /bin tmpfs
+        //    (longest-prefix-match), quindi una volta tolti i moduli /bin dalla
+        //    limine.conf nessun bin resta pre-caricato in RAM.
+        if let Some(cd) = crate::ahci::acquire_atapi_port() {
+            match crate::vfs::iso9660::mount_from_blockdev(
+                alloc::boxed::Box::new(cd), "/bin", "/bin",
+            ) {
+                Ok(()) => crate::binfo!("storage", "live-cd: /bin overlaid from ISO9660 (ATAPI)"),
+                Err(e) => crate::bwarn!("storage", "ISO9660 mount /bin failed: {}", e),
+            }
+        }
+    };
+
     let hba = match crate::ahci::init() {
         Some(h) => h,
-        None    => return Ok(()),
+        // Nessun HBA AHCI: niente SATA e niente CD. Popola comunque lo userspace
+        // (moduli Limine) prima di uscire.
+        None    => {
+            mount_userspace();
+            return Ok(());
+        }
     };
+
+    // HBA presente e `BOOT_HBA` popolato da `ahci::init()`: ora `acquire_atapi_port`
+    // (che legge `BOOT_HBA` + scan multi-HBA) può trovare il CD.
+    mount_userspace();
 
     // Walk Ports-Implemented; bring up every populated SATA port.
     for idx in 0..32 {
         if (hba.pi & (1 << idx)) == 0 { continue; }
+        // Skip the port already owned by the live-CD `/bin` ISO9660 mount: a
+        // second bringup here would reprogram that live port's command list base
+        // and corrupt the in-flight CD reads (VirtualBox: CD on boot-HBA port 0).
+        if crate::ahci::boot_cd_port() == Some(idx as usize) { continue; }
         if let Some(mut port) = crate::ahci::AhciPort::bringup(hba.abar, idx as usize) {
+            // An ATAPI device (CD-ROM) is not a FAT disk — never try to /mnt it
+            // (its 2048 B blocks also reject the 512 B sector-0 read below).
+            if port.is_atapi { continue; }
             // Smoke: read sector 0 (FAT BPB) + confirm 0x55AA boot signature
             // at bytes 510..512. End-to-end proof that READ DMA EXT works
             // against the QEMU disk we formatted with mkfs.vfat.

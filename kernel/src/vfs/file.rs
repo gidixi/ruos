@@ -33,6 +33,7 @@ pub trait File {
 use crate::vfs::tmpfs::TmpfsFile;
 use crate::vfs::devices::{ConsoleFile, NullFile, ZeroFile, PtySlaveFile};
 use crate::vfs::fat32::Fat32File;
+use crate::vfs::iso9660::Iso9660File;
 use crate::pipe::{PipeReadFile, PipeWriteFile};
 
 pub enum FileImpl {
@@ -42,6 +43,7 @@ pub enum FileImpl {
     Zero(ZeroFile),
     PtySlave(PtySlaveFile),
     Fat32(Fat32File),
+    Iso9660(Iso9660File),
     PipeRead(PipeReadFile),
     PipeWrite(PipeWriteFile),
 }
@@ -55,6 +57,7 @@ impl FileImpl {
             FileImpl::Zero(f)      => f.read(buf).await,
             FileImpl::PtySlave(f)  => f.read(buf).await,
             FileImpl::Fat32(f)     => f.read(buf).await,
+            FileImpl::Iso9660(f)   => f.read(buf).await,
             FileImpl::PipeRead(f)  => f.read(buf).await,
             FileImpl::PipeWrite(f) => f.read(buf).await,
         }
@@ -67,6 +70,7 @@ impl FileImpl {
             FileImpl::Zero(f)      => f.write(buf).await,
             FileImpl::PtySlave(f)  => f.write(buf).await,
             FileImpl::Fat32(f)     => f.write(buf).await,
+            FileImpl::Iso9660(f)   => f.write(buf).await,
             FileImpl::PipeRead(f)  => f.write(buf).await,
             FileImpl::PipeWrite(f) => f.write(buf).await,
         }
@@ -79,6 +83,7 @@ impl FileImpl {
             FileImpl::Zero(f)      => f.stat().await,
             FileImpl::PtySlave(f)  => f.stat().await,
             FileImpl::Fat32(f)     => f.stat().await,
+            FileImpl::Iso9660(f)   => f.stat().await,
             FileImpl::PipeRead(f)  => f.stat().await,
             FileImpl::PipeWrite(f) => f.stat().await,
         }
@@ -91,6 +96,7 @@ impl FileImpl {
             FileImpl::Zero(f)      => f.seek(off, whence).await,
             FileImpl::PtySlave(f)  => f.seek(off, whence).await,
             FileImpl::Fat32(f)     => f.seek(off, whence).await,
+            FileImpl::Iso9660(f)   => f.seek(off, whence).await,
             FileImpl::PipeRead(f)  => f.seek(off, whence).await,
             FileImpl::PipeWrite(f) => f.seek(off, whence).await,
         }

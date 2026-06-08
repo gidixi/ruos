@@ -9,6 +9,7 @@ pub mod block_on;
 pub mod tmpfs;
 pub mod devices;
 pub mod fat32;
+pub mod iso9660;
 
 pub use block_on::block_on;
 pub use error::VfsError;

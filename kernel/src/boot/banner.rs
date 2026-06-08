@@ -53,12 +53,35 @@ fn emit(fb_only: bool) {
     });
 }
 
+/// Fixed-capacity stack writer: lets us format a line, THEN center it as a
+/// `&str`. Centering with `{:^39}` directly on a `format_args!` does NOT work —
+/// `Display for Arguments` ignores the formatter's width/fill flags, so the
+/// dynamic lines came out unpadded (and the box borders didn't line up).
+struct LineBuf { bytes: [u8; 96], len: usize }
+impl LineBuf {
+    fn new() -> Self { Self { bytes: [0; 96], len: 0 } }
+    fn as_str(&self) -> &str { core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("") }
+}
+impl Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 fn render<W: Write>(w: &mut W, version: &str, sha: &str, date: &str, ram_mib: u64) {
+    let mut l1 = LineBuf::new();
+    let _ = write!(l1, "ruOS v{}-dev ({}, {})", version, sha, date);
+    let mut l3 = LineBuf::new();
+    let _ = write!(l3, "{} MiB RAM / 1 CPU / WASIX-bootstrap", ram_mib);
+
     let _ = writeln!(w);
     let _ = writeln!(w, "  +{:-<41}+", "");
-    let _ = writeln!(w, "  | {:^39} |", format_args!("ruos v{}-dev ({}, {})", version, sha, date));
+    let _ = writeln!(w, "  | {:^39} |", l1.as_str());
     let _ = writeln!(w, "  | {:^39} |", "x86_64-unknown-none / Limine 11.4.1");
-    let _ = writeln!(w, "  | {:^39} |", format_args!("{} MiB RAM / 1 CPU / WASIX-bootstrap", ram_mib));
+    let _ = writeln!(w, "  | {:^39} |", l3.as_str());
     let _ = writeln!(w, "  +{:-<41}+", "");
     let _ = writeln!(w);
 }

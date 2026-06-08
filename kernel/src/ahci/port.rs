@@ -45,6 +45,19 @@ const TFD_ERR: u32 = 1 << 0;
 // SATA disk signature reported in PxSIG.
 const SIG_SATA: u32 = 0x0000_0101;
 
+// ATAPI device signature reported in PxSIG (CD-ROM, packet device).
+const SIG_ATAPI: u32 = 0xEB14_0101;
+
+// ATA PACKET command + DMA feature bit.
+const ATA_PACKET: u8 = 0xA0;
+const PACKET_FEATURE_DMA: u8 = 1 << 0;
+
+// Command-header flag bit A (ATAPI) — bit 5 of `flags`.
+const CH_FLAG_ATAPI: u16 = 1 << 5;
+
+// CD-ROM logical block size.
+const ATAPI_BLOCK: usize = 2048;
+
 // DMA region layout offsets.
 const OFF_CL:      usize = 0x000;
 const OFF_FIS:     usize = 0x400;
@@ -124,6 +137,7 @@ pub struct AhciPort {
     dma:       DmaRegion,
     pub sectors: u64,
     pub model:   String,
+    pub is_atapi: bool,
 }
 
 impl AhciPort {
@@ -202,27 +216,44 @@ impl AhciPort {
         }
 
         let sig = read32(port_base + PXSIG);
-        if sig != SIG_SATA {
-            crate::bwarn!("ahci", "port {} non-SATA sig=0x{:08x}", port_idx, sig);
-            return None;
-        }
+        let is_atapi = match sig {
+            SIG_SATA  => false,
+            SIG_ATAPI => true,
+            other => {
+                crate::bwarn!("ahci", "port {} unknown sig=0x{:08x}", port_idx, other);
+                return None;
+            }
+        };
 
         // 9. Enable command engine.
         let cmd = read32(port_base + PXCMD);
         write32(port_base + PXCMD, cmd | PXCMD_ST);
 
-        let mut p = Self { abar, port_idx, dma, sectors: 0, model: String::new() };
+        let mut p = Self { abar, port_idx, dma, sectors: 0, model: String::new(), is_atapi };
 
-        // 10. IDENTIFY DEVICE.
-        if let Err(e) = p.identify() {
-            crate::bwarn!("ahci", "port {} IDENTIFY failed: {}", port_idx, e);
-            return None;
+        // 10. ATA IDENTIFY (SATA) o READ CAPACITY (ATAPI) per i settori.
+        if p.is_atapi {
+            match p.atapi_read_capacity() {
+                Ok(sectors) => {
+                    p.sectors = sectors;
+                    p.model = String::from("ATAPI CD-ROM");
+                    crate::binfo!("ahci", "port {} atapi sectors={} (2048B)", port_idx, sectors);
+                }
+                Err(e) => {
+                    crate::bwarn!("ahci", "port {} READ CAPACITY failed: {}", port_idx, e);
+                    return None;
+                }
+            }
+        } else {
+            if let Err(e) = p.identify() {
+                crate::bwarn!("ahci", "port {} IDENTIFY failed: {}", port_idx, e);
+                return None;
+            }
+            crate::binfo!(
+                "ahci", "port {} sata sectors={} model=\"{}\"",
+                port_idx, p.sectors, p.model.trim()
+            );
         }
-        crate::binfo!(
-            "ahci",
-            "port {} sata sectors={} model=\"{}\"",
-            port_idx, p.sectors, p.model.trim()
-        );
         // Cache this port's IDENTIFY info so `disks` can report it later WITHOUT
         // re-bringing-up the port — critical for a port that is about to be moved
         // into the `/mnt` mount, where a second bringup would reprogram its live
@@ -357,6 +388,99 @@ impl AhciPort {
         Ok(())
     }
 
+    /// Emette un comando ATAPI PACKET (DMA-in) con il CDB SCSI dato. Modellato
+    /// su `issue`, ma: command=PACKET, feature=DMA, command-header flag A=1, e il
+    /// CDB copiato nel campo `acmd` della Command Table.
+    fn issue_atapi(
+        &mut self,
+        cdb: &[u8; 12],
+        buf_phys: u64,
+        buf_bytes: u32,
+    ) -> Result<(), BlockError> {
+        let fis = FisH2D {
+            fis_type:  FIS_TYPE_REG_H2D,
+            flags:     FIS_FLAG_CMD,
+            command:   ATA_PACKET,
+            feature_l: PACKET_FEATURE_DMA,
+            lba0: 0,
+            lba1: (buf_bytes & 0xFF) as u8,
+            lba2: (buf_bytes >> 8) as u8,
+            device: 0,
+            lba3: 0, lba4: 0, lba5: 0, feature_h: 0,
+            count_l: 0, count_h: 0, icc: 0, control: 0,
+            rsv: [0; 4],
+        };
+
+        unsafe {
+            let ct = self.ct0_virt();
+            let cfis_ptr = core::ptr::addr_of_mut!((*ct).cfis) as *mut u8;
+            core::ptr::write_bytes(cfis_ptr, 0, 64);
+            let fis_bytes = core::slice::from_raw_parts(
+                &fis as *const FisH2D as *const u8,
+                core::mem::size_of::<FisH2D>(),
+            );
+            core::ptr::copy_nonoverlapping(fis_bytes.as_ptr(), cfis_ptr, fis_bytes.len());
+            let acmd_ptr = core::ptr::addr_of_mut!((*ct).acmd) as *mut u8;
+            core::ptr::write_bytes(acmd_ptr, 0, 16);
+            core::ptr::copy_nonoverlapping(cdb.as_ptr(), acmd_ptr, 12);
+            let prdt0_ptr = core::ptr::addr_of_mut!((*ct).prdt0);
+            core::ptr::write(prdt0_ptr, PrdtEntry {
+                dba:  buf_phys as u32,
+                dbau: (buf_phys >> 32) as u32,
+                rsv:  0,
+                dbc:  (buf_bytes - 1) & 0x3F_FFFF,
+            });
+        }
+
+        let ct0_phys = self.ct0_phys();
+        let cfl_dwords = (core::mem::size_of::<FisH2D>() as u16 / 4) & 0x1F;
+        let flags: u16 = cfl_dwords | CH_FLAG_ATAPI;
+        unsafe {
+            let ch = self.ch0_virt();
+            write_volatile(ch, CmdHeader {
+                flags,
+                prdtl: 1,
+                prdbc: 0,
+                ctba:  ct0_phys as u32,
+                ctbau: (ct0_phys >> 32) as u32,
+                rsv:   [0; 4],
+            });
+        }
+
+        let pb = self.port_base();
+        let start = crate::timer::ticks();
+        while (read32(pb + PXTFD) & (TFD_BSY | TFD_DRQ)) != 0 {
+            if crate::timer::ticks().wrapping_sub(start) > CMD_TIMEOUT {
+                return Err(BlockError::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+        write32(pb + PXIS, 0xFFFF_FFFF);
+        write32(pb + PXCI, 1);
+        let start = crate::timer::ticks();
+        while (read32(pb + PXCI) & 1) != 0 {
+            if crate::timer::ticks().wrapping_sub(start) > CMD_TIMEOUT {
+                return Err(BlockError::Timeout);
+            }
+            if (read32(pb + PXTFD) & TFD_ERR) != 0 { return Err(BlockError::Io); }
+            core::hint::spin_loop();
+        }
+        if (read32(pb + PXTFD) & TFD_ERR) != 0 { return Err(BlockError::Io); }
+        Ok(())
+    }
+
+    /// READ CAPACITY(10) → numero di blocchi (last_lba + 1). Legge nello scratch.
+    fn atapi_read_capacity(&mut self) -> Result<u64, BlockError> {
+        let scratch_phys = self.dma.phys.as_u64() + OFF_SCRATCH as u64;
+        let cdb = crate::ahci::atapi::read_capacity10_cdb();
+        self.issue_atapi(&cdb, scratch_phys, 8)?;
+        let scratch_virt = self.dma.virt.as_u64() as usize + OFF_SCRATCH;
+        let buf = unsafe { core::slice::from_raw_parts(scratch_virt as *const u8, 8) };
+        let (last_lba, _bs) = crate::ahci::atapi::parse_read_capacity10(buf)
+            .ok_or(BlockError::Io)?;
+        Ok(last_lba as u64 + 1)
+    }
+
     /// Issue IDENTIFY DEVICE into the scratch sector, parse sector count + model.
     fn identify(&mut self) -> Result<(), BlockError> {
         let scratch_phys = self.dma.phys.as_u64() + OFF_SCRATCH as u64;
@@ -401,16 +525,33 @@ impl AhciPort {
 }
 
 impl BlockDevice for AhciPort {
-    fn block_size(&self) -> u32 { 512 }
+    fn block_size(&self) -> u32 { if self.is_atapi { ATAPI_BLOCK as u32 } else { 512 } }
     fn block_count(&self) -> u64 { self.sectors }
 
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if self.is_atapi {
+            if buf.len() % ATAPI_BLOCK != 0 { return Err(BlockError::BadAlignment); }
+            let blocks = (buf.len() / ATAPI_BLOCK) as u64;
+            if lba.checked_add(blocks).map(|e| e > self.sectors).unwrap_or(true) {
+                return Err(BlockError::OutOfRange);
+            }
+            let mut done = 0u64;
+            while done < blocks {
+                let chunk = core::cmp::min(blocks - done, 2048) as u16;
+                let slice = &mut buf[(done as usize) * ATAPI_BLOCK
+                    ..((done + chunk as u64) as usize) * ATAPI_BLOCK];
+                let phys = slice.as_ptr() as u64 - crate::memory::mapper::hhdm_offset();
+                let cdb = crate::ahci::atapi::read10_cdb((lba + done) as u32, chunk);
+                self.issue_atapi(&cdb, phys, chunk as u32 * ATAPI_BLOCK as u32)?;
+                done += chunk as u64;
+            }
+            return Ok(());
+        }
         if buf.len() % 512 != 0 { return Err(BlockError::BadAlignment); }
         let sectors = (buf.len() / 512) as u64;
         if lba.checked_add(sectors).map(|e| e > self.sectors).unwrap_or(true) {
             return Err(BlockError::OutOfRange);
         }
-        // PRDT-entry cap: 4 MiB = 8192 sectors. Split larger transfers.
         let mut done = 0u64;
         while done < sectors {
             let chunk = core::cmp::min(sectors - done, 8192) as u16;
@@ -423,6 +564,7 @@ impl BlockDevice for AhciPort {
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if self.is_atapi { return Err(BlockError::Io); } // CD read-only
         if buf.len() % 512 != 0 { return Err(BlockError::BadAlignment); }
         let sectors = (buf.len() / 512) as u64;
         if lba.checked_add(sectors).map(|e| e > self.sectors).unwrap_or(true) {

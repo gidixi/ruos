@@ -11,6 +11,7 @@
 
 pub mod hba;
 pub mod port;
+pub mod atapi;
 
 pub use hba::{Hba, AhciError};
 pub use port::AhciPort;
@@ -26,6 +27,15 @@ static PORT0: Mutex<Option<AhciPort>> = Mutex::new(None);
 /// HBA reset. Lets `mkdisk`/`mkboot` bring up a SATA port via the already-reset
 /// HBA WITHOUT a second `GHC_HR`, which on real HW would orphan a live `/mnt`.
 static BOOT_HBA: Mutex<Option<(VirtAddr, u32)>> = Mutex::new(None); // (abar, pi)
+
+/// Boot-HBA port index consumed by the live-CD `/bin` ISO9660 mount, if the CD
+/// sits on the boot HBA (e.g. VirtualBox: single AHCI, CD on port 0). The SATA
+/// `/mnt` loop MUST skip this port: a second `bringup` on it would reprogram the
+/// live CD port's PxCLB/PxFB and corrupt the in-flight ISO9660 reads.
+static BOOT_CD_PORT: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Index of the boot-HBA port owned by the live-CD `/bin` mount, if any.
+pub fn boot_cd_port() -> Option<usize> { *BOOT_CD_PORT.lock() }
 
 /// Per-port cache of `(model, sectors)` learned from IDENTIFY the first (and,
 /// for a mounted port, ONLY) time the port is brought up. `AhciPort::bringup`
@@ -99,4 +109,48 @@ pub fn sata_ports() -> alloc::vec::Vec<usize> {
         }
     }
     v
+}
+
+/// Bring up the first ATAPI (CD-ROM) port reachable from ANY AHCI controller.
+/// First scans the boot HBA (already initialized), then any OTHER AHCI
+/// controllers — the live CD can sit on a different HBA than the boot disk
+/// (e.g. QEMU q35: CD on the builtin ICH9, disk on an added `-device ahci`).
+/// `None` if no ATAPI device is found anywhere. Used by `boot::phases::storage`
+/// to mount `/bin` from the live CD.
+pub fn acquire_atapi_port() -> Option<AhciPort> {
+    let boot = *BOOT_HBA.lock();
+
+    // 1. Boot HBA (already init'd by `init()`) — no re-init / reset. Record the
+    //    port index so the SATA /mnt loop skips it (re-bringup would corrupt the
+    //    live CD mount — the VirtualBox single-AHCI / CD-on-port-0 case).
+    if let Some((abar, pi)) = boot {
+        for idx in 0..32 {
+            if pi & (1 << idx) == 0 { continue; }
+            if let Some(port) = AhciPort::bringup(abar, idx) {
+                if port.is_atapi {
+                    *BOOT_CD_PORT.lock() = Some(idx);
+                    return Some(port);
+                }
+            }
+        }
+    }
+
+    // 2. Any other AHCI controllers (init each; their reset doesn't touch the
+    //    boot HBA, so the SATA /mnt bringup that follows is unaffected). A CD on
+    //    a different controller can't collide with the boot HBA's SATA loop.
+    for h in hba::Hba::find_all_except(boot.map(|(a, _)| a)) {
+        if let Some(p) = scan_atapi(h.abar, h.pi) { return Some(p); }
+    }
+    None
+}
+
+/// Bring up every implemented port of one HBA; return the first ATAPI one.
+fn scan_atapi(abar: VirtAddr, pi: u32) -> Option<AhciPort> {
+    for idx in 0..32 {
+        if pi & (1 << idx) == 0 { continue; }
+        if let Some(port) = AhciPort::bringup(abar, idx) {
+            if port.is_atapi { return Some(port); }
+        }
+    }
+    None
 }

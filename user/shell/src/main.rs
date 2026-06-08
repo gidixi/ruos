@@ -358,12 +358,12 @@ fn main() {
         print!("\x1b[2J\x1b[H");
         std::io::stdout().flush().ok();
     }
-    println!("\x1b[1;32mruos shell ready. type 'help' for builtins.\x1b[0m");
+    println!("\x1b[1;32mruOS shell ready. type 'help' for builtins.\x1b[0m");
 
     let saved = save_and_raw();
     loop {
         let cwd = CWD.lock().unwrap().clone();
-        let prompt = format!("ruos:{}$ ", cwd);
+        let prompt = format!("ruOS:{}$ ", cwd);
         match read_line_raw(&prompt) {
             Some(line) => {
                 let trimmed = line.trim();

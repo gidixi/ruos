@@ -13,10 +13,9 @@ HELLO     := shell: init.sh complete
 INIT_SCRIPT ?= user-bin/init.sh
 
 # Userspace .wasm tools shipped on the ISO. Root-level tools go to ISO_ROOT/,
-# /bin tools go to ISO_ROOT/bin/, /root/ demo blobs go to ISO_ROOT/root/.
+# /bin tools go to ISO_ROOT/bin/.
 # New tools: just append to BIN_TOOLS.
 ROOT_WASMS := user-bin/init.wasm
-ROOT_DEMOS := user-bin/server.wasm user-bin/client.wasm
 BIN_TOOLS  := shell ls cat echo \
               mkdir rmdir rm cp mv \
               head tail grep find diff du \
@@ -31,7 +30,7 @@ BIN_TOOLS  := shell ls cat echo \
               rtop \
               mkdisk mkboot install umount disks
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
-USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
+USER_WASMS := $(ROOT_WASMS) $(BIN_WASMS)
 
 .PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-smp-test run-comp-smp-test run-ssh-gui-test run-exec-ap-test
 
@@ -225,7 +224,6 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	cp limine-ssd.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
-	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	# Desktop app .cwasm: baked into the ISO /bin as boot modules (available diskless).
@@ -276,6 +274,8 @@ run-test: $(DISK_IMG)
 	grep -qF "ahci HBA up" build/serial.log || { echo TEST_FAIL_AHCI; exit 1; }; \
 	grep -qE "ahci port [0-9]+ sata sectors=" build/serial.log || { echo TEST_FAIL_AHCI_IDENTIFY; exit 1; }; \
 	grep -qF "disk read OK sector 0" build/serial.log || { echo TEST_FAIL_AHCI_READ; exit 1; }; \
+	grep -qE "ahci port [0-9]+ atapi sectors=" build/serial.log || { echo TEST_FAIL_ATAPI; exit 1; }; \
+	grep -qF "/bin overlaid from ISO9660" build/serial.log || { echo TEST_FAIL_LIVECD_BIN; exit 1; }; \
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
@@ -476,7 +476,6 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	cp limine-ssd.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
-	for f in $(ROOT_DEMOS); do cp $$f $(ISO_ROOT)/root/; done
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
 	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
 	# Desktop app .cwasm: baked into the ISO /bin as boot modules (available diskless).

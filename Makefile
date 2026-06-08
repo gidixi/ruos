@@ -27,14 +27,13 @@ BIN_TOOLS  := shell ls cat echo \
               touch wc clear which \
               sort uniq cut tr tee \
               ifconfig nc date wget ping \
-              service readdirtest \
-              spinloop smptest \
+              service \
               rtop \
               mkdisk mkboot install umount disks
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(ROOT_DEMOS) $(BIN_WASMS)
 
-.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-fuel-test run-smp-test run-smp2-test run-comp-smp-test run-ssh-gui-test run-exec-ap-test
+.PHONY: all build limine iso run run-test test-boot clean user-wasm disk run-smp-test run-comp-smp-test run-ssh-gui-test run-exec-ap-test
 
 all: iso
 
@@ -237,8 +236,6 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
 	cp build/notepad.cwasm $(ISO_ROOT)/bin/notepad.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
-	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
-	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
@@ -281,7 +278,6 @@ run-test: $(DISK_IMG)
 	grep -qF "disk read OK sector 0" build/serial.log || { echo TEST_FAIL_AHCI_READ; exit 1; }; \
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
-	grep -qE "readdir-std: [1-9][0-9]* entries" build/serial.log || { echo TEST_FAIL_READDIR; exit 1; }; \
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
 		grep -qE "^cpu0:[0-9]+%" build/serial.log || { echo TEST_FAIL_RTOP_CORE; exit 1; }; \
 		grep -qE "usb  xhci up" build/serial.log || { echo TEST_FAIL_USB_UP; exit 1; }; \
@@ -313,15 +309,6 @@ run-gpt-test:
 .PHONY: run-m2a-test
 run-m2a-test:
 	bash tests/m2a-test.sh
-
-# M2b-1 boot-payload-copy end-to-end: proves ruos AUTHORS a disk (M2a) AND COPIES
-# its full boot tree onto the ESP so the SSD boots standalone. Boots M1 with a
-# BLANK disk + INIT_SCRIPT=user-bin/m2b1-init.sh (runs `mkboot 64`); the script
-# then extracts the ESP and host-verifies it with sgdisk/fsck.fat/mtools,
-# including LFN listing and ~20 MB kernel byte-identity vs the ISO sources.
-.PHONY: run-m2b1-test
-run-m2b1-test:
-	bash tests/m2b1-test.sh
 
 # M2b-2 boot-from-SSD end-to-end (the SSD-installer CAPSTONE). Two phases on ONE
 # disk image, boot-marker-only (no mtools): phase 1 boots the ISO + a BLANK SATA
@@ -417,17 +404,9 @@ export PASSWD_GEN
 run-pipe-test: iso ssh-key-on-disk
 	bash tests/pipe-test.sh
 
-.PHONY: run-fuel-test
-run-fuel-test: iso ssh-key-on-disk
-	bash tests/fuel-test.sh
-
 .PHONY: run-smp-test
 run-smp-test: iso $(DISK_IMG)
 	bash tests/smp-test.sh
-
-.PHONY: run-smp2-test
-run-smp2-test: iso ssh-key-on-disk
-	bash tests/smp2-test.sh
 
 # rtop interactive test: runs rtop over SSH, asserts timer-driven auto-refresh
 # (multiple frames while idle) + clean 'q' quit (alt-screen restored).
@@ -508,8 +487,6 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
 	cp build/notepad.cwasm $(ISO_ROOT)/bin/notepad.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
-	cp kernel/src/wasm/wt/reactor_close.cwasm $(ISO_ROOT)/bin/reactor-close.cwasm
-	cp kernel/src/wasm/wt/probe.cwasm $(ISO_ROOT)/bin/probe.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh

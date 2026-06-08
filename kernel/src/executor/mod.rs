@@ -852,6 +852,7 @@ async fn tick_task() {
 async fn supervisor_task() {
     let mut prev = [0u64; crate::cpu::MAX_CPUS];
     let mut first = true;
+    let mut muted = false;
     loop {
         // Total cores = BSP (always 1) + online APs. cpus_online() counts APs only.
         let n = (1 + crate::cpu::cpus_online()) as usize;
@@ -872,8 +873,13 @@ async fn supervisor_task() {
             first = false;
         } else if mute > 0 {
             crate::bwarn!("super", "mute cores={} alive={}/{}", mute, alive, n);
-        } else {
-            crate::binfo!("super", "all {} cores alive", n);
+            muted = true;
+        } else if muted {
+            // Recovered: log the transition back to all-alive ONCE, then go
+            // quiet. Steady-state health is silent — no per-second INFO spam
+            // flooding the serial wire and the dmesg ring buffer.
+            crate::binfo!("super", "all {} cores alive (recovered)", n);
+            muted = false;
         }
     }
 }

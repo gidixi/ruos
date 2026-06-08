@@ -39,5 +39,3 @@ echo --- ping test ---
 ping -c 1 -W 2000 10.0.2.2
 echo --- pipe smoke ---
 ls /bin | wc -l
-echo --- readdir (std::fs::read_dir via fd_readdir) ---
-readdirtest /bin

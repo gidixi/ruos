@@ -41,6 +41,10 @@ xhci = "0.9"
 [features]
 boot-checks = []
 wasm-trace = []
+# Netconsole: stream kernel log (INFO+) as UDP broadcast on 255.255.255.255:6666,
+# captured with `nc -ul 6666`. Diagnostic; pulls in smoltcp's UDP socket. See
+# docs/superpowers/specs/2026-06-08-netconsole-udp-design.md
+netconsole = ["smoltcp/socket-udp"]
 # Escape hatch: build with plain global talc (no per-core magazine). Use as a
 # bisect baseline when investigating allocator-related regressions. The default
 # (no flag) uses MagazineAlloc.

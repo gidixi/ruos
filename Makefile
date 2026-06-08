@@ -284,6 +284,26 @@ run-test: $(DISK_IMG)
 		grep -qE "usb.*keyboard ready" build/serial.log || { echo TEST_FAIL_USB_KBD; exit 1; }; \
 	echo TEST_PASS
 
+# Live-CD-from-USB gate: boots the ISO from a USB Mass-Storage stick (NO -cdrom),
+# forcing the off-boot /bin overlay through the USB-MSC path (BOT/SCSI) instead
+# of ATAPI. Asserts the MSC device enumerates, /bin is overlaid from USB-MSC, and
+# the shell comes up. Limine's hybrid ISO boots from USB; the same image is the
+# usb-storage backing file the kernel re-reads via its own xHCI driver.
+.PHONY: run-test-usb
+run-test-usb:
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	@echo "--- usb-msc serial (timeout 240s) ---"
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -m 512 -no-reboot -display none -serial stdio \
+		-drive if=none,id=stick,file=$(ISO),format=raw \
+		-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
+		-device usb-kbd,bus=xhci.0 \
+		-netdev user,id=net0 -device $(NIC),netdev=net0 \
+		| tee build/serial-usb.log; \
+	grep -qF "$(HELLO)" build/serial-usb.log || { echo TEST_FAIL_SHELL; exit 1; }; \
+	grep -qE "msc  MSC ready slot=" build/serial-usb.log || { echo TEST_FAIL_MSC_ENUM; exit 1; }; \
+	grep -qF "/bin overlaid from USB-MSC" build/serial-usb.log || { echo TEST_FAIL_USB_BIN; exit 1; }; \
+	echo TEST_PASS_USB
+
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and
 # asserts that adapter's family-specific 'net: <chip> mac=..' boot line.
 .PHONY: run-test-e1000

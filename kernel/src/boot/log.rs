@@ -64,6 +64,8 @@ fn emit(level: &str, module: &str, args: core::fmt::Arguments) {
         let bytes = scratch.as_bytes();
         // dmesg ring buffer: always.
         crate::klog::push(bytes);
+        #[cfg(feature = "netconsole")]
+        crate::net::netconsole::enqueue(bytes);
         // Live console: serial always (debug/log wire); framebuffer only
         // above the current threshold.
         let line = core::str::from_utf8(bytes).unwrap_or("<log: invalid utf8>\n");

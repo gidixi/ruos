@@ -37,6 +37,14 @@ static BOOT_CD_PORT: Mutex<Option<usize>> = Mutex::new(None);
 /// Index of the boot-HBA port owned by the live-CD `/bin` mount, if any.
 pub fn boot_cd_port() -> Option<usize> { *BOOT_CD_PORT.lock() }
 
+/// Boot-HBA port index already mounted at `/mnt` (a live FAT SATA disk). Set by
+/// `boot::phases::storage` after the FAT mount; read by `acquire_atapi_port` so
+/// its ATAPI scan SKIPS this port — a second `bringup` would reprogram the live
+/// port's PxCLB/PxFB and corrupt the mounted volume's in-flight DMA. (Needed
+/// because `media_bin` now runs the ATAPI scan AFTER `/mnt` is mounted.)
+static MOUNTED_SATA_PORT: Mutex<Option<usize>> = Mutex::new(None);
+pub fn set_mounted_sata_port(idx: usize) { *MOUNTED_SATA_PORT.lock() = Some(idx); }
+
 /// Per-port cache of `(model, sectors)` learned from IDENTIFY the first (and,
 /// for a mounted port, ONLY) time the port is brought up. `AhciPort::bringup`
 /// populates this on every success — including the boot-time bringup of the
@@ -124,8 +132,12 @@ pub fn acquire_atapi_port() -> Option<AhciPort> {
     //    port index so the SATA /mnt loop skips it (re-bringup would corrupt the
     //    live CD mount — the VirtualBox single-AHCI / CD-on-port-0 case).
     if let Some((abar, pi)) = boot {
+        let mounted = *MOUNTED_SATA_PORT.lock();
         for idx in 0..32 {
             if pi & (1 << idx) == 0 { continue; }
+            // Skip the port already mounted at /mnt: bringing it up again would
+            // corrupt the live FAT volume's DMA (PxCLB/PxFB reprogram).
+            if mounted == Some(idx) { continue; }
             if let Some(port) = AhciPort::bringup(abar, idx) {
                 if port.is_atapi {
                     *BOOT_CD_PORT.lock() = Some(idx);

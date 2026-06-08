@@ -129,6 +129,37 @@ impl<'a> BlockDevice for PartBorrow<'a> {
     }
 }
 
+/// Presents a 2048-byte logical block on top of any smaller-sector device, so
+/// the ISO9660 driver — which addresses 2048-byte ISO sectors as device LBAs —
+/// can read a 512-byte USB Mass-Storage LUN. `ratio = 2048 / inner.block_size()`
+/// (1 = passthrough when the inner device is already 2048 B, e.g. an ATAPI CD).
+pub struct SectorScale {
+    inner: Box<dyn BlockDevice + Send>,
+    ratio: u64,
+}
+
+impl SectorScale {
+    pub fn new(inner: Box<dyn BlockDevice + Send>) -> Self {
+        let bs = inner.block_size().max(1) as u64;
+        let ratio = (2048 / bs).max(1);
+        Self { inner, ratio }
+    }
+}
+
+impl BlockDevice for SectorScale {
+    fn block_size(&self) -> u32 { 2048 }
+    fn block_count(&self) -> u64 { self.inner.block_count() / self.ratio }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.len() % 2048 != 0 { return Err(BlockError::BadAlignment); }
+        let inner_lba = lba.checked_mul(self.ratio).ok_or(BlockError::OutOfRange)?;
+        self.inner.read_blocks(inner_lba, buf)
+    }
+    // Off-boot `/bin` is read-only: the scaled view never writes.
+    fn write_blocks(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+        Err(BlockError::Io)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; extern crate std; use std::vec; use std::vec::Vec;
@@ -152,5 +183,36 @@ mod tests {
         assert_eq!(buf[0], 0xAB);
         assert!(pd.read_blocks(3, &mut buf).is_err());
         assert_eq!(pd.block_count(), 3);
+    }
+
+    #[test] fn sector_scale_512_to_2048() {
+        // 8 logical-512 sectors = 2 iso-2048 sectors; mark byte 0 of iso-sector 1
+        // (= device LBA 4 at 512 B).
+        let mut backing = vec![0u8; 512*8];
+        backing[4*512] = 0xCD;
+        let mut ss = SectorScale::new(Box::new(Mem(backing)));
+        assert_eq!(ss.block_size(), 2048);
+        assert_eq!(ss.block_count(), 2);
+        let mut buf = [0u8; 2048];
+        ss.read_blocks(1, &mut buf).unwrap();   // iso lba 1 -> dev lba 4
+        assert_eq!(buf[0], 0xCD);
+    }
+
+    #[test] fn sector_scale_passthrough_2048() {
+        struct M2(Vec<u8>);
+        impl BlockDevice for M2 {
+            fn block_size(&self)->u32{2048}
+            fn block_count(&self)->u64{(self.0.len()/2048) as u64}
+            fn read_blocks(&mut self,l:u64,b:&mut[u8])->Result<(),BlockError>{
+                let o=(l as usize)*2048; b.copy_from_slice(&self.0[o..o+b.len()]); Ok(())
+            }
+            fn write_blocks(&mut self,_:u64,_:&[u8])->Result<(),BlockError>{Err(BlockError::Io)}
+        }
+        let mut ss = SectorScale::new(Box::new(M2(vec![7u8; 2048*3])));
+        assert_eq!(ss.block_size(), 2048);
+        assert_eq!(ss.block_count(), 3);
+        let mut buf = [0u8; 2048];
+        ss.read_blocks(2, &mut buf).unwrap();
+        assert_eq!(buf[0], 7);
     }
 }

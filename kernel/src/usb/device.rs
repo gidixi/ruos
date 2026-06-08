@@ -189,6 +189,9 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
     // traits' methods dispatch through the trait object without being in scope.
     use ::xhci::context::{Input32Byte, Input64Byte, InputHandler, EndpointType};
 
+    // Owning controller index (copied out — `x` is borrowed mutably below).
+    let ctrl = x.idx;
+
     // ── 1. Enable Slot (command type 9) ─────────────────────────────────────
     ring::enqueue_cmd(x, [0, 0, 0, 0], 9);
     let ev = match ring::wait_cmd(x) {
@@ -382,6 +385,13 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
         } else {
             crate::usb::registry::SlotKind::Keyboard(st)
         }
+    } else if let Some(mi) = configure_msc(x, &mut dev) {
+        // USB Mass-Storage (BOT): configure both bulk endpoints + bring the LUN
+        // up. On failure fall back to Other (boot continues without USB /bin).
+        match crate::usb::msc::configure_endpoints(x, &mut dev, &mi) {
+            Some(st) => crate::usb::registry::SlotKind::Msc(st),
+            None => crate::usb::registry::SlotKind::Other,
+        }
     } else {
         crate::usb::registry::SlotKind::Other
     };
@@ -390,9 +400,10 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
     // After this insert the registry owns ep0_ring/dev_ctx/input_ctx (and the
     // kind-specific rings inside `kind`); returning Some(slot_id) signals the
     // caller below NOT to free them.
-    crate::usb::registry::insert(slot_id, crate::usb::registry::SlotEntry {
+    crate::usb::registry::insert(ctrl, slot_id, crate::usb::registry::SlotEntry {
         kind,
         dev,
+        ctrl,
         root_port:   loc.root_port,
         parent_slot: loc.parent_slot,
         parent_port: loc.parent_port,
@@ -551,6 +562,102 @@ pub fn configure(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::hid::H
         }
 
         found
+    })();
+    crate::memory::dma::dealloc(buf);
+    result
+}
+
+/// Read the Configuration Descriptor and walk it for a Mass-Storage interface
+/// (class 0x08, subclass 0x06 SCSI-transparent, protocol 0x50 Bulk-Only),
+/// capturing its bulk-IN + bulk-OUT endpoints. On a match, issue
+/// SET_CONFIGURATION and return the interface. `None` if the device is not BOT
+/// mass-storage. Mirrors `configure`'s descriptor walk.
+pub fn configure_msc(x: &mut Xhci, dev: &mut UsbDevice) -> Option<crate::usb::msc::MscIface> {
+    let buf = crate::memory::dma::alloc(1)?;
+    let result = (|| {
+        // Config header → wTotalLength + bConfigurationValue.
+        let s9 = crate::usb::control::Setup {
+            req_type: 0x80, request: 6, value: 0x0200, index: 0, length: 9,
+        };
+        if crate::usb::control::control_in(x, dev, s9, &buf)? < 9 { return None; }
+        let rd = |o: usize| unsafe { core::ptr::read_volatile(buf.virt.as_ptr::<u8>().add(o)) };
+        let total = ((rd(2) as u16) | ((rd(3) as u16) << 8)).min(4096);
+        let cfg_val = rd(5);
+
+        let s_all = crate::usb::control::Setup {
+            req_type: 0x80, request: 6, value: 0x0200, index: 0, length: total,
+        };
+        let n = crate::usb::control::control_in(x, dev, s_all, &buf)?;
+        let n = (n.min(total)) as usize;
+
+        // Walk: find the BOT interface, then its bulk IN/OUT endpoints.
+        let mut pos = 0usize;
+        let mut in_msc_iface = false;
+        let mut iface_num = 0u8;
+        let mut ep_in: Option<(u8, u16)> = None;
+        let mut ep_out: Option<(u8, u16)> = None;
+        let mut burst_in = 0u8;
+        let mut burst_out = 0u8;
+        // Direction (true=IN) of the bulk endpoint a following SuperSpeed
+        // Endpoint Companion descriptor belongs to (it immediately follows its EP).
+        let mut last_bulk_in: Option<bool> = None;
+        while pos + 2 <= n {
+            let blen = rd(pos) as usize;
+            if blen == 0 || pos + blen > n { break; }
+            match rd(pos + 1) {
+                4 if pos + 9 <= n => {
+                    // Interface descriptor.
+                    let cls = rd(pos + 5); let sub = rd(pos + 6); let proto = rd(pos + 7);
+                    in_msc_iface = cls == 0x08 && sub == 0x06 && proto == 0x50;
+                    if in_msc_iface {
+                        iface_num = rd(pos + 2);
+                        ep_in = None; ep_out = None;
+                    }
+                    last_bulk_in = None;
+                }
+                5 if in_msc_iface && pos + 7 <= n => {
+                    // Endpoint descriptor under the BOT interface.
+                    let addr = rd(pos + 2);
+                    let attr = rd(pos + 3);
+                    let mps = (rd(pos + 4) as u16) | ((rd(pos + 5) as u16) << 8);
+                    if attr & 0x03 == 2 { // bulk
+                        if addr & 0x80 != 0 { ep_in.get_or_insert((addr, mps)); last_bulk_in = Some(true); }
+                        else { ep_out.get_or_insert((addr, mps)); last_bulk_in = Some(false); }
+                    } else {
+                        last_bulk_in = None;
+                    }
+                }
+                48 if in_msc_iface && pos + 3 <= n => {
+                    // SuperSpeed Endpoint Companion (bMaxBurst @ offset 2). Real
+                    // USB3 controllers reject a multi-packet bulk transfer (e.g.
+                    // a 2048-byte READ(10)) if Max Burst Size is left 0 in the
+                    // endpoint context — even though an 8-byte READ CAPACITY in a
+                    // single packet succeeds. Apply it to the EP it follows.
+                    match last_bulk_in {
+                        Some(true) => burst_in = rd(pos + 2),
+                        Some(false) => burst_out = rd(pos + 2),
+                        None => {}
+                    }
+                }
+                _ => { last_bulk_in = None; }
+            }
+            pos += blen;
+        }
+
+        let (ep_in, mps_in) = ep_in?;
+        let (ep_out, mps_out) = ep_out?;
+
+        // SET_CONFIGURATION.
+        let ok = crate::usb::control::control_out(x, dev, crate::usb::control::Setup {
+            req_type: 0x00, request: 9, value: cfg_val as u16, index: 0, length: 0,
+        });
+        if !ok { crate::bwarn!("msc", "set_config failed"); return None; }
+        crate::binfo!("msc", "BOT iface={} ep_in=0x{:02x} ep_out=0x{:02x} mps_in={} burst_in={} burst_out={}",
+            iface_num, ep_in, ep_out, mps_in, burst_in, burst_out);
+
+        Some(crate::usb::msc::MscIface {
+            iface: iface_num, ep_in, ep_out, mps_in, mps_out, burst_in, burst_out,
+        })
     })();
     crate::memory::dma::dealloc(buf);
     result

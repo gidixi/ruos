@@ -11,24 +11,13 @@ pub fn init() -> Result<(), BootError> {
     // Eseguito in OGNI caso (anche senza HBA AHCI), come closure così da poterlo
     // chiamare sia nel path "HBA assente" sia DOPO `ahci::init()`.
     let mount_userspace = || {
-        // 1. Carica SEMPRE i moduli Limine in tmpfs: init.sh, init.wasm, /root e
-        //    — finché non sono spostati off-boot — i tool /bin. Questi sono
-        //    piccoli (config + bootstrap), non i ~45 MB di app che vanno sul CD.
+        // Carica i moduli Limine in tmpfs: init.sh, init.wasm, /root e il set
+        // minimo /bin (shell.wasm + bootstrap) come rete di sicurezza. Il resto
+        // di `/bin` è off-boot: lo sovrappone la fase `media_bin` (dopo l'USB)
+        // leggendo l'ISO9660 da CD ATAPI o chiavetta USB. Spostato lì perché
+        // l'USB-MSC si enumera DOPO questa fase.
         let n = crate::modules::mount_all();
         crate::binfo!("storage", "mounted {} boot modules into tmpfs", n);
-
-        // 2. Live-CD: sovrapponi `/bin` dal CD-ROM (ATAPI/ISO9660) se c'è. I bin
-        //    vengono letti on-demand dal CD; questo mount SHADOWA il /bin tmpfs
-        //    (longest-prefix-match), quindi una volta tolti i moduli /bin dalla
-        //    limine.conf nessun bin resta pre-caricato in RAM.
-        if let Some(cd) = crate::ahci::acquire_atapi_port() {
-            match crate::vfs::iso9660::mount_from_blockdev(
-                alloc::boxed::Box::new(cd), "/bin", "/bin",
-            ) {
-                Ok(()) => crate::binfo!("storage", "live-cd: /bin overlaid from ISO9660 (ATAPI)"),
-                Err(e) => crate::bwarn!("storage", "ISO9660 mount /bin failed: {}", e),
-            }
-        }
     };
 
     let hba = match crate::ahci::init() {
@@ -94,7 +83,15 @@ pub fn init() -> Result<(), BootError> {
                 None => crate::vfs::fat32::mount_from_blockdev(alloc::boxed::Box::new(port)),
             };
             match mounted {
-                Ok(())  => crate::binfo!("fat32", "mnt mounted FAT"),
+                Ok(())  => {
+                    // Record the live /mnt port so the later `media_bin` phase's
+                    // ATAPI scan does NOT re-bringup it — a second bringup would
+                    // reprogram this port's PxCLB/PxFB and corrupt the mounted
+                    // FAT's in-flight DMA (the reorder moved acquire_atapi_port
+                    // to AFTER this mount).
+                    crate::ahci::set_mounted_sata_port(idx as usize);
+                    crate::binfo!("fat32", "mnt mounted FAT");
+                }
                 Err(e)  => crate::bwarn!("fat32", "mount /mnt failed: {}", e),
             }
             break;

@@ -15,7 +15,7 @@ pub fn dispatch(x: &mut Xhci, ev: [u32; 4]) {
         }
         34 => { // Port Status Change Event: root port = word0 bits 24..31
             let port = ((ev[0] >> 24) & 0xFF) as u8;
-            registry::push_action(UsbAction::RootPortChanged(port));
+            registry::push_action(UsbAction::RootPortChanged { ctrl: x.idx, port });
         }
         _ => {} // Command Completion: handled by wait_for's predicate; else ignore
     }

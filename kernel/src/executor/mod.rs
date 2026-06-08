@@ -241,6 +241,10 @@ pub fn run_core(cpu: u32) -> ! {
         spawner.spawn(supervisor_task()).unwrap();
         spawner.spawn(net_poll_task()).unwrap();
         spawner.spawn(usb_poll_task()).unwrap();
+        // Deferred /bin overlay: mounts the off-boot tool/app set from the USB
+        // stick once it enumerates (real hardware enumerates later than the
+        // pre-userland pump window). No-op if /bin already came from ATAPI/USB.
+        spawner.spawn(bin_overlay_task()).unwrap();
         spawner.spawn(console_drain_task()).unwrap();
         // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
         // and server/client.wasm live under /root/ as runnable demo blobs
@@ -629,6 +633,40 @@ async fn usb_poll_task() {
         crate::usb::poll();
         delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
     }
+}
+
+/// Deferred `/bin` overlay from a USB Mass-Storage boot stick. Real hardware can
+/// take seconds to power + enumerate the stick — longer than `media_bin`'s
+/// pre-userland pump window — so retry here, where `usb_poll_task` drives
+/// enumeration over time. No-op if `/bin` was already overlaid (ATAPI CD or the
+/// fast USB path). Until it mounts, the Limine fallback shell keeps the system
+/// usable; once it mounts, the full off-boot tool + app set appears at `/bin`.
+#[embassy_executor::task]
+async fn bin_overlay_task() {
+    use crate::boot::phases::media_bin;
+    if media_bin::bin_overlaid() { return; }
+    // Two failure modes, handled differently:
+    //  - MSC not enumerated yet (slow real-HW connect) → keep waiting (timing).
+    //  - MSC present but the mount/read fails → a driver/device issue, not
+    //    timing: try a few times then STOP, so we don't flood the log every tick.
+    let mut waited_ms = 0u32;
+    let mut mount_fails = 0u32;
+    while waited_ms < 30_000 {
+        if crate::usb::msc::first_block().is_some() {
+            if media_bin::try_usb_overlay() {
+                crate::binfo!("media_bin", "/bin overlaid (deferred, userland) after {}ms", waited_ms);
+                return;
+            }
+            mount_fails += 1;
+            if mount_fails >= 5 {
+                crate::bwarn!("media_bin", "USB-MSC present but /bin mount keeps failing — giving up (read error, not timing)");
+                return;
+            }
+        }
+        delay::Delay::ticks(100).await; // 1 s @ 100 Hz
+        waited_ms += 1000;
+    }
+    crate::bwarn!("media_bin", "deferred USB /bin overlay gave up after ~30s (no MSC device)");
 }
 
 #[embassy_executor::task(pool_size = 4)]

@@ -24,5 +24,9 @@ pub fn run() -> Result<core::convert::Infallible, BootError> {
     // not depend on devices/fs/storage. Must still precede userland (the
     // executor that runs usb_poll_task).
     phases::usb::init()?;
+    // Overlay /bin off-boot from removable media (ATAPI CD or USB stick). Runs
+    // AFTER usb so a USB Mass-Storage boot stick is enumerated and reachable;
+    // before userland so the shell exec finds /bin/shell.wasm.
+    phases::media_bin::init()?;
     phases::userland::init()
 }

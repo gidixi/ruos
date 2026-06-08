@@ -4,10 +4,33 @@
 use crate::boot::BootError;
 
 pub fn init() -> Result<(), BootError> {
+    log_usb_controllers();
     crate::usb::init();
     #[cfg(feature = "usb-probe")]
     probe();
     Ok(())
+}
+
+/// Log every USB host controller in PCI (class 0x0C, subclass 0x03) with its
+/// prog_if type. Diagnostic for real hardware where the boot stick is not on the
+/// xHCI we drive: if the machine exposes a 2nd xHCI or an EHCI/UHCI/OHCI
+/// companion, the stick's ports may belong to that controller. `usb::init`
+/// currently brings up only the FIRST xHCI.
+fn log_usb_controllers() {
+    for d in crate::pci::devices() {
+        if d.class == 0x0C && d.subclass == 0x03 {
+            let kind = match d.prog_if {
+                0x00 => "UHCI(USB1)",
+                0x10 => "OHCI(USB1)",
+                0x20 => "EHCI(USB2)",
+                0x30 => "xHCI(USB3)",
+                _    => "USB?",
+            };
+            let a = d.address;
+            crate::binfo!("usb", "controller {} {:04x}:{:04x} @ {:02x}:{:02x}.{} prog_if=0x{:02x}",
+                kind, d.vendor_id, d.device_id, a.bus(), a.device(), a.function(), d.prog_if);
+        }
+    }
 }
 
 /// Diagnostic (feature `usb-probe`): drive USB enumeration to completion HERE —

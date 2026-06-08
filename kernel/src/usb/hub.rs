@@ -355,7 +355,7 @@ pub fn setup(x: &mut Xhci, slot: u8, dev: &mut UsbDevice, loc: &Location) -> Opt
     for port in 1..=nbr_ports {
         if let Some((status, _change)) = control::get_port_status(x, dev, port, &pbuf) {
             if encoding::decode_port_status(status, 0).connected {
-                registry::push_action(UsbAction::HubPortChanged { hub_slot: slot, port });
+                registry::push_action(UsbAction::HubPortChanged { ctrl: x.idx, hub_slot: slot, port });
             }
         }
     }
@@ -377,7 +377,7 @@ pub fn on_status(x: &mut Xhci, slot: u8, st: &mut HubState) {
     for port in 1..=nb {
         let byte = unsafe { core::ptr::read_volatile(p.add((port / 8) as usize)) };
         if byte & (1 << (port % 8)) != 0 {
-            registry::push_action(UsbAction::HubPortChanged { hub_slot: slot, port });
+            registry::push_action(UsbAction::HubPortChanged { ctrl: x.idx, hub_slot: slot, port });
         }
     }
     // Re-arm: queue the next status-change Normal TRB + ring the doorbell.
@@ -418,7 +418,7 @@ pub fn handle_port(x: &mut Xhci, hub_slot: u8, port: u8) {
 
     // ── Step 1: brief lock — copy hub topology + a Copy of its dev. ─────────
     let (route, tier, speed, root_port, mut hubdev) =
-        match registry::with_slot(hub_slot, |e| {
+        match registry::with_slot(x.idx, hub_slot, |e| {
             (e.route, e.tier, e.speed, e.root_port, e.dev) // e.dev is Copy
         }) {
             Some(v) => v,
@@ -429,7 +429,7 @@ pub fn handle_port(x: &mut Xhci, hub_slot: u8, port: u8) {
         };
 
     // ── Step 2: SLOTS free — hub control transfers on the local copy. ───────
-    let already = registry::find_child(hub_slot, port);
+    let already = registry::find_child(x.idx, hub_slot, port);
     let outcome = {
         let dev = &mut hubdev;
         match control::get_port_status(x, dev, port, &pbuf) {
@@ -490,7 +490,7 @@ pub fn handle_port(x: &mut Xhci, hub_slot: u8, port: u8) {
     crate::memory::dma::dealloc(pbuf);
 
     // ── Step 3: brief lock — write the advanced EP0 cursor back. ────────────
-    registry::with_slot(hub_slot, |e| {
+    registry::with_slot(x.idx, hub_slot, |e| {
         e.dev.ep0_enqueue = hubdev.ep0_enqueue;
         e.dev.ep0_cycle = hubdev.ep0_cycle;
     });
@@ -505,7 +505,7 @@ pub fn handle_port(x: &mut Xhci, hub_slot: u8, port: u8) {
             let _ = device::enumerate(x, child);
         }
         Outcome::Disconnect => {
-            if let Some(c) = registry::find_child(hub_slot, port) {
+            if let Some(c) = registry::find_child(x.idx, hub_slot, port) {
                 crate::binfo!("usb", "hub port {} disconnect, teardown slot={}", port, c);
                 registry::teardown(x, c);
             }

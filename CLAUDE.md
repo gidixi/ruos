@@ -106,6 +106,24 @@ wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <c
   stringa di successo (vedi `Makefile` variabile `HELLO`). Self-test in-boot con
   `make iso CARGO_FEATURES=boot-checks`.
 - **Run interattivo:** `make run` (QEMU con display).
+- **Debug su HARDWARE REALE (seriale COM assente/rotta) — USARE NETCONSOLE.**
+  Quando si fa debug bare-metal e non c'è seriale, il canale di log preferito è
+  **netconsole** (log kernel via UDP broadcast su `255.255.255.255:6666`):
+  1. Builda con la feature: `make iso CARGO_FEATURES=netconsole` (o
+     `.\build-iso.ps1 -Netconsole`). Il sink è gated compile-time → zero overhead
+     senza la feature.
+  2. Sul PC host (stessa LAN) lancia il ricevitore **`tools/netconsole-rx/`**
+     (binary Rust std, cross-platform, compila anche `.exe` Windows via
+     `x86_64-pc-windows-gnu`): `cargo run --release` — bind `0.0.0.0:6666`,
+     stampa i log su stdout E li scrive in `netconsole.log` accanto
+     all'eseguibile (troncato a ogni avvio). Equivalente: `nc -ul 6666`.
+  3. Boota ruos: dopo `dhcp bound ip=...` arriva lo stream live + il **backlog**
+     da `[T+0.0..]` (flush del ring klog al bind). NB: i log *pre-rete* (hang prima
+     di ~T+3s, prima che il NIC sia su) NON escono via UDP — per quelli resta il
+     framebuffer on-screen. Aggiungere `crate::binfo!/bwarn!` nel codice sotto
+     debug e leggerne l'output da `netconsole-rx`/`netconsole.log`.
+  Vedi `docs/superpowers/specs/2026-06-08-netconsole-udp-design.md`. Richiede un
+  NIC supportato (e1000 / virtio / **rtl8169**).
 - **Git remote:** push/pull/fetch solo da WSL (le credenziali stanno lì); HTTPS
   → richiede auth interattiva, non gira in background non-interattivo.
 

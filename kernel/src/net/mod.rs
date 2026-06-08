@@ -4,6 +4,8 @@
 
 pub mod icmp;
 pub mod loopback;
+#[cfg(feature = "netconsole")]
+pub mod netconsole;
 pub mod nic;
 pub mod sockets;
 pub mod virtio;
@@ -78,6 +80,9 @@ pub fn init() {
         crate::bwarn!("net", "no Ethernet NIC found — loopback only");
     }
 
+    #[cfg(feature = "netconsole")]
+    netconsole::init(&mut net_sockets);
+
     *NET.lock() = Some(NetState {
         iface_lo,
         dev_lo,
@@ -102,6 +107,11 @@ pub fn poll() {
 
         // Always poll loopback.
         let _ = net.iface_lo.poll(t, &mut net.dev_lo, &mut net.sockets);
+
+        // Drain queued log lines into the UDP socket before the ethernet poll
+        // below transmits them.
+        #[cfg(feature = "netconsole")]
+        netconsole::on_poll(&mut net.net_sockets);
 
         // Poll whichever Ethernet interface is active (virtio xor nic).
         if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_mut()) {
@@ -142,6 +152,8 @@ pub fn poll() {
                                 Some(gw) => crate::binfo!("net", "dhcp bound ip={} gw={}", addr.address(), gw),
                                 None      => crate::binfo!("net", "dhcp bound ip={} gw=none", addr.address()),
                             }
+                            #[cfg(feature = "netconsole")]
+                            netconsole::mark_bound();
                         }
                     }
                     (None, _) => {

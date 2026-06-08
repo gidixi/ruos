@@ -12,6 +12,7 @@
 //! Probe order: the first matching PCI device wins. Loopback always works.
 
 pub mod e1000;
+pub mod rtl8169;
 pub mod ring;
 
 use alloc::vec::Vec;
@@ -136,13 +137,15 @@ fn pci_probe() -> Option<(crate::pci::PciDevice, NicKind)> {
 /// later is a single-line change (no API churn on `NetState`).
 pub enum Nic {
     E1000(e1000::E1000),
+    Rtl8169(rtl8169::Rtl8169),
 }
 
 impl Nic {
     /// Hardware MAC address of the active NIC.
     pub fn mac(&self) -> [u8; 6] {
         match self {
-            Nic::E1000(d) => d.mac(),
+            Nic::E1000(d)   => d.mac(),
+            Nic::Rtl8169(d) => d.mac(),
         }
     }
 }
@@ -160,17 +163,20 @@ use smoltcp::time::Instant;
 /// smoltcp's GAT bounds satisfiable.
 pub enum NicRxToken {
     E1000(e1000::E1000RxToken),
+    Rtl8169(rtl8169::Rtl8169RxToken),
 }
 
 /// Transmit token analogue.
 pub enum NicTxToken<'a> {
     E1000(e1000::E1000TxToken<'a>),
+    Rtl8169(rtl8169::Rtl8169TxToken<'a>),
 }
 
 impl smoltcp::phy::RxToken for NicRxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, f: F) -> R {
         match self {
-            NicRxToken::E1000(t) => t.consume(f),
+            NicRxToken::E1000(t)   => t.consume(f),
+            NicRxToken::Rtl8169(t) => t.consume(f),
         }
     }
 }
@@ -178,7 +184,8 @@ impl smoltcp::phy::RxToken for NicRxToken {
 impl<'a> smoltcp::phy::TxToken for NicTxToken<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         match self {
-            NicTxToken::E1000(t) => t.consume(len, f),
+            NicTxToken::E1000(t)   => t.consume(len, f),
+            NicTxToken::Rtl8169(t) => t.consume(len, f),
         }
     }
 }
@@ -189,7 +196,8 @@ impl Device for Nic {
 
     fn capabilities(&self) -> DeviceCapabilities {
         match self {
-            Nic::E1000(d) => d.capabilities(),
+            Nic::E1000(d)   => d.capabilities(),
+            Nic::Rtl8169(d) => d.capabilities(),
         }
     }
 
@@ -197,12 +205,15 @@ impl Device for Nic {
         match self {
             Nic::E1000(d) => d.receive(ts)
                 .map(|(rx, tx)| (NicRxToken::E1000(rx), NicTxToken::E1000(tx))),
+            Nic::Rtl8169(d) => d.receive(ts)
+                .map(|(rx, tx)| (NicRxToken::Rtl8169(rx), NicTxToken::Rtl8169(tx))),
         }
     }
 
     fn transmit(&mut self, ts: Instant) -> Option<Self::TxToken<'_>> {
         match self {
-            Nic::E1000(d) => d.transmit(ts).map(NicTxToken::E1000),
+            Nic::E1000(d)   => d.transmit(ts).map(NicTxToken::E1000),
+            Nic::Rtl8169(d) => d.transmit(ts).map(NicTxToken::Rtl8169),
         }
     }
 }
@@ -232,7 +243,8 @@ pub fn probe_and_init() -> Option<Nic> {
         dev.address.function(),
     );
     match kind {
-        NicKind::E1000 => e1000::E1000::find_and_init().map(Nic::E1000),
+        NicKind::E1000   => e1000::E1000::find_and_init().map(Nic::E1000),
+        NicKind::Rtl8169 => rtl8169::Rtl8169::find_and_init().map(Nic::Rtl8169),
         other => {
             crate::bwarn!("nic", "no driver yet for {}", other.as_str());
             None

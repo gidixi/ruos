@@ -43,6 +43,12 @@
 .PARAMETER UsbProbe
     Shortcut for -Features usb-probe (serial-less real-HW USB triage build).
 
+.PARAMETER Netconsole
+    Shortcut for -Features netconsole (streams the kernel log as UDP broadcast on
+    255.255.255.255:6666, captured with `nc -ul 6666`). When omitted, the script
+    asks interactively and defaults to NO. Pass -Netconsole to force it on
+    non-interactively.
+
 .PARAMETER Clean
     Run `make clean` first for a fresh build (does NOT remove the cached Limine
     clone in third_party/).
@@ -62,6 +68,7 @@
     .\build-iso.ps1
     .\build-iso.ps1 -Distro Ubuntu
     .\build-iso.ps1 -UsbProbe
+    .\build-iso.ps1 -Netconsole
     .\build-iso.ps1 -BootChecks -Clean
     .\build-iso.ps1 -Features "usb-probe panic-halt"
 #>
@@ -71,6 +78,7 @@ param(
     [string]$Features = "",
     [switch]$BootChecks,
     [switch]$UsbProbe,
+    [switch]$Netconsole,
     [switch]$Clean,
     [switch]$SyncSubmodule,
     [switch]$SkipDeps
@@ -83,6 +91,19 @@ $featList = @()
 if ($Features)   { $featList += $Features }
 if ($BootChecks) { $featList += "boot-checks" }
 if ($UsbProbe)   { $featList += "usb-probe" }
+
+# Netconsole (UDP-broadcast kernel log on :6666): opt-in. The -Netconsole switch
+# forces it on; otherwise, unless already named via -Features, ask interactively
+# with NO as the default (just press Enter to skip it).
+$wantNetconsole = [bool]$Netconsole
+if (-not $wantNetconsole -and (($featList -join ' ') -notmatch 'netconsole')) {
+    $ans = Read-Host "Attivare netconsole (log kernel via UDP broadcast :6666)? [y/N]"
+    if ($ans -match '^(y|yes|s|si)$') { $wantNetconsole = $true }
+}
+if ($wantNetconsole -and (($featList -join ' ') -notmatch 'netconsole')) {
+    $featList += "netconsole"
+}
+
 $FeatureStr = ($featList -join " ").Trim()
 
 # --- Locate WSL + pick a usable distro -------------------------------------

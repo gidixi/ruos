@@ -32,10 +32,12 @@ pub trait FileSystem {
 
 use crate::vfs::tmpfs::Tmpfs;
 use crate::vfs::fat32::Fat32Fs;
+use crate::vfs::iso9660::Iso9660Fs;
 
 pub enum FsImpl {
     Tmpfs(Tmpfs),
     Fat32(Fat32Fs),
+    Iso9660(Iso9660Fs),
 }
 
 impl FsImpl {
@@ -43,48 +45,56 @@ impl FsImpl {
         match self {
             FsImpl::Tmpfs(t) => t.open(path, flags).await,
             FsImpl::Fat32(f) => f.open(path, flags).await,
+            FsImpl::Iso9660(i) => i.open(path, flags).await,
         }
     }
     pub async fn create(&self, path: &[&str]) -> Result<(), VfsError> {
         match self {
             FsImpl::Tmpfs(t) => t.create(path).await,
             FsImpl::Fat32(f) => f.create(path).await,
+            FsImpl::Iso9660(i) => i.create(path).await,
         }
     }
     pub async fn unlink(&self, path: &[&str]) -> Result<(), VfsError> {
         match self {
             FsImpl::Tmpfs(t) => t.unlink(path).await,
             FsImpl::Fat32(f) => f.unlink(path).await,
+            FsImpl::Iso9660(i) => i.unlink(path).await,
         }
     }
     pub async fn readdir(&self, path: &[&str]) -> Result<Vec<VfsDirent>, VfsError> {
         match self {
             FsImpl::Tmpfs(t) => t.readdir(path).await,
             FsImpl::Fat32(f) => f.readdir(path).await,
+            FsImpl::Iso9660(i) => i.readdir(path).await,
         }
     }
     pub async fn stat(&self, path: &[&str]) -> Result<VfsStat, VfsError> {
         match self {
             FsImpl::Tmpfs(t) => t.stat(path).await,
             FsImpl::Fat32(f) => f.stat(path).await,
+            FsImpl::Iso9660(i) => i.stat(path).await,
         }
     }
     pub async fn mkdir(&self, path: &[&str]) -> Result<(), VfsError> {
         match self {
             FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::mkdir(t, path).await,
             FsImpl::Fat32(f) => <Fat32Fs as FileSystem>::mkdir(f, path).await,
+            FsImpl::Iso9660(i) => <Iso9660Fs as FileSystem>::mkdir(i, path).await,
         }
     }
     pub async fn rmdir(&self, path: &[&str]) -> Result<(), VfsError> {
         match self {
             FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::rmdir(t, path).await,
             FsImpl::Fat32(f) => <Fat32Fs as FileSystem>::rmdir(f, path).await,
+            FsImpl::Iso9660(i) => <Iso9660Fs as FileSystem>::rmdir(i, path).await,
         }
     }
     pub async fn rename(&self, src: &[&str], dst: &[&str]) -> Result<(), VfsError> {
         match self {
             FsImpl::Tmpfs(t) => <Tmpfs as FileSystem>::rename(t, src, dst).await,
             FsImpl::Fat32(f) => <Fat32Fs as FileSystem>::rename(f, src, dst).await,
+            FsImpl::Iso9660(i) => <Iso9660Fs as FileSystem>::rename(i, src, dst).await,
         }
     }
 }

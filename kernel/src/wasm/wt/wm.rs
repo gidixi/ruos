@@ -496,6 +496,12 @@ fn dispatch_bands(
         if ids[b] == usize::MAX { continue; }
         loop {
             if crate::smp::pool::poll_done(ids[b]).is_some() { break; }
+            // Work-steal instead of pure spin so the waiting core makes forward
+            // progress if APs are slow/stuck (prevents the real-hw freeze). Running
+            // an ARBITRARY queued job here is safe: all pool jobs are pure
+            // `fn(&[u8]) -> u64`, and the single-BSP cooperative model means only one
+            // submitter is ever active at a time (APs never submit), so this never
+            // races another submitter or violates the disjoint-bands invariant.
             if let Some(slot) = crate::smp::pool::take() {
                 crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
             } else {

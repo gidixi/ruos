@@ -495,7 +495,11 @@ fn dispatch_bands(
         if ids[b] == usize::MAX { continue; }
         loop {
             if crate::smp::pool::poll_done(ids[b]).is_some() { break; }
-            core::hint::spin_loop();
+            if let Some(slot) = crate::smp::pool::take() {
+                crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+            } else {
+                core::hint::spin_loop();
+            }
         }
     }
     // After this point all jobs are DONE → the BSP may safely reuse the arenas

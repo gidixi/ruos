@@ -67,7 +67,11 @@ pub fn ruos_smp_bench(
                 if !cores.contains(&c) { cores.push(c); }
                 break;
             }
-            core::hint::spin_loop();
+            if let Some(slot) = crate::smp::pool::take() {
+                crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+            } else {
+                core::hint::spin_loop();
+            }
         }
     }
     let parallel_ms = crate::boot::clock::elapsed_ms().saturating_sub(t0);

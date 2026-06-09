@@ -338,6 +338,100 @@ pub fn bring_up(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     download_firmware(x, dev)
 }
 
+// ── SP3c-1: RF register access (FPGA0 LSSI/HSSI 3-wire, path A) ───────────────
+// RF registers are NOT in MAC space — they're reached through a baseband serial
+// bridge. Offsets/encoding from Linux rtl8xxxu regs.h + rtl8xxxu_read/write_rfreg.
+const REG_FPGA0_XA_HSSI_PARM1:  u16 = 0x0820;
+const REG_FPGA0_XA_HSSI_PARM2:  u16 = 0x0824;
+const REG_FPGA0_XA_LSSI_PARM:   u16 = 0x0840;
+const REG_FPGA0_XA_LSSI_READBK: u16 = 0x08A0;
+const REG_HSPI_XA_READBACK:     u16 = 0x08B8;
+const LSSI_DATA_MASK:        u32 = 0x000F_FFFF; // 20-bit RF data
+const LSSI_ADDR_SHIFT:       u32 = 20;
+const HSSI_PARM1_PI:         u32 = 1 << 8;
+const HSSI_PARM2_ADDR_MASK:  u32 = 0x7F80_0000;
+const HSSI_PARM2_ADDR_SHIFT: u32 = 23;
+const HSSI_PARM2_EDGE_READ:  u32 = 1 << 31;
+
+/// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
+/// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
+#[allow(dead_code)]
+fn write_rfreg(x: &mut Xhci, dev: &mut UsbDevice, reg: u8, val: u32) {
+    let word = ((reg as u32) << LSSI_ADDR_SHIFT) | (val & LSSI_DATA_MASK);
+    reg_write32(x, dev, REG_FPGA0_XA_LSSI_PARM, word);
+    crate::boot::clock::udelay(1);
+}
+
+/// Read a 20-bit RF register (path A) via the BB readback path (rtl8xxxu
+/// read_rfreg). The value is only meaningful after BB init (SP3c-3); pre-init it
+/// merely proves the FPGA0 register path is live.
+#[allow(dead_code)]
+fn read_rfreg(x: &mut Xhci, dev: &mut UsbDevice, reg: u8) -> u32 {
+    let hssia = reg_read32(x, dev, REG_FPGA0_XA_HSSI_PARM2).unwrap_or(0);
+    let mut sel = hssia & !HSSI_PARM2_ADDR_MASK;
+    sel |= ((reg as u32) << HSSI_PARM2_ADDR_SHIFT) & HSSI_PARM2_ADDR_MASK;
+    sel |= HSSI_PARM2_EDGE_READ;
+    reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, hssia & !HSSI_PARM2_EDGE_READ);
+    crate::boot::clock::udelay(10);
+    reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, sel);
+    crate::boot::clock::udelay(100);
+    reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, hssia | HSSI_PARM2_EDGE_READ);
+    crate::boot::clock::udelay(10);
+    let pi = reg_read32(x, dev, REG_FPGA0_XA_HSSI_PARM1).unwrap_or(0);
+    let rb = if pi & HSSI_PARM1_PI != 0 {
+        reg_read32(x, dev, REG_HSPI_XA_READBACK)
+    } else {
+        reg_read32(x, dev, REG_FPGA0_XA_LSSI_READBK)
+    };
+    rb.unwrap_or(0) & LSSI_DATA_MASK
+}
+
+// ── Register-table apply scaffolding (data filled in SP3c-2; used by SP3c-3) ──
+/// MAC init table: {reg16, val8}; stop at the (0xFFFF, 0xFF) terminator.
+#[allow(dead_code)]
+fn apply_reg8_table(x: &mut Xhci, dev: &mut UsbDevice, t: &[(u16, u8)]) {
+    for &(a, v) in t {
+        if a == 0xFFFF && v == 0xFF { break; }
+        reg_write8(x, dev, a, v);
+    }
+}
+/// BB/AGC init table: {reg16, val32}; stop at (0xFFFF, 0xFFFFFFFF).
+#[allow(dead_code)]
+fn apply_reg32_table(x: &mut Xhci, dev: &mut UsbDevice, t: &[(u16, u32)]) {
+    for &(a, v) in t {
+        if a == 0xFFFF && v == 0xFFFF_FFFF { break; }
+        reg_write32(x, dev, a, v);
+        crate::boot::clock::udelay(1);
+    }
+}
+/// RADIO table: {rfreg8, val32}; regs 0xFE..0xF9 are delay markers (rtl8xxxu
+/// rf-table opcode convention), not writes; stop at (0xFF, 0xFFFFFFFF).
+#[allow(dead_code)]
+fn apply_rf_table(x: &mut Xhci, dev: &mut UsbDevice, t: &[(u8, u32)]) {
+    for &(reg, v) in t {
+        match reg {
+            0xFF if v == 0xFFFF_FFFF => break,
+            0xFE => crate::boot::clock::mdelay(50),
+            0xFD => crate::boot::clock::mdelay(5),
+            0xFC => crate::boot::clock::mdelay(1),
+            0xFB => crate::boot::clock::udelay(50),
+            0xFA => crate::boot::clock::udelay(5),
+            0xF9 => crate::boot::clock::udelay(1),
+            _ => { write_rfreg(x, dev, reg, v); crate::boot::clock::udelay(1); }
+        }
+    }
+}
+
+/// SP3c-1 self-test: exercise the RF/FPGA0 register path + confirm it doesn't
+/// wedge EP0. Reads two RF regs (path A) and logs them; pre-BB-init the values
+/// may be 0/garbage — the point is the path runs and the device stays alive.
+fn rf_selftest(x: &mut Xhci, dev: &mut UsbDevice) {
+    let r00 = read_rfreg(x, dev, 0x00);
+    let r18 = read_rfreg(x, dev, 0x18);
+    crate::binfo!("wifi", "rf selftest rf[0x00]=0x{:05x} rf[0x18]=0x{:05x} tsc_per_ms={}",
+        r00, r18, crate::boot::clock::tsc_per_ms());
+}
+
 /// Probe an enumerated device: match `0bda:8179`, find its bulk endpoints, set
 /// the configuration, and read the chip's system-config register. Returns the
 /// endpoint layout on success, or None if this isn't our dongle / setup failed.
@@ -421,6 +515,8 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         } else {
             crate::bwarn!("wifi", "bring-up incomplete (SP2 unverified — see HW log)");
         }
+        // SP3c-1: prove the RF/FPGA0 register path is reachable + non-wedging.
+        rf_selftest(x, dev);
 
         Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out })
     })();

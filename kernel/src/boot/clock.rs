@@ -31,6 +31,26 @@ pub fn read_tsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
+/// Busy-wait `us` microseconds on the TSC. Bounded by construction (a TSC
+/// deadline). For synchronous driver bring-up paths where the async executor /
+/// `Delay` future is unusable (e.g. USB-WiFi RF init run inside enumeration).
+pub fn udelay(us: u64) {
+    let cycles = us.saturating_mul(tsc_per_ms()) / 1000;
+    let start = read_tsc();
+    while read_tsc().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
+    }
+}
+
+/// Busy-wait `ms` milliseconds on the TSC (e.g. RADIO_A table msleep markers).
+pub fn mdelay(ms: u64) {
+    let cycles = ms.saturating_mul(tsc_per_ms());
+    let start = read_tsc();
+    while read_tsc().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
+    }
+}
+
 /// TSC ticks per millisecond. Tries CPUID first (works without the PIT, which
 /// real UEFI machines often gate off — polling it then hangs forever), then a
 /// **bounded** PIT measurement, then a safe default. NEVER hangs.

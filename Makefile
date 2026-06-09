@@ -236,6 +236,10 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
+	# Prebuilt drop-folder apps (apps/*.cwasm, built by any external SDK): bundle
+	# into /bin so the compositor's manifest() scan discovers them. App-agnostic
+	# hook — new apps need NO change here. No-op when the dir is empty.
+	-cp apps/*.cwasm $(ISO_ROOT)/bin/ 2>/dev/null || true
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -508,6 +512,10 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
+	# Prebuilt drop-folder apps (apps/*.cwasm, built by any external SDK): bundle
+	# into /bin so the compositor's manifest() scan discovers them. App-agnostic
+	# hook — new apps need NO change here. No-op when the dir is empty.
+	-cp apps/*.cwasm $(ISO_ROOT)/bin/ 2>/dev/null || true
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

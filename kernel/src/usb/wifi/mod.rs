@@ -357,6 +357,21 @@ const HSSI_PARM2_ADDR_MASK:  u32 = 0x7F80_0000;
 const HSSI_PARM2_ADDR_SHIFT: u32 = 23;
 const HSSI_PARM2_EDGE_READ:  u32 = 1 << 31;
 
+// ── SP3c-3: MAC/BB/RF init registers (rtl8xxxu regs.h) ───────────────────────
+const REG_RF_CTRL:              u16 = 0x001F;
+const REG_MAX_AGGR_NUM:         u16 = 0x04CA;
+const REG_FPGA0_XA_RF_INT_OE:   u16 = 0x0860;
+const REG_FPGA0_XA_RF_SW_CTRL:  u16 = 0x0870;
+const SYSF_BBRSTB:      u16 = 1 << 0;
+const SYSF_BB_GLB_RSTN: u16 = 1 << 1;
+const SYSF_USBA:        u16 = 1 << 2;
+const SYSF_USBD:        u16 = 1 << 4;
+const SYSF_DIO_RF:      u16 = 1 << 13;
+const RF_CTRL_VAL:      u8  = 0x07; // RF_ENABLE(BIT0)|RF_RSTB(BIT1)|RF_SDMRSTB(BIT2)
+const FPGA0_RF_RFENV:   u16 = 1 << 4;
+const HSSI_3WIRE_ADDR_LEN: u32 = 0x400;
+const HSSI_3WIRE_DATA_LEN: u32 = 0x800;
+
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
 #[allow(dead_code)]
@@ -434,6 +449,68 @@ fn rf_selftest(x: &mut Xhci, dev: &mut UsbDevice) {
     let r18 = read_rfreg(x, dev, 0x18);
     crate::binfo!("wifi", "rf selftest rf[0x00]=0x{:05x} rf[0x18]=0x{:05x} tsc_per_ms={}",
         r00, r18, crate::boot::clock::tsc_per_ms());
+}
+
+// ── SP3c-3: MAC / BB / RF init (rtl8xxxu init_mac / rtl8188eu_init_phy_bb /
+//    rtl8xxxu_init_phy_rf), applied after `fw ready` to bring the radio alive. ──
+
+/// MAC init: apply the MAC reg table + 8188E max-aggregation default.
+fn init_mac(x: &mut Xhci, dev: &mut UsbDevice) {
+    apply_reg8_table(x, dev, tables::MAC_INIT);
+    reg_write16(x, dev, REG_MAX_AGGR_NUM, 0x0707);
+}
+
+/// Baseband init (rtl8188eu_init_phy_bb): BB/RF reset release, then the PHY_REG
+/// and AGC tables.
+fn init_phy_bb(x: &mut Xhci, dev: &mut UsbDevice) {
+    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
+        reg_write16(x, dev, REG_SYS_FUNC_EN, v | SYSF_BB_GLB_RSTN | SYSF_BBRSTB | SYSF_DIO_RF);
+    }
+    reg_write8(x, dev, REG_RF_CTRL, RF_CTRL_VAL);
+    reg_write8(x, dev, REG_SYS_FUNC_EN, (SYSF_USBA | SYSF_USBD | SYSF_BB_GLB_RSTN | SYSF_BBRSTB) as u8);
+    apply_reg32_table(x, dev, tables::PHY_INIT);
+    apply_reg32_table(x, dev, tables::AGC_TAB);
+}
+
+/// RF path-A init (rtl8xxxu_init_phy_rf, RF_A): RF_INT_OE / 3-wire-len preamble,
+/// the RADIO_A table, then restore RFENV.
+fn init_phy_rf(x: &mut Xhci, dev: &mut UsbDevice) {
+    let rfsi = reg_read16(x, dev, REG_FPGA0_XA_RF_SW_CTRL).unwrap_or(0) & FPGA0_RF_RFENV;
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_XA_RF_INT_OE) {
+        reg_write32(x, dev, REG_FPGA0_XA_RF_INT_OE, v | (1 << 20));
+    }
+    crate::boot::clock::udelay(1);
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_XA_RF_INT_OE) {
+        reg_write32(x, dev, REG_FPGA0_XA_RF_INT_OE, v | (1 << 4));
+    }
+    crate::boot::clock::udelay(1);
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_XA_HSSI_PARM2) {
+        reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, v & !HSSI_3WIRE_ADDR_LEN);
+    }
+    crate::boot::clock::udelay(1);
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_XA_HSSI_PARM2) {
+        reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, v & !HSSI_3WIRE_DATA_LEN);
+    }
+    crate::boot::clock::udelay(1);
+    apply_rf_table(x, dev, tables::RADIOA_INIT);
+    if let Some(v) = reg_read16(x, dev, REG_FPGA0_XA_RF_SW_CTRL) {
+        reg_write16(x, dev, REG_FPGA0_XA_RF_SW_CTRL, (v & !FPGA0_RF_RFENV) | rfsi);
+    }
+}
+
+/// SP3c-3: full radio bring-up after `fw ready`. Applies MAC → BB(+AGC) → RF
+/// tables, then the RF self-test (readback should now be live, not 0x00000).
+/// NOTE: synchronous + ~0.5-1s (≈420 register writes + RADIO_A msleep markers).
+/// TEMP: invoked at enumeration for SP3c-3 validation; moves behind a lazy
+/// `wifiscan` command in SP3c-6/7 so normal boots stay fast.
+pub fn bring_up_radio(x: &mut Xhci, dev: &mut UsbDevice) {
+    crate::binfo!("wifi", "radio init: mac ({} rows)", tables::MAC_INIT.len());
+    init_mac(x, dev);
+    crate::binfo!("wifi", "radio init: bb (phy {} + agc {})", tables::PHY_INIT.len(), tables::AGC_TAB.len());
+    init_phy_bb(x, dev);
+    crate::binfo!("wifi", "radio init: rf (radioa {})", tables::RADIOA_INIT.len());
+    init_phy_rf(x, dev);
+    crate::binfo!("wifi", "radio init done");
 }
 
 /// Probe an enumerated device: match `0bda:8179`, find its bulk endpoints, set
@@ -519,7 +596,9 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         } else {
             crate::bwarn!("wifi", "bring-up incomplete (SP2 unverified — see HW log)");
         }
-        // SP3c-1: prove the RF/FPGA0 register path is reachable + non-wedging.
+        // SP3c-3: bring the radio up (MAC/BB/RF tables), then the RF self-test —
+        // the readback should now be live (≠0x00000) since the BB is initialised.
+        bring_up_radio(x, dev);
         rf_selftest(x, dev);
 
         Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out })

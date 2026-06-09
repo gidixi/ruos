@@ -1375,6 +1375,13 @@ impl Compositor {
         let mut i = 0;
         while i < self.wins.len() {
             if !self.wins[i].alive {
+                // SP-sleep lifecycle: se questa finestra aveva un PTY legato (terminale),
+                // chiudilo deterministicamente — la shell legge EOF ed esce, il pair torna
+                // Free. Sostituisce il reap-a-timeout del watchdog per i pair LocalGui.
+                let wp = self.wins[i].store.data().win.wake_pty;
+                if wp >= 0 {
+                    crate::pty::request_shutdown(wp as usize);
+                }
                 self.remove_at(i);
             } else {
                 i += 1;

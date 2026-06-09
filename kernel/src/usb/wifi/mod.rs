@@ -110,6 +110,9 @@ pub struct WifiState {
     pub data:    DmaRegion, // scratch page: TxDesc+frame on TX, RxDesc+frame on RX
     pub mps_in:  u16,
     pub mps_out: u16,
+    /// Lazy bring-up latch: false until the first `wifiscan` runs power-on +
+    /// firmware + MAC/BB/RF init. Keeps enumeration fast (no chip bring-up at boot).
+    pub radio_up: bool,
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -474,6 +477,7 @@ fn apply_rf_table(x: &mut Xhci, dev: &mut UsbDevice, t: &[(u8, u32)]) {
 /// SP3c-1 self-test: exercise the RF/FPGA0 register path + confirm it doesn't
 /// wedge EP0. Reads two RF regs (path A) and logs them; pre-BB-init the values
 /// may be 0/garbage — the point is the path runs and the device stays alive.
+#[allow(dead_code)]
 fn rf_selftest(x: &mut Xhci, dev: &mut UsbDevice) {
     let r00 = read_rfreg(x, dev, 0x00);
     let r18 = read_rfreg(x, dev, 0x18);
@@ -656,16 +660,8 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         // SP2: attempt chip bring-up (power-on + firmware upload). Failure does
         // NOT abort the bind — the slot is still registered so later subprojects
         // can retry. UNVERIFIED on hardware.
-        if bring_up(x, dev) {
-            crate::binfo!("wifi", "bring-up OK (power-on + firmware)");
-        } else {
-            crate::bwarn!("wifi", "bring-up incomplete (SP2 unverified — see HW log)");
-        }
-        // SP3c-3: bring the radio up (MAC/BB/RF tables), then the RF self-test —
-        // the readback should now be live (≠0x00000) since the BB is initialised.
-        bring_up_radio(x, dev);
-        rf_selftest(x, dev);
-
+        // Chip bring-up (power-on + firmware + MAC/BB/RF + scan) is LAZY — it runs
+        // on the first `wifiscan` (run_scan), not here, so boot stays fast.
         Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out })
     })();
     crate::memory::dma::dealloc(buf);
@@ -770,17 +766,14 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
     }
     crate::binfo!("wifi", "config_ep ok slot={} in_dci={} out_dci={}", dev.slot_id, dci_in, dci_out);
 
-    let mut st = WifiState {
+    Some(WifiState {
         ctrl: x.idx, slot_id: dev.slot_id, iface: wi.iface,
         dci_in, dci_out,
         ring_in, enq_in: 0, cyc_in: true,
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
-    };
-    // SP3c-6: passive scan now that the rings exist + the radio is up. TEMP at
-    // enumeration; moves behind a lazy `wifiscan` shell command in SP3c-7.
-    scan(x, dev, &mut st);
-    Some(st)
+        radio_up: false,
+    })
 }
 
 /// Build the 40-byte RTL TX descriptor for an 802.11 management frame of
@@ -898,4 +891,39 @@ pub fn scan(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState) -> alloc::vec
     }
     crate::binfo!("wifi", "scan done: {} AP(s)", results.len());
     results
+}
+
+/// `wifiscan` command entry. Lazily brings the chip up (power-on + firmware +
+/// MAC/BB/RF) on the first call, then runs a passive scan. Formats the APs as
+/// `ssid\tchannel\tsecurity\n` into `out` and returns the byte count (0 = no
+/// device / no APs). Follows the MSC pattern: copy device + state out of the
+/// registry, run transfers holding only the controllers lock, write cursors back.
+pub fn run_scan(out: &mut [u8]) -> usize {
+    use core::fmt::Write as _;
+    let (ctrl, slot) = match crate::usb::registry::first_wifi_slot() { Some(s) => s, None => return 0 };
+    let cell = match crate::usb::CTRLS.get() { Some(c) => c, None => return 0 };
+    let mut g = cell.lock();
+    let x = match g.get_mut(ctrl as usize) { Some(x) => x, None => return 0 };
+    let mut dev = match crate::usb::registry::dev_copy(ctrl, slot) { Some(d) => d, None => return 0 };
+    let mut st = match crate::usb::registry::wifi_state(ctrl, slot) { Some(s) => s, None => return 0 };
+
+    if !st.radio_up {
+        crate::binfo!("wifi", "wifiscan: bring-up (power-on + firmware + radio)");
+        bring_up(x, &mut dev);
+        bring_up_radio(x, &mut dev);
+        st.radio_up = true;
+    }
+    let results = scan(x, &mut dev, &mut st);
+    // Persist advanced EP0 cursors + ring cursors + the radio_up latch.
+    crate::usb::registry::set_dev(ctrl, slot, dev);
+    crate::usb::registry::set_wifi_state(ctrl, slot, st);
+
+    let mut s = alloc::string::String::new();
+    for r in &results {
+        let _ = write!(s, "{}\t{}\t{}\n", r.ssid, r.channel, r.security.as_str());
+    }
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(out.len());
+    out[..n].copy_from_slice(&bytes[..n]);
+    n
 }

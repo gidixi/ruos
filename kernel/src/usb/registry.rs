@@ -103,6 +103,51 @@ pub fn set_msc_state(ctrl: u8, slot: u8, st: crate::usb::msc::MscState) {
     }
 }
 
+/// First WiFi device as `(ctrl, slot)`, if any. Used by `wifiscan`.
+pub fn first_wifi_slot() -> Option<(u8, u8)> {
+    let g = SLOTS.lock();
+    for c in 0..MAX_XHCI as u8 {
+        for s in 1..MAX_SLOTS as u16 {
+            if let Some(e) = g[gidx(c, s as u8)].as_ref() {
+                if matches!(e.kind, SlotKind::Wifi(_)) { return Some((c, s as u8)); }
+            }
+        }
+    }
+    None
+}
+
+/// Copy the WiFi state OUT of the registry (lock released on return) so the
+/// caller runs transfers without holding SLOTS. `WifiState` is `Copy`.
+pub fn wifi_state(ctrl: u8, slot: u8) -> Option<crate::usb::wifi::WifiState> {
+    let g = SLOTS.lock();
+    match g[gidx(ctrl, slot)].as_ref().map(|e| &e.kind) {
+        Some(SlotKind::Wifi(st)) => Some(*st),
+        _ => None,
+    }
+}
+
+/// Write back the WiFi state (ring cursors + radio_up) after a scan.
+pub fn set_wifi_state(ctrl: u8, slot: u8, st: crate::usb::wifi::WifiState) {
+    let mut g = SLOTS.lock();
+    if let Some(e) = g[gidx(ctrl, slot)].as_mut() {
+        if let SlotKind::Wifi(s) = &mut e.kind { *s = st; }
+    }
+}
+
+/// Copy the slot's `UsbDevice` OUT (it is `Copy`) so the caller can run EP0
+/// control transfers on the copy without holding SLOTS, then write the advanced
+/// EP0 cursor back via `set_dev`. Same pattern as `handle_port`.
+pub fn dev_copy(ctrl: u8, slot: u8) -> Option<UsbDevice> {
+    let g = SLOTS.lock();
+    g[gidx(ctrl, slot)].as_ref().map(|e| e.dev)
+}
+
+/// Write back the `UsbDevice` (advanced EP0 ring cursors) after control transfers.
+pub fn set_dev(ctrl: u8, slot: u8, dev: UsbDevice) {
+    let mut g = SLOTS.lock();
+    if let Some(e) = g[gidx(ctrl, slot)].as_mut() { e.dev = dev; }
+}
+
 /// Run `f` against the slot entry (if present) while holding the lock. Do NOT
 /// issue controller commands or drain events from inside `f` (lock held).
 pub fn with_slot<R>(ctrl: u8, slot: u8, f: impl FnOnce(&mut SlotEntry) -> R) -> Option<R> {

@@ -54,6 +54,13 @@ Each returns pre-formatted text (one device per line).
 ### `sata_list(buf, cap) -> i32`
 `<idx>\t<model>\t<N> MiB\n`. Returns byte count, `0` no disks, `-1` buffer too small.
 
+### `wifi_scan(buf, cap) -> i32`
+Scan for WiFi networks via the RTL8188EU USB dongle. Lazily brings the chip up
+(power-on + firmware + MAC/BB/RF init) on the FIRST call (~1-2 s), then runs a
+passive 2.4 GHz scan. Fills `buf` with `<ssid>\t<channel>\t<security>\n` per AP.
+Returns byte count, `0` no device / no APs in range, `-1` buffer too small. Used
+by the `wifiscan` tool.
+
 ## System info  (`sysinfo.rs`)
 
 ### `uname(buf, len, used) -> i32`

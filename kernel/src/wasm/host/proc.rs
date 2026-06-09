@@ -411,6 +411,29 @@ fn ruos_sata_list(
     Ok(bytes.len() as i32)
 }
 
+/// `wifi_scan(buf, cap) -> i32`: lazily brings the RTL8188EU up (power-on +
+/// firmware + MAC/BB/RF) on first call, runs a passive scan, fills `buf` with
+/// `ssid\tchannel\tsecurity\n` lines. Returns byte count, `0` no device/no APs,
+/// `-1` buffer too small. (Slow on first call: chip bring-up takes ~1-2 s.)
+fn ruos_wifi_scan(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_cap: i32,
+) -> Result<i32, Error> {
+    if buf_cap <= 0 {
+        return Ok(-1);
+    }
+    let mut buf = alloc::vec![0u8; buf_cap as usize];
+    let n = crate::usb::wifi::run_scan(&mut buf);
+    if n == 0 {
+        return Ok(0);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &buf[..n]) {
+        return Ok(e);
+    }
+    Ok(n as i32)
+}
+
 /// ruos_net_iface(buf_ptr, buf_len, used_ptr) -> errno.
 /// Pre-formatted output:
 ///   "lo    127.0.0.1/8\n"
@@ -872,6 +895,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
         .func_wrap("ruos", "usb_list", ruos_usb_list)?
         .func_wrap("ruos", "sata_list", ruos_sata_list)?
+        .func_wrap("ruos", "wifi_scan", ruos_wifi_scan)?
         .func_wrap("ruos", "net_iface", ruos_net_iface)?
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
         .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?

@@ -372,6 +372,26 @@ const FPGA0_RF_RFENV:   u16 = 1 << 4;
 const HSSI_3WIRE_ADDR_LEN: u32 = 0x400;
 const HSSI_3WIRE_DATA_LEN: u32 = 0x800;
 
+// ── SP3c-4: RX enable (usb_quirks CR MAC-RX, RCR/MAR, modems, enable_rf) ──────
+const REG_TRXFF_BNDY:            u16 = 0x0114;
+const REG_EARLY_MODE_CTRL_8188E: u16 = 0x04D0;
+const REG_RX_DRVINFO_SZ:         u16 = 0x060F;
+const REG_RCR:                   u16 = 0x0608;
+const REG_MAR:                   u16 = 0x0620;
+const REG_FPGA0_RF_MODE:         u16 = 0x0800;
+const REG_OFDM0_TRX_PATH_EN:     u16 = 0x0C04;
+const REG_TXPAUSE:               u16 = 0x0522;
+const CR_MAC_TX_ENABLE: u16 = 1 << 6;
+const CR_MAC_RX_ENABLE: u16 = 1 << 7;
+const FPGA_RF_MODE_CCK:  u32 = 1 << 24;
+const FPGA_RF_MODE_OFDM: u32 = 1 << 25;
+const OFDM_RF_PATH_RX_MASK: u32 = 0x0F;
+const OFDM_RF_PATH_TX_MASK: u32 = 0xF0;
+const OFDM_RF_PATH_RX_A: u32 = 1 << 0;
+const OFDM_RF_PATH_TX_A: u32 = 1 << 4;
+// RCR = ACCEPT_PHYS_MATCH|MCAST|BCAST|MGMT_FRAME|HTC_LOC_CTRL|PHYSTAT|ICV|MIC.
+const RCR_VAL: u32 = 0x7000_600E;
+
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
 #[allow(dead_code)]
@@ -510,7 +530,42 @@ pub fn bring_up_radio(x: &mut Xhci, dev: &mut UsbDevice) {
     init_phy_bb(x, dev);
     crate::binfo!("wifi", "radio init: rf (radioa {})", tables::RADIOA_INIT.len());
     init_phy_rf(x, dev);
+    rx_enable(x, dev);
     crate::binfo!("wifi", "radio init done");
+}
+
+/// SP3c-4: enable the receive path. RX FIFO boundary (must precede the MAC-RX
+/// enable on 8188E), MAC TX/RX enable (usb_quirks), RX driver-info size, RX
+/// config (accept mgmt+bcast+mcast), accept-all multicast, the CCK+OFDM modems,
+/// and enable_rf (rtl8188e_enable_rf). After this the MAC can DMA received
+/// frames to the bulk-IN pipe. Channel tuning is config_channel (SP3c-6).
+fn rx_enable(x: &mut Xhci, dev: &mut UsbDevice) {
+    // RX page boundary (8188E latches it wrong if set after MAC-RX enable).
+    reg_write16(x, dev, REG_TRXFF_BNDY + 2, 0x25FF);
+    // usb_quirks: enable MAC TX + RX (after TRXFF_BNDY).
+    if let Some(v) = reg_read16(x, dev, REG_CR) {
+        reg_write16(x, dev, REG_CR, v | CR_MAC_TX_ENABLE | CR_MAC_RX_ENABLE);
+    }
+    reg_write8(x, dev, REG_EARLY_MODE_CTRL_8188E + 3, 0x01);
+    // RX driver-info size (8-byte units) — the chip prepends PHY status.
+    reg_write8(x, dev, REG_RX_DRVINFO_SZ, 4);
+    // Receive config + accept-all multicast.
+    reg_write32(x, dev, REG_RCR, RCR_VAL);
+    reg_write32(x, dev, REG_MAR, 0xFFFF_FFFF);
+    reg_write32(x, dev, REG_MAR + 4, 0xFFFF_FFFF);
+    // Enable the CCK + OFDM baseband modems.
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_RF_MODE) {
+        reg_write32(x, dev, REG_FPGA0_RF_MODE, v | FPGA_RF_MODE_CCK | FPGA_RF_MODE_OFDM);
+    }
+    // enable_rf (rtl8188e_enable_rf): RF on, OFDM path RX_A|TX_A, unpause TX.
+    reg_write8(x, dev, REG_RF_CTRL, RF_CTRL_VAL);
+    if let Some(v) = reg_read32(x, dev, REG_OFDM0_TRX_PATH_EN) {
+        let nv = (v & !(OFDM_RF_PATH_RX_MASK | OFDM_RF_PATH_TX_MASK))
+            | OFDM_RF_PATH_RX_A | OFDM_RF_PATH_TX_A;
+        reg_write32(x, dev, REG_OFDM0_TRX_PATH_EN, nv);
+    }
+    reg_write8(x, dev, REG_TXPAUSE, 0x00);
+    crate::binfo!("wifi", "rx enabled (CR MAC-RX, RCR={:#010x}, modems+RF on)", RCR_VAL);
 }
 
 /// Probe an enumerated device: match `0bda:8179`, find its bulk endpoints, set

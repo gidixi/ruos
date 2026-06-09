@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Read;
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let reverse = args.iter().any(|a| a == "-r");
     let unique  = args.iter().any(|a| a == "-u");

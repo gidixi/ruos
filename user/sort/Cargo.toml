@@ -3,6 +3,9 @@ name = "sort"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+ruos-rt = { path = "../ruos-rt" }
+
 [[bin]]
 name = "sort"
 path = "src/main.rs"

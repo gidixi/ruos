@@ -124,7 +124,15 @@ impl Fiber {
     }
 
     pub fn set_cwd(&mut self, cwd: alloc::string::String) {
-        self.store.data_mut().cwd = cwd;
+        let data = self.store.data_mut();
+        // Expose cwd to the guest libc via PWD (read by `ruos_rt::init()` →
+        // set_current_dir) so the child's RELATIVE paths resolve against the
+        // shell's working dir. The kernel resolves WASI fd paths against "/", so
+        // cwd must live in the guest libc — this is how it's seeded across exec.
+        let pwd = alloc::format!("PWD={}", cwd).into_bytes();
+        data.env.retain(|e| !e.starts_with(b"PWD="));
+        data.env.push(pwd);
+        data.cwd = cwd;
     }
 
     pub fn set_pid(&mut self, pid: u32) {

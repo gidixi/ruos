@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Read;
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let count = args.iter().any(|a| a == "-c");
     let file: Option<&String> = args.iter().skip(1).find(|a| !a.starts_with('-'));

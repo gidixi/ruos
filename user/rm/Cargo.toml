@@ -3,6 +3,9 @@ name = "rm"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+ruos-rt = { path = "../ruos-rt" }
+
 [[bin]]
 name = "rm"
 path = "src/main.rs"

@@ -44,6 +44,7 @@ fn parse_url(u: &str) -> Option<Url> {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut out: Option<String> = None;
     let mut url: Option<String> = None;

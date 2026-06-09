@@ -3,6 +3,9 @@ name = "grep"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+ruos-rt = { path = "../ruos-rt" }
+
 [[bin]]
 name = "grep"
 path = "src/main.rs"

@@ -20,6 +20,7 @@ members = [
     "install",
     "umount",
     "disks",
+    "ruos-rt",
 ]
 
 [profile.release]

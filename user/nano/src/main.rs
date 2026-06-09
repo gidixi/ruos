@@ -310,6 +310,7 @@ macro_rules! alloc_format {
 pub(crate) use alloc_format;
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: nano <file>");

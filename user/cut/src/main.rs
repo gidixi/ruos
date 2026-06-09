@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Read;
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut delim = '\t';
     let mut fields: Option<Vec<usize>> = None;

@@ -46,20 +46,41 @@ pub fn environ_sizes_get(
     environc_ptr: i32,
     environ_buf_size_ptr: i32,
 ) -> Result<i32, Error> {
-    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environc_ptr, 0) {
+    let envc = caller.data().env.len() as u32;
+    let buf: u32 = caller.data().env.iter().map(|e| e.len() as u32 + 1).sum();
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environc_ptr, envc) {
         return Ok(e);
     }
-    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environ_buf_size_ptr, 0) {
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, environ_buf_size_ptr, buf) {
         return Ok(e);
     }
     Ok(0)
 }
 
+/// Expose `RuntimeState.env` to the guest as WASI environ (mirror of `args_get`).
+/// Each entry is a `KEY=VALUE` byte string, written null-terminated. The kernel
+/// seeds `PWD=<cwd>` here (see `Fiber::set_cwd`) so `ruos_rt::init()` can sync the
+/// guest libc cwd — relative paths resolve against the shell's working dir even
+/// though the kernel resolves WASI fd paths against "/".
 pub fn environ_get(
-    _caller: Caller<'_, RuntimeState>,
-    _environ_ptr: i32,
-    _environ_buf_ptr: i32,
+    mut caller: Caller<'_, RuntimeState>,
+    environ_ptr: i32,
+    environ_buf_ptr: i32,
 ) -> Result<i32, Error> {
+    let env = caller.data().env.clone();
+    let mut cursor = environ_buf_ptr;
+    for (i, e) in env.iter().enumerate() {
+        let slot_ptr = environ_ptr.wrapping_add((i * 4) as i32);
+        if let Err(err) = crate::wasm::host::mem::guest_write_u32(&mut caller, slot_ptr, cursor as u32) {
+            return Ok(err);
+        }
+        let mut owned = e.clone();
+        owned.push(0u8); // null terminator
+        if let Err(err) = crate::wasm::host::mem::guest_write(&mut caller, cursor, &owned) {
+            return Ok(err);
+        }
+        cursor = cursor.wrapping_add(owned.len() as i32);
+    }
     Ok(0)
 }
 

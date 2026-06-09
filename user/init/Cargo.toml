@@ -8,4 +8,5 @@ name = "init"
 path = "src/main.rs"
 
 [dependencies]
+ruos-rt = { path = "../ruos-rt" }
 getrandom = "0.2"

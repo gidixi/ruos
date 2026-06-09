@@ -332,6 +332,7 @@ fn read_line_raw(prompt: &str) -> Option<String> {
 }
 
 fn main() {
+    ruos_rt::init(); // sync libc cwd from PWD (the shell's own relative ops, e.g. `source`)
     *CWD.lock().unwrap() = "/".to_string();
 
     // `--no-init` (passed by the SSH server when spawning a session shell)
@@ -445,30 +446,41 @@ fn builtin_cd(argv: &[&str]) {
         eprintln!("cd: {}: errno {}", target, errno);
         return;
     }
-    // Mirror kernel CWD locally so the prompt and history look right.
+    // Mirror kernel CWD locally so the prompt and history look right. Use the
+    // SAME normalization the kernel applies (see `resolve_cwd`): split on '/',
+    // drop ""/".", pop on "..", re-root at "/". The old ad-hoc logic mishandled a
+    // trailing slash — `cd bin/` left cwd "/bin/", then `cd ..` did rfind('/') on
+    // the trailing slash → "/bin" instead of "/" (prompt diverged from the real
+    // kernel cwd).
     let mut cwd = CWD.lock().unwrap();
-    let new = if target.starts_with('/') {
+    *cwd = norm_cwd(&cwd, target);
+    // Keep the shell's OWN libc cwd in sync so its relative ops (e.g. `source
+    // foo.sh`) resolve against the new dir, matching what child tools get via PWD.
+    let _ = std::env::set_current_dir(&*cwd);
+}
+
+/// Normalize `target` (absolute, relative, with `.`/`..`/trailing slashes)
+/// against `base` into a canonical absolute path with no trailing slash (except
+/// root "/"). Mirrors the kernel's `resolve_cwd` so the prompt matches the real
+/// cwd.
+fn norm_cwd(base: &str, target: &str) -> String {
+    let combined = if target.starts_with('/') {
         target.to_string()
-    } else if target == "." {
-        cwd.clone()
-    } else if target == ".." {
-        let mut s = cwd.clone();
-        if s.len() > 1 {
-            if let Some(idx) = s.rfind('/') {
-                s.truncate(idx.max(1));
-            }
-        }
-        if s.is_empty() { s.push('/'); }
-        s
     } else {
-        let mut s = cwd.clone();
-        if !s.ends_with('/') {
-            s.push('/');
-        }
+        let mut s = base.to_string();
+        if !s.ends_with('/') { s.push('/'); }
         s.push_str(target);
         s
     };
-    *cwd = new;
+    let mut out: Vec<&str> = Vec::new();
+    for seg in combined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => { out.pop(); }
+            s => out.push(s),
+        }
+    }
+    format!("/{}", out.join("/"))
 }
 
 fn builtin_help() {

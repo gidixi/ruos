@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut n: usize = 10;
     let mut paths: Vec<String> = Vec::new();

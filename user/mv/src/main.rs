@@ -1,4 +1,5 @@
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 2 {
         eprintln!("mv: usage: mv <src> <dst>");

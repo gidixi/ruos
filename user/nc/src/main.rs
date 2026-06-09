@@ -28,6 +28,7 @@ fn parse_ip4(s: &str) -> Option<[u8; 4]> {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         eprintln!("usage: nc <ip> <port>");

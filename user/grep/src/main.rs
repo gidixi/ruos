@@ -76,6 +76,7 @@ fn walk(path: &str, pat: &str, recursive: bool, show_num: bool) {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut recursive = false;
     let mut show_num = false;

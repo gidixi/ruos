@@ -32,6 +32,9 @@ dependencies = [
 [[package]]
 name = "cat"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "cfg-if"
@@ -64,10 +67,16 @@ dependencies = [
 [[package]]
 name = "cp"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "cut"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "darling"
@@ -114,6 +123,9 @@ version = "0.1.0"
 [[package]]
 name = "diff"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "disks"
@@ -126,6 +138,9 @@ version = "0.1.0"
 [[package]]
 name = "du"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "echo"
@@ -146,6 +161,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "find"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "foldhash"
@@ -171,6 +189,9 @@ dependencies = [
 [[package]]
 name = "grep"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "hashbrown"
@@ -186,6 +207,9 @@ dependencies = [
 [[package]]
 name = "head"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "heck"
@@ -221,6 +245,7 @@ name = "init"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "ruos-rt",
 ]
 
 [[package]]
@@ -301,6 +326,9 @@ version = "0.1.0"
 [[package]]
 name = "mkdir"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "mkdisk"
@@ -309,14 +337,23 @@ version = "0.1.0"
 [[package]]
 name = "mv"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "nano"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "nc"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "paste"
@@ -377,10 +414,16 @@ dependencies = [
 [[package]]
 name = "rm"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "rmdir"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "rtop"
@@ -388,6 +431,10 @@ version = "0.1.0"
 dependencies = [
  "ratatui",
 ]
+
+[[package]]
+name = "ruos-rt"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"
@@ -412,10 +459,16 @@ version = "0.1.0"
 [[package]]
 name = "shell"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "sort"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "static_assertions"
@@ -465,14 +518,23 @@ dependencies = [
 [[package]]
 name = "tail"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "tee"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "touch"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "tr"
@@ -524,6 +586,9 @@ checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
 [[package]]
 name = "uniq"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "uptime"
@@ -538,14 +603,23 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 [[package]]
 name = "wc"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "wget"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "which"
 version = "0.1.0"
+dependencies = [
+ "ruos-rt",
+]
 
 [[package]]
 name = "whoami"

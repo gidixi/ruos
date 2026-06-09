@@ -12,13 +12,30 @@ use crate::vfs::OpenFlags;
 /// directory (`FdEntry::Dir`), relative paths resolve against THAT directory —
 /// this is what makes `std::fs::read_dir` work: after `fd_readdir`, std calls
 /// `path_filestat_get(dir_fd, "<entry>")` to stat each entry, expecting it
-/// resolved against the directory, not the cwd. For the virtual preopen fd 3
-/// (and any non-dir fd) we fall back to the cwd, which preserves the prior
-/// behavior for absolute paths and cwd-relative opens.
+/// resolved against the directory, not the cwd.
+///
+/// For the virtual preopen fd 3 (and any non-dir fd) we resolve against the
+/// preopen ROOT "/", NOT the kernel cwd. Rationale: wasi-libc resolves the
+/// program's path against the "/" preopen and passes the kernel the REMAINDER
+/// after the preopen prefix — so an absolute `/bin/ls.wasm` arrives here as
+/// `bin/ls.wasm` (leading slash stripped). Re-applying the kernel cwd as base
+/// double-counted it: at cwd `/bin`, `bin/ls.wasm` → `/bin/bin/ls.wasm` → ENOENT,
+/// which broke EVERY external command (and every absolute path) at any cwd ≠ "/".
+/// Rooting at "/" makes absolute paths correct at any cwd. (It works at cwd "/"
+/// identically to before, since base was "/" there too.)
+///
+/// CWD-RELATIVE PATHS: a tool that opens a genuinely cwd-relative path (e.g.
+/// `cat foo.txt` while the shell is in /mnt) is handled by syncing the GUEST libc
+/// cwd, not by this function. The kernel injects `PWD=<cwd>` into each child's
+/// environ (`Fiber::set_cwd`); the tool's `ruos_rt::init()` reads it and calls
+/// `set_current_dir`, so wasi-libc roots the relative path at the real cwd BEFORE
+/// stripping the preopen prefix — and it then arrives here already correct. This
+/// keeps `resolve_at` stateless (base "/") while both absolute and cwd-relative
+/// paths resolve correctly. (A tool that does NOT link ruos-rt sees cwd "/".)
 fn resolve_at(caller: &Caller<'_, RuntimeState>, dir_fd: i32, path: &str) -> alloc::string::String {
     let base = match caller.data().fds.get(dir_fd as usize).and_then(|x| x.as_ref()) {
         Some(FdEntry::Dir(p)) => p.clone(),
-        _ => caller.data().cwd.clone(),
+        _ => alloc::string::String::from("/"),
     };
     crate::wasm::host::proc::resolve_cwd(&base, path)
 }

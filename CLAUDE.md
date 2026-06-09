@@ -173,6 +173,22 @@ Prima di creare una entry, controllo il numero più alto già presente in
 
 - Le spec di design vanno in `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`.
 
+### API app-facing → `docs/api/` (OBBLIGATORIO)
+
+`docs/api/` è il **manuale** (una pagina per modulo, stile crate docs) dell'API host
+che le app/tool WASM possono importare: `wm`/`sys`/`term` (GUI Wasmtime), `ruos` +
+`wasi` (tool wasmi), `wit` (component model). Indice in `docs/api/README.md`. Il
+`demo-apps-sdk` copia l'intera cartella in ogni progetto generato (come `api/`),
+quindi deve restare **completa e precisa**.
+
+Ogni volta che **aggiungi, rimuovi o modifichi una host fn app-facing** — un
+`func_wrap("wm"|"sys"|"term"|"ruos", …)` in `kernel/src/wasm/wt/*` o
+`kernel/src/wasm/host/*`, oppure un'interfaccia in `wit/*.wit` — **aggiorna la
+pagina corrispondente in `docs/api/` nello STESSO commit**: aggiungi/modifica
+l'entry della funzione (signature + parametri + return + semantica), aggiorna
+"Last reviewed" della pagina, e per le GUI aggiorna anche l'`extern "C"` in
+`ruos-desktop/crates/ruos-window/src/lib.rs`.
+
 ### Stile
 
 - Codice nuovo segue lo stile del codice circostante (naming, commenti, idiomi).

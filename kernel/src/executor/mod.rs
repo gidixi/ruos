@@ -501,6 +501,7 @@ pub async fn wasm_ap_probe() {
 async fn exec_worker_task() {
     use crate::wasm::exec_queue::{EXEC_QUEUE, WaitForRequest};
     use core::sync::atomic::Ordering;
+    let _ = crate::proc::register_kernel("exec-worker");
     loop {
         // Wait for a request from a shell fiber.
         let slot = WaitForRequest::new(&EXEC_QUEUE).await;
@@ -611,11 +612,13 @@ async fn exec_worker_task() {
 
 #[embassy_executor::task]
 async fn pipeline_worker_task() {
+    let _ = crate::proc::register_kernel("pipe-worker");
     crate::wasm::pipeline::worker().await;
 }
 
 #[embassy_executor::task]
 async fn ssh_serve_task() {
+    let _ = crate::proc::register_kernel("sshd");
     crate::ssh::server::serve_loop_pub().await;
 }
 
@@ -683,10 +686,11 @@ async fn wasm_task(path: &'static str) {
 /// dead. Mirrors `init`/getty respawn on Unix: you can't really "log out"
 /// of the only physical console, it just comes back.
 ///
-/// SSH sessions are independent (ssh_pty_dispatcher_task on pts/1..3) and
-/// unaffected: exiting an SSH session never touches this task.
+/// SSH sessions are independent (ssh_pty_dispatcher_task on pts/1..NUM_PAIRS)
+/// and unaffected: exiting an SSH session never touches this task.
 #[embassy_executor::task]
 async fn boot_shell_task() {
+    let _ = crate::proc::register_kernel("init");
     let mut first = true;
     loop {
         let code = crate::wasm::run_boot_shell(first).await;
@@ -702,8 +706,10 @@ async fn boot_shell_task() {
 /// terminal window (and the next SSH client) each get their own instance. This
 /// is what makes SSH and the UI terminal coexist: previously the single
 /// dispatcher `await`ed each shell to exit before starting the next, so only one
-/// PTY shell could be alive at a time. `pool_size` ≥ usable pairs (`NUM_PAIRS`).
-#[embassy_executor::task(pool_size = 4)]
+/// PTY shell could be alive at a time. `pool_size` must be ≥ usable pairs
+/// (NUM_PAIRS-1 = 7, pair 0 is the console's own task); kept at NUM_PAIRS=8.
+/// (Embassy needs a literal here — keep in sync with `pty::NUM_PAIRS`.)
+#[embassy_executor::task(pool_size = 8)]
 async fn pty_shell_task(idx: usize, path: alloc::string::String) {
     let bytes = match crate::wasm::read_all(&path).await {
         Ok(b)  => b,
@@ -744,6 +750,7 @@ async fn pty_shell_task(idx: usize, path: alloc::string::String) {
 /// shells run concurrently, so SSH and the UI terminal no longer block each other.
 #[embassy_executor::task]
 async fn ssh_pty_dispatcher_task() {
+    let _ = crate::proc::register_kernel("pty-dispatch");
     let spawner = embassy_executor::Spawner::for_current_executor().await;
     loop {
         let next = PTY_QUEUE.lock().pop_front();
@@ -769,6 +776,7 @@ async fn ssh_pty_dispatcher_task() {
 #[embassy_executor::task]
 async fn service_dispatcher_task() {
     use crate::service::{WaitForServiceRequest, mark_running, mark_exited, mark_failed, path_of};
+    let _ = crate::proc::register_kernel("svc-dispatch");
     loop {
         let name = WaitForServiceRequest.await;
         let path = match path_of(name) {
@@ -820,6 +828,7 @@ pub fn enqueue_shell_pty(idx: usize, path: alloc::string::String) {
 /// → pair[0].master_out → this task → CONSOLE.
 #[embassy_executor::task]
 async fn console_drain_task() {
+    let _ = crate::proc::register_kernel("console-drain");
     loop {
         let b = crate::pty::master_output_read(0).await;
         x86_64::instructions::interrupts::without_interrupts(|| {
@@ -830,6 +839,13 @@ async fn console_drain_task() {
             let _ = c.write_str(s);
         });
     }
+}
+
+/// Decide se il watchdog deve reap-are un pair: SOLO le sessioni SSH leak-ate.
+/// I terminali GUI locali (`LocalGui`) non vanno mai uccisi per idle — dormono
+/// nel compositor e restano vivi finché la finestra esiste. Pura → ovvia.
+fn should_reap(origin: crate::pty::PtyOrigin, idle_exceeded: bool) -> bool {
+    origin == crate::pty::PtyOrigin::Ssh && idle_exceeded
 }
 
 /// Software watchdog over SSH-spawned PTY pairs. Boot shell on pair 0 is
@@ -847,6 +863,7 @@ async fn console_drain_task() {
 /// the per-session SIGHUP.
 #[embassy_executor::task]
 async fn pty_watchdog_task() {
+    let _ = crate::proc::register_kernel("watchdog");
     const CHECK_INTERVAL_TICKS: u64 = 1000;  // 10 s @ 100 Hz
     const IDLE_LIMIT_TICKS:     u64 = 30000; // 5 min @ 100 Hz — backstop for
                                              // LEAKED pairs only; a live bridge
@@ -860,7 +877,8 @@ async fn pty_watchdog_task() {
             if !crate::pty::is_claimed(idx) { continue; }
             if crate::pty::is_shutdown(idx) { continue; }
             let last = crate::pty::last_activity(idx);
-            if now.saturating_sub(last) > IDLE_LIMIT_TICKS {
+            let idle_exceeded = now.saturating_sub(last) > IDLE_LIMIT_TICKS;
+            if should_reap(crate::pty::origin(idx), idle_exceeded) {
                 crate::bwarn!(
                     "pty", "watchdog: pair {} idle {}s — shutting down",
                     idx, now.saturating_sub(last) / 100,

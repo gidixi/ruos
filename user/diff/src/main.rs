@@ -1,6 +1,7 @@
 //! Naive line-by-line diff. Not LCS-based — adequate for small text files.
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
         eprintln!("diff: usage: diff <a> <b>");

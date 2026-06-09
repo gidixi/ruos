@@ -38,6 +38,20 @@ netconsole-rx --src         # prefix each line with the sender's IP
 netconsole-rx -h            # help
 ```
 
+### Interactive commands
+
+While running, type a command + Enter on stdin:
+
+| Command       | Action                                        |
+| ------------- | --------------------------------------------- |
+| `c` / `clear` | clear the terminal screen (ANSI)              |
+| `l` / `clog`  | clear the log file (truncate `netconsole.log`)|
+| `h` / `help`  | show the command list                         |
+| `q` / `quit`  | exit                                          |
+
+(Commands need stdin, so they're inert when input is piped/redirected — the
+receive loop keeps running regardless.)
+
 Logs go to **stdout** (pipe/redirect freely); the listening banner and errors go
 to **stderr**:
 

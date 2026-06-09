@@ -3,6 +3,7 @@ use std::io::Read;
 
 /// Print lines/words/bytes of each file (or stdin if no args).
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let want_l = args.iter().any(|a| a == "-l");
     let want_w = args.iter().any(|a| a == "-w");

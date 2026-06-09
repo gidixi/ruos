@@ -77,6 +77,20 @@ extern "x86-interrupt" fn gp_handler(frame: InterruptStackFrame, code: u64) {
 
 extern "x86-interrupt" fn pf_handler(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let cr2 = x86_64::registers::control::Cr2::read().unwrap_or(VirtAddr::zero());
+    // Not-present fault inside the Wasmtime VA window → demand-commit a zeroed
+    // frame and resume (lazy linear-memory / code paging, see wt::demand). A
+    // PROTECTION_VIOLATION (present page, wrong perms) is never our lazy commit —
+    // it falls through to the panic path. We pass the faulting context's IF so
+    // commit_fault can re-enable IRQs while spinning on MAPPER (TLB-shootdown
+    // deadlock avoidance) only when it was safe to (the guest runs with IF=1).
+    if !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+        let irqs_on = frame
+            .cpu_flags
+            .contains(x86_64::registers::rflags::RFlags::INTERRUPT_FLAG);
+        if crate::wasm::wt::demand::commit_fault(cr2.as_u64(), irqs_on) {
+            return;
+        }
+    }
     kprintln!(
         "ruos: #PF rip=0x{:X} cr2=0x{:X} err={:?}",
         frame.instruction_pointer.as_u64(),

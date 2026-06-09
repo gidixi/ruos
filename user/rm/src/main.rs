@@ -48,6 +48,7 @@ fn rm_recursive(path: &str) -> std::io::Result<()> {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut recursive = false;
     let mut force = false;

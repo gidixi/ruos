@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     if let Some(arg0) = args.get(0) {
         println!("init.wasm: argv0={}", arg0);

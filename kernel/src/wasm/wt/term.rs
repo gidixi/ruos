@@ -22,6 +22,7 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     linker.func_wrap("term", "open", |_caller: Caller<'_, T>| -> i32 {
         for idx in 1..crate::pty::NUM_PAIRS {
             if crate::pty::try_claim(idx) {
+                crate::pty::set_origin(idx, crate::pty::PtyOrigin::LocalGui);
                 crate::wasm::ssh_spawn::spawn_shell_on_pty(idx);
                 return idx as i32;
             }

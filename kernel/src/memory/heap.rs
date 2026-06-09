@@ -11,15 +11,18 @@ use limine::memmap::MEMMAP_USABLE;
 #[cfg(feature = "legacy-talc")]
 use talc::{ErrOnOom, Span, Talc, Talck};
 
-/// Heap size in bytes: 256 MiB. Large enough to hold MULTIPLE egui compositor
+/// Heap size in bytes: 384 MiB. Large enough to hold MULTIPLE egui compositor
 /// windows simultaneously: each egui wasm instance reserves ~48 MiB of guest
-/// linear memory (its declared minimum) plus its ~9 MiB AOT module and software
-/// raster buffers. SP-C's `wm.spawn` instantiates a SECOND egui window while the
-/// first is live, so 128 MiB OOM'd the second linear-memory allocation
-/// (`failed to allocate 0x3000000 bytes`). 256 MiB fits several windows; the QEMU
-/// run-config gives 512 MiB RAM so the USABLE region is ample.
-/// (Was 16 MiB — OOM'd the GUI; then 128 MiB — OOM'd the 2nd compositor window.)
-pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
+/// linear memory (its declared minimum, `--initial-memory` in
+/// `ruos-desktop/.cargo/config.toml`) plus its ~9 MiB AOT module and software
+/// raster buffers — ~60 MiB live per window. SP-C's `wm.spawn` instantiates each
+/// window as a separate live instance, so the heap must hold compositor + shell +
+/// N windows at once; 256 MiB OOM'd the 3rd app window (`failed to allocate
+/// 0x3000000 bytes` = the 48 MiB linear-memory minimum). 384 MiB fits ~2 more.
+/// REQUIRES the QEMU run-config to give ≥ this much RAM in one USABLE region:
+/// the Makefile `-m 1024` (was 512) guarantees a contiguous region ≥ HEAP_SIZE.
+/// (Was 16 MiB — OOM'd the GUI; 128 MiB — OOM'd the 2nd window; 256 MiB — the 3rd.)
+pub const HEAP_SIZE: usize = 384 * 1024 * 1024;
 
 // SMP baseline (migrazione shared-nothing, spec 2026-06-05): questo è un VERO
 // spinlock SMP (spin 0.9.8, CAS cross-core), non uno stub single-core. È preso su

@@ -10,11 +10,12 @@
 //!   declined (no_std, `memory_init_cow(false)`), and native signals are off, so
 //!   no signal/trap symbols are needed.
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use core::ffi::c_void;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
-use crate::memory::{allocate_frame, free_frame, map_page, unmap_page, set_flags};
+use crate::memory::{free_frame, unmap_page, set_flags, UnmapError};
+use crate::wasm::wt::demand;
 
 // ---------------------------------------------------------------------------
 // TLS — one pointer PER CORE. Wasmtime stores per-activation CallThreadState
@@ -133,10 +134,6 @@ const PROT_WRITE: u32 = 1 << 1;
 const PROT_EXEC: u32 = 1 << 2;
 const PAGE: u64 = 0x1000;
 
-/// Dedicated VA window for Wasmtime mappings (distinct from `memory::exec`).
-const WT_VM_BASE: u64 = 0xFFFF_D000_0000_0000;
-static NEXT: AtomicU64 = AtomicU64::new(WT_VM_BASE);
-
 fn prot_to_flags(prot: u32) -> PageTableFlags {
     let mut f = PageTableFlags::PRESENT;
     if prot & PROT_WRITE != 0 {
@@ -153,84 +150,46 @@ pub extern "C" fn wasmtime_page_size() -> usize {
     PAGE as usize
 }
 
-/// Allocate `size` bytes of fresh virtual memory with the given protections.
+/// Reserve `size` bytes of fresh virtual memory with the given protections.
 /// Returns 0 on success and writes the base into `*ret`; non-zero on failure.
+///
+/// DEMAND-PAGED: this only reserves VA and records the range (`demand::reserve`)
+/// — it commits NO physical frames. The page-fault handler commits a zeroed frame
+/// on first touch (`demand::commit_fault`). wasm's zero-init guarantee holds
+/// because `commit_fault` zeroes each frame (via its HHDM alias) before mapping
+/// it. This is what lets many 48 MiB egui linear-memory minimums coexist while
+/// only the touched pages (a few MiB each) actually consume RAM.
 #[no_mangle]
 pub extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: *mut *mut u8) -> i32 {
     let pages = (size as u64 + PAGE - 1) / PAGE;
-    let base = NEXT.fetch_add(pages * PAGE, Ordering::SeqCst);
-    let final_flags = prot_to_flags(prot_flags);
-    // wasm requires fresh memory to read as zero, and our frame allocator hands
-    // back DIRTY frames. Wasmtime never memsets grown memory — it assumes the
-    // platform mmap delivers zeroed pages (true on Linux/Windows). So we MUST
-    // zero here. Crucially, wasm *linear memory* is created via `Mmap::reserve`,
-    // i.e. `wasmtime_mmap_new(size, prot=0)` (PROT_NONE), and only later made
-    // writable through `wasmtime_mprotect` (make_accessible). Zeroing only the
-    // PROT_WRITE case therefore missed it entirely → stale frame bytes leaked
-    // into the guest. egui/tiny-skia build the font atlas with `alloc_zeroed`,
-    // which trusts the wasm zero-init guarantee and skips its own memset, so the
-    // garbage surfaced as garbled glyphs (shapes write-before-read, so crisp).
-    // Map each frame writable, zero it, then downgrade to the requested flags.
-    let zero_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let downgrade = (prot_flags & PROT_WRITE == 0) || (prot_flags & PROT_EXEC != 0);
-    for i in 0..pages {
-        let frame = match allocate_frame() {
-            Some(f) => f,
-            None => return 1,
-        };
-        let va = VirtAddr::new(base + i * PAGE);
-        if map_page(va, frame.start_address(), zero_flags).is_err() {
-            return 1;
-        }
-        // SAFETY: the page was just mapped writable for the whole 4 KiB.
-        unsafe { core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, PAGE as usize); }
-        if downgrade && set_flags(va, final_flags).is_err() {
-            return 1;
-        }
-    }
+    let base = demand::reserve(pages, prot_flags);
     // SAFETY: `ret` is a valid out-pointer supplied by Wasmtime.
     unsafe { *ret = base as *mut u8; }
     0
 }
 
 /// Replace the mapping covering `[addr, addr+size)` with a fresh, zeroed mapping
-/// having the given protections (blank private mapping). prot 0 → unmap.
+/// having the given protections (blank private mapping). prot 0 → erase.
+///
+/// DEMAND-PAGED: drop any frames already committed in the range (they re-commit
+/// zeroed on the next fault), then re-record the prot lazily. No eager commit.
 #[no_mangle]
 pub extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> i32 {
     let base = addr as u64;
     let pages = (size as u64 + PAGE - 1) / PAGE;
-    let flags = prot_to_flags(prot_flags);
-    let writable = prot_flags & PROT_WRITE != 0;
     for i in 0..pages {
         let va = VirtAddr::new(base + i * PAGE);
         if let Ok(frame) = unmap_page(va) {
-            free_frame(frame);
-        }
-        if prot_flags == 0 {
-            continue; // erase: leave unmapped
-        }
-        let frame = match allocate_frame() {
-            Some(f) => f,
-            None => return 1,
-        };
-        // Map writable first so we can zero it, then downgrade to target prot.
-        let tmp = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-        if map_page(va, frame.start_address(), tmp).is_err() {
-            return 1;
-        }
-        // SAFETY: page is mapped writable for the whole 4 KiB.
-        unsafe { core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, PAGE as usize); }
-        if !writable || (prot_flags & PROT_EXEC != 0) {
-            if set_flags(va, flags).is_err() {
-                return 1;
-            }
+            free_frame(frame); // committed page: free it; not-present pages: skip
         }
     }
+    // Re-record the range's prot (prot 0 = reserved/erased → faults are real).
+    demand::set_prot(base, base + pages * PAGE, prot_flags);
     0
 }
 
-/// Unmap `[ptr, ptr+size)` and free the backing frames.
+/// Unmap `[ptr, ptr+size)`, free the committed frames, and drop the range.
+/// Not-present (never-touched) pages have no frame and are simply skipped.
 #[no_mangle]
 pub extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
     let base = ptr as u64;
@@ -241,19 +200,30 @@ pub extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
             free_frame(frame);
         }
     }
+    demand::remove(base, base + pages * PAGE);
     0
 }
 
 /// Change protections on `[ptr, ptr+size)`.
+///
+/// DEMAND-PAGED: record the new prot for the range (future faults map with it),
+/// then flip the flags of pages ALREADY committed — e.g. code W^X (RW→RX after a
+/// module's machine code was faulted in writable). Not-present pages are skipped:
+/// they'll be mapped with the new prot when first touched. The common
+/// `make_accessible` (PROT_NONE→RW, before anything is committed) thus touches no
+/// frames at all.
 #[no_mangle]
 pub extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> i32 {
     let base = ptr as u64;
     let pages = (size as u64 + PAGE - 1) / PAGE;
+    demand::set_prot(base, base + pages * PAGE, prot_flags);
     let flags = prot_to_flags(prot_flags);
     for i in 0..pages {
         let va = VirtAddr::new(base + i * PAGE);
-        if set_flags(va, flags).is_err() {
-            return 1;
+        match set_flags(va, flags) {
+            Ok(()) => {}
+            Err(UnmapError::NotMapped) => {} // lazy page, not committed yet — skip
+            Err(_) => return 1,
         }
     }
     0

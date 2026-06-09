@@ -165,6 +165,43 @@ pub fn slot_summary() -> (usize, usize) {
     (total, msc)
 }
 
+/// One enumerated USB device for `lsusb` (the `usb_list` host fn formats these).
+pub struct UsbInfo {
+    pub ctrl: u8,
+    pub slot: u8,
+    pub root_port: u8,
+    pub tier: u8,
+    pub speed: u8,
+    pub vid: u16,
+    pub pid: u16,
+    pub class: u8,
+    pub kind: &'static str,
+}
+
+/// Snapshot of every enumerated slot for `lsusb`, ordered by (ctrl, slot).
+pub fn usb_list() -> alloc::vec::Vec<UsbInfo> {
+    let g = SLOTS.lock();
+    let mut v = alloc::vec::Vec::new();
+    for c in 0..MAX_XHCI as u8 {
+        for s in 1..MAX_SLOTS as u16 {
+            if let Some(e) = g[gidx(c, s as u8)].as_ref() {
+                v.push(UsbInfo {
+                    ctrl: c,
+                    slot: s as u8,
+                    root_port: e.root_port,
+                    tier: e.tier,
+                    speed: e.speed,
+                    vid: e.dev.vid,
+                    pid: e.dev.pid,
+                    class: e.dev.class,
+                    kind: kind_name(&e.kind),
+                });
+            }
+        }
+    }
+    v
+}
+
 /// Per-slot kind list `(ctrl, slot, root_port, kind)` for boot diagnostics.
 pub fn dump_slots() -> alloc::vec::Vec<(u8, u8, u8, &'static str)> {
     let g = SLOTS.lock();

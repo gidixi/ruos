@@ -20,12 +20,27 @@ pub struct ProcInfo {
     pub cpu_tsc: u64,
     /// Last-observed wasm linear-memory size in bytes.
     pub mem_bytes: u64,
+    /// True for kernel async daemons (executor tasks, no wasm fiber). They show
+    /// in `ps` with a `[bracketed]` name (Linux kernel-thread convention) and
+    /// cannot be killed (`request_kill` refuses them).
+    pub kernel: bool,
 }
 
 static REGISTRY: Mutex<BTreeMap<u32, ProcInfo>> = Mutex::new(BTreeMap::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
 pub fn register(name: String) -> u32 {
+    register_inner(name, false)
+}
+
+/// Register a long-lived kernel daemon (an `#[embassy_executor::task]` with no
+/// wasm fiber: watchdog, sshd, dispatchers, workers). The name is shown
+/// `[bracketed]` in `ps`; the daemon never exits, so it is never unregistered.
+pub fn register_kernel(name: &str) -> u32 {
+    register_inner(alloc::format!("[{}]", name), true)
+}
+
+fn register_inner(name: String, kernel: bool) -> u32 {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let info = ProcInfo {
         pid,
@@ -34,6 +49,7 @@ pub fn register(name: String) -> u32 {
         kill: false,
         cpu_tsc: 0,
         mem_bytes: 0,
+        kernel,
     };
     REGISTRY.lock().insert(pid, info);
     pid
@@ -47,11 +63,13 @@ pub fn list() -> Vec<ProcInfo> {
     REGISTRY.lock().values().cloned().collect()
 }
 
-/// Returns true if a process with `pid` exists and was marked for kill.
-/// Returns false if the pid is unknown.
+/// Returns true if a process with `pid` exists, is killable (not a kernel
+/// daemon), and was marked for kill. Returns false if the pid is unknown OR is a
+/// kernel daemon (those are protected — you can't `kill` the watchdog/sshd).
 pub fn request_kill(pid: u32) -> bool {
     let mut r = REGISTRY.lock();
     if let Some(p) = r.get_mut(&pid) {
+        if p.kernel { return false; } // protected kernel daemon
         p.kill = true;
         true
     } else {

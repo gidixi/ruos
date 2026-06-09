@@ -73,6 +73,7 @@ fn walk(path: &str, pat: Option<&str>) {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut root = String::from(".");
     let mut name_pat: Option<String> = None;

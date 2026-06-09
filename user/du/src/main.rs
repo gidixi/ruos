@@ -66,6 +66,7 @@ fn human(b: u64) -> String {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut summary = false;
     let mut human_r = false;

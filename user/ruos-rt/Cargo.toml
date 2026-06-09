@@ -1,0 +1,8 @@
+[package]
+name = "ruos-rt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ruos_rt"
+path = "src/lib.rs"

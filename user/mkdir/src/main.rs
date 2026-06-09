@@ -1,4 +1,5 @@
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut paths: Vec<String> = Vec::new();
     let mut parents = false;

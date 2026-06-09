@@ -1,6 +1,7 @@
 use std::io::Read;
 
 fn main() {
+    ruos_rt::init(); // sync libc cwd from PWD so relative paths honor the shell's cwd
     let args: Vec<String> = std::env::args().collect();
     let path = match args.get(1) {
         Some(p) => p.clone(),

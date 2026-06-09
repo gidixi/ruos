@@ -66,6 +66,7 @@ fn copy_recursive(src: &str, dst: &str) -> std::io::Result<()> {
 }
 
 fn main() {
+    ruos_rt::init();
     let args: Vec<String> = std::env::args().collect();
     let mut recursive = false;
     let mut rest: Vec<String> = Vec::new();

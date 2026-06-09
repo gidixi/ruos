@@ -175,6 +175,9 @@ pub struct UsbDevice {
     pub dev_ctx:     DmaRegion,
     pub ep0_enqueue: usize,
     pub ep0_cycle:   bool,
+    pub vid:         u16, // device descriptor idVendor  (0 if descriptor read failed)
+    pub pid:         u16, // device descriptor idProduct (0 if descriptor read failed)
+    pub class:       u8,  // bDeviceClass (0 if descriptor read failed)
 }
 
 /// Enumerate the device at `loc`: Enable Slot → build Input Context (root-hub
@@ -363,6 +366,9 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
         dev_ctx,
         ep0_enqueue: 0,
         ep0_cycle: true,
+        vid: 0,
+        pid: 0,
+        class: 0,
     };
 
     // ── 8. Device descriptor (for bDeviceClass) + class dispatch ─────────────
@@ -709,6 +715,10 @@ pub fn read_device_descriptor(x: &mut Xhci, dev: &mut UsbDevice) -> Option<u8> {
                     "dev {:04x}:{:04x} class={} maxpkt0={} numcfg={}",
                     vid, pid, class, mps0, num_cfg
                 );
+                // Persist identity for `lsusb` (registry → usb_list).
+                dev.vid = vid;
+                dev.pid = pid;
+                dev.class = class;
                 Some(class)
             }
             Some(n) => {

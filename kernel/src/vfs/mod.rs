@@ -85,9 +85,10 @@ pub fn init() -> Result<usize, VfsError> {
         content: alloc::vec::Vec::new(),
     })?;
     fs.mkdir_sync(&["dev", "pts"])?;
-    const PTY_NAMES: [&str; crate::pty::NUM_PAIRS] = ["0", "1", "2", "3"];
-    for (i, name) in PTY_NAMES.iter().enumerate() {
-        fs.insert_inode(&["dev", "pts", name], TmpInode {
+    // One /dev/pts/<i> slave per PTY pair (scales with NUM_PAIRS).
+    for i in 0..crate::pty::NUM_PAIRS {
+        let name = alloc::format!("{}", i);
+        fs.insert_inode(&["dev", "pts", name.as_str()], TmpInode {
             kind: TmpKind::PtySlave(i),
             children: alloc::collections::BTreeMap::new(),
             content: alloc::vec::Vec::new(),

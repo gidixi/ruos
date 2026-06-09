@@ -186,6 +186,10 @@ pub fn init() -> Result<(), BootError> {
         // path); regression for the egui font-atlas garble.
         let zi = crate::wasm::wt::platform::zero_init_self_test();
         crate::binfo!("wt", "linear-mem zero-init self-test {}", if zi { "ok" } else { "FAIL" });
+        // Demand paging: a reserved-but-untouched range must cost ZERO frames,
+        // and a touch must commit exactly its page lazily (the OOM fix).
+        let dp = crate::wasm::wt::demand::self_test();
+        crate::binfo!("wt", "linear-mem demand-paging self-test {}", if dp { "ok" } else { "FAIL" });
         let mok = crate::mouse::self_test();
         crate::binfo!("mouse", "decode self-test {}", if mok { "ok" } else { "FAIL" });
         let umok = crate::usb::mouse::self_test();

@@ -3,6 +3,7 @@
 //! docs/superpowers/plans/2026-06-04-wasmtime-nostd-spike.md
 
 pub mod platform;
+pub mod demand;
 pub mod state;
 pub mod mem;
 pub mod wasi;

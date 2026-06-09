@@ -79,6 +79,7 @@ pub fn control_in(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) 
     // Code 1 = Success, code 13 = Short Packet (also OK for IN)
     if code != 1 && code != 13 {
         crate::bwarn!("usb", "control_in xfer event code={}", code);
+        if code == 4 || code == 6 { recover_ep0_halt(x, dev); }
         return None;
     }
     // word2 bits 0..23 = residual transfer length
@@ -121,6 +122,7 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     let code = crate::usb::xhci::ring::completion_code(&ev);
     if code != 1 {
         crate::bwarn!("usb", "control_out code={}", code);
+        if code == 4 || code == 6 { recover_ep0_halt(x, dev); }
         return false;
     }
     true
@@ -163,8 +165,41 @@ pub fn control_out_data(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRe
     let code = crate::usb::xhci::ring::completion_code(&ev);
     if code != 1 {
         crate::bwarn!("usb", "control_out_data code={}", code);
+        if code == 4 || code == 6 { recover_ep0_halt(x, dev); }
         return false;
     }
+    true
+}
+
+/// Recover a halted EP0: xHCI Reset Endpoint (TRB 14) + ring re-init + Set TR
+/// Dequeue Pointer (TRB 16), targeting slot + DCI 1 (EP0). A control transfer
+/// that completes with code 4 (USB Transaction Error) or 6 (Stall) leaves EP0 in
+/// the Halted state; on the shared EP0 ring the next transfer then produces NO
+/// completion event (a hard timeout). Linux's USB core clears halts automatically;
+/// this is the equivalent. Returns true if the endpoint was reset and re-armed.
+pub fn recover_ep0_halt(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
+    use crate::usb::xhci::ring::{enqueue_cmd, wait_cmd, completion_code, init_link};
+    let slot = dev.slot_id as u32;
+    // Reset Endpoint command (TRB type 14): word3 = slot<<24 | DCI(1)<<16.
+    enqueue_cmd(x, [0, 0, 0, (slot << 24) | (1 << 16)], 14);
+    let rc = wait_cmd(x).map(|e| completion_code(&e)).unwrap_or(0);
+    // 1 = Success; 19 = Context State Error (EP wasn't actually halted) — tolerate.
+    if rc != 1 && rc != 19 {
+        crate::bwarn!("usb", "ep0 reset-endpoint rc={} slot={}", rc, dev.slot_id);
+    }
+    // Re-init the EP0 transfer ring + reset the software cursors.
+    init_link(dev.ep0_ring.virt, dev.ep0_ring.phys.as_u64(), true);
+    dev.ep0_enqueue = 0;
+    dev.ep0_cycle = true;
+    // Set TR Dequeue Pointer (TRB type 16): word0 = (deq & ~0xF) | DCS(1).
+    let deq = dev.ep0_ring.phys.as_u64();
+    enqueue_cmd(x, [((deq & 0xFFFF_FFF0) as u32) | 1, (deq >> 32) as u32, 0, (slot << 24) | (1 << 16)], 16);
+    let rc2 = wait_cmd(x).map(|e| completion_code(&e)).unwrap_or(0);
+    if rc2 != 1 {
+        crate::bwarn!("usb", "ep0 set-tr-dequeue rc={} slot={}", rc2, dev.slot_id);
+        return false;
+    }
+    crate::binfo!("usb", "ep0 halt recovered slot={}", dev.slot_id);
     true
 }
 

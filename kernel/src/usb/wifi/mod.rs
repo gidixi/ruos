@@ -37,8 +37,11 @@ const REQ_TYPE_READ: u8 = 0xC0;
 const REQ_TYPE_WRITE: u8 = 0x40;
 
 // ── Firmware-download registers/bits (RTL8188E, from rtl8xxxu reference) ──────
-const REG_SYS_FUNC_EN:    u16 = 0x0002; // FEN_CPUEN @ bit2 gates the 8051
-const FEN_CPUEN:          u8  = 0x04;
+const REG_SYS_FUNC_EN:    u16 = 0x0002; // SYS_FUNC: CPU enable @ BIT10, USBA @ BIT2
+const SYS_FUNC_CPU_EN:    u16 = 0x0400; // BIT10 = SYS_FUNC_CPU_ENABLE (8051 CPU clock).
+                                        // NOT 0x04 (BIT2 = SYS_FUNC_USBA = USB analog
+                                        // PHY enable): clearing BIT2 kills the USB link
+                                        // mid-transfer → code-4 + pipe wedge (old bug).
 const REG_MCUFWDL:        u16 = 0x0080; // +2 (0x0082) low 3 bits = page select
 const MCUFWDL_EN:         u8  = 0x01;
 const MCUFWDL_RAM_DL_SEL: u8  = 0x80;
@@ -179,9 +182,9 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     crate::binfo!("wifi", "fw {} bytes, body {} (sig {:#06x})", FW.len(), body.len(), sig);
 
     // Enter download mode (rtl8xxxu_download_firmware order):
-    // 1. Enable the 8051 CPU — 16-bit SYS_FUNC.
+    // 1. Enable the 8051 CPU — 16-bit SYS_FUNC, BIT10 (SYS_FUNC_CPU_ENABLE).
     if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
-        reg_write16(x, dev, REG_SYS_FUNC_EN, v | FEN_CPUEN as u16);
+        reg_write16(x, dev, REG_SYS_FUNC_EN, v | SYS_FUNC_CPU_EN);
     }
     // 2. If firmware already resident (RAM-select), clear it.
     if let Some(v) = reg_read8(x, dev, REG_MCUFWDL) {
@@ -253,15 +256,18 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
         let nv = (v | MCUFWDL_DL_RDY as u32) & !(WINTINI_RDY as u32);
         reg_write32(x, dev, REG_MCUFWDL, nv);
     }
-    // NOTE: the reference reset_8051 toggles FEN_CPUEN off→on on SYS_FUNC (0x02).
-    // On THIS dongle, verified on HW, the CPU-off write errors (off_ok=false) AND
-    // wedges the USB pipe (mid=None — reads die after) → the device drops and
-    // needs a physical replug. The 8051 evidently drives the USB function, so we
-    // must NOT disable it. We leave the CPU enabled (it was enabled at download
-    // start) and only poll briefly for init-ready. Fully booting the firmware
-    // (which likely re-enumerates the USB device) is the next subproject.
+    // reset_8051 (rtl8188eu_reset_8051): toggle SYS_FUNC_CPU_ENABLE (BIT10) off→on
+    // to restart the 8051 so it runs the loaded firmware. The earlier wedge was a
+    // bug — we cleared BIT2 (SYS_FUNC_USBA = the USB analog PHY), which dropped the
+    // USB link. BIT10 is the CPU clock and is safe to toggle; the USB PHY stays on.
+    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
+        let off_ok = reg_write16(x, dev, REG_SYS_FUNC_EN, v & !SYS_FUNC_CPU_EN);
+        let on_ok  = reg_write16(x, dev, REG_SYS_FUNC_EN, v | SYS_FUNC_CPU_EN);
+        crate::binfo!("wifi", "reset_8051 sysfunc={:#06x} off_ok={} on_ok={}", v, off_ok, on_ok);
+    }
+    // Poll WINT_INIT_READY (BIT6 of MCUFWDL) on the same pipe — bounded.
     let mut ready = false;
-    for _ in 0..20 {
+    for _ in 0..50 {
         if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
             if (v as u8) & WINTINI_RDY != 0 { ready = true; break; }
         }
@@ -269,7 +275,7 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     if ready {
         crate::binfo!("wifi", "fw ready");
     } else {
-        crate::binfo!("wifi", "fw downloaded+verified (csum={}); init-ready not signalled — 8051 run TBD", csum);
+        crate::bwarn!("wifi", "fw verified (csum={}) but WINT_INIT_READY not set", csum);
     }
     csum || ready
 }

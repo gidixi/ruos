@@ -113,6 +113,10 @@ pub struct WifiState {
     /// Lazy bring-up latch: false until the first `wifiscan` runs power-on +
     /// firmware + MAC/BB/RF init. Keeps enumeration fast (no chip bring-up at boot).
     pub radio_up: bool,
+    /// 802.11 transmit sequence number (12-bit), incremented per frame.
+    pub tx_seq: u16,
+    /// Our station MAC, read from REG_MACID at bring-up (SA for TX frames).
+    pub mac: [u8; 6],
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -673,8 +677,9 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
 /// RTL8188EU TX descriptor size (txdesc40) prepended to every outgoing 802.11
 /// frame on the bulk-OUT pipe. RX descriptor (rxdesc24) precedes each received
 /// frame on bulk-IN. From the rtl8xxxu reference.
-const TX_DESC_SIZE: usize = 40;
+const TX_DESC_SIZE: usize = 32; // rtl8xxxu_txdesc32 (8188eu); was wrongly 40
 const RX_DESC_SIZE: usize = 24;
+const REG_MACID: u16 = 0x0610;  // station MAC (6 bytes), loaded from EEPROM
 /// Management TX queue select (QSEL in txdw1 bits 8:12).
 const QSEL_MGMT: u32 = 0x12;
 
@@ -772,7 +777,7 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
         ring_in, enq_in: 0, cyc_in: true,
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
-        radio_up: false,
+        radio_up: false, tx_seq: 0, mac: [0; 6],
     })
 }
 
@@ -780,26 +785,39 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
 /// `frame_len` bytes. Sets packet size, header offset, first/last segment and
 /// the management queue. Other fields (rate, macid) left default. From the
 /// rtl8xxxu txdesc40 layout — UNVERIFIED on hardware.
-fn tx_desc_mgmt(frame_len: usize) -> [u8; TX_DESC_SIZE] {
+/// 16-bit XOR checksum over the first 32 bytes (csum field zeroed during compute).
+/// rtl8xxxu_calc_tx_desc_csum — a wrong/missing csum hangs TX.
+fn tx_desc_csum(d: &mut [u8; TX_DESC_SIZE]) {
+    d[28] = 0; d[29] = 0;
+    let mut c: u16 = 0;
+    for i in 0..16 { c ^= u16::from_le_bytes([d[2 * i], d[2 * i + 1]]); }
+    d[28..30].copy_from_slice(&c.to_le_bytes());
+}
+
+/// Build the 32-byte `rtl8xxxu_txdesc32` for a management frame: `frame_len`
+/// payload bytes, sequence `seq`, `bcast` = DA is broadcast/multicast.
+fn tx_desc_mgmt(frame_len: usize, seq: u16, bcast: bool) -> [u8; TX_DESC_SIZE] {
     let mut d = [0u8; TX_DESC_SIZE];
-    // txdw0: pkt_size[0:15] | offset[16:23]=TX_DESC_SIZE | FSG[25] | LSG[26].
-    let dw0 = (frame_len as u32 & 0xFFFF)
-        | ((TX_DESC_SIZE as u32) << 16)
-        | (1 << 25)
-        | (1 << 26);
-    d[0..4].copy_from_slice(&dw0.to_le_bytes());
-    // txdw1: QSEL[8:12] = management queue.
-    let dw1 = QSEL_MGMT << 8;
-    d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    d[0..2].copy_from_slice(&(frame_len as u16).to_le_bytes());       // pkt_size
+    d[2] = TX_DESC_SIZE as u8;                                        // pkt_offset = 32
+    d[3] = 0x80 | 0x08 | 0x04 | if bcast { 0x01 } else { 0 };         // OWN|FSG|LSG[|BMC]
+    d[4..8].copy_from_slice(&(QSEL_MGMT << 8).to_le_bytes());         // txdw1: QSEL<<8
+    d[8..12].copy_from_slice(&0x0301_0000u32.to_le_bytes());          // txdw2: ANT_A|ANT_B|AGG_BREAK
+    d[12..16].copy_from_slice(&(((seq as u32) & 0xFFF) << 16).to_le_bytes()); // txdw3: seq
+    d[16..20].copy_from_slice(&0x0000_0100u32.to_le_bytes());         // txdw4: USE_DRIVER_RATE
+    d[20..24].copy_from_slice(&0x001A_0000u32.to_le_bytes());         // txdw5: rate1M|retry6|RL_EN
+    d[30..32].copy_from_slice(&0x2000u16.to_le_bytes());              // txdw7: ANT_C
+    tx_desc_csum(&mut d);
     d
 }
 
-/// Send one 802.11 frame on the bulk-OUT pipe (TX descriptor prepended). Returns
-/// false on a non-success completion or oversize frame.
-pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8]) -> bool {
+/// Send one 802.11 frame on the bulk-OUT pipe (txdesc32 prepended). `seq` must
+/// match the frame's header sequence; `bcast` for a broadcast/multicast DA.
+/// Returns the bulk completion code (1 = Success).
+pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool) -> u8 {
     let total = TX_DESC_SIZE + frame.len();
-    if total > 4096 { return false; }
-    let desc = tx_desc_mgmt(frame.len());
+    if total > 4096 { return 0; }
+    let desc = tx_desc_mgmt(frame.len(), seq, bcast);
     unsafe {
         let p = st.data.virt.as_ptr::<u8>() as *mut u8;
         core::ptr::copy_nonoverlapping(desc.as_ptr(), p, TX_DESC_SIZE);
@@ -809,9 +827,16 @@ pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8]) -> bool {
         x, st.slot_id, st.dci_out, &st.ring_out, &mut st.enq_out, &mut st.cyc_out,
         st.data.phys.as_u64(), total as u32,
     ) {
-        Some((1, _)) => true,
-        _ => false,
+        Some((code, _)) => code,
+        None => 0,
     }
+}
+
+/// Next 802.11 sequence number (12-bit, wrapping).
+fn next_seq(st: &mut WifiState) -> u16 {
+    let s = st.tx_seq & 0x0FFF;
+    st.tx_seq = (st.tx_seq.wrapping_add(1)) & 0x0FFF;
+    s
 }
 
 /// Receive one frame on the bulk-IN pipe and copy the 802.11 payload (after the
@@ -871,9 +896,18 @@ pub fn scan(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState) -> alloc::vec
     use alloc::vec::Vec;
     let mut results: Vec<ieee80211::ScanResult> = Vec::new();
     let mut buf = [0u8; 2048];
+    let mut logged_tx = false;
     for &ch in &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
         config_channel(x, dev, ch);
         crate::boot::clock::mdelay(15); // let the synthesizer settle
+        // Active scan: broadcast a probe-request (SP-WIFI-1 — proves TX works).
+        let seq = next_seq(st);
+        let probe = ieee80211::build_probe_request(st.mac, [0xFF; 6], &[], seq);
+        let code = send_frame(x, st, &probe, seq, true);
+        if !logged_tx {
+            crate::binfo!("wifi", "tx probe code={} (1=ok)", code);
+            logged_tx = true;
+        }
         for _ in 0..12 {
             match recv_frame(x, st, &mut buf, 40) {
                 Some(n) => {
@@ -911,6 +945,10 @@ pub fn run_scan(out: &mut [u8]) -> usize {
         crate::binfo!("wifi", "wifiscan: bring-up (power-on + firmware + radio)");
         bring_up(x, &mut dev);
         bring_up_radio(x, &mut dev);
+        for i in 0..6u16 {
+            st.mac[i as usize] = reg_read8(x, &mut dev, REG_MACID + i).unwrap_or(0);
+        }
+        crate::binfo!("wifi", "mac={:02x?}", st.mac);
         st.radio_up = true;
     }
     let results = scan(x, &mut dev, &mut st);

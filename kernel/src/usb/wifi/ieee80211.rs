@@ -58,14 +58,15 @@ const CAP_PRIVACY: u16 = 1 << 4;
 /// Build a probe-request management frame for `ssid` (empty slice = wildcard,
 /// i.e. broadcast probe). Layout: 24-byte MAC header + SSID IE + supported-rates
 /// IE. `sa` is our station MAC. The chip TX descriptor is prepended elsewhere.
-pub fn build_probe_request(sa: [u8; 6], ssid: &[u8]) -> Vec<u8> {
+pub fn build_probe_request(sa: [u8; 6], da: [u8; 6], ssid: &[u8], seq: u16) -> Vec<u8> {
     let mut f = Vec::with_capacity(28 + ssid.len());
     // Frame Control (2) + Duration (2).
     f.extend_from_slice(&[FC_PROBE_REQ, 0x00, 0x00, 0x00]);
-    f.extend_from_slice(&[0xff; 6]); // Addr1 = DA = broadcast
-    f.extend_from_slice(&sa);        // Addr2 = SA
-    f.extend_from_slice(&[0xff; 6]); // Addr3 = BSSID = broadcast
-    f.extend_from_slice(&[0x00, 0x00]); // Sequence control
+    f.extend_from_slice(&da);        // Addr1 = DA (broadcast, or a specific BSSID)
+    f.extend_from_slice(&sa);        // Addr2 = SA (our MAC)
+    f.extend_from_slice(&da);        // Addr3 = BSSID = DA
+    // Sequence control: fragment(0) | sequence-number << 4.
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
     // SSID IE.
     f.push(IE_SSID);
     f.push(ssid.len() as u8);

@@ -1,4 +1,4 @@
-# 360 — WiFi RTL8188EU SP1: bind + register transport
+# 381 — WiFi RTL8188EU SP1: bind + register transport
 
 **Data:** 2026-06-08
 

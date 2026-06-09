@@ -1,4 +1,4 @@
-# 364 — WiFi RTL8188EU SP3b: bulk endpoint config + frame I/O
+# 385 — WiFi RTL8188EU SP3b: bulk endpoint config + frame I/O
 
 **Data:** 2026-06-08
 

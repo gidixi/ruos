@@ -1,4 +1,4 @@
-# 362 — WiFi RTL8188EU SP2b: power-on sequence + bring-up wired
+# 383 — WiFi RTL8188EU SP2b: power-on sequence + bring-up wired
 
 **Data:** 2026-06-08
 

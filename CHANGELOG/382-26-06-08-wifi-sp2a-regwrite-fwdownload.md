@@ -1,4 +1,4 @@
-# 361 — WiFi RTL8188EU SP2a: reg-write transport + firmware download
+# 382 — WiFi RTL8188EU SP2a: reg-write transport + firmware download
 
 **Data:** 2026-06-08
 

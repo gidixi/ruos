@@ -25,6 +25,24 @@ pub fn bulk_xfer(
     buf_phys: u64,
     len: u32,
 ) -> Option<(u8, u32)> {
+    bulk_xfer_timeout(x, slot, dci, ring, enq, cyc, buf_phys, len, BULK_TIMEOUT_MS)
+}
+
+/// Like `bulk_xfer` but with a caller-chosen timeout. Used by the WiFi scan,
+/// which polls bulk-IN with a SHORT timeout so an idle channel (no queued frame)
+/// doesn't stall for the full 2 s per read.
+#[allow(clippy::too_many_arguments)]
+pub fn bulk_xfer_timeout(
+    x: &mut Xhci,
+    slot: u8,
+    dci: u8,
+    ring: &DmaRegion,
+    enq: &mut usize,
+    cyc: &mut bool,
+    buf_phys: u64,
+    len: u32,
+    timeout_ms: u64,
+) -> Option<(u8, u32)> {
     super::ring::enqueue_xfer(ring, enq, cyc, [
         (buf_phys & 0xFFFF_FFFF) as u32,
         (buf_phys >> 32) as u32,
@@ -34,7 +52,7 @@ pub fn bulk_xfer(
     x.regs.doorbell.update_volatile_at(slot as usize, |d| {
         d.set_doorbell_target(dci);
     });
-    let ev = super::event::wait_for(x, BULK_TIMEOUT_MS, |w| {
+    let ev = super::event::wait_for(x, timeout_ms, |w| {
         super::ring::trb_type(w) == 32
             && ((w[3] >> 24) & 0xFF) as u8 == slot
             && ((w[3] >> 16) & 0x1F) as u8 == dci

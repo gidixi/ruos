@@ -392,6 +392,16 @@ const OFDM_RF_PATH_TX_A: u32 = 1 << 4;
 // RCR = ACCEPT_PHYS_MATCH|MCAST|BCAST|MGMT_FRAME|HTC_LOC_CTRL|PHYSTAT|ICV|MIC.
 const RCR_VAL: u32 = 0x7000_600E;
 
+// ── SP3c-6: channel set (config_channel, 20 MHz) ─────────────────────────────
+const REG_BW_OPMODE:    u16 = 0x0603;
+const REG_FPGA1_RF_MODE: u16 = 0x0900;
+const BW_OPMODE_20MHZ:  u8  = 1 << 2;
+const FPGA_RF_MODE_BW:  u32 = 1 << 0; // FPGA_RF_MODE bandwidth bit
+const RF6052_REG_MODE_AG: u8 = 0x18;  // RF channel + BW switch (the rf[0x18] reg)
+const MODE_AG_CHANNEL_MASK: u32 = 0x3FF;
+const MODE_AG_BW_MASK:      u32 = (1 << 10) | (1 << 11);
+const MODE_AG_BW_20MHZ:     u32 = (1 << 10) | (1 << 11);
+
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
 #[allow(dead_code)]
@@ -760,13 +770,17 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
     }
     crate::binfo!("wifi", "config_ep ok slot={} in_dci={} out_dci={}", dev.slot_id, dci_in, dci_out);
 
-    Some(WifiState {
+    let mut st = WifiState {
         ctrl: x.idx, slot_id: dev.slot_id, iface: wi.iface,
         dci_in, dci_out,
         ring_in, enq_in: 0, cyc_in: true,
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
-    })
+    };
+    // SP3c-6: passive scan now that the rings exist + the radio is up. TEMP at
+    // enumeration; moves behind a lazy `wifiscan` shell command in SP3c-7.
+    scan(x, dev, &mut st);
+    Some(st)
 }
 
 /// Build the 40-byte RTL TX descriptor for an 802.11 management frame of
@@ -809,21 +823,22 @@ pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8]) -> bool {
 
 /// Receive one frame on the bulk-IN pipe and copy the 802.11 payload (after the
 /// RX descriptor + driver-info) into `out`. Returns the payload length, or None.
-pub fn recv_frame(x: &mut Xhci, st: &mut WifiState, out: &mut [u8]) -> Option<usize> {
-    let (code, residual) = crate::usb::xhci::bulk::bulk_xfer(
+pub fn recv_frame(x: &mut Xhci, st: &mut WifiState, out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    let (code, residual) = crate::usb::xhci::bulk::bulk_xfer_timeout(
         x, st.slot_id, st.dci_in, &st.ring_in, &mut st.enq_in, &mut st.cyc_in,
-        st.data.phys.as_u64(), 4096,
+        st.data.phys.as_u64(), 4096, timeout_ms,
     )?;
     if code != 1 && code != 13 { return None; }
     let got = (4096u32.saturating_sub(residual)) as usize;
     if got < RX_DESC_SIZE { return None; }
     let rd = |o: usize| unsafe { read_volatile(st.data.virt.as_ptr::<u8>().add(o)) };
-    // rxdesc24 dw0: pkt length [0:13]; dw0 bits 24:28 = driver-info size (8-byte
-    // units) — payload starts at RX_DESC_SIZE + drvinfo*8.
+    // rxdesc16 dw0: pkt_len [0:13]; drvinfo_sz [16:19] (8-byte units); shift [24:25].
+    // Frame starts after the 24-byte descriptor + drvinfo + shift.
     let dw0 = (rd(0) as u32) | ((rd(1) as u32) << 8) | ((rd(2) as u32) << 16) | ((rd(3) as u32) << 24);
     let pkt_len = (dw0 & 0x3FFF) as usize;
-    let drvinfo = ((dw0 >> 24) & 0x0F) as usize * 8;
-    let start = RX_DESC_SIZE + drvinfo;
+    let drvinfo = ((dw0 >> 16) & 0x0F) as usize * 8;
+    let shift = ((dw0 >> 24) & 0x03) as usize;
+    let start = RX_DESC_SIZE + drvinfo + shift;
     let end = (start + pkt_len).min(got);
     if end <= start { return None; }
     let n = (end - start).min(out.len());
@@ -837,24 +852,50 @@ pub fn recv_frame(x: &mut Xhci, st: &mut WifiState, out: &mut [u8]) -> Option<us
 /// for beacons/probe-responses and collect APs. Channel hopping needs RF/PHY
 /// init + channel-set (SP3c/SP4) which are NOT yet implemented, so this only
 /// sees APs on whatever channel the chip powers up on. UNVERIFIED on hardware.
-pub fn scan(x: &mut Xhci, st: &mut WifiState, sa: [u8; 6]) -> alloc::vec::Vec<ieee80211::ScanResult> {
+/// Tune the radio to a 2.4 GHz channel (config_channel, 20 MHz): BW_OPMODE +
+/// FPGA RF-mode bandwidth bits + RF6052 MODE_AG (0x18) channel + BW fields.
+fn config_channel(x: &mut Xhci, dev: &mut UsbDevice, channel: u8) {
+    if let Some(v) = reg_read8(x, dev, REG_BW_OPMODE) {
+        reg_write8(x, dev, REG_BW_OPMODE, v | BW_OPMODE_20MHZ);
+    }
+    if let Some(v) = reg_read32(x, dev, REG_FPGA0_RF_MODE) {
+        reg_write32(x, dev, REG_FPGA0_RF_MODE, v & !FPGA_RF_MODE_BW);
+    }
+    if let Some(v) = reg_read32(x, dev, REG_FPGA1_RF_MODE) {
+        reg_write32(x, dev, REG_FPGA1_RF_MODE, v & !FPGA_RF_MODE_BW);
+    }
+    let v = read_rfreg(x, dev, RF6052_REG_MODE_AG);
+    write_rfreg(x, dev, RF6052_REG_MODE_AG, (v & !MODE_AG_CHANNEL_MASK) | (channel as u32 & MODE_AG_CHANNEL_MASK));
+    let v = read_rfreg(x, dev, RF6052_REG_MODE_AG);
+    write_rfreg(x, dev, RF6052_REG_MODE_AG, (v & !MODE_AG_BW_MASK) | MODE_AG_BW_20MHZ);
+}
+
+/// SP3c-6: passive scan. Hop the 2.4 GHz channels, poll bulk-IN for beacons /
+/// probe-responses (short timeout so idle channels don't stall), parse + collect
+/// unique APs. Logs each discovered SSID. Needs the radio brought up (SP3c-3/4)
+/// and the bulk rings (configure_endpoints).
+pub fn scan(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState) -> alloc::vec::Vec<ieee80211::ScanResult> {
     use alloc::vec::Vec;
     let mut results: Vec<ieee80211::ScanResult> = Vec::new();
-    let probe = ieee80211::build_probe_request(sa, &[]);
-    if !send_frame(x, st, &probe) {
-        crate::bwarn!("wifi", "scan: probe-request TX failed");
-    }
     let mut buf = [0u8; 2048];
-    for _ in 0..32 {
-        if let Some(n) = recv_frame(x, st, &mut buf) {
-            if let Some(ap) = ieee80211::parse_beacon(&buf[..n]) {
-                if !results.iter().any(|r| r.bssid == ap.bssid) {
-                    crate::binfo!("wifi", "scan: ssid='{}' ch={} sec={}",
-                        ap.ssid, ap.channel, ap.security.as_str());
-                    results.push(ap);
+    for &ch in &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
+        config_channel(x, dev, ch);
+        crate::boot::clock::mdelay(15); // let the synthesizer settle
+        for _ in 0..12 {
+            match recv_frame(x, st, &mut buf, 40) {
+                Some(n) => {
+                    if let Some(ap) = ieee80211::parse_beacon(&buf[..n]) {
+                        if !ap.ssid.is_empty() && !results.iter().any(|r| r.bssid == ap.bssid) {
+                            crate::binfo!("wifi", "scan: ssid='{}' ch={} sec={}",
+                                ap.ssid, ap.channel, ap.security.as_str());
+                            results.push(ap);
+                        }
+                    }
                 }
+                None => break, // nothing queued this dwell — next channel
             }
         }
     }
+    crate::binfo!("wifi", "scan done: {} AP(s)", results.len());
     results
 }

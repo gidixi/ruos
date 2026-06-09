@@ -1191,6 +1191,7 @@ impl Compositor {
             self.wins[i].maximized = true;
         }
         self.wins[i].sized = true;
+        self.wins[i].last_active_frame = self.frame_no; // sveglia per ridisegnare alla nuova size
         self.dirty = true;
     }
 
@@ -1201,6 +1202,7 @@ impl Compositor {
             self.wins[i].minimized = false;
             let top = self.raise(i);
             self.set_focus(top);
+            self.wins[top].last_active_frame = self.frame_no; // sveglia dopo un-minimize/raise
             self.dirty = true;
         }
     }
@@ -1420,13 +1422,18 @@ impl Compositor {
                 continue; // dormiente: niente frame(); la surface in cache resta valida
             }
             w.awake = true;
-            w.framed_once = true;
             w.last_active_frame = fno;
             if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
                 match frame.call(&mut w.store, ()) {
                     Ok(()) => {}
                     Err(_) => { w.store.data_mut().win.close_requested = true; }
                 }
+            }
+            // Considera la finestra "avviata" solo quando ha prodotto una surface:
+            // un'app egui può richiedere più frame per il primo commit; finché non
+            // disegna resta sveglia (framed_once=false ⇒ gira ogni frame).
+            if w.store.data().win.committed {
+                w.framed_once = true;
             }
             // CSD: the window IS its committed surface, so the hit-rect size must
             // track the committed `win_w × win_h` (apps pick their own size — the

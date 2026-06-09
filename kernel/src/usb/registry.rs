@@ -32,6 +32,7 @@ pub enum SlotKind {
     Keyboard(crate::usb::hid::HidState),
     Mouse(crate::usb::hid::HidState),
     Msc(crate::usb::msc::MscState),
+    Wifi(crate::usb::wifi::WifiState),
     Other,
 }
 
@@ -144,6 +145,7 @@ fn kind_name(k: &SlotKind) -> &'static str {
         SlotKind::Keyboard(_) => "Keyboard",
         SlotKind::Mouse(_) => "Mouse",
         SlotKind::Msc(_) => "Msc",
+        SlotKind::Wifi(_) => "Wifi",
         SlotKind::Other => "Other",
     }
 }
@@ -241,6 +243,7 @@ pub fn teardown(x: &mut crate::usb::xhci::Xhci, slot: u8) {
             SlotKind::Msc(m) => {
                 dma::dealloc(m.ring_in); dma::dealloc(m.ring_out); dma::dealloc(m.data);
             }
+            SlotKind::Wifi(w) => { dma::dealloc(w.ring_in); dma::dealloc(w.ring_out); dma::dealloc(w.data); }
             SlotKind::Other => {}
         }
         crate::binfo!("usb", "teardown ctrl={} slot={}", ctrl, slot);

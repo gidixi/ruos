@@ -9,6 +9,7 @@ pub mod mouse;
 pub mod hub;
 pub mod registry;
 pub mod usage;
+pub mod wifi;
 pub mod xhci;
 
 use crate::sync::IrqMutex;

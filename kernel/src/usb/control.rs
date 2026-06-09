@@ -126,6 +126,48 @@ pub fn control_out(x: &mut Xhci, dev: &mut UsbDevice, s: Setup) -> bool {
     true
 }
 
+/// Control-OUT transfer WITH a Data(OUT) stage: Setup(TRT=2,OUT) + Data(OUT) +
+/// Status(IN, IOC). Sends `s.length` bytes from `buf` host→device. Used for
+/// vendor register writes (e.g. the rtl8xxxu register-write request). Returns
+/// true on a Success completion.
+pub fn control_out_data(x: &mut Xhci, dev: &mut UsbDevice, s: Setup, buf: &DmaRegion) -> bool {
+    let w0 = (s.req_type as u32) | ((s.request as u32) << 8) | ((s.value as u32) << 16);
+    let w1 = (s.index as u32) | ((s.length as u32) << 16);
+    // Setup: IDT(6) | type 2 | TRT(16..17)=2 (OUT Data Stage).
+    let setup = [w0, w1, 8u32, (1 << 6) | (2 << 10) | (2 << 16)];
+    // Data Stage TRB (type 3, DIR=OUT=0).
+    let dphys = buf.phys.as_u64();
+    let data = [
+        (dphys & 0xFFFF_FFFF) as u32,
+        (dphys >> 32) as u32,
+        s.length as u32,
+        3 << 10,
+    ];
+    // Status Stage for a control-OUT-with-data is IN (DIR=1), with IOC.
+    let status = [0u32, 0u32, 0u32, (1 << 5) | (4 << 10) | (1 << 16)];
+    crate::usb::xhci::ring::enqueue_xfer(&dev.ep0_ring, &mut dev.ep0_enqueue, &mut dev.ep0_cycle, setup);
+    crate::usb::xhci::ring::enqueue_xfer(&dev.ep0_ring, &mut dev.ep0_enqueue, &mut dev.ep0_cycle, data);
+    crate::usb::xhci::ring::enqueue_xfer(&dev.ep0_ring, &mut dev.ep0_enqueue, &mut dev.ep0_cycle, status);
+    x.regs.doorbell.update_volatile_at(dev.slot_id as usize, |d| {
+        d.set_doorbell_target(1);
+    });
+    let sid = dev.slot_id;
+    let ev = match crate::usb::xhci::event::wait_for(x, 100, |w| {
+        crate::usb::xhci::ring::trb_type(w) == 32
+            && ((w[3] >> 24) & 0xFF) as u8 == sid
+            && ((w[3] >> 16) & 0x1F) as u8 == 1
+    }) {
+        Some(e) => e,
+        None => { crate::bwarn!("usb", "control_out_data timeout"); return false; }
+    };
+    let code = crate::usb::xhci::ring::completion_code(&ev);
+    if code != 1 {
+        crate::bwarn!("usb", "control_out_data code={}", code);
+        return false;
+    }
+    true
+}
+
 // ── Hub class requests (USB 2.0 §11.24) ─────────────────────────────────────
 // These operate on the hub's own EP0 (`dev` = the hub's UsbDevice). The class
 // constants live here so the hub driver builds Setup packets symbolically.

@@ -392,6 +392,13 @@ pub fn enumerate(x: &mut Xhci, loc: Location) -> Option<u8> {
             Some(st) => crate::usb::registry::SlotKind::Msc(st),
             None => crate::usb::registry::SlotKind::Other,
         }
+    } else if let Some(wi) = crate::usb::wifi::configure_wifi(x, &mut dev) {
+        // Realtek RTL8188EU USB-WiFi (vendor class). configure_wifi binds + does
+        // SP2 bring-up; configure_endpoints sets up the bulk pipes (SP3b).
+        match crate::usb::wifi::configure_endpoints(x, &mut dev, &wi) {
+            Some(st) => crate::usb::registry::SlotKind::Wifi(st),
+            None => crate::usb::registry::SlotKind::Other,
+        }
     } else {
         crate::usb::registry::SlotKind::Other
     };

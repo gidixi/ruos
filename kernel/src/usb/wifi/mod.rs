@@ -42,8 +42,12 @@ const FEN_CPUEN:          u8  = 0x04;
 const REG_MCUFWDL:        u16 = 0x0080; // +2 (0x0082) low 3 bits = page select
 const MCUFWDL_EN:         u8  = 0x01;
 const MCUFWDL_RAM_DL_SEL: u8  = 0x80;
-const WINTINI_RDY:        u8  = 0x40;   // fw init done, in REG_MCUFWDL
+const WINTINI_RDY:        u8  = 0x40;   // fw init done (WINT_INIT_READY), MCUFWDL
+const MCUFWDL_CSUM_RPT:   u8  = 0x04;   // checksum report / download done
+const MCUFWDL_DL_RDY:     u8  = 0x02;   // MCU_FW_DL_READY
+const MCUFWDL_RST_8051:   u32 = 1 << 19; // 8051 reset bit in the 32-bit MCUFWDL
 const REG_FW_START_ADDR:  u16 = 0x1000; // page FIFO; page selected via MCUFWDL+2
+const REG_RSV_CTRL:       u16 = 0x001C; // write-protect lock for SYS_FUNC_EN etc.
 const FW_HDR_SIZE:        usize = 32;   // 8188e fw header (sig 0x88e1) skipped
 const FW_SIG:             u16 = 0x88E1;
 const FW_PAGE:            usize = 4096;
@@ -140,6 +144,7 @@ fn reg_write(x: &mut Xhci, dev: &mut UsbDevice, addr: u16, val: u32, len: u16) -
     let s = Setup { req_type: REQ_TYPE_WRITE, request: VENDOR_REQ, value: addr, index: 0, length: len };
     let ok = control_out_data(x, dev, s, &buf);
     crate::memory::dma::dealloc(buf);
+    if !ok { crate::bwarn!("wifi", "reg_write FAIL addr=0x{:04x} len={}", addr, len); }
     ok
 }
 
@@ -173,41 +178,88 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     let body = if sig == FW_SIG { &FW[FW_HDR_SIZE..] } else { &FW[..] };
     crate::binfo!("wifi", "fw {} bytes, body {} (sig {:#06x})", FW.len(), body.len(), sig);
 
-    // Enable the 8051 + the firmware-download path; clear RAM download-select.
-    reg_set8(x, dev, REG_SYS_FUNC_EN, FEN_CPUEN, true);
-    reg_set8(x, dev, REG_MCUFWDL, MCUFWDL_EN, true);
-    reg_set8(x, dev, REG_MCUFWDL, MCUFWDL_RAM_DL_SEL, false);
+    // Enter download mode (rtl8xxxu_download_firmware order):
+    // 1. Enable the 8051 CPU — 16-bit SYS_FUNC.
+    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
+        reg_write16(x, dev, REG_SYS_FUNC_EN, v | FEN_CPUEN as u16);
+    }
+    // 2. If firmware already resident (RAM-select), clear it.
+    if let Some(v) = reg_read8(x, dev, REG_MCUFWDL) {
+        if v & MCUFWDL_RAM_DL_SEL != 0 { reg_write8(x, dev, REG_MCUFWDL, 0); }
+    }
+    // 3. Enable MCU firmware download.
+    if let Some(v) = reg_read8(x, dev, REG_MCUFWDL) { reg_write8(x, dev, REG_MCUFWDL, v | MCUFWDL_EN); }
+    // 4. Hold the 8051 in reset for the download — clear BIT19 of the 32-bit MCUFWDL.
+    if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) { reg_write32(x, dev, REG_MCUFWDL, v & !MCUFWDL_RST_8051); }
+    // 5. Arm the checksum report.
+    if let Some(v) = reg_read8(x, dev, REG_MCUFWDL) { reg_write8(x, dev, REG_MCUFWDL, v | MCUFWDL_CSUM_RPT); }
+    crate::binfo!("wifi", "fw dl: MCUFWDL=0x{:02x}", reg_read8(x, dev, REG_MCUFWDL).unwrap_or(0xFF));
 
-    // One DMA page reused for each 4 KiB firmware page; written to the page FIFO
-    // at REG_FW_START_ADDR after selecting the page in MCUFWDL+2[2:0].
+    // Upload page-by-page (4 KiB, page selected in MCUFWDL+2[2:0]). Within a page
+    // the firmware is written in small blocks to REG_FW_START_ADDR + offset: a
+    // single 4 KiB control-OUT fails with a USB Transaction Error (EP0 mps=64),
+    // verified on hardware — so cap each control transfer at FW_BLOCK bytes.
+    const FW_BLOCK: usize = 64;
     let buf = match crate::memory::dma::alloc(1) { Some(b) => b, None => return false };
     let pages = body.len().div_ceil(FW_PAGE);
     let mut ok = true;
-    for p in 0..pages {
-        reg_set8(x, dev, REG_MCUFWDL + 2, 0x07, false); // clear page bits
+    'pages: for p in 0..pages {
         if let Some(v) = reg_read8(x, dev, REG_MCUFWDL + 2) {
             reg_write8(x, dev, REG_MCUFWDL + 2, (v & 0xF8) | (p as u8 & 0x07));
         }
-        let off = p * FW_PAGE;
-        let end = (off + FW_PAGE).min(body.len());
-        let n = end - off;
-        unsafe {
-            let dst = buf.virt.as_ptr::<u8>() as *mut u8;
-            for i in 0..n { core::ptr::write_volatile(dst.add(i), body[off + i]); }
+        let page_off = p * FW_PAGE;
+        let page_len = FW_PAGE.min(body.len() - page_off);
+        let mut o = 0;
+        while o < page_len {
+            let csz = (page_len - o).min(FW_BLOCK);
+            unsafe {
+                let dst = buf.virt.as_ptr::<u8>() as *mut u8;
+                for i in 0..csz { core::ptr::write_volatile(dst.add(i), body[page_off + o + i]); }
+            }
+            let s = Setup {
+                req_type: REQ_TYPE_WRITE, request: VENDOR_REQ,
+                value: REG_FW_START_ADDR + o as u16, index: 0, length: csz as u16,
+            };
+            if !control_out_data(x, dev, s, &buf) {
+                crate::bwarn!("wifi", "fw page {} off {} write failed", p, o);
+                ok = false;
+                break 'pages;
+            }
+            o += csz;
         }
-        let s = Setup { req_type: REQ_TYPE_WRITE, request: VENDOR_REQ, value: REG_FW_START_ADDR, index: 0, length: n as u16 };
-        if !control_out_data(x, dev, s, &buf) { crate::bwarn!("wifi", "fw page {} write failed", p); ok = false; break; }
     }
     crate::memory::dma::dealloc(buf);
     if !ok { return false; }
 
-    // Leave download mode, restart the 8051, poll for firmware-init-ready.
-    reg_set8(x, dev, REG_MCUFWDL, MCUFWDL_EN, false);
-    reg_set8(x, dev, REG_SYS_FUNC_EN, FEN_CPUEN, false);
-    reg_set8(x, dev, REG_SYS_FUNC_EN, FEN_CPUEN, true);
-    for _ in 0..100 {
-        if let Some(v) = reg_read8(x, dev, REG_MCUFWDL) {
-            if v & WINTINI_RDY != 0 { crate::binfo!("wifi", "fw ready"); return true; }
+    // 8. Leave download mode — 16-bit clear of MCU_FW_DL_ENABLE.
+    if let Some(v) = reg_read16(x, dev, REG_MCUFWDL) {
+        reg_write16(x, dev, REG_MCUFWDL, v & !(MCUFWDL_EN as u16));
+    }
+
+    // start_firmware (rtl8xxxu): wait checksum, mark ready, reset 8051, wait init.
+    // 1. Poll the checksum-report bit (download complete).
+    let mut csum = false;
+    for _ in 0..1000 {
+        if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
+            if (v as u8) & MCUFWDL_CSUM_RPT != 0 { csum = true; break; }
+        }
+    }
+    if !csum { crate::bwarn!("wifi", "fw checksum-report timeout"); }
+    // 2. Set MCU_FW_DL_READY, clear WINT_INIT_READY (32-bit RMW on MCUFWDL).
+    if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
+        let nv = (v | MCUFWDL_DL_RDY as u32) & !(WINTINI_RDY as u32);
+        reg_write32(x, dev, REG_MCUFWDL, nv);
+    }
+    // 3. reset_8051: unlock RSV_CTRL, then 16-bit toggle of the 8051 enable.
+    reg_write8(x, dev, REG_RSV_CTRL, 0x00);
+    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
+        reg_write16(x, dev, REG_SYS_FUNC_EN, v & !(FEN_CPUEN as u16));
+        reg_write16(x, dev, REG_SYS_FUNC_EN, v | (FEN_CPUEN as u16));
+    }
+    // 4. Wait for firmware init-ready (WINT_INIT_READY) in the 32-bit MCUFWDL.
+    for _ in 0..1000 {
+        if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
+            if (v as u8) & WINTINI_RDY != 0 { crate::binfo!("wifi", "fw ready"); return true; }
         }
     }
     crate::bwarn!("wifi", "fw ready timeout (verify on HW)");

@@ -315,6 +315,58 @@ fn pci_class_name(class: u8, sub: u8, prog_if: u8) -> &'static str {
     }
 }
 
+/// ruos_usb_list(buf_ptr, buf_len, used_ptr) -> errno. Mirrors `ruos_pci_list`:
+/// writes one enumerated USB device per line to the caller buffer:
+///   "Bus BB Dev SS  Port P  Tier T  ID vvvv:pppp  <speed>  <kind>\n"
+/// `Bus` = xHCI controller index, `Dev` = per-controller slot id. Returns 0 OK
+/// with the byte count at `used_ptr`; on buffer too small returns 8 (ENOBUFS)
+/// and still sets `used_ptr` to the required size.
+pub fn ruos_usb_list(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_len: i32,
+    used_ptr: i32,
+) -> Result<i32, Error> {
+    let mut text = String::new();
+    for d in crate::usb::registry::usb_list() {
+        let _ = writeln!(
+            text,
+            "Bus {:02} Dev {:02}  Port {}  Tier {}  ID {:04x}:{:04x}  {:<5}  {}",
+            d.ctrl,
+            d.slot,
+            d.root_port,
+            d.tier,
+            d.vid,
+            d.pid,
+            usb_speed_name(d.speed),
+            d.kind,
+        );
+    }
+    let bytes = text.as_bytes();
+    let need = bytes.len() as u32;
+    if let Err(e) = crate::wasm::host::mem::guest_write_u32(&mut caller, used_ptr, need) {
+        return Ok(e);
+    }
+    if (buf_len as usize) < bytes.len() {
+        return Ok(8); // ENOBUFS
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, bytes) {
+        return Ok(e);
+    }
+    Ok(0)
+}
+
+/// xHCI PSI / hub-status speed code → human name (1=Full, 2=Low, 3=High, 4=Super).
+fn usb_speed_name(speed: u8) -> &'static str {
+    match speed {
+        1 => "Full",
+        2 => "Low",
+        3 => "High",
+        4 => "Super",
+        _ => "?",
+    }
+}
+
 /// ruos_sata_list(buf_ptr, buf_cap) -> i32.
 /// Writes pre-formatted text (one SATA disk per line) into the caller buffer:
 ///   "<idx>\t<model>\t<N> MiB\n"
@@ -818,6 +870,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
+        .func_wrap("ruos", "usb_list", ruos_usb_list)?
         .func_wrap("ruos", "sata_list", ruos_sata_list)?
         .func_wrap("ruos", "net_iface", ruos_net_iface)?
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?

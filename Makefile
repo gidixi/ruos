@@ -21,7 +21,7 @@ BIN_TOOLS  := shell ls cat echo \
               head tail grep find diff du \
               whoami id uname uptime free df lscpu dmesg \
               ps kill pkill \
-              lspci ip \
+              lspci lsusb ip \
               nano \
               touch wc clear which \
               sort uniq cut tr tee \
@@ -254,7 +254,7 @@ iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cw
 NIC ?= virtio-net-pci
 
 run: iso $(DISK_IMG)
-	qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -m 512 \
+	qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -m 1024 \
 		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
@@ -262,7 +262,7 @@ run: iso $(DISK_IMG)
 run-test: $(DISK_IMG)
 	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
 	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
-	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
 		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
@@ -293,7 +293,7 @@ run-test: $(DISK_IMG)
 run-test-usb:
 	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
 	@echo "--- usb-msc serial (timeout 240s) ---"
-	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -m 512 -no-reboot -display none -serial stdio \
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -m 1024 -no-reboot -display none -serial stdio \
 		-drive if=none,id=stick,file=$(ISO),format=raw \
 		-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
 		-device usb-kbd,bus=xhci.0 \
@@ -379,7 +379,7 @@ run-ssh-gui-test: ssh-key-on-disk
 run-exec-ap-test:
 	@$(MAKE) iso INIT_SCRIPT=user-bin/exec-ap-init.sh
 	@echo "--- exec-on-AP (-smp 4) ---"
-	@timeout 90 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -m 512 -no-reboot -display none -serial stdio \
+	@timeout 90 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -m 1024 -no-reboot -display none -serial stdio \
 	  -device qemu-xhci -cdrom $(ISO) 2>&1 | tee build/exec-ap.log; \
 	grep -qE "exec-ap ran_on=core[1-9]" build/exec-ap.log || { echo TEST_FAIL_EXEC_AP_CORE; exit 1; }; \
 	grep -qF "EXEC_AP_OK" build/exec-ap.log || { echo TEST_FAIL_EXEC_AP_OUTPUT; exit 1; }; \
@@ -479,7 +479,7 @@ run-passwd-diskless-test: iso
 .PHONY: run-console-test
 run-console-test: iso
 	@$(MAKE) iso INIT_SCRIPT=user-bin/console-test-init.sh CARGO_FEATURES=boot-checks > build/console-iso.log 2>&1 || { echo TEST_FAIL_ISO; tail -20 build/console-iso.log; exit 1; }
-	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 512 \
+	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
 test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm
@@ -519,7 +519,7 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 		$(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 	@echo "--- test-boot (boot-checks feature) ---"
-	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -m 512 -no-reboot -display none -serial stdio \
+	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -m 1024 -no-reboot -display none -serial stdio \
 		-device qemu-xhci -cdrom $(ISO) > build/test-boot.log 2>&1 || true
 	@grep -qF "smoke" build/test-boot.log || \
 		{ echo "FAIL: no smoke lines in boot log"; cat build/test-boot.log | head -60; exit 1; }

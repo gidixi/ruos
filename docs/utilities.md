@@ -22,8 +22,8 @@ util-linux / standard POSIX).
   `[0]=kind (0=REG,1=DIR,2=DEV)`, `[2..4]=name_len u16 LE`, `[4..12]=size u64 LE`,
   seguito da `name_len` byte UTF-8 del nome.
 - **Buffer cap fissi**: ls=8192, cp/rm/du/find/grep=16384, ps/pkill=8192, dmesg=32768.
-  Directory/log oltre il cap vengono **troncati silenziosamente** (solo `lspci`/`ip`/
-  `ifconfig` riprovano su ENOBUFS).
+  Directory/log oltre il cap vengono **troncati silenziosamente** (solo `lspci`/`lsusb`/
+  `ip`/`ifconfig` riprovano su ENOBUFS).
 - **Decodifica UTF-8**: quasi sempre `from_utf8_lossy` (sostituisce byte invalidi).
 - **Input bufferizzato**: la maggior parte legge tutto in `Vec<u8>` (no streaming).
 - **Parsing flag**: ad-hoc, posizionale, match per uguaglianza esatta. Nessun tool
@@ -44,7 +44,7 @@ util-linux / standard POSIX).
 | du df diff head tail | file | dimensioni / diff / porzioni |
 | wc sort uniq cut tr tee echo clear which | testo | manipolazione testo |
 | ps kill pkill | processi | gestione processi |
-| uname uptime free lscpu lspci dmesg id whoami date | sistema | info sistema |
+| uname uptime free lscpu lspci lsusb dmesg id whoami date | sistema | info sistema |
 | ip ifconfig nc ping wget | rete | networking |
 | find grep | ricerca | ricerca file/contenuti |
 | init client server | speciali | init + test stub socket |
@@ -333,6 +333,17 @@ util-linux / standard POSIX).
 - **Manca dal reale:** interamente formattato dal kernel — niente `-v`/`-vv`/`-vvv`,
   `-n`/`-nn`, `-k` (driver), `-s`/`-d` (filtri), `-t` (tree), `-x` (hex).
 
+### lsusb
+- **Funzione:** lista i dispositivi USB enumerati dallo stack xHCI. Una riga per
+  slot: `Bus BB Dev SS  Port P  Tier T  ID vvvv:pppp  <speed>  <kind>`
+  (`Bus`=controller xHCI, `Dev`=slot id, `speed`=Full/Low/High/Super,
+  `kind`=Hub/Keyboard/Mouse/Msc/Other).
+- **Implementato:** nessun flag. Host `usb_list` (buf 4096, **retry su ENOBUFS**
+  con resize, come `lspci`). Il kernel ritorna testo già formattato da
+  `registry::usb_list()`, stampato verbatim.
+- **Manca dal reale:** niente `-v` (descriptor dump), `-t` (tree), `-s`/`-d`
+  (filtri), nome stringa del device (solo VID:PID numerici).
+
 ### dmesg
 - **Funzione:** stampa il buffer di log del kernel.
 - **Implementato:** nessun flag. Host `dmesg` (buf 32 KiB, **niente retry** → log >32 KiB
@@ -468,7 +479,7 @@ util-linux / standard POSIX).
 
 - **Dati finti/hardcoded:** `id`, `whoami` (costanti), `lscpu` (Architecture x86_64),
   `date` (sempre "UTC"), `server` (banner 127.0.0.1:8080), `free` (`?` se heap-used n/d).
-- **Retry ENOBUFS (errno 8):** solo `lspci`, `ip`, `ifconfig`. `dmesg`, `ps`, `pkill`
+- **Retry ENOBUFS (errno 8):** solo `lspci`, `lsusb`, `ip`, `ifconfig`. `dmesg`, `ps`, `pkill`
   **non** riprovano → troncamento silenzioso al cap.
 - **Parsing record binari condiviso** `ps`/`pkill` (count u32 + record pid/start/namelen/
   pad/name) e `ls`/`cp`/`rm`/`du`/`find`/`grep` (`readdir` 12-byte header).

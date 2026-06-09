@@ -8,7 +8,7 @@ members = [
     "head", "tail", "grep", "find", "diff", "du",
     "whoami", "id", "uname", "uptime", "free", "df", "lscpu", "dmesg",
     "ps", "kill", "pkill",
-    "lspci", "ip",
+    "lspci", "lsusb", "ip",
     "nano",
     "touch", "wc", "clear", "which",
     "sort", "uniq", "cut", "tr", "tee",

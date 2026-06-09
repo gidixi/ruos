@@ -23,10 +23,11 @@
 //! dropped before they reach this process.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Seek, SeekFrom, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_PORT: u16 = 6666;
 const DEFAULT_BIND: &str = "0.0.0.0";
@@ -63,8 +64,54 @@ fn print_help() {
          \x20       --src           prefix each line with the sender's IP\n\
          \x20   -h, --help          show this help\n\
          \n\
+         INTERACTIVE COMMANDS (type + Enter while running):\n\
+         \x20   c, clear   clear the terminal screen\n\
+         \x20   l, clog    clear the log file (truncate netconsole.log)\n\
+         \x20   h, help    show interactive commands\n\
+         \x20   q, quit    exit\n\
+         \n\
          Drop-in for `nc -ul {DEFAULT_PORT}`. Build ruos with --features netconsole."
     );
+}
+
+/// Print the interactive (runtime) command list to stderr.
+fn print_keys() {
+    eprintln!(
+        "commands: [c]lear screen  [l]/clog clear log  [h]elp  [q]uit"
+    );
+}
+
+/// Read stdin line-by-line and handle interactive commands. Runs on its own
+/// thread; shares the log file with the receive loop via `logf`.
+fn command_loop(logf: Arc<Mutex<File>>, log_display: String) {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let cmd = match line {
+            Ok(l) => l,
+            Err(_) => break, // stdin closed / piped EOF — stop reading, keep RX alive
+        };
+        match cmd.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "c" | "clear" | "cls" => {
+                // ANSI: clear screen + home cursor.
+                let stdout = io::stdout();
+                let mut out = stdout.lock();
+                let _ = out.write_all(b"\x1b[2J\x1b[H");
+                let _ = out.flush();
+            }
+            "l" | "clog" | "clearlog" => {
+                if let Ok(mut f) = logf.lock() {
+                    if f.set_len(0).is_ok() {
+                        let _ = f.seek(SeekFrom::Start(0));
+                    }
+                }
+                eprintln!("netconsole-rx: log cleared ({log_display})");
+            }
+            "h" | "help" | "?" => print_keys(),
+            "q" | "quit" | "exit" => std::process::exit(0),
+            other => eprintln!("netconsole-rx: unknown command '{other}' (h for help)"),
+        }
+    }
 }
 
 /// Parse argv. Returns Err with a message on bad input, Ok(None) when help was
@@ -114,16 +161,26 @@ fn main() -> ExitCode {
     // Log file next to the exe, TRUNCATED on every start (File::create wipes any
     // previous run's contents). Mirrors everything also written to stdout.
     let log = log_path();
-    let mut logf = match File::create(&log) {
+    let logf = match File::create(&log) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: cannot create log file {}: {e}", log.display());
             return ExitCode::FAILURE;
         }
     };
+    // Shared with the command thread so `clog` can truncate while RX writes.
+    let logf = Arc::new(Mutex::new(logf));
 
     eprintln!("netconsole-rx: listening on {addr} (UDP) — Ctrl-C to stop");
     eprintln!("netconsole-rx: logging to {} (cleared on each start)", log.display());
+    print_keys();
+
+    // Interactive command reader on its own thread.
+    {
+        let logf = Arc::clone(&logf);
+        let disp = log.display().to_string();
+        std::thread::spawn(move || command_loop(logf, disp));
+    }
 
     // 64 KiB covers the largest plausible datagram; netconsole caps at ~512 B.
     let mut buf = [0u8; 64 * 1024];
@@ -146,8 +203,10 @@ fn main() -> ExitCode {
                 let mut out = stdout.lock();
                 let _ = out.write_all(&line);
                 let _ = out.flush();
-                let _ = logf.write_all(&line);
-                let _ = logf.flush();
+                if let Ok(mut f) = logf.lock() {
+                    let _ = f.write_all(&line);
+                    let _ = f.flush();
+                }
             }
             Err(e) => {
                 eprintln!("netconsole-rx: recv error: {e}");

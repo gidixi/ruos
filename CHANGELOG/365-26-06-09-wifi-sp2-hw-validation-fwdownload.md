@@ -1,4 +1,4 @@
-# 363 — WiFi RTL8188EU: validazione HW reale + firmware download corretto
+# 365 — WiFi RTL8188EU: validazione HW reale + firmware download corretto
 
 **Data:** 2026-06-09
 

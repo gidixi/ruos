@@ -201,7 +201,8 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
                            move_requested: false, spawn_request: VecDeque::new(),
                            bg_request: false, committed: false,
                            minimize_request: false, maximize_request: false,
-                           activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
+                           activate_request: VecDeque::new(), target_w: 0, target_h: 0,
+                           stay_awake_request: false, wake_pty: -1 },
         },
     );
     // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -628,6 +629,12 @@ pub struct WmState {
     /// first committed size. Maximize/restore/resize update these.
     pub target_w: u32,
     pub target_h: u32,
+    /// Override dinamico: il guest ha chiamato `wm.stay_awake()` in questo frame →
+    /// resta sveglio il prossimo. Azzerato dal run loop prima di ogni `frame_all`.
+    pub stay_awake_request: bool,
+    /// Risorsa PTY legata via `wm.wake_on_pty(idx)`: -1 = nessuna. Il compositor
+    /// sveglia la finestra dormiente se quel pair ha output non drenato.
+    pub wake_pty: i32,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -861,7 +868,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         engine,
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
+            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0, stay_awake_request: false, wake_pty: -1 },
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -938,6 +945,13 @@ pub struct Window {
     /// then the kernel owns the size (`wm.window_size()` reports it; maximize/resize
     /// change it) and stops blindly adopting the committed size.
     pub sized: bool,
+    /// SP-sleep: questa finestra ha girato `frame()` in questo loop (diagnostica).
+    pub awake: bool,
+    /// Ultimo `frame_no` con attività (input/override/dati) — grace/debounce.
+    pub last_active_frame: u32,
+    /// Ha già eseguito `_initialize` + almeno una `frame()`. Falso → primo giro
+    /// sempre sveglio.
+    pub framed_once: bool,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -956,6 +970,8 @@ pub struct Compositor {
     /// new pixels. ORed with "any window committed" to decide whether `present`
     /// runs this frame; reset after each present. Starts `true` (first frame).
     pub dirty: bool,
+    /// Contatore di frame del run loop (per il grace/debounce dello sleep).
+    pub frame_no: u32,
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -1004,6 +1020,7 @@ impl Compositor {
             free_ids: Vec::new(),
             next_id: 0,
             dirty: true,
+            frame_no: 0,
         };
 
         // Initial window = the userspace desktop SHELL. Prefer the VFS
@@ -1046,6 +1063,7 @@ impl Compositor {
             free_ids: Vec::new(),
             next_id: 0,
             dirty: true,
+            frame_no: 0,
         }
     }
 
@@ -1258,7 +1276,8 @@ impl Compositor {
                                move_requested: false, spawn_request: VecDeque::new(),
                                bg_request: false, committed: false,
                                minimize_request: false, maximize_request: false,
-                               activate_request: VecDeque::new(), target_w: 0, target_h: 0 },
+                               activate_request: VecDeque::new(), target_w: 0, target_h: 0,
+                               stay_awake_request: false, wake_pty: -1 },
             },
         );
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -1297,6 +1316,9 @@ impl Compositor {
             maximized: false,
             saved_rect: None,
             sized: false,
+            awake: true,
+            last_active_frame: 0,
+            framed_once: false,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order

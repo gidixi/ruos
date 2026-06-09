@@ -17,6 +17,10 @@ use core::ptr::read_volatile;
 #[allow(dead_code)]
 pub mod ieee80211;
 
+// RTL8188EU init register tables (MAC/PHY_REG/AGC/RADIO_A), ported verbatim from
+// rtl8xxxu 8188e.c. Applied by init_mac/init_phy_bb/init_phy_rf in SP3c-3.
+pub mod tables;
+
 use crate::usb::control::{control_in, control_out_data, Setup};
 use crate::usb::device::UsbDevice;
 use crate::usb::xhci::Xhci;

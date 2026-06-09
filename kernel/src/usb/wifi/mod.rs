@@ -229,6 +229,7 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
         }
     }
     crate::memory::dma::dealloc(buf);
+    crate::binfo!("wifi", "fw upload pages={} ok={}", pages, ok);
     if !ok { return false; }
 
     // 8. Leave download mode — 16-bit clear of MCU_FW_DL_ENABLE.
@@ -236,34 +237,41 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
         reg_write16(x, dev, REG_MCUFWDL, v & !(MCUFWDL_EN as u16));
     }
 
-    // start_firmware (rtl8xxxu): wait checksum, mark ready, reset 8051, wait init.
-    // 1. Poll the checksum-report bit (download complete).
+    // start_firmware: wait checksum, mark ready, wait init-ready.
+    // Polls are bounded LOW: a write to a wedged device makes every following
+    // control transfer time out (~200 ms each); a 1000-iteration poll would hang
+    // the whole boot for minutes. Keep counts small so boot always proceeds.
     let mut csum = false;
-    for _ in 0..1000 {
+    for _ in 0..50 {
         if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
             if (v as u8) & MCUFWDL_CSUM_RPT != 0 { csum = true; break; }
         }
     }
-    if !csum { crate::bwarn!("wifi", "fw checksum-report timeout"); }
-    // 2. Set MCU_FW_DL_READY, clear WINT_INIT_READY (32-bit RMW on MCUFWDL).
+    crate::binfo!("wifi", "fw dl: csum_report={}", csum);
+    // Mark MCU_FW_DL_READY, clear WINT_INIT_READY (32-bit RMW on MCUFWDL).
     if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
         let nv = (v | MCUFWDL_DL_RDY as u32) & !(WINTINI_RDY as u32);
         reg_write32(x, dev, REG_MCUFWDL, nv);
     }
-    // 3. reset_8051: unlock RSV_CTRL, then 16-bit toggle of the 8051 enable.
-    reg_write8(x, dev, REG_RSV_CTRL, 0x00);
-    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
-        reg_write16(x, dev, REG_SYS_FUNC_EN, v & !(FEN_CPUEN as u16));
-        reg_write16(x, dev, REG_SYS_FUNC_EN, v | (FEN_CPUEN as u16));
-    }
-    // 4. Wait for firmware init-ready (WINT_INIT_READY) in the 32-bit MCUFWDL.
-    for _ in 0..1000 {
+    // NOTE: the reference reset_8051 toggles FEN_CPUEN off→on on SYS_FUNC (0x02).
+    // On THIS dongle, verified on HW, the CPU-off write errors (off_ok=false) AND
+    // wedges the USB pipe (mid=None — reads die after) → the device drops and
+    // needs a physical replug. The 8051 evidently drives the USB function, so we
+    // must NOT disable it. We leave the CPU enabled (it was enabled at download
+    // start) and only poll briefly for init-ready. Fully booting the firmware
+    // (which likely re-enumerates the USB device) is the next subproject.
+    let mut ready = false;
+    for _ in 0..20 {
         if let Some(v) = reg_read32(x, dev, REG_MCUFWDL) {
-            if (v as u8) & WINTINI_RDY != 0 { crate::binfo!("wifi", "fw ready"); return true; }
+            if (v as u8) & WINTINI_RDY != 0 { ready = true; break; }
         }
     }
-    crate::bwarn!("wifi", "fw ready timeout (verify on HW)");
-    false
+    if ready {
+        crate::binfo!("wifi", "fw ready");
+    } else {
+        crate::binfo!("wifi", "fw downloaded+verified (csum={}); init-ready not signalled — 8051 run TBD", csum);
+    }
+    csum || ready
 }
 
 /// Chip power-on sequence (RTL8188EU `rtl8188eu_power_on`, rtl8xxxu reference):

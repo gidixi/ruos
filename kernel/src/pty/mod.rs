@@ -8,14 +8,15 @@ pub mod spsc;
 use spin::Mutex;
 use pair::PtyPair;
 
-pub const NUM_PAIRS: usize = 4;
+// Static pool of PTY pairs. Pair 0 = framebuffer console (boot shell); pairs
+// 1..NUM_PAIRS are claimed on demand by SSH sessions AND GUI terminal windows
+// (both via `try_claim`, same shared pool). 3 GUI terminals + console exhausted
+// the old pool of 4 → SSH got "no free pty"; 8 leaves 7 usable. All NUM_PAIRS-
+// sized statics below use `[CONST; NUM_PAIRS]` so they scale with this number.
+pub const NUM_PAIRS: usize = 8;
 
-static PAIRS: [Mutex<PtyPair>; NUM_PAIRS] = [
-    Mutex::new(PtyPair::new()),
-    Mutex::new(PtyPair::new()),
-    Mutex::new(PtyPair::new()),
-    Mutex::new(PtyPair::new()),
-];
+const PAIR_INIT: Mutex<PtyPair> = Mutex::new(PtyPair::new());
+static PAIRS: [Mutex<PtyPair>; NUM_PAIRS] = [PAIR_INIT; NUM_PAIRS];
 
 pub fn pair(idx: usize) -> &'static Mutex<PtyPair> {
     &PAIRS[idx]
@@ -29,18 +30,14 @@ pub fn pty_owner(_idx: usize) -> u32 { 0 }
 
 /// Per-pair slave-input ring (replaces `PtyPair::slave_rx`). Producer = owner
 /// (line discipline); consumer = the app core reading stdin.
-static SLAVE_RX: [spsc::SpscRing; NUM_PAIRS] = [
-    spsc::SpscRing::new(), spsc::SpscRing::new(),
-    spsc::SpscRing::new(), spsc::SpscRing::new(),
-];
+const RING_INIT: spsc::SpscRing = spsc::SpscRing::new();
+static SLAVE_RX: [spsc::SpscRing; NUM_PAIRS] = [RING_INIT; NUM_PAIRS];
 pub fn slave_rx_ring(idx: usize) -> &'static spsc::SpscRing { &SLAVE_RX[idx] }
 
 /// Foreground pid per pair as an atomic (0 = none) so the app-side read path
 /// can check kill/EOF without taking the owner-local pair lock.
-static FOREGROUND: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [
-    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
-];
+const AU32_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FOREGROUND: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [AU32_ZERO; NUM_PAIRS];
 
 /// Foreground app pid for pair `idx`, or `None` (at the shell prompt). Read by
 /// the app-side stdin path to detect a `^C`/kill and report EOF.
@@ -57,10 +54,7 @@ pub fn foreground_pid(idx: usize) -> Option<u32> {
 /// adding fields there would corrupt tcgetattr/tcsetattr). A GUI terminal sets
 /// this on resize; the shell (or a future SIGWINCH path) can read it to size its
 /// editing. Plain atomics → readable/writable without the pair lock.
-static WINSIZE: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [
-    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
-];
+static WINSIZE: [core::sync::atomic::AtomicU32; NUM_PAIRS] = [AU32_ZERO; NUM_PAIRS];
 
 /// Set pair `idx`'s window size (in character cells). No-op for a bad index.
 pub fn set_winsize(idx: usize, cols: u16, rows: u16) {
@@ -80,9 +74,10 @@ pub fn winsize(idx: usize) -> (u16, u16) {
 /// `Waker` here; the producer (owner) wakes it after `push`. Lives outside the
 /// pair lock so producer + consumer never share the pair lock just for the
 /// waker handoff.
+const WAKER_INIT: crate::sync::IrqMutex<Option<core::task::Waker>> =
+    crate::sync::IrqMutex::new(None);
 static SLAVE_WAKER: [crate::sync::IrqMutex<Option<core::task::Waker>>; NUM_PAIRS] =
-    [crate::sync::IrqMutex::new(None), crate::sync::IrqMutex::new(None),
-     crate::sync::IrqMutex::new(None), crate::sync::IrqMutex::new(None)];
+    [WAKER_INIT; NUM_PAIRS];
 
 /// Consumer (app core): register the waker to be notified when input arrives.
 pub fn register_slave_waker(idx: usize, w: core::task::Waker) {
@@ -236,6 +231,7 @@ pub fn release(idx: usize) {
     // resets too — a freshly claimed pty shouldn't inherit the previous
     // session's idle counter.
     SHUTDOWN[idx].store(false, Ordering::SeqCst);
+    ORIGIN[idx].store(0, Ordering::Relaxed); // back to Free
     LAST_ACTIVITY[idx].store(crate::timer::ticks(), Ordering::Relaxed);
 }
 
@@ -248,27 +244,45 @@ pub fn is_claimed(idx: usize) -> bool {
     CLAIMED[idx].load(Ordering::SeqCst)
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-static CLAIMED: [AtomicBool; NUM_PAIRS] = [
-    AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false),
-];
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+const ABOOL_FALSE: AtomicBool = AtomicBool::new(false);
+static CLAIMED: [AtomicBool; NUM_PAIRS] = [ABOOL_FALSE; NUM_PAIRS];
 
 /// Per-pair shutdown flag. Set by [`request_shutdown`] (e.g. SSH session
 /// dropped, watchdog idle timeout). When set, `PtySlaveFile::read` returns
 /// `Ok(0)` (EOF) once `slave_rx` is drained, so a shell blocked on stdin
 /// reads EOF and exits cleanly. Cleared on `release` for the next claim.
-static SHUTDOWN: [AtomicBool; NUM_PAIRS] = [
-    AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false),
-];
+static SHUTDOWN: [AtomicBool; NUM_PAIRS] = [ABOOL_FALSE; NUM_PAIRS];
 
 /// Per-pair last-activity tick (100 Hz). Updated on any input/output the
 /// pair sees so the watchdog can detect genuinely idle pairs vs busy ones.
-static LAST_ACTIVITY: [AtomicU64; NUM_PAIRS] = [
-    AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
-];
+const AU64_ZERO: AtomicU64 = AtomicU64::new(0);
+static LAST_ACTIVITY: [AtomicU64; NUM_PAIRS] = [AU64_ZERO; NUM_PAIRS];
+
+/// Origine di un pair claimed: distingue i terminali GUI locali (mai reap-ati
+/// per idle: dormono nel compositor) dalle sessioni SSH remote (reap-ate dal
+/// watchdog se la sessione leak-a). `Free` = non claimed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PtyOrigin { Free, Ssh, LocalGui }
+
+/// Per-pair origin. 0=Free, 1=Ssh, 2=LocalGui (vedi `set_origin`/`origin`).
+const AU8_ZERO: AtomicU8 = AtomicU8::new(0);
+static ORIGIN: [AtomicU8; NUM_PAIRS] = [AU8_ZERO; NUM_PAIRS];
+
+pub fn set_origin(idx: usize, o: PtyOrigin) {
+    if idx >= NUM_PAIRS { return; }
+    let v = match o { PtyOrigin::Free => 0, PtyOrigin::Ssh => 1, PtyOrigin::LocalGui => 2 };
+    ORIGIN[idx].store(v, Ordering::Relaxed);
+}
+
+pub fn origin(idx: usize) -> PtyOrigin {
+    if idx >= NUM_PAIRS { return PtyOrigin::Free; }
+    match ORIGIN[idx].load(Ordering::Relaxed) {
+        1 => PtyOrigin::Ssh,
+        2 => PtyOrigin::LocalGui,
+        _ => PtyOrigin::Free,
+    }
+}
 
 /// Mark `idx` for shutdown and wake any task blocked reading the slave.
 /// Idempotent. Once a pair is in shutdown, `PtySlaveFile::read` returns

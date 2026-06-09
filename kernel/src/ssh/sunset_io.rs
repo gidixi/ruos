@@ -409,6 +409,7 @@ fn alloc_and_spawn_shell() -> Option<usize> {
     // free for SSH-driven shells.
     for idx in 1..crate::pty::NUM_PAIRS {
         if crate::pty::try_claim(idx) {
+            crate::pty::set_origin(idx, crate::pty::PtyOrigin::Ssh);
             // Spawn shell.wasm with stdin/stdout/stderr bound to pts/idx via
             // the existing wasm_task pattern. We post into exec_queue with
             // an explicit PTY index.

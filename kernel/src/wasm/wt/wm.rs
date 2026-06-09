@@ -1156,6 +1156,9 @@ impl Compositor {
                 self.dirty = true; // window moved → recomposite
                 self.wins[i].rect = (nx, ny, w, h);
             }
+            // Marcatura attività: il drag non inserisce eventi nel queue, quindi
+            // aggiorni `last_active_frame` per tenerla sveglia durante il move.
+            self.wins[i].last_active_frame = self.frame_no;
         }
     }
 
@@ -1387,6 +1390,21 @@ impl Compositor {
         Some((s.win.pixels.as_ptr(), s.win.pixels.len(), x, y, s.win.win_w, s.win.win_h))
     }
 
+    /// Numero di frame di grazia dopo l'ultima attività prima di dormire (evita
+    /// flapping sleep↔wake; ~poche decine di ms al wake-rate del compositor).
+    const GRACE_FRAMES: u32 = 6;
+
+    /// `should_wake` calato su una `Window` concreta + il frame corrente.
+    fn compute_awake(w: &Window, frame_no: u32) -> bool {
+        let s = w.store.data();
+        let has_events = !s.win.events.is_empty();
+        let stay_awake = s.win.stay_awake_request;
+        let pty_has_output = s.win.wake_pty >= 0
+            && crate::pty::master_output_len(s.win.wake_pty as usize) > 0;
+        should_wake(w.framed_once, has_events, stay_awake,
+                    frame_no, w.last_active_frame, Self::GRACE_FRAMES, pty_has_output)
+    }
+
     /// Call `frame()` on every window's instance (the gate's get_typed_func loop,
     /// ONE copy). Each app drains its queue via `wm.poll_event` and redraws.
     ///
@@ -1395,7 +1413,15 @@ impl Compositor {
     /// flags the window `close_requested`, so the reap pass drops it next loop
     /// instead of leaving a frozen, un-closeable window (its CSD [X] is gone).
     fn frame_all(&mut self) {
+        let fno = self.frame_no;
         for w in self.wins.iter_mut() {
+            if !Self::compute_awake(w, fno) {
+                w.awake = false;
+                continue; // dormiente: niente frame(); la surface in cache resta valida
+            }
+            w.awake = true;
+            w.framed_once = true;
+            w.last_active_frame = fno;
             if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
                 match frame.call(&mut w.store, ()) {
                     Ok(()) => {}
@@ -1510,6 +1536,9 @@ impl Compositor {
         self.wins[idx].store.data_mut().win.events.push_back(crate::gfx::GfxEvt {
             kind: 1, p0: lx.to_bits(), p1: ly.to_bits(), p2: 0,
         });
+        // Marcatura attività: garantisce il ridisegno anche se compute_awake
+        // venisse rivisto. L'evento appena inserito basta già per il wake.
+        self.wins[idx].last_active_frame = self.frame_no;
     }
 
     /// Forward a left-button event (press/release) to the focused window so its
@@ -1523,6 +1552,8 @@ impl Compositor {
         self.wins[idx].store.data_mut().win.events.push_back(crate::gfx::GfxEvt {
             kind: 2, p0: 0, p1: pressed as u32, p2: 0,
         });
+        // Marcatura attività (belt-and-suspenders; l'evento nel queue basta già).
+        self.wins[idx].last_active_frame = self.frame_no;
     }
 
     /// Left mouse-down at screen (px,py). Under CSD the kernel only does window
@@ -1537,6 +1568,8 @@ impl Compositor {
         if let Some(i) = self.window_at(px, py) {
             let top = self.raise(i);
             self.set_focus(top);
+            // Marcatura attività sulla finestra appena portata in primo piano.
+            self.wins[top].last_active_frame = self.frame_no;
             // Forward the POSITIONED press to the now-focused window so egui clicks
             // at the cursor (not 0,0) and its drag-sense (title bar) can arm.
             self.forward_left_button(top, px, py, true);
@@ -1571,9 +1604,9 @@ impl Compositor {
         unsafe { core::arch::asm!("cld", options(nostack)); }
 
         let mut btn_l = false;
-        let mut frame_no: u32 = 0;
         let mut marker_done = false;
         loop {
+            self.frame_no = self.frame_no.wrapping_add(1);
             // Supervisor 6-detect: bump the GUI core's heartbeat each compositor
             // frame so the supervisor never false-mutes it. The GUI core owns the
             // CPU here and may not call run_core(), so it must bump explicitly.
@@ -1655,8 +1688,13 @@ impl Compositor {
             }
 
             // Clear per-window damage flags; `wm.commit` re-sets `committed` for any
-            // window that draws a new surface during this `frame_all`.
-            for w in self.wins.iter_mut() { w.store.data_mut().win.committed = false; }
+            // window that draws a new surface during this `frame_all`. Also azzera
+            // l'override dinamico `stay_awake_request` (dura un solo frame).
+            for w in self.wins.iter_mut() {
+                let s = w.store.data_mut();
+                s.win.committed = false;
+                s.win.stay_awake_request = false;
+            }
 
             self.frame_all();
 
@@ -1771,11 +1809,10 @@ impl Compositor {
             // the marker could see <2 cores. Idle-skipping kicks in after warm-up.
             const WARMUP_FRAMES: u32 = 90;
             let any_committed = self.wins.iter().any(|w| w.store.data().win.committed);
-            if self.dirty || any_committed || frame_no < WARMUP_FRAMES {
+            if self.dirty || any_committed || self.frame_no < WARMUP_FRAMES {
                 self.present();
                 self.dirty = false;
             }
-            frame_no += 1;
 
             // After 30 composited frames, report the distinct cores that ran
             // band jobs (one-shot; greppable by the boot-marker test). The
@@ -1783,7 +1820,7 @@ impl Compositor {
             // wake-IPI + worker-loop latency means the first frame or two may
             // run partly inline on the BSP before APs warm up). cpu_id is
             // LAPIC-based per core, VBox-safe — see project memory.
-            if !marker_done && frame_no >= 30 {
+            if !marker_done && self.frame_no >= 30 {
                 let mask = take_composite_core_mask();
                 let mut cores: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
                 for c in 0..32u32 {
@@ -1804,6 +1841,20 @@ impl Compositor {
             x86_64::instructions::hlt();
         }
     }
+}
+
+/// Decide se una finestra deve girare `frame()` questo giro. Pura → boot-checkabile.
+/// Sveglia se: non ha ancora girato (init), ha input in coda, ha l'override
+/// `stay_awake`, ha output PTY legato in attesa, o è entro il grace dall'ultima
+/// attività.
+fn should_wake(framed_once: bool, has_events: bool, stay_awake: bool,
+               frame_no: u32, last_active: u32, grace: u32,
+               pty_has_output: bool) -> bool {
+    !framed_once
+        || has_events
+        || stay_awake
+        || pty_has_output
+        || frame_no.wrapping_sub(last_active) < grace
 }
 
 /// Entry point (the executor router calls EXACTLY this name; do NOT rename).

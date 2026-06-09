@@ -691,6 +691,15 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // reap pass (top of the loop) drops the Store/Instance next iteration.
     linker.func_wrap("wm", "close",
         |mut caller: Caller<'_, T>| { caller.data_mut().win().close_requested = true; })?;
+    // wm.stay_awake(): il guest chiede di restare sveglio il PROSSIMO frame.
+    // Azzerato dal run loop prima di ogni frame_all → va richiamato ogni frame
+    // (modello egui request_repaint) per un aggiornamento continuo.
+    linker.func_wrap("wm", "stay_awake",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().stay_awake_request = true; })?;
+    // wm.wake_on_pty(idx): lega una risorsa PTY a questa finestra; idx<0 = slega.
+    // Il compositor sveglia la finestra dormiente quando quel pair ha output.
+    linker.func_wrap("wm", "wake_on_pty",
+        |mut caller: Caller<'_, T>, idx: i32| { caller.data_mut().win().wake_pty = idx; })?;
     // wm.start_move(): the guest (CSD title-bar grab) asks the compositor to begin
     // a kernel-driven interactive move of THIS window. We only record the request;
     // the run loop turns it into a `DragState` (reusing SP3's drag machinery) so

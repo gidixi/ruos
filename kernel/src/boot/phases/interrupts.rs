@@ -299,7 +299,7 @@ pub fn init() -> Result<(), BootError> {
         //
         // We target the first ComputeApp AP (core 2 when ≥3 CPUs). Skipped if none exists.
         {
-            use x86_64::{PhysAddr, VirtAddr};
+            use x86_64::VirtAddr;
             use x86_64::structures::paging::PageTableFlags;
 
             // A dedicated virt range that does not collide with any existing test mapping.
@@ -406,6 +406,151 @@ pub fn init() -> Result<(), BootError> {
                 );
             } else {
                 crate::binfo!("tlb", "remap test skipped (no ComputeApp AP)");
+            }
+        }
+
+        // Range-shootdown boot-check: 64 pages flagged via set_flags_range must
+        // cost ONE shootdown (not 64 — the batch fix), then unmap_range must
+        // remove all 64 translations (re-unmap of first/last page → NotMapped).
+        //
+        // REMOTE leg (when a ComputeApp AP exists) — same protocol as the Step 3d
+        // remap test above, but through the RANGE path: the AP reads the FIRST
+        // page BEFORE unmap_range (caching the translation in its TLB) → r1.
+        // unmap_range of all 64 pages fires ONE shootdown with 64 > FLUSH_THRESHOLD
+        // → remote cores take the CR3-reload path. Remapping the first page to a
+        // NEW frame needs no shootdown (map_page over not-present — x86 caches no
+        // negative entries), so the AP's re-read → r2 can only see the new sentinel
+        // if the CR3 reload actually dropped its cached entry.
+        //   r1=0xAAAAAAAA AND r2=0xBBBBBBBB → remote CR3 flush proven.
+        //   r2=0xAAAAAAAA → stale entry survived the range shootdown. FAIL.
+        {
+            use x86_64::VirtAddr;
+            use x86_64::structures::paging::PageTableFlags;
+
+            const RANGE_VIRT: u64 = 0x4445_0000_0000; // disjoint from other tests
+            const N: usize = 64; // > FLUSH_THRESHOLD → exercises the CR3-reload path
+            let rw = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE;
+            let ro = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+
+            let mut mapped = 0usize;
+            for i in 0..N {
+                let Some(f) = crate::memory::allocate_frame() else { break };
+                let va = VirtAddr::new(RANGE_VIRT + (i as u64) * 0x1000);
+                if crate::memory::map_page(va, f.start_address(), rw).is_err() {
+                    crate::memory::free_frame(f);
+                    break;
+                }
+                mapped += 1;
+            }
+
+            // Sentinel into the FIRST page (still RW here) for the remote read.
+            if mapped > 0 {
+                // SAFETY: just mapped PRESENT|WRITABLE to a private test frame.
+                unsafe { core::ptr::write_volatile(RANGE_VIRT as *mut u32, 0xAAAA_AAAAu32); }
+            }
+
+            let (sd0, _) = crate::memory::tlb::stats();
+            let changed = crate::memory::set_flags_range(VirtAddr::new(RANGE_VIRT), mapped, ro)
+                .unwrap_or(usize::MAX);
+            let (sd1, _) = crate::memory::tlb::stats();
+            let sd_grew = sd1.saturating_sub(sd0);
+
+            // Inline driver for the AP read (same no-op-waker bounded poll the
+            // Step 3d remap test uses).
+            fn read_first(_input: &[u8]) -> u64 {
+                // SAFETY: RANGE_VIRT is mapped (RO or RW) whenever this op runs.
+                unsafe { core::ptr::read_volatile(RANGE_VIRT as *const u32) as u64 }
+            }
+            fn poll_reply(mut fut: crate::smp::inbox::ReplyFuture) -> Option<u64> {
+                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                fn nop(_: *const ()) {}
+                fn cl(_: *const ()) -> RawWaker { RawWaker::new(core::ptr::null(), &VT) }
+                static VT: RawWakerVTable = RawWakerVTable::new(cl, nop, nop, nop);
+                let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+                let mut cx = Context::from_waker(&waker);
+                for _ in 0..50_000_000u64 {
+                    if let Poll::Ready(v) = core::future::Future::poll(
+                        core::pin::Pin::new(&mut fut), &mut cx,
+                    ) {
+                        return Some(v);
+                    }
+                    core::hint::spin_loop();
+                }
+                None
+            }
+
+            // Remote leg part 1 — BEFORE unmap_range: the AP reads the first page,
+            // caching the soon-to-be-stale translation in its TLB. Skipped when no
+            // ComputeApp AP is online (single-core / 2-CPU GUI-only boots) or when
+            // the range failed to map (nothing safe to read).
+            let target_ap = (0..crate::cpu::cpus_online())
+                .find(|&c| c != 0 && crate::cpu::core_role(c) == crate::cpu::CoreRole::ComputeApp)
+                .filter(|_| mapped > 0);
+            let r1 = target_ap.map(|t| {
+                poll_reply(crate::smp::inbox::request(
+                    t, read_first, alloc::boxed::Box::from(&[][..]),
+                )).unwrap_or(0xDEAD)
+            });
+
+            // ONE range shootdown for all 64 pages (> FLUSH_THRESHOLD → remote CR3).
+            let unmapped = crate::memory::unmap_range(VirtAddr::new(RANGE_VIRT), mapped);
+            // Translations gone: re-unmapping the first and last page must fail.
+            // (Probed BEFORE the remote remap below re-populates the first page.)
+            let last = RANGE_VIRT + (mapped.max(1) as u64 - 1) * 0x1000;
+            let gone = crate::memory::unmap_page(VirtAddr::new(RANGE_VIRT)).is_err()
+                && crate::memory::unmap_page(VirtAddr::new(last)).is_err();
+
+            // Remote leg part 2 — remap the first page to a NEW frame holding a
+            // different sentinel (map_page: no shootdown needed), AP re-reads → r2.
+            let mut r2: Option<u64> = None;
+            let mut remote_ok = true; // no AP → vacuously true (local check only)
+            if let Some(t) = target_ap {
+                let frame_b = crate::memory::allocate_frame()
+                    .expect("tlb-range-test: failed to allocate frame B");
+                // SAFETY: HHDM alias of a freshly allocated frame is kernel-writable.
+                unsafe {
+                    core::ptr::write_volatile(
+                        crate::memory::hhdm_virt(frame_b.start_address()).as_mut_ptr::<u32>(),
+                        0xBBBB_BBBBu32,
+                    );
+                }
+                crate::memory::map_page(VirtAddr::new(RANGE_VIRT), frame_b.start_address(), rw)
+                    .expect("tlb-range-test: remap frame B failed");
+                let v2 = poll_reply(crate::smp::inbox::request(
+                    t, read_first, alloc::boxed::Box::from(&[][..]),
+                )).unwrap_or(0xDEAD);
+                r2 = Some(v2);
+                remote_ok = r1 == Some(0xAAAA_AAAA) && v2 == 0xBBBB_BBBB;
+                // Cleanup of the remote leg: unmap + free the new frame.
+                let _ = crate::memory::unmap_page(VirtAddr::new(RANGE_VIRT));
+                crate::memory::free_frame(frame_b);
+            }
+
+            // sd_grew: ≥ 1 (set_flags_range batched the broadcast) and < 64 (the
+            // per-page storm is gone). NOT == 1: this boot phase is assumed
+            // quiescent, but the counters are GLOBAL — a future concurrent
+            // shootdown from another core during the window would bump them, and
+            // the check must not be fragile to that.
+            let ok = mapped == N && changed == N && sd_grew >= 1 && sd_grew < 64
+                && unmapped == N && gone && remote_ok;
+            match (r1, r2) {
+                (Some(r1), Some(r2)) => crate::binfo!(
+                    "tlb",
+                    "range check {}: mapped={} changed={} shootdowns+={} unmapped={} gone={} remote_r1=0x{:X} r2=0x{:X}",
+                    if ok { "ok" } else { "FAIL" },
+                    mapped, changed, sd_grew, unmapped, gone, r1, r2
+                ),
+                _ => {
+                    crate::binfo!("tlb", "range remote check skipped (no AP)");
+                    crate::binfo!(
+                        "tlb",
+                        "range check {}: mapped={} changed={} shootdowns+={} unmapped={} gone={}",
+                        if ok { "ok" } else { "FAIL" },
+                        mapped, changed, sd_grew, unmapped, gone
+                    );
+                }
             }
         }
 

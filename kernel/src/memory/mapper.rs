@@ -1,6 +1,7 @@
 //! Paging Mapper: a single global `OffsetPageTable` driven by Limine's HHDM
 //! offset, plus thin helpers used everywhere outside this module.
 
+use alloc::vec::Vec;
 use core::fmt;
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
@@ -105,6 +106,10 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: PageTableFlags)
     Ok(())
 }
 
+// Single-page path kept for the per-page callers (exec.rs W^X, boot-checks,
+// demand self-test); bulk callers now go through unmap_range. In default builds
+// (no boot-checks) every remaining caller is gated → silence dead_code.
+#[allow(dead_code)]
 pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     let mut g_map = MAPPER.lock();
     let mapper = g_map.as_mut().ok_or(UnmapError::NotInitialized)?;
@@ -128,6 +133,9 @@ pub fn unmap_page(virt: VirtAddr) -> Result<PhysFrame<Size4KiB>, UnmapError> {
 /// Change the flags of an already-mapped 4 KiB page (and flush its TLB entry).
 /// Used to flip executable-memory pages from W (writable, NX) to X (read-only,
 /// executable) — the W^X protection step.
+// Single-page path kept for the per-page callers (exec.rs W^X protect step);
+// bulk callers now go through set_flags_range. See unmap_page note on dead_code.
+#[allow(dead_code)]
 pub fn set_flags(virt: VirtAddr, flags: PageTableFlags) -> Result<(), UnmapError> {
     let mut g_map = MAPPER.lock();
     let mapper = g_map.as_mut().ok_or(UnmapError::NotInitialized)?;
@@ -148,6 +156,96 @@ pub fn set_flags(virt: VirtAddr, flags: PageTableFlags) -> Result<(), UnmapError
     // deadlock analysis; MAPPER must remain a spin::Mutex, not IrqMutex).
     crate::memory::tlb::shootdown(virt.as_u64());
     Ok(())
+}
+
+/// Change the flags of `pages` consecutive 4 KiB pages starting at `base` under
+/// ONE MAPPER acquisition and with ONE final TLB shootdown for the whole range
+/// (instead of one broadcast IPI per page — the publish/teardown storm fix, see
+/// 2026-06-10-tlb-shootdown-batch-design.md). Not-mapped pages are skipped
+/// silently (lazy demand-paged pages not committed yet — same semantics as the
+/// old per-page loop in platform.rs). Returns the number of pages actually
+/// modified; hard errors (huge-page parent) propagate after the partial range
+/// has still been shot down, so no stale entry can survive an error return.
+pub fn set_flags_range(base: VirtAddr, pages: usize, flags: PageTableFlags)
+    -> Result<usize, UnmapError>
+{
+    if pages == 0 { return Ok(0); }
+    let mut g_map = MAPPER.lock();
+    let mapper = g_map.as_mut().ok_or(UnmapError::NotInitialized)?;
+    let start: Page<Size4KiB> = Page::containing_address(base);
+    let mut changed = 0usize;
+    for i in 0..pages {
+        let page = start + i as u64;
+        // SAFETY: caller guarantees `flags` is a valid combination for an existing
+        // mapping; update_flags does not change the frame, only its permissions.
+        match unsafe { mapper.update_flags(page, flags) } {
+            Ok(fl) => {
+                fl.flush(); // local invlpg, same as single-page set_flags
+                changed += 1;
+            }
+            Err(FlagUpdateError::PageNotMapped) => {} // lazy page, not committed — skip
+            Err(FlagUpdateError::ParentEntryHugePage) => {
+                // Flush remote TLBs for what was already modified before bailing.
+                if changed > 0 {
+                    crate::memory::tlb::shootdown_range(start.start_address().as_u64(), pages);
+                }
+                return Err(UnmapError::ParentHugePage);
+            }
+        }
+    }
+    // ONE shootdown for the whole range, only if at least one page was present
+    // (a fully-lazy range left no stale TLB entry anywhere). Issued while still
+    // holding MAPPER — same lock/shootdown discipline as set_flags (MAPPER
+    // serializes shootdowns; see tlb.rs).
+    if changed > 0 {
+        crate::memory::tlb::shootdown_range(start.start_address().as_u64(), pages);
+    }
+    Ok(changed)
+}
+
+/// Unmap `pages` consecutive 4 KiB pages starting at `base` under ONE MAPPER
+/// acquisition, free their frames, and issue ONE final TLB shootdown for the
+/// whole range. Not-mapped pages are skipped (same semantics as the old caller
+/// pattern `if let Ok(frame) = unmap_page(va) { free_frame(frame) }`). Frames
+/// are freed only AFTER the shootdown — exactly like the single-page flow
+/// (unmap_page shoots down before returning the frame to its caller) — so no
+/// core can still hit a freed-and-reallocated frame through a stale entry.
+/// Returns the number of pages actually unmapped.
+pub fn unmap_range(base: VirtAddr, pages: usize) -> usize {
+    if pages == 0 { return 0; }
+    // Pre-allocate OUTSIDE the lock so no heap allocation happens under MAPPER.
+    // Capped at 4096 entries (32 KiB): a giant, mostly-sparse range (multi-GiB
+    // demand-paged munmap) must NOT pre-allocate MBs for frames that are mostly
+    // not committed. Only if MORE than 4096 pages are actually present does the
+    // Vec grow (a realloc under MAPPER — rare, and the heap never takes MAPPER).
+    let mut freed: Vec<PhysFrame<Size4KiB>> = Vec::with_capacity(pages.min(4096));
+    {
+        let mut g_map = MAPPER.lock();
+        let mapper = match g_map.as_mut() { Some(m) => m, None => return 0 };
+        let start: Page<Size4KiB> = Page::containing_address(base);
+        for i in 0..pages {
+            let page = start + i as u64;
+            match mapper.unmap(page) {
+                Ok((frame, flush)) => {
+                    flush.flush(); // local invlpg on this core
+                    freed.push(frame);
+                }
+                // Not mapped (or huge-page parent / bogus frame): skip, like the
+                // old `if let Ok(frame) = unmap_page(va)` per-page callers did.
+                Err(_) => {}
+            }
+        }
+        // ONE shootdown for the whole range, only if something was present.
+        // Still holding MAPPER (serializes shootdowns; see tlb.rs).
+        if !freed.is_empty() {
+            crate::memory::tlb::shootdown_range(start.start_address().as_u64(), pages);
+        }
+    } // MAPPER released — frames are now invisible to every core's TLB
+    let n = freed.len();
+    for frame in freed {
+        crate::memory::frames::free_frame(frame);
+    }
+    n
 }
 
 /// Virtual (HHDM) alias of a physical address. Valid for any RAM/MMIO phys

@@ -12,7 +12,9 @@
 //!
 //! Invariants:
 //! * `RANGES` is a LEAF lock: taken only to read/update the registry, NEVER held
-//!   across `map_page`/`set_flags` (which take MAPPER) or any WT-page access. So
+//!   across `map_page`/`set_flags`/`set_flags_range`/`unmap_range` (which take
+//!   MAPPER — the range variants for the whole batched range + its one final
+//!   shootdown, so their critical sections are LONGER) or any WT-page access. So
 //!   a #PF can never occur while this core holds `RANGES` (no reentrant deadlock).
 //! * Only ranges whose prot includes R/W/X commit on fault. A fault in a
 //!   PROT_NONE (reserved-only) page is a real bug — Wasmtime uses inline bounds
@@ -119,8 +121,11 @@ fn prot_to_flags(prot: u32) -> PageTableFlags {
 ///
 /// `irqs_were_on` = IF of the faulting context. When set we re-enable IRQs while
 /// allocating + mapping so this core still services TLB-shootdown IPIs: a peer
-/// core blocked in `set_flags`/`unmap_page` (which broadcast a shootdown and wait
-/// for every core's ack) would otherwise deadlock against us spinning on MAPPER.
+/// core blocked in `set_flags`/`unmap_page` or in the batched
+/// `set_flags_range`/`unmap_range` (same MAPPER+shootdown discipline, but they
+/// hold MAPPER for the WHOLE range so the wait can be longer) broadcasts a
+/// shootdown and waits for every core's ack — it would otherwise deadlock
+/// against us spinning on MAPPER.
 /// `map_page` of a not-present page itself issues NO shootdown (x86 never caches
 /// negative TLB entries), so committing is cheap and IPI-free.
 pub fn commit_fault(cr2: u64, irqs_were_on: bool) -> bool {

@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use core::ffi::c_void;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
-use crate::memory::{free_frame, unmap_page, set_flags, UnmapError};
+use crate::memory::{set_flags_range, unmap_range};
 use crate::wasm::wt::demand;
 
 // ---------------------------------------------------------------------------
@@ -177,12 +177,9 @@ pub extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: *mut *mut
 pub extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> i32 {
     let base = addr as u64;
     let pages = (size as u64 + PAGE - 1) / PAGE;
-    for i in 0..pages {
-        let va = VirtAddr::new(base + i * PAGE);
-        if let Ok(frame) = unmap_page(va) {
-            free_frame(frame); // committed page: free it; not-present pages: skip
-        }
-    }
+    // Range unmap: committed pages are unmapped + freed, not-present pages are
+    // skipped; ONE TLB shootdown for the whole range instead of one per page.
+    let _ = unmap_range(VirtAddr::new(base), pages as usize);
     // Re-record the range's prot (prot 0 = reserved/erased → faults are real).
     demand::set_prot(base, base + pages * PAGE, prot_flags);
     0
@@ -194,12 +191,9 @@ pub extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, prot_flags: u3
 pub extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
     let base = ptr as u64;
     let pages = (size as u64 + PAGE - 1) / PAGE;
-    for i in 0..pages {
-        let va = VirtAddr::new(base + i * PAGE);
-        if let Ok(frame) = unmap_page(va) {
-            free_frame(frame);
-        }
-    }
+    // Range unmap: frees the committed frames, skips never-touched pages, ONE
+    // TLB shootdown for the whole range.
+    let _ = unmap_range(VirtAddr::new(base), pages as usize);
     demand::remove(base, base + pages * PAGE);
     0
 }
@@ -218,15 +212,13 @@ pub extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) 
     let pages = (size as u64 + PAGE - 1) / PAGE;
     demand::set_prot(base, base + pages * PAGE, prot_flags);
     let flags = prot_to_flags(prot_flags);
-    for i in 0..pages {
-        let va = VirtAddr::new(base + i * PAGE);
-        match set_flags(va, flags) {
-            Ok(()) => {}
-            Err(UnmapError::NotMapped) => {} // lazy page, not committed yet — skip
-            Err(_) => return 1,
-        }
+    // Range update: not-mapped (lazy, not committed yet) pages are skipped inside
+    // set_flags_range — they'll be mapped with the new prot when first touched.
+    // ONE TLB shootdown for the whole range; hard errors (huge-page parent) → 1.
+    match set_flags_range(VirtAddr::new(base), pages as usize, flags) {
+        Ok(_) => 0,
+        Err(_) => 1,
     }
-    0
 }
 
 // ---------------------------------------------------------------------------

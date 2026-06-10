@@ -48,7 +48,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, GzError> {
     if data.len() < hlen + 8 {
         return Err(GzError::TruncatedTrailer);
     }
-    let (out, consumed) = inflate_raw(&data[hlen..])?;
+    // ISIZE (dimensione decompressa mod 2^32) dal trailer → hint per
+    // pre-allocare l'output esatto, evitando il raddoppio del buffer.
+    let isize_hint = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+    let (out, consumed) = inflate_raw(&data[hlen..], isize_hint)?;
     let trailer = &data[hlen + consumed..];
     if trailer.len() < 8 {
         return Err(GzError::TruncatedTrailer);
@@ -114,39 +117,42 @@ fn skip_zstr(data: &[u8], mut pos: usize) -> Result<usize, GzError> {
 }
 
 /// Inflate raw che riporta anche i byte consumati (serve per localizzare il
-/// trailer e rifiutare garbage dopo di esso).
-fn inflate_raw(input: &[u8]) -> Result<(Vec<u8>, usize), GzError> {
+/// trailer e rifiutare garbage dopo di esso). `size_hint` = ISIZE del trailer
+/// gzip: dimensiona il buffer output ESATTO in un colpo, niente raddoppio.
+fn inflate_raw(input: &[u8], size_hint: usize) -> Result<(Vec<u8>, usize), GzError> {
     use miniz_oxide::inflate::core::{decompress as tinfl, inflate_flags, DecompressorOxide};
     use miniz_oxide::inflate::TINFLStatus;
 
     const FLAGS: u32 = inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
         | inflate_flags::TINFL_FLAG_IGNORE_ADLER32;
+    // Crescita additiva se l'hint è troppo piccolo (ISIZE corrotto): niente
+    // raddoppio del buffer, che allocava ~8x l'input → OOM su membri grossi.
+    const GROW: usize = 256 * 1024;
 
     let mut decomp = Box::<DecompressorOxide>::default();
-    // Start with a reasonable output buffer; grow as needed.
-    let mut out: Vec<u8> = Vec::with_capacity(input.len().saturating_mul(4).max(256));
+    // Pre-dimensiona all'ISIZE (esatto per output < 4 GiB), limitato a 64x
+    // l'input come guardia contro un ISIZE corrotto/gigante.
+    let cap = size_hint.min(input.len().saturating_mul(64)).max(256);
+    let mut out: Vec<u8> = alloc::vec![0u8; cap];
     let mut total_in = 0usize;
+    let mut out_len = 0usize;
 
     loop {
-        // Ensure there is room in `out` for at least one more byte so the
-        // decompressor never hits HasMoreOutput due to a zero-length write space.
-        let out_pos = out.len();
-        let new_cap = (out.capacity().max(256)).saturating_mul(2);
-        out.resize(new_cap, 0u8);
-
         let (status, in_consumed, out_consumed) =
-            tinfl(&mut decomp, &input[total_in..], &mut out, out_pos, FLAGS);
+            tinfl(&mut decomp, &input[total_in..], &mut out, out_len, FLAGS);
 
         total_in += in_consumed;
-        let new_len = out_pos + out_consumed;
-        out.truncate(new_len);
+        out_len += out_consumed;
 
         match status {
             TINFLStatus::Done => {
+                out.truncate(out_len);
                 return Ok((out, total_in));
             }
             TINFLStatus::HasMoreOutput => {
-                // Need more output space; loop will grow `out`.
+                // Hint insufficiente: estendi (preserva i byte già scritti,
+                // serv­ono al decompressore per le back-reference).
+                out.resize(out.len() + GROW, 0u8);
             }
             _ => {
                 return Err(GzError::BadDeflate);

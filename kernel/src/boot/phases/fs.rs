@@ -44,10 +44,10 @@ pub fn init() -> Result<(), BootError> {
         }
     }
 
-    // I bin NON vengono più montati qui dai moduli Limine: la fase `storage`
-    // monta `/bin` dal CD live (ISO9660/ATAPI) e, SOLO se non c'è CD, fa il
-    // fallback a `modules::mount_all()`. Lasciamo intatti i `/dev` e la root.
-    crate::binfo!("fs", "bin mount deferred to storage phase");
+    // I bin NON vengono montati qui: la fase `unpack_bin` (subito dopo) li
+    // decomprime in tmpfs `/bin` dall'archivio `bin.bgz` (modulo Limine).
+    // Lasciamo intatti i `/dev` e la root creati da `vfs::init`.
+    crate::binfo!("fs", "bin populate deferred to unpack_bin phase");
 
     #[cfg(feature = "boot-checks")]
     {

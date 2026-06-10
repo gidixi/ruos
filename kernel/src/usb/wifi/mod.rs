@@ -623,8 +623,13 @@ const OFDM_RF_PATH_RX_MASK: u32 = 0x0F;
 const OFDM_RF_PATH_TX_MASK: u32 = 0xF0;
 const OFDM_RF_PATH_RX_A: u32 = 1 << 0;
 const OFDM_RF_PATH_TX_A: u32 = 1 << 4;
-// RCR = ACCEPT_PHYS_MATCH|MCAST|BCAST|MGMT_FRAME|HTC_LOC_CTRL|PHYSTAT|ICV|MIC.
-const RCR_VAL: u32 = 0x7000_600E;
+// RCR = ACCEPT_PHYS_MATCH|MCAST|BCAST|MGMT_FRAME|HTC_LOC_CTRL|PHYSTAT|ICV|MIC,
+// plus ACCEPT_DATA_FRAME (BIT11). The HW test showed rx total=75 data=0 during
+// the 4-way window: with only APM, directed data frames (the AP's EAPOL msg1)
+// never reach the bulk-IN, so the handshake stalls. BIT11 accepts all data so
+// msg1/msg3 arrive. (The earlier "instability" was the smoltcp DNS panic + a
+// bad USB stick, not a data-frame flood — that attribution was wrong.)
+const RCR_VAL: u32 = 0x7000_680E;
 
 // ── SP3c-6: channel set (config_channel, 20 MHz) ─────────────────────────────
 const REG_BW_OPMODE:    u16 = 0x0603;
@@ -1395,13 +1400,21 @@ fn enable_hw_security(x: &mut Xhci, dev: &mut UsbDevice) {
 }
 
 /// Receive the next EAPOL-Key frame from the AP matching `want`/`mask` on the
-/// key_info bits (e.g. ACK set + MIC clear = msg1). Bounded poll. None on timeout.
+/// key_info bits, within `timeout_ms` of WALL-CLOCK time (not a frame count — a
+/// busy channel floods beacons that would otherwise burn an iteration budget
+/// before the EAPOL frame arrives). Logs the key_info of every EAPOL seen.
 fn recv_eapol(x: &mut Xhci, st: &mut WifiState, buf: &mut [u8],
-              want: u16, mask: u16) -> Option<eapol::KeyFrame> {
-    for _ in 0..80 { // ~80 * 50ms = 4 s
+              want: u16, mask: u16, timeout_ms: u64, label: &str) -> Option<eapol::KeyFrame> {
+    let deadline = crate::boot::clock::elapsed_ms() + timeout_ms;
+    let mut total = 0u32;
+    let mut data = 0u32;
+    while crate::boot::clock::elapsed_ms() < deadline {
         if let Some(n) = recv_frame(x, st, buf, 50) {
+            total += 1;
+            if n > 0 && buf[0] & 0x0C == 0x08 { data += 1; } // data-type frame
             if let Some(payload) = ieee80211::parse_eapol_data(&buf[..n]) {
                 if let Some(kf) = eapol::parse(payload) {
+                    crate::binfo!("wifi", "4way {}: eapol key_info={:#06x}", label, kf.key_info);
                     if kf.key_info & mask == want {
                         return Some(kf);
                     }
@@ -1409,6 +1422,7 @@ fn recv_eapol(x: &mut Xhci, st: &mut WifiState, buf: &mut [u8],
             }
         }
     }
+    crate::binfo!("wifi", "4way {}: timeout (rx total={} data={})", label, total, data);
     None
 }
 
@@ -1420,8 +1434,12 @@ fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     let mut buf = [0u8; 600];
 
     // msg1 (AP→STA): ANonce. key_info: ACK set, MIC clear.
-    let m1 = recv_eapol(x, st, &mut buf, eapol::KEY_INFO_ACK,
-                        eapol::KEY_INFO_ACK | eapol::KEY_INFO_MIC)?;
+    let m1 = match recv_eapol(x, st, &mut buf, eapol::KEY_INFO_ACK,
+                              eapol::KEY_INFO_ACK | eapol::KEY_INFO_MIC, 3000, "m1") {
+        Some(k) => k,
+        None => { crate::bwarn!("wifi", "4way: no msg1"); return None; }
+    };
+    crate::binfo!("wifi", "4way: msg1 ok (anonce)");
     let anonce = m1.nonce;
 
     // Generate SNonce, derive PTK.
@@ -1436,12 +1454,16 @@ fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     let mic = wpa2::eapol_mic(&ptk.kck, &m2);
     m2[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN].copy_from_slice(&mic);
     let seq = next_seq(st);
-    send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m2, seq), seq);
+    let c2 = send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m2, seq), seq);
+    crate::binfo!("wifi", "4way: msg2 sent code={}", c2);
 
-    // msg3 (AP→STA): MIC + SECURE + ENCRYPTED key data (GTK). MIC clear-check first.
-    let m3 = recv_eapol(x, st, &mut buf,
-                        eapol::KEY_INFO_MIC | eapol::KEY_INFO_ACK | eapol::KEY_INFO_ENCRYPTED,
-                        eapol::KEY_INFO_MIC | eapol::KEY_INFO_ACK | eapol::KEY_INFO_ENCRYPTED)?;
+    // msg3 (AP→STA): MIC + ENCRYPTED key data (GTK).
+    let m3 = match recv_eapol(x, st, &mut buf,
+                              eapol::KEY_INFO_MIC | eapol::KEY_INFO_ENCRYPTED,
+                              eapol::KEY_INFO_MIC | eapol::KEY_INFO_ENCRYPTED, 3000, "m3") {
+        Some(k) => k,
+        None => { crate::bwarn!("wifi", "4way: no msg3"); return None; }
+    };
     // Verify the msg3 MIC over the exact received bytes with the MIC field
     // zeroed (proves the PMK / passphrase).
     let mut m3_chk = m3.raw.clone();
@@ -1451,9 +1473,16 @@ fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
         crate::bwarn!("wifi", "4way: msg3 MIC mismatch (wrong passphrase?)");
         return None;
     }
+    crate::binfo!("wifi", "4way: msg3 mic ok");
     // Unwrap the encrypted key data with the KEK → extract the GTK KDE.
-    let plain = wpa2::aes_unwrap(&ptk.kek, &m3.key_data)?;
-    let (gtk_idx, gtk) = eapol::extract_gtk(&plain)?;
+    let plain = match wpa2::aes_unwrap(&ptk.kek, &m3.key_data) {
+        Some(p) => p,
+        None => { crate::bwarn!("wifi", "4way: gtk unwrap failed"); return None; }
+    };
+    let (gtk_idx, gtk) = match eapol::extract_gtk(&plain) {
+        Some(g) => g,
+        None => { crate::bwarn!("wifi", "4way: no gtk kde in msg3"); return None; }
+    };
 
     // msg4 (STA→AP): MIC + SECURE, empty key data.
     let ki4 = eapol::KEY_DESC_VERSION_2 | eapol::KEY_INFO_KEY_TYPE
@@ -1484,6 +1513,10 @@ pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     };
     out.found = true;
     crate::binfo!("wifi", "connect: ap {:02x?} ch={}", bssid, channel);
+
+    // Pre-compute the PMK now (PBKDF2 is slow) so the 4-way can start listening
+    // for msg1 the instant association completes, before beacons flood the RX FIFO.
+    let pmk = if !password.is_empty() { Some(wpa2::pmk(password, ssid)) } else { None };
 
     // 2. Tune to the AP channel, set STA opmode + BSSID.
     config_channel(x, dev, channel);
@@ -1541,8 +1574,7 @@ pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     crate::binfo!("wifi", "media-connect sent (aid={})", out.aid);
 
     // 6. WPA2-PSK 4-way handshake + CCMP key install (skipped for an open net).
-    if !password.is_empty() {
-        let pmk = wpa2::pmk(password, ssid);
+    if let Some(pmk) = pmk {
         match four_way_handshake(x, dev, st, &pmk, bssid) {
             Some((ptk, gtk_idx, gtk)) if gtk.len() >= 16 => {
                 enable_hw_security(x, dev);

@@ -25,7 +25,7 @@ BIN_TOOLS  := shell ls cat echo \
               nano \
               touch wc clear which \
               sort uniq cut tr tee \
-              ifconfig nc date wget ping \
+              ifconfig nc date wget ping resolve \
               service \
               rtop \
               mkdisk mkboot install umount disks wifiscan wificonnect \

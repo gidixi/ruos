@@ -626,6 +626,33 @@ pub fn ruos_ping(
     }))
 }
 
+/// ruos_net_resolve(name_ptr, name_len, addrs_out_ptr, max_addrs, count_out_ptr) -> errno.
+pub fn ruos_net_resolve(
+    caller: Caller<'_, RuntimeState>,
+    name_ptr: i32,
+    name_len: i32,
+    addrs_out_ptr: i32,
+    max_addrs: i32,
+    count_out_ptr: i32,
+) -> Result<i32, Error> {
+    use crate::wasm::suspend::SuspendReason;
+    let name_buf = match crate::wasm::host::mem::guest_read(&caller, name_ptr, name_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(e),
+    };
+    let name = match core::str::from_utf8(&name_buf) {
+        Ok(s) => alloc::string::String::from(s),
+        Err(_) => return Ok(28), // EINVAL
+    };
+    Err(Error::host(SuspendReason::NetResolve {
+        name,
+        addrs_ptr: addrs_out_ptr as u32,
+        max_addrs: max_addrs as u32,
+        count_ptr: count_out_ptr as u32,
+    }))
+}
+
+
 /// ruos_time_get(year_ptr, month_ptr, day_ptr, hour_ptr, min_ptr, sec_ptr,
 ///                epoch_ptr) -> errno. All fields are written through the
 /// wasm-memory pointers; epoch_ptr receives a u64 unix seconds value.
@@ -944,6 +971,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "tcp_dial", ruos_tcp_dial)?
         .func_wrap("ruos", "time_get", ruos_time_get)?
         .func_wrap("ruos", "ping", ruos_ping)?
+        .func_wrap("ruos", "net_resolve", ruos_net_resolve)?
         .func_wrap("ruos", "mkdisk", ruos_mkdisk)?
         .func_wrap("ruos", "mkboot", ruos_mkboot)?
         .func_wrap("ruos", "install", ruos_install)?

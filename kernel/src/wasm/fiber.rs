@@ -588,6 +588,19 @@ impl Fiber {
                     Err(_) => 110, // ETIMEDOUT-ish
                 }
             }
+            SuspendReason::NetResolve { name, addrs_ptr, max_addrs, count_ptr } => {
+                match crate::net::dns::resolve(&name).await {
+                    Ok(addrs) => {
+                        let count = addrs.len().min(max_addrs as usize);
+                        for (i, ip) in addrs.iter().take(count).enumerate() {
+                            let _ = self.write_to_memory(addrs_ptr + (i as u32 * 4), &ip.0);
+                        }
+                        let _ = self.write_u32(count_ptr, count as u32);
+                        0
+                    }
+                    Err(_) => 44, // ENOENT
+                }
+            }
             SuspendReason::ReadDir { path, buf_ptr, buf_len, nread_ptr } => {
                 let entries = match crate::vfs::readdir(&path).await {
                     Ok(v) => v,

@@ -117,6 +117,11 @@ Restart the DHCP client. `0` OK, `8` no iface.
 ICMP echo (suspends, `SuspendReason::Ping`); writes RTT ms at `latency_ms_ptr`.
 `0` OK, `110` timeout.
 
+### `net_resolve(name_ptr, name_len, addrs_out_ptr, max_addrs, count_out_ptr) -> i32`
+DNS lookup for a hostname (suspends, `SuspendReason::NetResolve`).
+`name_ptr/len` is the utf-8 hostname. `addrs_out_ptr` is a buffer where up to `max_addrs` IPv4 addresses (4 bytes each) will be written. `count_out_ptr` receives the number of addresses actually written.
+`0` OK, `44` ENOENT (not found / timeout / no servers), `28` EINVAL.
+
 ### `tcp_dial(ip0, ip1, ip2, ip3, port, fd_out_ptr) -> i32`
 Open a TCP socket, inject it as a guest fd (written at `fd_out_ptr`), connect
 (suspends). `22` invalid port, `8` no iface, `33` EMFILE. Then use WASI `fd_read`/

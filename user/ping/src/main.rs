@@ -12,6 +12,14 @@ extern "C" {
         timeout_ms: i32,
         latency_ms_ptr: u32,
     ) -> i32;
+
+    fn net_resolve(
+        name_ptr: i32,
+        name_len: i32,
+        addrs_out_ptr: i32,
+        max_addrs: i32,
+        count_out_ptr: i32,
+    ) -> i32;
 }
 
 fn parse_ip4(s: &str) -> Option<[u8; 4]> {
@@ -35,9 +43,30 @@ fn main() {
             other => { target = Some(other.to_string()); i += 1; }
         }
     }
-    let ip = match target.and_then(|t| parse_ip4(&t)) {
+    let ip = match target.clone().and_then(|t| parse_ip4(&t)) {
         Some(v) => v,
-        None    => { eprintln!("usage: ping [-c N] [-W ms] <ip>"); std::process::exit(2); }
+        None => {
+            let t = match target {
+                Some(t) => t,
+                None => { eprintln!("usage: ping [-c N] [-W ms] <ip_or_host>"); std::process::exit(2); }
+            };
+            let mut addrs = [0u8; 4];
+            let mut count = 0u32;
+            let r = unsafe {
+                net_resolve(
+                    t.as_ptr() as i32,
+                    t.len() as i32,
+                    addrs.as_mut_ptr() as i32,
+                    1,
+                    &mut count as *mut u32 as i32,
+                )
+            };
+            if r != 0 || count == 0 {
+                eprintln!("ping: bad address '{}'", t);
+                std::process::exit(2);
+            }
+            [addrs[0], addrs[1], addrs[2], addrs[3]]
+        }
     };
     println!("PING {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
 

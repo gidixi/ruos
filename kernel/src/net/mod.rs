@@ -4,6 +4,7 @@
 
 pub mod icmp;
 pub mod loopback;
+pub mod dns;
 #[cfg(feature = "netconsole")]
 pub mod netconsole;
 pub mod nic;
@@ -12,7 +13,7 @@ pub mod virtio;
 
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
-use smoltcp::socket::dhcpv4;
+use smoltcp::socket::{dhcpv4, dns as dns_sock};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -30,8 +31,10 @@ pub struct NetState {
     // uses iface_lo.context()), i.e. loopback. Wiring app sockets over the
     // Ethernet iface is a Step 16 (SSH) item.
     pub sockets:   SocketSet<'static>,      // app/loopback sockets (iface_lo)
-    pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP
+    pub net_sockets: SocketSet<'static>,    // Ethernet sockets incl. DHCP & DNS
     pub dhcp:      Option<SocketHandle>,
+    pub dns:       Option<SocketHandle>,
+    pub dns_servers: alloc::vec::Vec<smoltcp::wire::Ipv4Address>,
     dhcp_bound:    bool,
 }
 
@@ -63,6 +66,7 @@ pub fn init() {
     let mut iface_nic: Option<Interface>      = None;
     let mut dev_nic:   Option<nic::Nic>       = None;
     let mut dhcp: Option<SocketHandle>        = None;
+    let dns = net_sockets.add(dns_sock::Socket::new(&[], alloc::vec::Vec::new()));
 
     if let Some(mut d) = virtio::VirtioNet::find_and_init() {
         let mac = d.mac();
@@ -93,6 +97,8 @@ pub fn init() {
         sockets,
         net_sockets,
         dhcp,
+        dns: Some(dns),
+        dns_servers: alloc::vec::Vec::new(),
         dhcp_bound: false,
     });
 }
@@ -125,20 +131,24 @@ pub fn poll() {
         // before touching whichever iface owns the DHCP lease (virtio xor nic).
         if let Some(h) = net.dhcp {
             let event = net.net_sockets.get_mut::<dhcpv4::Socket>(h).poll();
-            let action: Option<(Option<smoltcp::wire::Ipv4Cidr>, Option<smoltcp::wire::Ipv4Address>)> =
-                match event {
-                    Some(dhcpv4::Event::Configured(ref cfg)) => {
-                        Some((Some(cfg.address), cfg.router))
-                    }
-                    Some(dhcpv4::Event::Deconfigured) => Some((None, None)),
-                    None => None,
-                };
+            let action: Option<(
+                Option<smoltcp::wire::Ipv4Cidr>,
+                Option<smoltcp::wire::Ipv4Address>,
+                Option<alloc::vec::Vec<smoltcp::wire::Ipv4Address>>
+            )> = match event {
+                Some(dhcpv4::Event::Configured(ref cfg)) => {
+                    let srvs = cfg.dns_servers.iter().copied().collect();
+                    Some((Some(cfg.address), cfg.router, Some(srvs)))
+                }
+                Some(dhcpv4::Event::Deconfigured) => Some((None, None, None)),
+                None => None,
+            };
 
             // Apply to whichever iface was created at init.
             let iface = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
             if let (Some(action), Some(iface)) = (action, iface) {
                 match action {
-                    (Some(addr), router) => {
+                    (Some(addr), router, dns_srvs) => {
                         iface.update_ip_addrs(|a| {
                             a.clear();
                             a.push(IpCidr::Ipv4(addr)).unwrap();
@@ -146,20 +156,37 @@ pub fn poll() {
                         if let Some(gw) = router {
                             let _ = iface.routes_mut().add_default_ipv4_route(gw);
                         }
+                        if let Some(srvs) = dns_srvs {
+                            net.dns_servers = srvs;
+                            if let Some(dns_h) = net.dns {
+                                let dns_socket = net.net_sockets.get_mut::<dns_sock::Socket>(dns_h);
+                                let addrs: alloc::vec::Vec<IpAddress> = net.dns_servers
+                                    .iter()
+                                    .map(|a| IpAddress::Ipv4(*a))
+                                    .collect();
+                                dns_socket.update_servers(&addrs[..]);
+                            }
+                        }
                         if !net.dhcp_bound {
                             net.dhcp_bound = true;
+                            let dns_str = net.dns_servers
+                                .iter()
+                                .map(|a| alloc::format!("{}", a))
+                                .collect::<alloc::vec::Vec<_>>()
+                                .join(",");
                             match router {
-                                Some(gw) => crate::binfo!("net", "dhcp bound ip={} gw={}", addr.address(), gw),
-                                None      => crate::binfo!("net", "dhcp bound ip={} gw=none", addr.address()),
+                                Some(gw) => crate::binfo!("net", "dhcp bound ip={} gw={} dns={}", addr.address(), gw, dns_str),
+                                None      => crate::binfo!("net", "dhcp bound ip={} gw=none dns={}", addr.address(), dns_str),
                             }
                             #[cfg(feature = "netconsole")]
                             netconsole::mark_bound();
                         }
                     }
-                    (None, _) => {
+                    (None, _, _) => {
                         iface.update_ip_addrs(|a| a.clear());
                         let _ = iface.routes_mut().remove_default_ipv4_route();
                         net.dhcp_bound = false;
+                        net.dns_servers.clear();
                     }
                 }
             }

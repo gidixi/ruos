@@ -3,6 +3,9 @@
 
 use core::fmt;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use crate::crc32::crc32;
 
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];

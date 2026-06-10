@@ -23,7 +23,7 @@ members = [
     "wifiscan",
     "wificonnect",
     "ruos-rt",
-    "gzip-core",
+    "gzip-core", "gzip", "gunzip", "zcat",
 ]
 
 [profile.release]

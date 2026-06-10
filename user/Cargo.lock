@@ -200,6 +200,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gunzip"
+version = "0.1.0"
+dependencies = [
+ "gzip-core",
+ "ruos-rt",
+]
+
+[[package]]
+name = "gzip"
+version = "0.1.0"
+dependencies = [
+ "gzip-core",
+ "ruos-rt",
+]
+
+[[package]]
 name = "gzip-core"
 version = "0.1.0"
 dependencies = [
@@ -654,3 +670,11 @@ version = "0.1.0"
 [[package]]
 name = "wifiscan"
 version = "0.1.0"
+
+[[package]]
+name = "zcat"
+version = "0.1.0"
+dependencies = [
+ "gzip-core",
+ "ruos-rt",
+]

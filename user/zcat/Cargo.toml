@@ -1,0 +1,12 @@
+[package]
+name = "zcat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruos-rt = { path = "../ruos-rt" }
+gzip-core = { path = "../gzip-core" }
+
+[[bin]]
+name = "zcat"
+path = "src/main.rs"

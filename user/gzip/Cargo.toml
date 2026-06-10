@@ -1,0 +1,12 @@
+[package]
+name = "gzip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruos-rt = { path = "../ruos-rt" }
+gzip-core = { path = "../gzip-core" }
+
+[[bin]]
+name = "gzip"
+path = "src/main.rs"

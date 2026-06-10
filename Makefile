@@ -28,7 +28,8 @@ BIN_TOOLS  := shell ls cat echo \
               ifconfig nc date wget ping \
               service \
               rtop \
-              mkdisk mkboot install umount disks wifiscan wificonnect
+              mkdisk mkboot install umount disks wifiscan wificonnect \
+              gzip gunzip zcat
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
 USER_WASMS := $(ROOT_WASMS) $(BIN_WASMS)
 

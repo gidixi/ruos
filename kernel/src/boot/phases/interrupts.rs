@@ -238,6 +238,19 @@ pub fn init() -> Result<(), BootError> {
         crate::rng::init();
         let en = crate::wasm::wt::run_egui_demo_demo();
         crate::binfo!("wm", "egui demo spawn ok pixels={}", en);
+        // SP-GATE (Phase-0.5): spawn the Blitz HTML/CSS style+layout GATE as a window
+        // + drive one frame. The guest prints its own benchmark table to serial
+        // (rows | nodes | avg_resolve_ms | heap_peak_KiB) bracketed by "== Blitz GATE"
+        // and "GATE done". Quantifies the compositor freeze + heap of a real Stylo
+        // relayout. RNG seeded above (Stylo seeds HashMaps via WASI random_get).
+        let gn = crate::wasm::wt::run_gate_demo();
+        crate::binfo!("wm", "blitz gate spawn ok pixels={}", gn);
+
+        // SP-VIEWER (Phase-2): spawn the Blitz viewer app + drive two frames. The
+        // guest renders its embedded HTML page (Stylo+Taffy+vello_cpu) into an
+        // egui texture and prints "viewer: <nodes> nodes · resolve … · paint …".
+        let vn = crate::wasm::wt::run_viewer_demo();
+        crate::binfo!("wm", "blitz viewer spawn ok pixels={}", vn);
 
         // RNG per-core distinct-streams check: draw a value on the BSP (core 0 →
         // RNG[0]) and one on a ComputeApp AP via the message bus; they must differ.

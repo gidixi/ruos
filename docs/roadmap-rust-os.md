@@ -485,6 +485,35 @@ bootstrap + shell + SSH locale. SMP serve quando arriverà:
 - Performance compute-heavy wasm (bash/python multi-thread)
 - Real hardware deployment con N core
 
+## Step 20-24 (Roadmap Futura)
+
+Con gli step 1-19 tutti completati (GUI e SMP inclusi), la nuova "North Star" si sposta verso l'espansione hardware, prestazioni multi-core complete e l'ecosistema app WASM.
+
+### Step 20 — Wi-Fi RTL8188EU: Completamento
+Il driver Wi-Fi attuale (RTL8188EU) supporta scan e associazione (WPA2). Rimane da completare il data path:
+- **Crypto Path**: Implementare AES-CCMP (TX/RX) per decifrare/cifrare i frame 802.11 dati.
+- **DHCP over Wi-Fi**: Instradare i pacchetti chiari verso `smoltcp` e ottenere un IP.
+
+### Step 21 — SMP Fase 3: Executor Multi-Core
+L'SMP attuale offre un pool di compute offload. La Fase 3 porterà l'executor su tutti i core:
+- **Run-queue per-CPU / MPMC** con work-stealing (Rayon-style).
+- **IPI-wake**: Svegliare gli AP dallo stato di idle `hlt` quando c'è lavoro (anziché usare busy-poll).
+- **TLB Shootdown**: Sincronizzazione sicura della TLB tra core via IPI.
+- **Esecuzione WASM su AP**: Far girare le app (fiber) concorrentemente su core multipli con un runtime thread-safe.
+
+### Step 22 — Webserver HTTP
+Sulla base della spec 2026-06-08:
+- Integrazione di un server HTTP `no_std` (es. `picoserve`).
+- Esposizione diagnostica o file sharing direttamente dall'OS, in stile SSH.
+
+### Step 23 — Storage Avanzato (NVMe)
+- Driver NVMe nativo via PCIe, riusando l'allocatore DMA e l'infrastruttura ECAM.
+- Supporto potenziale a file system più robusti (es. ext2) rispetto al FAT32 attuale.
+
+### Step 24 — Espansione Userland & GUI Apps
+- **Terminale grafico**: Un vero emulatore di terminale scritto in egui per avere la shell `wasmi` come finestra nel desktop.
+- **App complesse**: Porting di linguaggi interpretati in WASM (es. MicroPython, Lua).
+
 ## Diagramma di dipendenza
 
 ```
@@ -539,10 +568,32 @@ Rami indipendenti (qualsiasi momento dopo i loro prereq):
   Wasmtime AOT, con host fn `ruos_gfx` + bridge WIT e un compositor kernel-side.
   App grafiche WASM ruos-specific (legate a `ruos_gfx`/WIT), non portabili — è OK.
 
+## Modello di Sicurezza (Capability-Based Security)
+
+In un sistema basato su WASM in Ring 0, non si usano controlli hardware o permessi sui file basati su UID/GID; si utilizza invece un approccio chiamato Capability-Based Security gestito direttamente dal runtime e dal kernel al momento dell'iniezione delle interfacce.
+
+Ecco come si gestirebbero le autorizzazioni (anche in un potenziale scenario multi-utente):
+
+1. **Concessione granulare dei percorsi (Capability-Scoped Paths e Preopens)**
+Nei sistemi WASI, i programmi non vedono l'intero file system per impostazione predefinita, ma solo le directory che il kernel "inietta" loro all'avvio (chiamate preopens).
+In ruOS attualmente, l'ambiente riceve la radice completa tramite il file descriptor fd 3 = `/`.
+In uno scenario multi-utente, il kernel inietterebbe a ciascun utente solo la propria directory (es. fd 3 = `/utenti/alice`).
+I tentativi di uscire da questa radice autorizzata (ad esempio usando `../` nei percorsi) vengono bloccati a livello di funzione host dal kernel. Se l'utente cerca di aprire un file o cambiare directory fuori dal suo perimetro tramite chiamate come `path_open` o `chdir`, il kernel restituisce immediatamente l'errore 76 `ENOTCAPABLE` (al di fuori della capability concessa).
+
+2. **Filtro delle Funzioni Host (Import)**
+Le applicazioni WASM non possono eseguire istruzioni privilegiate della CPU; possono solo chiamare le funzioni host che il kernel decide esplicitamente di esportare e collegare al loro modulo.
+Per differenziare i privilegi, il kernel potrebbe creare ambienti di esecuzione su misura. A uno strumento di sistema eseguito da un amministratore verrebbero forniti i collegamenti a funzioni distruttive o di rete (come `mkdisk`, `install` o `tcp_dial`).
+Al contrario, al processo di un utente standard queste funzioni non verrebbero fornite affatto. Qualsiasi tentativo di invocare un'operazione non autorizzata (come usare `exec` per avviare binari di sistema) fallirebbe restituendo sempre l'errore 76 `ENOTCAPABLE`.
+
+3. **Protezione dei Processi e della Memoria via Software**
+Poiché tutti i processi girano nello stesso spazio di indirizzamento (Ring 0), la separazione è garantita dal fatto che la memoria lineare WASM di un utente è fisicamente inaccessibile al processo di un altro utente.
+Ogni lettura o scrittura tra il kernel e lo spazio utente passa attraverso un'unica funzione rigorosamente ispezionata (l'audited guest-memory accessor), prevenendo attacchi in cui un utente cerca di leggere la memoria altrui.
+Le API di controllo dei processi possiedono già logiche di autoprotezione: ad esempio, la funzione host `proc_kill` attualmente rifiuta di terminare i demoni protetti del kernel. Questa stessa logica software può essere estesa per verificare l'appartenenza di un processo: il kernel scarterebbe semplicemente le chiamate `proc_kill` se l'ID del processo bersaglio appartiene a un altro utente.
+
+In sintesi, le autorizzazioni si gestiscono limitando ciò che il runtime inietta nel programma. Invece di far partire un processo per poi bloccarlo quando cerca di accedere a un file vietato, in un'architettura WASM il programma nasce all'interno di una "realtà" su misura, in cui i file di altri utenti e le funzioni amministrative semplicemente non esistono.
+
 ## Cosa NON è in roadmap (rifiutato esplicitamente)
 
-- Multi-utente Unix-style (uid/gid, permessi POSIX) — fuori scope (tesi
-  WASM-as-sandbox single-address-space).
 - ~~Multi-CPU/SMP — solo se serve dopo Step 16.~~ → era differito, **poi
   implementato** (Step 18: bring-up AP + compute pool; il compositor lo usa per
   il compositing parallelo).

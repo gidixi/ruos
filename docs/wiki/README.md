@@ -24,20 +24,20 @@ tono e lingua. Pagine che non seguono lo stile vanno riallineate.
 ## Indice
 
 ### Architettura
-- [Panoramica](architecture/overview.md) — *stub*
+- [Panoramica](architecture/overview.md) — layer cake, boot, runtime, SMP, source map
 
 ### Componenti
+- [Boot a fasi](components/boot-phases.md) — le 10 fasi di init, da GDT a executor
+- [Runtime WASM](components/wasm-runtime.md) — wasmi + Wasmtime AOT, fibers, fuel, host ABI
+- [VFS / Storage](components/vfs-storage.md) — tmpfs, FAT32, AHCI, GPT, disk authoring
+- [Input](components/input.md) — PS/2 + USB HID keyboard/mouse, coda condivisa
+- [Networking + SSH](components/networking-ssh.md) — smoltcp, NIC, DHCP, TCP, SSH, Wi-Fi
+- [SMP / Executor async](components/smp-executor.md) — embassy, compute pool, CPU accounting
 - [Compositor / Window Manager](components/compositor.md) — la GUI kernel-side, multi-finestra
-
-### Sottosistemi (da scrivere)
-- Boot a fasi — *TODO*
-- Runtime WASM (wasmi + Wasmtime AOT) — *TODO*
-- VFS / storage — *TODO*
-- Input (PS/2 + USB HID) — *TODO*
-- Networking + SSH — *TODO*
-- SMP / executor async — *TODO*
 
 ## Stato della wiki
 
-Appena nata. Coperto finora: il compositor. Il resto è elencato sopra come TODO —
-si riempie un componente alla volta, ognuno seguendo [STYLE.md](STYLE.md).
+Copre tutti i sottosistemi principali (7 componenti + panoramica architettura).
+Ogni pagina è in stato `bozza` — rispecchia il codice al 2026-06-10 ma non è
+stata revisionata a fondo. Si rifinisce un componente alla volta, seguendo
+[STYLE.md](STYLE.md).

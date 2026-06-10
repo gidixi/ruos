@@ -96,9 +96,6 @@ Cooperative kill (sets a flag the target checks at its next host call). `0` OK,
 ### `net_iface(buf, len, used) -> i32`
 Interface list, e.g. `lo  127.0.0.1/8\n`, `eth0  10.0.2.15/24 mac=… gw=…\n`. `8` ENOBUFS.
 
-### `wifi_scan(buf, cap) -> i32`
-Perform a Wi-Fi scan and write results to `buf`. Returns the number of bytes written, or `-1` if the buffer is too small.
-
 ### `wifi_connect(ssid_ptr, ssid_len, pass_ptr, pass_len, buf_ptr, buf_cap) -> i32`
 Connect to a WPA2-PSK network on the RTL8188EU dongle: lazily brings the chip up,
 scans for `ssid`, runs open-system authentication + WPA2 association (assoc-request

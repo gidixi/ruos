@@ -134,6 +134,23 @@ pub fn run_egui_demo_demo() -> usize {
     crate::wasm::wt::wm::egui_demo_self_test()
 }
 
+/// Boot self-test (SP-GATE, Phase-0.5): spawn the Blitz style+layout GATE as a
+/// window + drive one frame; the guest prints its benchmark table to serial.
+/// Returns the committed surface length (non-zero = the Blitz/Stylo guest ran).
+#[cfg(feature = "boot-checks")]
+pub fn run_gate_demo() -> usize {
+    crate::wasm::wt::wm::gate_self_test()
+}
+
+/// Boot self-test (SP-VIEWER, Phase-2): spawn the Blitz viewer (full
+/// parse→style→layout→vello_cpu-paint pipeline on an embedded HTML page) as a
+/// window + drive two frames; the guest prints its timing line to serial.
+/// Returns the committed surface length (non-zero = the pipeline ran).
+#[cfg(feature = "boot-checks")]
+pub fn run_viewer_demo() -> usize {
+    crate::wasm::wt::wm::viewer_self_test()
+}
+
 /// Boot self-test (egui SP-C): exercise the `wm.spawn` deferred-spawn mechanism +
 /// the `wm.set_background` full-screen-bg mechanism headlessly (embedded module,
 /// since `/bin` isn't mounted this early). Returns a 2-bit flag word (`0b11` ==

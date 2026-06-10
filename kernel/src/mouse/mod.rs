@@ -13,6 +13,9 @@ use crate::acpi_init::IrqOverride;
 
 /// One decoded mouse report. Movement is relative; Y is already flipped so
 /// positive `dy` means "cursor moves down" (PS/2 reports up as positive).
+/// `wheel` is in detents, positive = wheel rolled AWAY from the user (scroll
+/// up) — PS/2 reports Z toward-user as positive, so it is negated at decode;
+/// USB HID already reports away-from-user as positive.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MouseEvent {
     pub dx: i16,
@@ -20,6 +23,7 @@ pub struct MouseEvent {
     pub left: bool,
     pub right: bool,
     pub middle: bool,
+    pub wheel: i16,
 }
 
 /// Decode a raw 3-byte PS/2 mouse packet.
@@ -45,7 +49,16 @@ pub fn decode_packet(b: [u8; 3]) -> MouseEvent {
         b[2] as i16
     };
 
-    MouseEvent { dx, dy: -dy_raw, left, right, middle }
+    MouseEvent { dx, dy: -dy_raw, left, right, middle, wheel: 0 }
+}
+
+/// Decode a 4-byte IntelliMouse packet (wheel mode, device ID 3): bytes 0-2 as
+/// [`decode_packet`], byte3 = Z movement (i8, positive = wheel toward the user =
+/// scroll down) — negated so positive `wheel` means scroll up, matching USB HID.
+pub fn decode_packet4(b: [u8; 4]) -> MouseEvent {
+    let mut ev = decode_packet([b[0], b[1], b[2]]);
+    ev.wheel = -((b[3] as i8) as i16);
+    ev
 }
 
 // --- Event queue ----------------------------------------------------------
@@ -87,17 +100,22 @@ pub fn event_count() -> u32 {
 
 // --- ISR ------------------------------------------------------------------
 
-/// Index of the next byte within the current 3-byte packet (0,1,2).
+/// Index of the next byte within the current packet (0..PKT_LEN-1).
 static PKT_IDX: AtomicU8 = AtomicU8::new(0);
-/// The two already-received bytes packed as (byte0 << 8) | byte1.
+/// Already-received bytes packed LE-style: byte0 << 16 | byte1 << 8 | byte2.
 static PKT_BUF: AtomicU32 = AtomicU32::new(0);
+/// True when the device acknowledged IntelliMouse mode (ID 3): packets are
+/// 4 bytes, byte3 = wheel Z. Set once during `init`, before IRQs are unmasked.
+static WHEEL_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// IRQ12 handler. Reads one byte from the PS/2 data port, assembles a 3-byte
-/// packet, and on completion decodes + enqueues a `MouseEvent`.
+/// (or 4-byte IntelliMouse) packet, and on completion decodes + enqueues a
+/// `MouseEvent`.
 pub extern "x86-interrupt" fn mouse_handler(_frame: InterruptStackFrame) {
     let mut data: Port<u8> = Port::new(0x60);
     // SAFETY: 0x60 is the PS/2 controller data port.
     let byte = unsafe { data.read() };
+    let wheel_mode = WHEEL_MODE.load(Ordering::SeqCst) != 0;
 
     match PKT_IDX.load(Ordering::SeqCst) {
         0 => {
@@ -106,19 +124,29 @@ pub extern "x86-interrupt" fn mouse_handler(_frame: InterruptStackFrame) {
                 apic::lapic::eoi();
                 return;
             }
-            PKT_BUF.store((byte as u32) << 8, Ordering::SeqCst);
+            PKT_BUF.store((byte as u32) << 16, Ordering::SeqCst);
             PKT_IDX.store(1, Ordering::SeqCst);
         }
         1 => {
             let prev = PKT_BUF.load(Ordering::SeqCst);
-            PKT_BUF.store(prev | (byte as u32), Ordering::SeqCst);
+            PKT_BUF.store(prev | ((byte as u32) << 8), Ordering::SeqCst);
             PKT_IDX.store(2, Ordering::SeqCst);
+        }
+        2 if wheel_mode => {
+            let prev = PKT_BUF.load(Ordering::SeqCst);
+            PKT_BUF.store(prev | (byte as u32), Ordering::SeqCst);
+            PKT_IDX.store(3, Ordering::SeqCst);
+        }
+        2 => {
+            let packed = PKT_BUF.load(Ordering::SeqCst);
+            push_event(decode_packet([(packed >> 16) as u8, (packed >> 8) as u8, byte]));
+            PKT_IDX.store(0, Ordering::SeqCst);
         }
         _ => {
             let packed = PKT_BUF.load(Ordering::SeqCst);
-            let b0 = (packed >> 8) as u8;
-            let b1 = packed as u8;
-            push_event(decode_packet([b0, b1, byte]));
+            push_event(decode_packet4([
+                (packed >> 16) as u8, (packed >> 8) as u8, packed as u8, byte,
+            ]));
             PKT_IDX.store(0, Ordering::SeqCst);
         }
     }
@@ -195,12 +223,25 @@ pub fn init(overrides: &[IrqOverride]) {
     cmd(0x60);
     write_data(config);
 
-    // 3. Set defaults (0xF6) and 4. enable data reporting (0xF4). 0xFA = ACK.
+    // 3. Set defaults (0xF6), then try the IntelliMouse wheel unlock: the magic
+    //    sample-rate sequence 200,100,80 followed by Get-ID (0xF2). A wheel mouse
+    //    (QEMU included) answers ID 3 and switches to 4-byte packets (byte3 = Z);
+    //    a plain mouse answers 0 and stays on 3-byte packets. Must happen BEFORE
+    //    enabling data reporting so the ID byte isn't mixed with movement data.
     let ack_def = mouse_cmd(0xF6);
+    for rate in [200u8, 100, 80] {
+        mouse_cmd(0xF3);
+        mouse_cmd(rate);
+    }
+    mouse_cmd(0xF2);
+    let id = read_data();
+    WHEEL_MODE.store((id == 3) as u8, Ordering::SeqCst);
+
+    // 4. Enable data reporting (0xF4). 0xFA = ACK.
     let ack_en = mouse_cmd(0xF4);
     crate::binfo!(
-        "mouse", "init defaults_ack=0x{:02X} enable_ack=0x{:02X}",
-        ack_def, ack_en
+        "mouse", "init defaults_ack=0x{:02X} id={} wheel={} enable_ack=0x{:02X}",
+        ack_def, id, id == 3, ack_en
     );
 
     // 5. Route IRQ12 → VEC_MOUSE (handles ACPI interrupt overrides).
@@ -212,28 +253,36 @@ pub fn init(overrides: &[IrqOverride]) {
 #[cfg(feature = "boot-checks")]
 pub fn self_test() -> bool {
     if decode_packet([0x08, 0x00, 0x00])
-        != (MouseEvent { dx: 0, dy: 0, left: false, right: false, middle: false })
+        != (MouseEvent { dx: 0, dy: 0, left: false, right: false, middle: false, wheel: 0 })
     {
         return false;
     }
     if decode_packet([0x09, 0x05, 0x03])
-        != (MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false })
+        != (MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false, wheel: 0 })
     {
         return false;
     }
     // 0x3C = always-1(0x08) | middle(0x04) | X-sign(0x10) | Y-sign(0x20).
     if decode_packet([0x3C, 0xFE, 0xFF])
-        != (MouseEvent { dx: -2, dy: 1, left: false, right: false, middle: true })
+        != (MouseEvent { dx: -2, dy: 1, left: false, right: false, middle: true, wheel: 0 })
     {
         return false;
     }
+    // IntelliMouse 4-byte: byte3 = Z (i8). QEMU wheel-up sends Z=-1 (0xFF) →
+    // wheel +1 (scroll up); wheel-down sends Z=+1 → wheel -1.
+    if decode_packet4([0x08, 0x00, 0x00, 0xFF]).wheel != 1 {
+        return false;
+    }
+    if decode_packet4([0x08, 0x00, 0x00, 0x01]).wheel != -1 {
+        return false;
+    }
     // Queue FIFO + drain.
-    push_event(MouseEvent { dx: 1, dy: 2, left: true, right: false, middle: false });
-    push_event(MouseEvent { dx: 3, dy: 4, left: false, right: true, middle: false });
+    push_event(MouseEvent { dx: 1, dy: 2, left: true, right: false, middle: false, wheel: 0 });
+    push_event(MouseEvent { dx: 3, dy: 4, left: false, right: true, middle: false, wheel: 0 });
     let a = pop_event();
     let b = pop_event();
     let c = pop_event();
-    a == Some(MouseEvent { dx: 1, dy: 2, left: true, right: false, middle: false })
-        && b == Some(MouseEvent { dx: 3, dy: 4, left: false, right: true, middle: false })
+    a == Some(MouseEvent { dx: 1, dy: 2, left: true, right: false, middle: false, wheel: 0 })
+        && b == Some(MouseEvent { dx: 3, dy: 4, left: false, right: true, middle: false, wheel: 0 })
         && c.is_none()
 }

@@ -147,6 +147,27 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
             OK
         })?;
 
+    // path_filestat_get(dirfd, flags, path, path_len, out) -> errno. 64-byte filestat
+    // (filetype@16, size@32), same layout as fd_filestat_get. Resolves `path` against
+    // the single "/" preopen like path_open. std::fs::metadata / Path::exists import
+    // this; without it Rust-std guests (Blitz, and the kernel's own cat.cwasm) fail to
+    // instantiate with "unknown import path_filestat_get". Best-effort via vfs::stat.
+    linker.func_wrap("wasi_snapshot_preview1", "path_filestat_get",
+        |mut caller: Caller<'_, T>, _dirfd: i32, _flags: i32, path: i32, path_len: i32, out: i32| -> i32 {
+            let raw = match mem::read(&mut caller, path as u32, path_len as u32) { Some(b) => b, None => return EINVAL };
+            let rel = match core::str::from_utf8(&raw) { Ok(s) => s, Err(_) => return EINVAL };
+            let abs = alloc::format!("/{}", rel.trim_start_matches('/'));
+            let (ft, size): (u8, u64) = match vfs::block_on(vfs::stat(&abs)) {
+                Ok(s) => (kind_to_filetype(s.kind), s.size),
+                Err(_) => return ENOENT,
+            };
+            let mut st = [0u8; 64];
+            st[16] = ft;
+            st[32..40].copy_from_slice(&size.to_le_bytes());
+            if !mem::write(&mut caller, out as u32, &st) { return EINVAL; }
+            OK
+        })?;
+
     // fd_prestat_get(fd, out) -> errno. Only fd 3 = preopen "/".
     linker.func_wrap("wasi_snapshot_preview1", "fd_prestat_get",
         |mut caller: Caller<'_, T>, fd: i32, out: i32| -> i32 {

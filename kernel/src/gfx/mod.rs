@@ -183,7 +183,8 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
 
 /// One GUI event in wire form (16 bytes, 4×u32 LE): [kind, p0, p1, p2].
 /// kind 0 key {p0=scancode, p1=pressed}, 1 mousemove {p0=x f32, p1=y f32},
-/// 2 mousebtn {p0=button 0=L/1=R/2=M, p1=pressed}, 3 resize {p0=w,p1=h}, 4 quit.
+/// 2 mousebtn {p0=button 0=L/1=R/2=M, p1=pressed}, 3 resize {p0=w,p1=h}, 4 quit,
+/// 5 wheel {p0=detents i32 (two's complement; positive = scroll up)}.
 #[derive(Copy, Clone)]
 pub struct GfxEvt { pub kind: u32, pub p0: u32, pub p1: u32, pub p2: u32 }
 
@@ -263,6 +264,11 @@ pub fn fold_mouse() {
                 prev.store(*cur, Ordering::Relaxed);
                 push(GfxEvt { kind: 2, p0: i as u32, p1: *cur as u32, p2: 0 });
             }
+        }
+        // Wheel: detents as i32 (positive = scroll up), routed by the compositor
+        // to the window under the cursor (hover-scroll).
+        if ev.wheel != 0 {
+            push(GfxEvt { kind: 5, p0: ev.wheel as i32 as u32, p1: 0, p2: 0 });
         }
     }
     // Responsive software cursor: redraw at the new position without forcing a

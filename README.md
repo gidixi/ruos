@@ -79,6 +79,8 @@ for the existing tools.
 and userland — boot flow, drivers, the WASM runtime, and the host ABI — is in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+**Architectural Paradigms:** To understand how ruOS reinvents traditional OS concepts (Ring-0 WASM, Fuel Metering, Linear Offsets, etc.), read the glossary at [`docs/ruos-terminologia.md`](docs/ruos-terminologia.md).
+
 Detailed roadmap: [`docs/superpowers/roadmap-rust-os.md`](docs/superpowers/roadmap-rust-os.md).
 Per-step design specs and implementation plans live under
 [`docs/superpowers/specs/`](docs/superpowers/specs/) and

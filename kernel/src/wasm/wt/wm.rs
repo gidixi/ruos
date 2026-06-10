@@ -57,6 +57,19 @@ static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
 /// needs `_initialize` run before its first `frame()`. The FIRST launcher-visible
 /// app (`show_in_launcher: true`).
 static EGUI_DEMO_CWASM: &[u8] = include_bytes!("egui_demo.cwasm");
+/// Phase-0.5 GATE app (Blitz HTML/CSS style+layout benchmark). Embedded ONLY under
+/// `boot-checks` — it is ~51 MB of AOT Stylo native code, so production builds must
+/// not carry it. Its guest `frame()` runs the bench once and prints a table to
+/// serial via stdout (`fd_write` → console). Built by the demo-apps SDK
+/// (`apps/viewer-gate`) and copied in as `viewer-gate.cwasm`.
+#[cfg(feature = "boot-checks")]
+static GATE_CWASM: &[u8] = include_bytes!("viewer-gate.cwasm");
+/// Phase-2 viewer app (Blitz parse→style→layout→vello_cpu paint of an embedded
+/// HTML page). Embedded ONLY under `boot-checks` — ~63 MB of AOT Stylo+vello_cpu
+/// native code, so production builds must not carry it. Built by the demo-apps
+/// SDK (`apps/viewer`) and copied in as `viewer.cwasm`.
+#[cfg(feature = "boot-checks")]
+static VIEWER_CWASM: &[u8] = include_bytes!("viewer.cwasm");
 
 /// A launchable app: a display name + its precompiled `.cwasm` bytes.
 pub struct AppEntry {
@@ -1706,6 +1719,22 @@ impl Compositor {
                             self.wins[self.focused].store.data_mut().win.events.push_back(ev);
                         }
                     }
+                    5 => { // wheel -> topmost window under the cursor (hover-
+                           // scroll, like kind 1), falling through to the bg
+                           // window over bare desktop. Forwarded verbatim (the
+                           // payload is a delta, not a position — no local-coord
+                           // rewrite needed). A MouseMove is forwarded first so
+                           // egui's pointer is over the scroll area it should
+                           // scroll.
+                        let target = self.window_at(cx, cy).or_else(|| self.bg_index());
+                        if let Some(i) = target {
+                            if i < self.wins.len() {
+                                self.forward_mouse_move(i, cx, cy);
+                                self.wins[i].store.data_mut().win.events.push_back(ev);
+                                self.wins[i].last_active_frame = self.frame_no;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2046,6 +2075,43 @@ pub fn egui_demo_self_test() -> usize {
     let idx = APPS.iter().position(|a| a.name == "egui-demo").unwrap_or(usize::MAX);
     if idx == usize::MAX || c.spawn_app(idx).is_none() { return 0; }
     c.frame_all();
+    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+}
+
+/// Boot self-test (SP-GATE, Phase-0.5): spawn the Blitz GATE app as a compositor
+/// window and drive ONE frame. The guest's first `frame()` runs the Blitz
+/// style+layout benchmark (Stylo + Taffy on synthetic pages of growing size) and
+/// prints a table — `rows | nodes | avg_resolve_ms | heap_peak_KiB` — to serial via
+/// stdout. The numbers quantify how long a `resolve()` would FREEZE the single-core
+/// synchronous compositor (`frame.call`) and the heap a `StoreLimits` cap must hold.
+/// Returns the committed surface length (non-zero = the Blitz guest instantiated
+/// against the unified WASI+wm `Linker<AppState>` and ran). RNG must already be live
+/// (Stylo seeds HashMaps via WASI `random_get`) — the caller seeds it first.
+/// Resolves the module from the EMBEDDED blob (`/bin` isn't mounted this early).
+#[cfg(feature = "boot-checks")]
+pub fn gate_self_test() -> usize {
+    let mut c = Compositor::new_empty();
+    let module = match module_for(GATE_CWASM) { Some(m) => m, None => return 0 };
+    if c.spawn_named("viewer-gate", module).is_none() { return 0; }
+    c.frame_all();
+    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+}
+
+/// Boot self-test (SP-VIEWER, Phase-2): spawn the Blitz viewer app and drive TWO
+/// frames. The guest's first `frame()` parses+styles+lays out its embedded HTML
+/// page, paints it with vello_cpu into an RGBA buffer and uploads it as an egui
+/// texture (printing `viewer: <nodes> nodes · resolve <ms> · paint <ms>` to
+/// serial via stdout); the second frame draws the textured image. Returns the
+/// committed surface length (non-zero = the full parse→style→layout→paint
+/// pipeline ran in-kernel). RNG must already be live (Stylo seeds HashMaps via
+/// WASI `random_get`). Resolves the module from the EMBEDDED blob.
+#[cfg(feature = "boot-checks")]
+pub fn viewer_self_test() -> usize {
+    let mut c = Compositor::new_empty();
+    let module = match module_for(VIEWER_CWASM) { Some(m) => m, None => return 0 };
+    if c.spawn_named("viewer", module).is_none() { return 0; }
+    c.frame_all();
+    c.frame_all(); // 2nd frame: the texture uploaded on frame 1 is drawn here
     c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
 }
 

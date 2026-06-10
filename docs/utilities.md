@@ -5,7 +5,7 @@ Per ogni tool: cosa fa, comportamento effettivamente implementato (flag/argoment
 onorati, internals), e cosa manca rispetto alla versione reale (GNU coreutils /
 util-linux / standard POSIX).
 
-**Ultimo aggiornamento:** 2026-05-30 — 45 programmi (`build/iso_root/bin/*.wasm`).
+**Ultimo aggiornamento:** 2026-06-10 — ~59 programmi (`build/iso_root/bin/*.wasm`).
 
 ---
 
@@ -38,38 +38,51 @@ util-linux / standard POSIX).
 
 | Tool | Categoria | Funzione |
 |------|-----------|----------|
-| shell | sistema | shell interattiva con history/completion/exec wasm |
+| shell | sistema | shell interattiva con history/completion/pipe/exec wasm |
 | nano | editor | editor full-screen 80×24 |
 | ls cat cp mv rm mkdir rmdir touch | file | gestione file/directory |
 | du df diff head tail | file | dimensioni / diff / porzioni |
 | wc sort uniq cut tr tee echo clear which | testo | manipolazione testo |
 | ps kill pkill | processi | gestione processi |
+| rtop | processi | htop-style monitor full-screen (ratatui) |
+| service | sistema | gestione servizi kernel |
 | uname uptime free lscpu lspci lsusb dmesg id whoami date | sistema | info sistema |
 | ip ifconfig nc ping wget | rete | networking |
+| wifiscan wificonnect | rete | Wi-Fi scan/connect (RTL8188EU) |
 | find grep | ricerca | ricerca file/contenuti |
+| disks umount | disco | elenco dischi SATA / unmount |
+| mkdisk mkboot install | disco | disk authoring / installer SSD |
+| gzip gunzip zcat | compressione | gzip RFC 1952 compress/decompress |
 | init client server | speciali | init + test stub socket |
+| base64 | utility | codifica/decodifica dati |
+| sha256sum | crittografia | hash file |
 
 ---
 
 ## Shell ed editor
 
 ### shell
-- **Funzione:** shell interattiva con line editing, history, tab completion, builtin,
-  exec di `.wasm`.
+- **Funzione:** shell interattiva con line editing, history, tab completion, pipe,
+  builtin, exec di `.wasm`.
 - **Implementato:** nessun flag CLI. Builtin: `cd`, `pwd`, `exit`, `help`, `poweroff`,
   `reboot`, `source`/`.`. Comandi esterni risolti come `/bin/<cmd>.wasm` (o path letterale
-  se contiene `/`). Host fn ruos: `exec`, `readdir`, `tcgetattr`/`tcsetattr`, `chdir`,
-  `poweroff`, `reboot`. Raw mode (clear `ICANON|ECHO|ISIG`). Editor: backspace, Ctrl-A
-  (home), Ctrl-E (fine), Ctrl-L (clear), Ctrl-C (annulla riga), Tab (completion builtin +
-  `/bin/*.wasm` e path filesystem), frecce Su/Giù (history), Sx/Dx (cursore). Avvio:
-  esegue `/etc/init.sh` riga per riga, banner verde. `exec` passa argv come blob binario
-  (count u32 + tabella offset/len + byte). HISTORY globale in `Mutex<Vec<String>>`.
-- **Manca dal reale (bash/sh):** niente pipe `|`, redirezioni (`>` `<` `>>` `2>`), job
+  se contiene `/`; su SSD anche `/mnt/bin/<cmd>.wasm`). Host fn ruos: `exec`,
+  `exec_pipeline`, `readdir`, `tcgetattr`/`tcsetattr`, `chdir`, `poweroff`, `reboot`.
+  Raw mode (clear `ICANON|ECHO|ISIG`). Editor: backspace, Ctrl-A (home), Ctrl-E (fine),
+  Ctrl-L (clear), Ctrl-C (annulla riga), Tab (completion builtin + `/bin/*.wasm` e path
+  filesystem), frecce Su/Giù (history), Sx/Dx (cursore). **Pipe `|`**: le righe con `|`
+  sono splittate in segmenti, serializzate in un blob binario e passate alla host fn
+  `exec_pipeline` che le esegue come fiber concorrenti collegate da pipe in-RAM (max 4
+  stadi). Builtin non ammessi in pipeline. Avvio: esegue `/etc/init.sh` riga per riga,
+  banner verde. `exec` passa argv come blob binario (count u32 + tabella offset/len +
+  byte). HISTORY globale in `Mutex<Vec<String>>`.
+- **Manca dal reale (bash/sh):** niente redirezioni (`>` `<` `>>`  `2>`), job
   control (`&` `fg` `bg` Ctrl-Z). Niente variabili/`export`/espansione env, command
   substitution `$()`/backtick, globbing (`*`/`?` passati letterali), quoting (split su
   whitespace puro), control flow (`if`/`for`/`while`/`case`/funzioni), sequencing
   (`;` `&&` `||`), `~`, `$PATH` (hardcoded `/bin`), alias. History non persistita, no
-  Ctrl-R, no builtin `history`. `exit` ignora il codice (sempre 0).
+  Ctrl-R, no builtin `history`. `exit` ignora il codice (sempre 0). Pipeline max 4
+  stadi, non infinita.
 
 ### nano
 - **Funzione:** editor di testo full-screen 80×24 (apri, modifica, salva).
@@ -447,6 +460,138 @@ util-linux / standard POSIX).
 
 ---
 
+## Monitor e servizi
+
+### rtop
+- **Funzione:** monitor di sistema full-screen stile `htop` — per-core CPU%, memoria,
+  uptime, tabella processi.
+- **Implementato:** `--once` (output testuale plain, grep-safe). Senza flag: TUI
+  interattiva via `ratatui` su `AnsiBackend` 80×24. Raw mode (`tcgetattr`/`tcsetattr`).
+  Host fn `cpustat` (per-core busy/idle TSC), `proc_stat` (pid, start_tick, cpu_tsc,
+  mem_bytes, name), `meminfo` (heap + frame), `uptime` (centisecondi). **Auto-refresh
+  1 Hz** via `poll_stdin` (host fn, timer-driven: un tasto torna immediatamente, timeout
+  ridisegna). `q` o Ctrl-C escono. Barre ASCII `[####------]` perché il font FB non ha
+  glifi Unicode box-drawing. Processi ordinati per CPU% decrescente. CPU per-core: delta
+  busy/(busy+idle) tra due snapshot a ~1 s. CPU per-processo: delta cpu_tsc/wall.
+  Formato bytes: B/K/M. Tempo elapsed: `m:ss.cc`.
+- **Manca dal reale (htop):** niente tree view, filtri, sort interattivo, kill
+  interattivo, thread, `nice`, I/O counters, ricerca, mouse, resize, scroll. Geometria
+  fissa 80×24. Niente colori per-usage (solo verde fisso per CPU). No signal selection.
+  No swapping.
+
+### service
+- **Funzione:** gestione servizi del kernel (lista, start, status).
+- **Implementato:** subcomandi posizionali: `service [list]` (default), `service start
+  <name>`, `service status <name>`, `service stop <name>` (riservato, non implementato:
+  exit 3). `list` stampa tabella `NAME STATUS PID RUNS PATH` via host fn
+  `service_list` (buf 8192, formato TSV NUL-terminato dal kernel). `start` chiama
+  `service_start` (0=ok, 1=NotFound, 2=Already, 3=NotSupported, 99=Internal). `status`
+  chiama `service_status` (buf 4096, una riga TSV).
+- **Manca dal reale (systemctl/service):** niente `stop`/`restart`/`enable`/`disable`,
+  log, dipendenze, journal. Solo la registry kernel (shell, SSH). Nessun flag.
+
+---
+
+## Disco e storage
+
+### disks
+- **Funzione:** elenca i dischi SATA (indice, modello, dimensione).
+- **Implementato:** nessun flag. Host `sata_list` (buf 1024, formato `<idx>\t<model>\t<size>`).
+  Stampa tabella `IDX MODEL SIZE`. Il modello arriva come stringa `{:?}` (con apici);
+  `trim_matches('"')` li toglie. Return `0` = nessun disco; `<0` = buffer troppo piccolo.
+- **Manca dal reale (lsblk/fdisk):** nessun flag, nessun dettaglio partizioni/GPT,
+  nessun filtro per tipo. Solo SATA/AHCI.
+
+### umount
+- **Funzione:** smonta un filesystem.
+- **Implementato:** un operando posizionale `<path>` (obbligatorio). Host fn `ruos::umount`.
+  Return `0`=ok, `-2`=non smontabile (es. `/`), `-3`=busy (file aperti), altro=non montato.
+  Necessario prima di `install` quando `/mnt` è auto-montata.
+- **Manca dal reale (umount):** niente `-f` (force), `-l` (lazy), `-a`, multi-path.
+  Nessun parsing flag (un `-flag` sarebbe trattato come path).
+
+### mkdisk
+- **Funzione:** crea un disco ruOS: GPT + FAT32 ESP + data partition (⚠ DISTRUTTIVO).
+- **Implementato:** `[esp_mib]` (default 64). Host fn `ruos::mkdisk`. Agisce sul
+  **primo** disco SATA. Return `0`=ok, `-1`=nessun disco, `-2`=errore di scrittura.
+- **Manca dal reale (fdisk/mkfs):** solo il primo SATA, nessuna scelta disco, nessun
+  layout customizzabile. Un solo formato (GPT+FAT32).
+
+### mkboot
+- **Funzione:** come `mkdisk` + copia dell'albero di boot completo (⚠ DISTRUTTIVO).
+- **Implementato:** `[esp_mib]` (default 64). Host fn `ruos::mkboot`. Agisce sul primo
+  SATA. Scrive kernel, `BOOTX64.EFI`, `limine.conf` e tutti i moduli sull'ESP.
+  Return come `mkdisk`.
+- **Manca dal reale:** stessi limiti di `mkdisk`.
+
+### install
+- **Funzione:** installa ruOS su un disco SATA scelto (⚠ DISTRUTTIVO).
+- **Implementato:** `install` senza argomenti stampa un hint (`run disks to list`).
+  `install <idx> [esp_mib]` (default 64). Host fn `ruos::install`. **Guard**: rifiuta
+  se `/mnt` è montato (return `-3`). Return `0`=ok, `-11`=nessun disco a quell'indice,
+  `-1`=non pronto, `-2`=errore scrittura. Il disco risultante si avvia autonomamente
+  sotto UEFI.
+- **Manca dal reale:** nessun interattivo/conferma prima di cancellare.
+
+---
+
+## Compressione
+
+### gzip
+- **Funzione:** comprime file in formato gzip (RFC 1952) tramite `miniz_oxide`.
+- **Implementato:** flag `-c` (stdout), `-k` (keep input), `-d` (decomprimi, come
+  `gunzip`), `-1`..`-9` (livello compressione, default 6), `-h` (help). File multipli.
+  Senza file: stdin→stdout. Semantica Unix: senza `-c`/`-k`, il file originale viene
+  **cancellato** e rimpiazzato con `<file>.gz`. Rifiuta file che hanno già `.gz`.
+  Validazione suffisso prima della lettura. Logica condivisa con `gunzip`/`zcat` nel
+  crate `gzip-core` (`no_std` disponibile per il kernel).
+- **Manca dal reale (gzip):** niente `--best`/`--fast` (solo flag corti), niente `-r`
+  (ricorsivo), `-t` (test), `-l` (list), `-n`/`-N` (nome/timestamp), `-v` (verbose),
+  `--suffix`, `--rsyncable`. Input completamente bufferizzato (non streaming). Niente
+  multi-member gzip.
+
+### gunzip
+- **Funzione:** decomprime file `.gz` (= `gzip -d`).
+- **Implementato:** stessi flag di `gzip`. Default: `decompress_mode=true`,
+  `to_stdout=false`. Richiede suffisso `.gz` sull'input. Cancella il `.gz` dopo
+  decompressione (a meno di `-k`).
+- **Manca dal reale (gunzip):** stessi limiti di `gzip`.
+
+### zcat
+- **Funzione:** decomprime su stdout e tiene l'input (= `gzip -dc`).
+- **Implementato:** stessi flag di `gzip`. Default: `decompress_mode=true`,
+  `to_stdout=true`, `keep=true`. Non cancella mai l'input.
+- **Manca dal reale (zcat):** stessi limiti di `gzip`.
+
+---
+
+## Wi-Fi
+
+### wifiscan
+- **Funzione:** scansiona le reti Wi-Fi 2.4 GHz nelle vicinanze via dongle USB
+  RTL8188EU.
+- **Implementato:** nessun flag. Host fn `ruos::wifi_scan` (buf 4096). Al **primo**
+  invocamento porta il chip online (power-on + firmware + MAC/BB/RF init, ~1–2 s);
+  poi esegue una scansione passiva. Stampa tabella `SSID CH SECURITY`. Return `0`=
+  nessun device / nessun AP, `<0`=buffer troppo piccolo.
+- **Manca dal reale (iw scan):** solo 2.4 GHz, solo passiva, solo RTL8188EU. Nessun
+  filtro SSID/canale/security, nessun RSSI/signal, nessun timeout, no scan attiva.
+
+### wificonnect
+- **Funzione:** associa a una rete WPA2 via RTL8188EU.
+- **Implementato:** `<ssid> [password]`. Host fn `ruos::wifi_connect`. Porta il chip
+  online se non già inizializzato. Scansiona per l'SSID, poi open-system auth +
+  WPA2 association (con RSN IE). Se `password` non vuota, esegue il 4-way handshake
+  WPA2 (HMAC-SHA1 PTK/MIC, AES GTK unwrap) e installa le chiavi CCMP nel CAM del
+  chip. Stampa una riga di stato:
+  `auth=<ok|rejected|no-response> assoc=<ok|...> aid=<N> 4way=<ok|failed|skipped>`.
+  Return `0`=no device, `<0`=bad args.
+- **Manca dal reale (wpa_supplicant):** niente WPA3, niente WPA-Enterprise, niente
+  profili salvati, niente roaming, niente DHCP (separato), niente 5 GHz. Solo
+  RTL8188EU.
+
+---
+
 ## Programmi speciali (non coreutils)
 
 ### init
@@ -486,6 +631,10 @@ util-linux / standard POSIX).
 - **Nessuna regex** in tutto il sistema (`grep`, `find` usano substring/glob `*`).
 - **Nessun modello di permessi, timestamp o utenti** nel kernel: limita `touch`, `cp`,
   `ls -l`, `id`, `whoami`, `chmod`/`chown` (inesistenti).
-- **Niente pipe/redirezione nella shell** → i tool che leggono stdin (`grep`, `wc`, `sort`,
-  `tr`, `tee`, `cut`, `uniq`, `head`, `tail`, `nc`) non sono concatenabili interattivamente
-  finché la shell non avrà pipe.
+- **Pipe `|` supportate** (max 4 stadi): i tool che leggono stdin (`grep`, `wc`, `sort`,
+  `tr`, `tee`, `cut`, `uniq`, `head`, `tail`, `nc`) sono concatenabili.
+  **Niente redirezioni** (`>` `<` `>>` `2>`): queste non sono ancora supportate.
+- **Compressione gzip** condivisa tra `gzip`/`gunzip`/`zcat` via `gzip-core` (no_std),
+  usata anche dal kernel per decomprimere i binari impacchettati.
+- **Wi-Fi limitato al RTL8188EU**: `wifiscan`/`wificonnect` funzionano solo con quel
+  dongle specifico; il path dati cifrato + DHCP over Wi-Fi è un lavoro in corso.

@@ -8,7 +8,7 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-09 (20 functions).
+**Last reviewed:** 2026-06-10 (20 functions; gfx-event kind 5 = wheel added).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -89,9 +89,16 @@ Drain ONE pending input event into a **20-byte** area at `ptr`, encoding
 | 2 | MouseButton | button (0=L,1=R,2=M) | pressed (0/1) | — |
 | 3 | Resize | width | height | — |
 | 4 | Quit | — | — | — |
+| 5 | Wheel | detents (i32 two's complement; positive = scroll up / away from user) | — | — |
 
 Call repeatedly until `present == 0` to drain the queue each frame. `ruos-window`
 does this and feeds egui `RawInput`.
+
+Wheel events are routed by the compositor to the **topmost window under the
+cursor** (hover-scroll), preceded by a window-local MouseMove so egui's pointer
+is positioned over the area to scroll. Sources: PS/2 IntelliMouse (4-byte
+packets, enabled at boot when the device answers ID 3 — QEMU does) and USB HID
+boot mouse byte 3.
 
 ### `wake_on_pty(idx: i32)`
 Wake this window whenever PTY pair `idx` produces output (so a terminal window

@@ -183,18 +183,37 @@ const EXCLUDE: &[&str] = &["shell", "compositor"];
 static APP_CATALOG: crate::sync::IrqMutex<Vec<Manifest>> =
     crate::sync::IrqMutex::new(Vec::new());
 
-/// Per-stem manifest memo: `Some(m)` = a launcher app, `None` = scanned and has no
-/// manifest (don't re-instantiate it every scan). Keyed by `.cwasm` stem.
-static MANIFEST_CACHE: crate::sync::IrqMutex<BTreeMap<String, Option<Manifest>>> =
+/// One memoised manifest probe: the resolved file identity (path + size) and the
+/// probe result (`Some(m)` = a launcher app, `None` = probed and has no manifest).
+struct ProbeEntry {
+    /// Resolved `.cwasm` path the probe ran against (a stem can shadow-flip
+    /// between `/bin` and `/mnt/apps` — a path change forces a re-probe).
+    path: String,
+    /// File size at probe time, from `vfs::stat` METADATA (no content read). A
+    /// changed size (e.g. an updated `.cwasm` dropped into `/mnt/apps`) forces a
+    /// re-probe; same (path, size) = reuse without touching the file.
+    size: u64,
+    manifest: Option<Manifest>,
+}
+
+/// Per-stem manifest probe memo, keyed by `.cwasm` stem. A probe means
+/// deserialising + instantiating a multi-MB AOT image on a throwaway store
+/// (publish/teardown mprotect storm — see the 2026-06-10 TLB-shootdown spec), so
+/// the ~1 Hz catalog refresh must NOT repeat it: a stem is re-probed ONLY when
+/// new or when its resolved (path, size) changed; stems whose file disappeared
+/// are evicted (so a re-dropped file is probed again).
+static MANIFEST_CACHE: crate::sync::IrqMutex<BTreeMap<String, ProbeEntry>> =
     crate::sync::IrqMutex::new(BTreeMap::new());
 
 /// Wall-clock seconds of the last catalog scan (throttle). Sentinel forces a scan
 /// on the first frame.
 static LAST_SCAN: crate::sync::IrqMutex<f64> = crate::sync::IrqMutex::new(-1.0e9);
 
-/// Deserialize `<stem>.cwasm` fresh (uncached) for a manifest probe.
-fn module_at_stem(stem: &str) -> Option<Module> {
-    let bytes = read_app_bytes(stem)?;
+/// Deserialize the `.cwasm` at `path` fresh (uncached) for a manifest probe.
+/// Takes the already-resolved path (not a stem) so the probe reads exactly the
+/// file the scan stat'ed for the cache key.
+fn module_at_path(path: &str) -> Option<Module> {
+    let bytes = crate::vfs::block_on(crate::wasm::read_all(path)).ok()?;
     // SAFETY: wt-precompile output for this exact engine Config.
     unsafe { Module::deserialize(engine(), &bytes) }.ok()
 }
@@ -246,20 +265,19 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
     Some(Manifest { id: String::from(id), title: String::from(title) })
 }
 
-/// Scan `APP_DIRS` for `*.cwasm`, extract any newly-seen app's manifest (memoised),
-/// and rebuild [`APP_CATALOG`] from the CURRENTLY-present manifest-bearing files
-/// (so deleting a `.cwasm` drops it from the launcher next scan). Runs between
-/// frames (never inside a guest call) so the throwaway instantiate is safe.
+/// Scan `APP_DIRS` for `*.cwasm`, probe any new-or-changed file's manifest
+/// (memoised by resolved (path, size) — see [`MANIFEST_CACHE`]), and rebuild
+/// [`APP_CATALOG`] from the CURRENTLY-present manifest-bearing files (so
+/// deleting a `.cwasm` drops it from the launcher next scan). The file LIST is
+/// re-read every scan (readdir + per-file `vfs::stat`, metadata only — cheap),
+/// so `/mnt/apps` hot-plug keeps working; only the expensive probe is cached.
+/// Runs between frames (never inside a guest call) so the throwaway
+/// instantiate is safe.
 fn scan_apps() {
-    let engine = engine();
-    let mut linker: Linker<AppState> = Linker::new(engine);
-    if crate::wasm::wt::wasi::add_to_linker(&mut linker).is_err() { return; }
-    if add_to_linker(&mut linker).is_err() { return; }
-    if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return; }
-    if crate::wasm::wt::sys::add_to_linker(&mut linker).is_err() { return; }
-
-    // Present `.cwasm` stems across the app dirs, in priority order, de-duped.
-    let mut present: Vec<String> = Vec::new();
+    // Present `.cwasm` stems across the app dirs, in priority order, de-duped,
+    // each with its resolved path + size. The size comes from `vfs::stat`
+    // METADATA (tmpfs node / FAT32 dir entry) — no file content is read here.
+    let mut present: Vec<(String, String, u64)> = Vec::new(); // (stem, path, size)
     for dir in APP_DIRS {
         if *dir == "/mnt/apps" && !crate::vfs::is_mounted("/mnt") { continue; }
         let entries = match crate::vfs::block_on(crate::vfs::readdir(dir)) {
@@ -269,31 +287,76 @@ fn scan_apps() {
         for e in entries {
             if let Some(stem) = e.name.strip_suffix(".cwasm") {
                 if EXCLUDE.contains(&stem) { continue; }
-                if !present.iter().any(|p| p == stem) {
-                    present.push(String::from(stem));
-                }
+                if present.iter().any(|(s, _, _)| s == stem) { continue; }
+                let path = alloc::format!("{}/{}", dir, e.name);
+                let size = match crate::vfs::block_on(crate::vfs::stat(&path)) {
+                    Ok(st) => st.size,
+                    Err(_) => continue, // raced with a delete: retry next scan
+                };
+                present.push((String::from(stem), path, size));
             }
         }
     }
 
-    // Extract + memoise the manifest for any stem not seen before.
-    {
+    // Evict memo entries whose file is gone, then pick the stems needing a
+    // (re-)probe: new, or resolved to a different path, or size changed. The
+    // IrqMutex is held ONLY for these map ops — never across the blocking VFS
+    // read / throwaway instantiate below.
+    let (need_probe, evicted): (Vec<(String, String, u64)>, Vec<String>) = {
         let mut cache = MANIFEST_CACHE.lock();
-        for stem in &present {
-            if cache.contains_key(stem) { continue; }
-            let m = module_at_stem(stem).and_then(|module| extract_manifest(&linker, &module));
-            cache.insert(stem.clone(), m);
+        let evicted: Vec<String> = cache.keys()
+            .filter(|stem| !present.iter().any(|(s, _, _)| s == stem.as_str()))
+            .cloned()
+            .collect();
+        for stem in &evicted { cache.remove(stem); }
+        let need: Vec<(String, String, u64)> = present.iter()
+            .filter(|(stem, path, size)| {
+                !matches!(cache.get(stem.as_str()),
+                          Some(e) if e.path == *path && e.size == *size)
+            })
+            .cloned()
+            .collect();
+        (need, evicted)
+    };
+
+    // Invalida anche il Module cache-ato PER NOME (lo spawn) per gli stem
+    // evitti o da ri-probare: altrimenti il launcher mostrerebbe il manifest
+    // nuovo ma `wm.spawn` eseguirebbe ancora il Module vecchio (v1 cached dopo
+    // un drop di v2 in /mnt/apps). Lock separato, mai annidato in MANIFEST_CACHE.
+    if !evicted.is_empty() || !need_probe.is_empty() {
+        let mut names = NAME_CACHE.lock();
+        for stem in evicted.iter().chain(need_probe.iter().map(|(s, _, _)| s)) {
+            names.remove(stem.as_str());
+        }
+    }
+
+    // Probe (deserialize + throwaway instantiate + `manifest()` + drop) ONLY the
+    // new-or-changed files; cached stems are reused without touching the file.
+    // A failed probe is memoised as `manifest: None` at that size, so a partial
+    // copy into `/mnt/apps` is re-probed once its size settles.
+    if !need_probe.is_empty() {
+        let engine = engine();
+        let mut linker: Linker<AppState> = Linker::new(engine);
+        if crate::wasm::wt::wasi::add_to_linker(&mut linker).is_err() { return; }
+        if add_to_linker(&mut linker).is_err() { return; }
+        if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return; }
+        if crate::wasm::wt::sys::add_to_linker(&mut linker).is_err() { return; }
+        for (stem, path, size) in need_probe {
+            let m = module_at_path(&path)
+                .and_then(|module| extract_manifest(&linker, &module));
+            MANIFEST_CACHE.lock().insert(stem, ProbeEntry { path, size, manifest: m });
         }
     }
 
     // Rebuild the visible catalog from the present, manifest-bearing files.
     let cache = MANIFEST_CACHE.lock();
     let mut cat: Vec<Manifest> = Vec::new();
-    for stem in &present {
-        if let Some(Some(m)) = cache.get(stem) {
+    for (stem, _, _) in &present {
+        if let Some(ProbeEntry { manifest: Some(m), .. }) = cache.get(stem) {
             if !cat.iter().any(|c| c.id == m.id) { cat.push(m.clone()); }
         }
     }
+    drop(cache);
     cat.sort_by(|a, b| a.title.cmp(&b.title));
     *APP_CATALOG.lock() = cat;
 }
@@ -1634,6 +1697,11 @@ impl Compositor {
     /// colour (blue focused / grey unfocused), so there is no focus border.
     pub fn run(mut self) -> ! {
         crate::kprintln!("[wm] compositor SP3: window manager ({} windows)", self.wins.len());
+        // Telemetria one-shot a compositor-ready: quanti shootdown TLB (e quanti
+        // full-flush CR3 remoti) è costato arrivare alla GUI — la metrica del fix
+        // "shootdown a range" (publish/teardown storm, spec 2026-06-10).
+        let (sd, ff) = crate::memory::tlb::stats();
+        crate::binfo!("wm", "tlb stats at compositor-ready: shootdowns={} full_flushes={}", sd, ff);
         // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
         // BACKWARD if DF=1, silently corrupting copied data.
         #[cfg(target_arch = "x86_64")]

@@ -102,7 +102,15 @@ pub fn copy_boot_payload(dev: &mut dyn crate::blockdev::BlockDevice,
         let mut d = PartBorrow::new(dev, layout.data.first_lba, layout.data.sectors);
         let mut w = FatWriter::open(&mut d).map_err(|_| DiskError::Io)?;
         for (cmdline, data) in crate::modules::all() {
-            if cmdline.starts_with("/payload/") || BOOTSTRAP.contains(&cmdline) { continue; }
+            // /payload/ = extra Limine assets; /archive/ = bin.bgz blob; /rescue/ = fallback wasm:
+            // nessuno di questi va installato sul disco SSD.
+            if cmdline.starts_with("/payload/")
+                || cmdline.starts_with("/archive/")
+                || cmdline.starts_with("/rescue/")
+                || BOOTSTRAP.contains(&cmdline)
+            {
+                continue;
+            }
             w.write_file(cmdline, data).map_err(|_| DiskError::Io)?; // /bin/ls.wasm → data:/bin/ls.wasm
         }
     }

@@ -32,11 +32,15 @@ fn main() {
     let mut config = Config::new();
     config.target("x86_64-unknown-none").expect("set target");
     // Signals-based traps are OFF in the kernel runtime; match the dependent
-    // memory tunables it expects (no CoW, no virtual reservation/guard pages).
+    // memory tunables it expects. memory_reservation MUST equal the kernel's
+    // engine_config (hashed into the .cwasm, exact-match check at deserialize):
+    // 256 MiB VA per linear memory → kernel-side MmapMemory + demand paging
+    // (frames on touch) instead of MallocMemory from the kernel heap.
     config.signals_based_traps(false);
     config.memory_init_cow(false);
-    config.memory_reservation(0);
+    config.memory_reservation(256 << 20);
     config.memory_guard_size(0);
+    // Runtime-only (not hashed): keep 0 here, the kernel sets its own.
     config.memory_reservation_for_growth(0);
     config.memory_may_move(true);
     #[cfg(target_arch = "x86_64")]

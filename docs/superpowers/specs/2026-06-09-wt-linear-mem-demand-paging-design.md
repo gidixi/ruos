@@ -5,6 +5,15 @@
 self-test ok; due finestre egui live concorrenti senza OOM in `test-boot`.
 **Area:** `kernel/src/wasm/wt/platform.rs`, `kernel/src/idt.rs`, `kernel/src/memory/`
 
+> **CORREZIONE (2026-06-10, changelog 422):** la premessa "con
+> `memory_reservation(0)` la linear memory passa da `wasmtime_mmap_new`" è
+> **errata**: in wasmtime 45 con `signals_based_traps(false)` + reservation 0 +
+> guard 0 + cow off la linear memory usa `MallocMemory` (heap talc), MAI il path
+> mmap — il demand paging di questa spec copriva quindi solo codice AOT e altri
+> usi di Mmap. Il whack-a-mole di HEAP_SIZE (16→128→256→384 MiB, changelog 366)
+> era il sintomo. Fix: `memory_reservation(256 MiB)` (kernel + wt-precompile,
+> valore hashato nel .cwasm) → MmapMemory → demand paging reale sui frame.
+
 ## Problema
 
 Aprire la 3ª finestra del desktop egui fallisce con:

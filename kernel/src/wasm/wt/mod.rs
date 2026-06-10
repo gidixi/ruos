@@ -284,9 +284,17 @@ fn engine_config() -> wasmtime::Config {
     // settings hash matches.
     config.signals_based_traps(false);
     config.memory_init_cow(false);
-    config.memory_reservation(0);
+    // memory_reservation > 0 forza il path MmapMemory (wasmtime memory.rs:
+    // signals||guard||reservation||cow): la linear memory passa da
+    // wasmtime_mmap_new → demand paging → FRAME allocator (RAM−heap), non più
+    // MallocMemory dallo heap talc (48 MiB contigui per app → OOM alla 2ª
+    // finestra). 256 MiB è solo VA riservata nella finestra WT (demand-paged:
+    // i frame si pagano al touch); i grow entro la reservation sono in-place.
+    config.memory_reservation(256 << 20);
     config.memory_guard_size(0);
-    config.memory_reservation_for_growth(0);
+    // Non hashata nel .cwasm (runtime-only): headroom per i move oltre la
+    // reservation (new+copy+unmap), ammortizza i grow giganti.
+    config.memory_reservation_for_growth(64 << 20);
     config.memory_may_move(true);
     #[cfg(target_arch = "x86_64")]
     unsafe {

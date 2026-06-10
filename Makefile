@@ -94,6 +94,14 @@ WT_PRECOMPILE := tools/wt-precompile/target/release/wt-precompile
 $(WT_PRECOMPILE): tools/wt-precompile/src/main.rs tools/wt-precompile/Cargo.toml
 	source $$HOME/.cargo/env && cd tools/wt-precompile && cargo build --release
 
+# Host packer: /bin → bin.bgz (container RBIN di membri gzip).
+MKBINPACK := tools/mkbinpack/target/release/mkbinpack
+$(MKBINPACK): tools/mkbinpack/src/main.rs tools/mkbinpack/Cargo.toml user/gzip-core/src/pack.rs
+	source $$HOME/.cargo/env && cd tools/mkbinpack && cargo build --release
+
+# Set rescue: piccoli .wasm tenuti loose in /rescue sull'ISO + dentro bin.bgz.
+RESCUE_TOOLS := shell ls cat echo dmesg lspci
+
 build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	@mkdir -p build
 	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
@@ -217,30 +225,30 @@ kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1
 		cargo build --release --target wasm32-wasip1
 	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
 
-iso: build limine $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
-	rm -rf $(ISO_ROOT)
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
+	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
-	         $(ISO_ROOT)/bin $(ISO_ROOT)/etc $(ISO_ROOT)/root
+	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel
 	cp limine.conf $(ISO_ROOT)/boot/limine/
 	cp limine-ssd.conf $(ISO_ROOT)/boot/limine/
 	for f in $(ROOT_WASMS); do cp $$f $(ISO_ROOT)/; done
-	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/bin/; done
-	cp build/wtecho.cwasm $(ISO_ROOT)/bin/wtecho.cwasm
-	# Desktop app .cwasm: baked into the ISO /bin as boot modules (available diskless).
-	# The compositor's launcher still discovers them dynamically via manifest() scan.
-	cp build/about.cwasm $(ISO_ROOT)/bin/about.cwasm
-	cp build/files.cwasm $(ISO_ROOT)/bin/files.cwasm
-	cp build/terminal.cwasm $(ISO_ROOT)/bin/terminal.cwasm
-	cp build/system.cwasm $(ISO_ROOT)/bin/system.cwasm
-	cp build/notepad.cwasm $(ISO_ROOT)/bin/notepad.cwasm
-	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
-	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
-	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
-	# Prebuilt drop-folder apps (apps/*.cwasm, built by any external SDK): bundle
-	# into /bin so the compositor's manifest() scan discovers them. App-agnostic
-	# hook — new apps need NO change here. No-op when the dir is empty.
-	-cp apps/*.cwasm $(ISO_ROOT)/bin/ 2>/dev/null || true
+	# Stage dell'intero /bin in build/binstage, poi pack → bin.bgz (non loose).
+	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm build/binstage/; done
+	cp build/wtecho.cwasm build/binstage/wtecho.cwasm
+	cp build/about.cwasm build/binstage/about.cwasm
+	cp build/files.cwasm build/binstage/files.cwasm
+	cp build/terminal.cwasm build/binstage/terminal.cwasm
+	cp build/system.cwasm build/binstage/system.cwasm
+	cp build/notepad.cwasm build/binstage/notepad.cwasm
+	cp kernel/src/wasm/wt/reactor.cwasm build/binstage/compositor.cwasm
+	cp kernel/src/wasm/wt/egui_demo.cwasm build/binstage/egui-demo.cwasm
+	cp kernel/src/wasm/wt/shell.cwasm build/binstage/shell.cwasm
+	# App drop-folder esterne (apps/*.cwasm): nel pack se presenti. No-op se vuoto.
+	-cp apps/*.cwasm build/binstage/ 2>/dev/null || true
+	$(MKBINPACK) $(ISO_ROOT)/bin.bgz build/binstage/*
+	# Set rescue loose in /rescue (piccolo): fallback se bin.bgz fallisce.
+	for n in $(RESCUE_TOOLS); do cp user-bin/$$n.wasm $(ISO_ROOT)/rescue/; done
 	cp $(INIT_SCRIPT) $(ISO_ROOT)/etc/init.sh
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -279,8 +287,7 @@ run-test: $(DISK_IMG)
 	grep -qF "ahci HBA up" build/serial.log || { echo TEST_FAIL_AHCI; exit 1; }; \
 	grep -qE "ahci port [0-9]+ sata sectors=" build/serial.log || { echo TEST_FAIL_AHCI_IDENTIFY; exit 1; }; \
 	grep -qF "disk read OK sector 0" build/serial.log || { echo TEST_FAIL_AHCI_READ; exit 1; }; \
-	grep -qE "ahci port [0-9]+ atapi sectors=" build/serial.log || { echo TEST_FAIL_ATAPI; exit 1; }; \
-	grep -qF "/bin overlaid from ISO9660" build/serial.log || { echo TEST_FAIL_LIVECD_BIN; exit 1; }; \
+	grep -qE "unpacked [0-9]+ bins from bin.bgz" build/serial.log || { echo TEST_FAIL_UNPACK_BIN; exit 1; }; \
 	grep -qF "mnt mounted FAT" build/serial.log || { echo TEST_FAIL_FAT_MOUNT; exit 1; }; \
 	grep -qF "hello from disk" build/serial.log || { echo TEST_FAIL_FAT_CAT; exit 1; }; \
 		grep -qE "rtop: uptime=" build/serial.log || { echo TEST_FAIL_RTOP; exit 1; }; \
@@ -289,11 +296,10 @@ run-test: $(DISK_IMG)
 		grep -qE "usb.*keyboard ready" build/serial.log || { echo TEST_FAIL_USB_KBD; exit 1; }; \
 	echo TEST_PASS
 
-# Live-CD-from-USB gate: boots the ISO from a USB Mass-Storage stick (NO -cdrom),
-# forcing the off-boot /bin overlay through the USB-MSC path (BOT/SCSI) instead
-# of ATAPI. Asserts the MSC device enumerates, /bin is overlaid from USB-MSC, and
-# the shell comes up. Limine's hybrid ISO boots from USB; the same image is the
-# usb-storage backing file the kernel re-reads via its own xHCI driver.
+# Live-CD-from-USB gate: boots the ISO from a USB Mass-Storage stick (NO -cdrom).
+# Limine's hybrid ISO boots from USB firmware; the kernel loads bin.bgz from the
+# Limine module (same as CD path — no USB-MSC driver involvement for /bin).
+# Asserts the shell comes up and bin.bgz was unpacked successfully.
 .PHONY: run-test-usb
 run-test-usb:
 	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
@@ -305,8 +311,7 @@ run-test-usb:
 		-netdev user,id=net0 -device $(NIC),netdev=net0 \
 		| tee build/serial-usb.log; \
 	grep -qF "$(HELLO)" build/serial-usb.log || { echo TEST_FAIL_SHELL; exit 1; }; \
-	grep -qE "msc  MSC ready slot=" build/serial-usb.log || { echo TEST_FAIL_MSC_ENUM; exit 1; }; \
-	grep -qF "/bin overlaid from USB-MSC" build/serial-usb.log || { echo TEST_FAIL_USB_BIN; exit 1; }; \
+	grep -qE "unpacked [0-9]+ bins from bin.bgz" build/serial-usb.log || { echo TEST_FAIL_UNPACK_BIN; exit 1; }; \
 	echo TEST_PASS_USB
 
 # Per-NIC gates: each runs run-test with a specific QEMU adapter model and

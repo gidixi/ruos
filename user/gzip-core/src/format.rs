@@ -37,6 +37,121 @@ impl fmt::Display for GzError {
     }
 }
 
+/// Decomprimi un singolo member gzip. Errore se header/trailer invalidi,
+/// CRC/ISIZE non tornano, o restano byte dopo il trailer (multi-member non
+/// supportato → TrailingGarbage).
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>, GzError> {
+    let hlen = header_len(data)?;
+    if data.len() < hlen + 8 {
+        return Err(GzError::TruncatedTrailer);
+    }
+    let (out, consumed) = inflate_raw(&data[hlen..])?;
+    let trailer = &data[hlen + consumed..];
+    if trailer.len() < 8 {
+        return Err(GzError::TruncatedTrailer);
+    }
+    if trailer.len() > 8 {
+        return Err(GzError::TrailingGarbage);
+    }
+    let crc = u32::from_le_bytes(trailer[..4].try_into().unwrap());
+    let isize_ = u32::from_le_bytes(trailer[4..].try_into().unwrap());
+    if crc32(&out) != crc {
+        return Err(GzError::CrcMismatch);
+    }
+    if out.len() as u32 != isize_ {
+        return Err(GzError::SizeMismatch);
+    }
+    Ok(out)
+}
+
+/// Lunghezza header: 10 byte fissi + campi opzionali da FLG (FEXTRA, FNAME,
+/// FCOMMENT, FHCRC) da saltare.
+fn header_len(data: &[u8]) -> Result<usize, GzError> {
+    if data.len() < 2 || data[..2] != GZIP_MAGIC {
+        return Err(GzError::NotGzip);
+    }
+    if data.len() < 10 {
+        return Err(GzError::TruncatedHeader);
+    }
+    if data[2] != CM_DEFLATE {
+        return Err(GzError::NotGzip);
+    }
+    let flg = data[3];
+    let mut pos = 10usize;
+    if flg & FEXTRA != 0 {
+        if data.len() < pos + 2 {
+            return Err(GzError::TruncatedHeader);
+        }
+        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+    if flg & FNAME != 0 {
+        pos = skip_zstr(data, pos)?;
+    }
+    if flg & FCOMMENT != 0 {
+        pos = skip_zstr(data, pos)?;
+    }
+    if flg & FHCRC != 0 {
+        pos += 2;
+    }
+    if data.len() < pos {
+        return Err(GzError::TruncatedHeader);
+    }
+    Ok(pos)
+}
+
+fn skip_zstr(data: &[u8], mut pos: usize) -> Result<usize, GzError> {
+    while pos < data.len() {
+        pos += 1;
+        if data[pos - 1] == 0 {
+            return Ok(pos);
+        }
+    }
+    Err(GzError::TruncatedHeader)
+}
+
+/// Inflate raw che riporta anche i byte consumati (serve per localizzare il
+/// trailer e rifiutare garbage dopo di esso).
+fn inflate_raw(input: &[u8]) -> Result<(Vec<u8>, usize), GzError> {
+    use miniz_oxide::inflate::core::{decompress as tinfl, inflate_flags, DecompressorOxide};
+    use miniz_oxide::inflate::TINFLStatus;
+
+    const FLAGS: u32 = inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
+        | inflate_flags::TINFL_FLAG_IGNORE_ADLER32;
+
+    let mut decomp = Box::<DecompressorOxide>::default();
+    // Start with a reasonable output buffer; grow as needed.
+    let mut out: Vec<u8> = Vec::with_capacity(input.len().saturating_mul(4).max(256));
+    let mut total_in = 0usize;
+
+    loop {
+        // Ensure there is room in `out` for at least one more byte so the
+        // decompressor never hits HasMoreOutput due to a zero-length write space.
+        let out_pos = out.len();
+        let new_cap = (out.capacity().max(256)).saturating_mul(2);
+        out.resize(new_cap, 0u8);
+
+        let (status, in_consumed, out_consumed) =
+            tinfl(&mut decomp, &input[total_in..], &mut out, out_pos, FLAGS);
+
+        total_in += in_consumed;
+        let new_len = out_pos + out_consumed;
+        out.truncate(new_len);
+
+        match status {
+            TINFLStatus::Done => {
+                return Ok((out, total_in));
+            }
+            TINFLStatus::HasMoreOutput => {
+                // Need more output space; loop will grow `out`.
+            }
+            _ => {
+                return Err(GzError::BadDeflate);
+            }
+        }
+    }
+}
+
 /// Comprimi `data` in un member gzip completo. `level` 1..=9 (clamp), 6 = default.
 pub fn compress(data: &[u8], level: u8) -> Vec<u8> {
     let level = level.clamp(1, 9);
@@ -89,5 +204,113 @@ mod tests {
         let gz = compress(b"", 6);
         assert_eq!(&gz[..2], &GZIP_MAGIC);
         assert_eq!(&gz[gz.len() - 4..], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn roundtrip_levels() {
+        let cases: &[&[u8]] = &[b"", b"hello ruos", &[0xAAu8; 100_000], b"abcabcabcabcabc"];
+        for data in cases {
+            for level in [1u8, 6, 9] {
+                assert_eq!(decompress(&compress(data, level)).unwrap(), *data);
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_big_pseudorandom() {
+        // ~1 MiB pseudo-random deterministico (xorshift), niente Math/rand dep.
+        let mut x = 0x12345678u32;
+        let data: Vec<u8> = (0..1_048_576)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        assert_eq!(decompress(&compress(&data, 6)).unwrap(), data);
+    }
+
+    #[test]
+    fn golden_real_gzip() {
+        // `printf 'hello ruos' | gzip -n -6` su Ubuntu (Step 1). Byte reali:
+        const GZ: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+            0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0x2a, 0xcd, 0x2f,
+            0x06, 0x00, 0xb5, 0x7c, 0x1a, 0x7c, 0x0a, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(decompress(GZ).unwrap(), b"hello ruos");
+    }
+
+    #[test]
+    fn skips_fname() {
+        let gz = compress(b"abc", 6);
+        let mut v = Vec::new();
+        v.extend_from_slice(&gz[..3]);
+        v.push(8); // FLG = FNAME
+        v.extend_from_slice(&gz[4..10]);
+        v.extend_from_slice(b"file.txt\0");
+        v.extend_from_slice(&gz[10..]);
+        assert_eq!(decompress(&v).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn skips_fextra() {
+        let gz = compress(b"abc", 6);
+        let mut v = Vec::new();
+        v.extend_from_slice(&gz[..3]);
+        v.push(4); // FLG = FEXTRA
+        v.extend_from_slice(&gz[4..10]);
+        v.extend_from_slice(&3u16.to_le_bytes()); // XLEN = 3
+        v.extend_from_slice(&[1, 2, 3]);
+        v.extend_from_slice(&gz[10..]);
+        assert_eq!(decompress(&v).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn rejects_not_gzip() {
+        assert_eq!(decompress(b"plain text").unwrap_err(), GzError::NotGzip);
+        assert_eq!(decompress(b"").unwrap_err(), GzError::NotGzip);
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        let gz = compress(b"hello ruos", 6);
+        assert_eq!(decompress(&gz[..5]).unwrap_err(), GzError::TruncatedHeader);
+        // header ok ma manca il trailer
+        assert!(decompress(&gz[..gz.len() - 8]).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_crc() {
+        let mut gz = compress(b"hello ruos", 6);
+        let n = gz.len();
+        gz[n - 8] ^= 0xFF; // corrompi il CRC nel trailer
+        assert_eq!(decompress(&gz).unwrap_err(), GzError::CrcMismatch);
+    }
+
+    #[test]
+    fn rejects_bad_isize() {
+        let mut gz = compress(b"hello ruos", 6);
+        let n = gz.len();
+        gz[n - 1] ^= 0xFF; // corrompi ISIZE
+        assert_eq!(decompress(&gz).unwrap_err(), GzError::SizeMismatch);
+    }
+
+    #[test]
+    fn rejects_trailing_garbage_and_multimember() {
+        let mut gz = compress(b"abc", 6);
+        gz.push(0x00);
+        assert_eq!(decompress(&gz).unwrap_err(), GzError::TrailingGarbage);
+        let two: Vec<u8> = [compress(b"a", 6), compress(b"b", 6)].concat();
+        assert_eq!(decompress(&two).unwrap_err(), GzError::TrailingGarbage);
+    }
+
+    #[test]
+    fn rejects_corrupt_deflate() {
+        let mut gz = compress(b"hello ruos hello ruos", 6);
+        gz[12] ^= 0xFF; // corrompi il payload deflate
+        // Qualsiasi errore va bene (BadDeflate o Crc), MAI panic.
+        assert!(decompress(&gz).is_err());
     }
 }

@@ -4,4 +4,4 @@
 mod crc32;
 mod format;
 
-pub use format::{compress, GzError};
+pub use format::{compress, decompress, GzError};

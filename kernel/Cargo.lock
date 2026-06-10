@@ -781,16 +781,19 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "aes",
  "bitflags 2.11.1",
  "ed25519-dalek",
  "embassy-executor",
  "getrandom",
+ "hmac",
  "limine",
  "log",
  "noto-sans-mono-bitmap",
  "pbkdf2",
  "pci_types",
  "rand_chacha",
+ "sha1",
  "sha2",
  "smoltcp",
  "spin",
@@ -1216,6 +1219,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

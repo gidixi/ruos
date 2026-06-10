@@ -6,6 +6,11 @@ use crate::boot::BootError;
 pub fn init() -> Result<(), BootError> {
     log_usb_controllers();
     crate::usb::init();
+    #[cfg(feature = "boot-checks")]
+    {
+        crate::usb::wifi::wpa2::selftest().map_err(BootError::Other)?;
+        crate::binfo!("usb", "wpa2 supplicant self-test ok (pmk + aes-unwrap vectors)");
+    }
     #[cfg(feature = "usb-probe")]
     probe();
     Ok(())

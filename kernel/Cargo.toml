@@ -31,6 +31,15 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 # unifies into the ed25519-dalek transitive dependency.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# WPA2-PSK 4-way handshake (SP-WIFI-3): PMK=PBKDF2-HMAC-SHA1, PTK-PRF + MIC =
+# HMAC-SHA1, GTK unwrap = AES-128 key-unwrap (RFC 3394). force-soft on sha1/aes
+# for the same reason as sha2 (cpufeatures probes AES-NI/SHA-NI intrinsics that
+# LLVM refuses on x86_64-unknown-none).
+sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
+hmac = { version = "0.12", default-features = false }
+# aes 0.8 forces the soft backend via the `aes_force_soft` cfg (see .cargo/config),
+# not a cargo feature — bare-metal must avoid the cpufeatures AES-NI autodetect.
+aes = { version = "0.8", default-features = false }
 sunset = { path = "../third_party/sunset", default-features = false }
 # getrandom needs an explicit custom backend on bare-metal — we wire it
 # to crate::rng via register_custom_getrandom! in ssh/rng_bridge.rs.

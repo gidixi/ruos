@@ -21,6 +21,12 @@ pub mod ieee80211;
 // rtl8xxxu 8188e.c. Applied by init_mac/init_phy_bb/init_phy_rf in SP3c-3.
 pub mod tables;
 
+// WPA2-PSK 4-way-handshake supplicant crypto (SP-WIFI-3). Pure offline math,
+// consumed by the association/key path in SP-WIFI-2/4. Allowed dead until then;
+// boot-checks runs its known-answer self-test (`wpa2::selftest`).
+#[allow(dead_code)]
+pub mod wpa2;
+
 use crate::usb::control::{control_in, control_out_data, Setup};
 use crate::usb::device::UsbDevice;
 use crate::usb::xhci::Xhci;
@@ -89,6 +95,9 @@ pub struct WifiIface {
     pub ep_out:  u8,
     pub mps_in:  u16,
     pub mps_out: u16,
+    /// Number of bulk-OUT endpoints exposed — selects the TX queue layout
+    /// (rtl8xxxu config_endpoints_no_sie). We drive mgmt frames on the first.
+    pub nr_out_eps: u8,
 }
 
 /// Per-slot state kept in the USB registry. `Copy` (DmaRegion is Copy, like
@@ -115,8 +124,10 @@ pub struct WifiState {
     pub radio_up: bool,
     /// 802.11 transmit sequence number (12-bit), incremented per frame.
     pub tx_seq: u16,
-    /// Our station MAC, read from REG_MACID at bring-up (SA for TX frames).
+    /// Our station MAC, read from EFUSE at bring-up (SA for TX frames).
     pub mac: [u8; 6],
+    /// Bulk-OUT endpoint count (TX queue layout). See `WifiIface::nr_out_eps`.
+    pub nr_out_eps: u8,
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -342,10 +353,220 @@ pub fn power_on(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     true
 }
 
-/// SP2 bring-up: power-on then upload firmware. ⚠️ UNVERIFIED on hardware — the
-/// register transport (SP1) has not yet been confirmed on a real dongle.
-pub fn bring_up(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
+// ── TX-engine bring-up (SP-WIFI-1) ───────────────────────────────────────────
+// The chip TX path needs its internal packet-buffer pages allocated before it
+// will accept a bulk-OUT frame. rtl8xxxu does this across init_device in two
+// places: RQPN + queue-priority + RX FIFO boundary *before* firmware download,
+// and the TX buffer boundary + LLT + quirks *after* the PHY/RF tables. We mirror
+// that split so the (working) firmware download and RX path are untouched.
+
+/// 8188eu uses `config_endpoints_no_sie`: the bulk-OUT endpoint count picks which
+/// DMA queues exist. Returns (ep_tx_count, hi_en, lo_en, norm_en).
+fn ep_queue_config(nr_out_eps: u8) -> (u8, bool, bool, bool) {
+    match nr_out_eps {
+        0 | 1 => (1, true, false, false),
+        2     => (2, true, false, true),
+        _     => (3, true, true, true), // 3..=6
+    }
+}
+
+/// Per-traffic-class queue selectors (hiq, mgq, bkq, beq, viq, voq) for the
+/// REG_TRXDMA_CTRL mapping — rtl8xxxu_init_queue_priority cases 1/2/3.
+fn queue_select(ep_tx_count: u8, hi: bool, lo: bool, nq: bool) -> (u16, u16, u16, u16, u16, u16) {
+    match ep_tx_count {
+        1 => {
+            let h = if hi { TRXDMA_QUEUE_HIGH } else if lo { TRXDMA_QUEUE_LOW } else { TRXDMA_QUEUE_NORMAL };
+            (h, h, h, h, h, h)
+        }
+        2 => {
+            let (h, l) = if hi && lo { (TRXDMA_QUEUE_HIGH, TRXDMA_QUEUE_LOW) }
+                else if nq && lo     { (TRXDMA_QUEUE_NORMAL, TRXDMA_QUEUE_LOW) }
+                else                 { (TRXDMA_QUEUE_HIGH, TRXDMA_QUEUE_NORMAL) }; // hi && nq
+            (h, h, l, l, h, h) // hiq=mgq=viq=voq=h, bkq=beq=l
+        }
+        _ => (TRXDMA_QUEUE_HIGH, TRXDMA_QUEUE_HIGH, TRXDMA_QUEUE_LOW,
+              TRXDMA_QUEUE_LOW, TRXDMA_QUEUE_NORMAL, TRXDMA_QUEUE_HIGH),
+    }
+}
+
+/// Reserve packet-buffer pages per queue (rtl8xxxu_init_queue_reserved_page).
+fn init_queue_reserved_page(x: &mut Xhci, dev: &mut UsbDevice, hi: bool, lo: bool, nq: bool) {
+    let hq = if hi { TX_PAGE_NUM_HI_PQ_8188E } else { 0 };
+    let lq = if lo { TX_PAGE_NUM_LO_PQ_8188E } else { 0 };
+    let nq_pages = if nq { TX_PAGE_NUM_NORM_PQ_8188E } else { 0 };
+    let eq = 0u32;
+    reg_write32(x, dev, REG_RQPN_NPQ, (nq_pages << RQPN_NPQ_SHIFT) | (eq << RQPN_EPQ_SHIFT));
+    let pubq = TX_TOTAL_PAGE_NUM_8188E - hq - lq - nq_pages - 1;
+    let val = RQPN_LOAD
+        | (hq << RQPN_HI_PQ_SHIFT)
+        | (lq << RQPN_LO_PQ_SHIFT)
+        | (pubq << RQPN_PUB_PQ_SHIFT);
+    reg_write32(x, dev, REG_RQPN, val);
+}
+
+/// Map the traffic-class queues onto the DMA queues (REG_TRXDMA_CTRL).
+fn init_queue_priority(x: &mut Xhci, dev: &mut UsbDevice, ep_tx_count: u8, hi: bool, lo: bool, nq: bool) {
+    let (hiq, mgq, bkq, beq, viq, voq) = queue_select(ep_tx_count, hi, lo, nq);
+    let cur = reg_read16(x, dev, REG_TRXDMA_CTRL).unwrap_or(0) & 0x7;
+    let val = cur
+        | (voq << TRXDMA_CTRL_VOQ_SHIFT)
+        | (viq << TRXDMA_CTRL_VIQ_SHIFT)
+        | (beq << TRXDMA_CTRL_BEQ_SHIFT)
+        | (bkq << TRXDMA_CTRL_BKQ_SHIFT)
+        | (mgq << TRXDMA_CTRL_MGQ_SHIFT)
+        | (hiq << TRXDMA_CTRL_HIQ_SHIFT);
+    reg_write16(x, dev, REG_TRXDMA_CTRL, val);
+}
+
+/// Write one LLT entry (rtl8xxxu_llt_write): REG_LLT_INIT = OP_WRITE|addr<<8|data,
+/// then poll until the op goes inactive. Returns false on timeout.
+fn llt_write(x: &mut Xhci, dev: &mut UsbDevice, addr: u8, data: u8) -> bool {
+    reg_write32(x, dev, REG_LLT_INIT, LLT_OP_WRITE | ((addr as u32) << 8) | data as u32);
+    for _ in 0..20 {
+        if let Some(v) = reg_read32(x, dev, REG_LLT_INIT) {
+            if (v & LLT_OP_MASK) == LLT_OP_INACTIVE { return true; }
+        }
+    }
+    false
+}
+
+/// Build the packet-buffer link list (rtl8xxxu_init_llt_table): pages
+/// 0..total form the TX chain, total points to 0xff (end), the rest form a
+/// ring buffer that wraps to total+1.
+fn init_llt_table(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
+    let last_tx_page = TX_TOTAL_PAGE_NUM_8188E as u8;
+    let last_entry = LAST_LLT_ENTRY_8188E;
+    for i in 0..last_tx_page {
+        if !llt_write(x, dev, i, i + 1) { return false; }
+    }
+    if !llt_write(x, dev, last_tx_page, 0xff) { return false; }
+    for i in (last_tx_page + 1)..last_entry {
+        if !llt_write(x, dev, i, i + 1) { return false; }
+    }
+    llt_write(x, dev, last_entry, last_tx_page + 1)
+}
+
+/// TX-engine init that must run *before* the firmware download (rtl8xxxu order):
+/// reserve queue pages, map queue priorities, set the RX FIFO boundary.
+fn tx_engine_pre_fw(x: &mut Xhci, dev: &mut UsbDevice, nr_out_eps: u8) {
+    let (ep_tx_count, hi, lo, nq) = ep_queue_config(nr_out_eps);
+    init_queue_reserved_page(x, dev, hi, lo, nq);
+    init_queue_priority(x, dev, ep_tx_count, hi, lo, nq);
+    reg_write16(x, dev, REG_TRXFF_BNDY + 2, TRXFF_BOUNDARY_8188E);
+    crate::binfo!("wifi", "tx-engine pre-fw: out_eps={} ep_tx_count={}", nr_out_eps, ep_tx_count);
+}
+
+/// TX-engine init that must run *after* the PHY/RF tables (rtl8xxxu order):
+/// TX buffer page boundaries, PBP page size, the LLT, the gen2 TX-DMA quirk,
+/// TX report timer, and the firmware/HW TX-queue control bits.
+fn tx_engine_post_rf(x: &mut Xhci, dev: &mut UsbDevice) {
+    // TX buffer boundary = last TX page + 1.
+    let bdny = (TX_TOTAL_PAGE_NUM_8188E + 1) as u8;
+    reg_write8(x, dev, REG_TXPKTBUF_BCNQ_BDNY, bdny);
+    reg_write8(x, dev, REG_TXPKTBUF_MGQ_BDNY, bdny);
+    reg_write8(x, dev, REG_TXPKTBUF_WMAC_LBK_BF_HD, bdny);
+    reg_write8(x, dev, REG_TRXFF_BNDY, bdny);
+    reg_write8(x, dev, REG_TDECTRL + 1, bdny);
+    // PBP page size (128B rx/tx).
+    reg_write8(x, dev, REG_PBP,
+        (PBP_PAGE_SIZE_128 << PBP_PAGE_SIZE_TX_SHIFT) | (PBP_PAGE_SIZE_128 << PBP_PAGE_SIZE_RX_SHIFT));
+    let llt = init_llt_table(x, dev);
+    // gen2 USB quirk: drop-data-enable on the TX DMA offset check.
+    if let Some(v) = reg_read32(x, dev, REG_TXDMA_OFFSET_CHK) {
+        reg_write32(x, dev, REG_TXDMA_OFFSET_CHK, v | TXDMA_OFFSET_DROP_DATA_EN);
+    }
+    // TX report (8188e needs BIT0; timer for sw rate control).
+    if let Some(v) = reg_read8(x, dev, REG_TX_REPORT_CTRL) {
+        reg_write8(x, dev, REG_TX_REPORT_CTRL, v | 0x01 | TX_REPORT_CTRL_TIMER_ENABLE);
+    }
+    reg_write8(x, dev, REG_TX_REPORT_CTRL + 1, 0x02);
+    reg_write16(x, dev, REG_TX_REPORT_TIME, 0xcdf0);
+    if let Some(v) = reg_read8(x, dev, 0xa3) { reg_write8(x, dev, 0xa3, v & 0xf8); }
+    // FW/HW TX-queue control: AMPDU retry + ack for transmitted mgmt frames.
+    if let Some(v) = reg_read32(x, dev, REG_FWHW_TXQ_CTRL) {
+        reg_write32(x, dev, REG_FWHW_TXQ_CTRL, v | FWHW_TXQ_CTRL_AMPDU_RETRY | FWHW_TXQ_CTRL_XMIT_MGMT_ACK);
+    }
+    crate::binfo!("wifi", "tx-engine post-rf: boundary+pbp+llt({})+report done", llt);
+}
+
+/// Read one EFUSE byte (rtl8xxxu_read_efuse8): program the address, trigger a
+/// read (clear bit7 of CTRL+3), poll BIT31 of CTRL for data-valid.
+fn read_efuse8(x: &mut Xhci, dev: &mut UsbDevice, offset: u16) -> Option<u8> {
+    reg_write8(x, dev, REG_EFUSE_CTRL + 1, (offset & 0xff) as u8);
+    let v = reg_read8(x, dev, REG_EFUSE_CTRL + 2)?;
+    reg_write8(x, dev, REG_EFUSE_CTRL + 2, (v & 0xfc) | (((offset >> 8) & 0x03) as u8));
+    let v = reg_read8(x, dev, REG_EFUSE_CTRL + 3)?;
+    reg_write8(x, dev, REG_EFUSE_CTRL + 3, v & 0x7f);
+    let mut ok = false;
+    for _ in 0..500 {
+        if reg_read32(x, dev, REG_EFUSE_CTRL)? & (1 << 31) != 0 { ok = true; break; }
+    }
+    if !ok { return None; }
+    crate::boot::clock::udelay(50);
+    Some((reg_read32(x, dev, REG_EFUSE_CTRL)? & 0xff) as u8)
+}
+
+/// Decode the EFUSE into a 512-byte map and return the station MAC (8188eu MAC
+/// at map offset 0xd7, gated on rtl_id 0x8129). Mirrors rtl8xxxu_read_efuse +
+/// rtl8188eu_parse_efuse. Returns None on a transport/format error.
+fn read_efuse_mac(x: &mut Xhci, dev: &mut UsbDevice) -> Option<[u8; 6]> {
+    // Loader clock / 1.2V power / reset gates the EFUSE controller needs.
+    reg_write8(x, dev, REG_EFUSE_ACCESS, EFUSE_ACCESS_ENABLE);
+    if let Some(v) = reg_read16(x, dev, REG_9346CR) { let _ = v; }
+    if let Some(v) = reg_read16(x, dev, REG_SYS_ISO_CTRL) {
+        if v & SYS_ISO_PWC_EV12V == 0 { reg_write16(x, dev, REG_SYS_ISO_CTRL, v | SYS_ISO_PWC_EV12V); }
+    }
+    if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
+        if v & SYS_FUNC_ELDR == 0 { reg_write16(x, dev, REG_SYS_FUNC_EN, v | SYS_FUNC_ELDR); }
+    }
+    if let Some(v) = reg_read16(x, dev, REG_SYS_CLKR) {
+        if v & SYS_CLK_LOADER_ENABLE == 0 || v & SYS_CLK_ANA8M == 0 {
+            reg_write16(x, dev, REG_SYS_CLKR, v | SYS_CLK_LOADER_ENABLE | SYS_CLK_ANA8M);
+        }
+    }
+
+    let mut map = [0xffu8; EFUSE_MAP_LEN];
+    let mut addr: u16 = 0;
+    while (addr as usize) < EFUSE_MAP_LEN {
+        let header = read_efuse8(x, dev, addr)?;
+        addr += 1;
+        if header == 0xff { break; }
+        let (offset, word_mask) = if header & 0x1f == 0x0f {
+            let ext = read_efuse8(x, dev, addr)?;
+            addr += 1;
+            if ext & 0x0f == 0x0f { continue; } // all words disabled
+            (((header as usize & 0xe0) >> 5) | ((ext as usize & 0xf0) >> 1), ext & 0x0f)
+        } else {
+            (((header as usize) >> 4) & 0x0f, header & 0x0f)
+        };
+        let mut map_addr = offset * 8;
+        for i in 0..EFUSE_MAX_WORD_UNIT {
+            if word_mask & (1 << i) != 0 { map_addr += 2; continue; }
+            let lo = read_efuse8(x, dev, addr)?; addr += 1;
+            if map_addr >= EFUSE_MAP_LEN - 1 { break; }
+            map[map_addr] = lo; map_addr += 1;
+            let hi = read_efuse8(x, dev, addr)?; addr += 1;
+            map[map_addr] = hi; map_addr += 1;
+        }
+    }
+    reg_write8(x, dev, REG_EFUSE_ACCESS, EFUSE_ACCESS_DISABLE);
+
+    let rtl_id = (map[0] as u16) | ((map[1] as u16) << 8);
+    if rtl_id != EFUSE_8188EU_RTL_ID {
+        crate::bwarn!("wifi", "efuse rtl_id=0x{:04x} (want 0x{:04x})", rtl_id, EFUSE_8188EU_RTL_ID);
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&map[EFUSE_8188EU_MAC_OFFSET..EFUSE_8188EU_MAC_OFFSET + 6]);
+    Some(mac)
+}
+
+/// SP2 bring-up: power-on, TX-engine pre-firmware init, then upload firmware.
+/// ⚠️ UNVERIFIED on hardware — the register transport (SP1) has not yet been
+/// confirmed on a real dongle.
+pub fn bring_up(x: &mut Xhci, dev: &mut UsbDevice, nr_out_eps: u8) -> bool {
     if !power_on(x, dev) { return false; }
+    tx_engine_pre_fw(x, dev, nr_out_eps);
     download_firmware(x, dev)
 }
 
@@ -408,6 +629,77 @@ const RF6052_REG_MODE_AG: u8 = 0x18;  // RF channel + BW switch (the rf[0x18] re
 const MODE_AG_CHANNEL_MASK: u32 = 0x3FF;
 const MODE_AG_BW_MASK:      u32 = (1 << 10) | (1 << 11);
 const MODE_AG_BW_20MHZ:     u32 = (1 << 10) | (1 << 11);
+
+// ── TX engine init (RQPN + queue priority + LLT + boundary), rtl8xxxu ref ─────
+// Without these the on-chip TX packet buffer has no pages → the MAC NAKs every
+// bulk-OUT forever → the host transfer times out (the `tx code=0` we saw). The
+// 8188eu page-allocation constants come straight from rtl8188eu_fops.
+const TX_TOTAL_PAGE_NUM_8188E:   u32 = 0xa9;
+const TX_PAGE_NUM_HI_PQ_8188E:   u32 = 0x29;
+const TX_PAGE_NUM_LO_PQ_8188E:   u32 = 0x1c;
+const TX_PAGE_NUM_NORM_PQ_8188E: u32 = 0x1c;
+const LAST_LLT_ENTRY_8188E:      u8  = 175;
+const TRXFF_BOUNDARY_8188E:      u16 = 0x25ff;
+
+const REG_RQPN:          u16 = 0x0200;
+const RQPN_HI_PQ_SHIFT:  u32 = 0;
+const RQPN_LO_PQ_SHIFT:  u32 = 8;
+const RQPN_PUB_PQ_SHIFT: u32 = 16;
+const RQPN_LOAD:         u32 = 1 << 31;
+const REG_RQPN_NPQ:      u16 = 0x0214;
+const RQPN_NPQ_SHIFT:    u32 = 0;
+const RQPN_EPQ_SHIFT:    u32 = 16;
+
+const REG_TRXDMA_CTRL:       u16 = 0x010c;
+const TRXDMA_CTRL_VOQ_SHIFT: u16 = 4;
+const TRXDMA_CTRL_VIQ_SHIFT: u16 = 6;
+const TRXDMA_CTRL_BEQ_SHIFT: u16 = 8;
+const TRXDMA_CTRL_BKQ_SHIFT: u16 = 10;
+const TRXDMA_CTRL_MGQ_SHIFT: u16 = 12;
+const TRXDMA_CTRL_HIQ_SHIFT: u16 = 14;
+const TRXDMA_QUEUE_LOW:    u16 = 1;
+const TRXDMA_QUEUE_NORMAL: u16 = 2;
+const TRXDMA_QUEUE_HIGH:   u16 = 3;
+
+const REG_LLT_INIT:    u16 = 0x01e0;
+const LLT_OP_INACTIVE: u32 = 0x0;
+const LLT_OP_WRITE:    u32 = 0x1 << 30;
+const LLT_OP_MASK:     u32 = 0x3 << 30;
+
+const REG_TXPKTBUF_BCNQ_BDNY:     u16 = 0x0424;
+const REG_TXPKTBUF_MGQ_BDNY:      u16 = 0x0425;
+const REG_TXPKTBUF_WMAC_LBK_BF_HD: u16 = 0x045d;
+const REG_TDECTRL: u16 = 0x0208;
+const REG_PBP:     u16 = 0x0104;
+const PBP_PAGE_SIZE_128:     u8 = 0x1;
+const PBP_PAGE_SIZE_RX_SHIFT: u8 = 0;
+const PBP_PAGE_SIZE_TX_SHIFT: u8 = 4;
+
+const REG_TXDMA_OFFSET_CHK:    u16 = 0x020c;
+const TXDMA_OFFSET_DROP_DATA_EN: u32 = 1 << 9;
+const REG_TX_REPORT_CTRL:        u16 = 0x04ec;
+const TX_REPORT_CTRL_TIMER_ENABLE: u8 = 1 << 1;
+const REG_TX_REPORT_TIME:        u16 = 0x04f0;
+const REG_FWHW_TXQ_CTRL:         u16 = 0x0420;
+const FWHW_TXQ_CTRL_AMPDU_RETRY:   u32 = 1 << 7;
+const FWHW_TXQ_CTRL_XMIT_MGMT_ACK: u32 = 1 << 12;
+
+// ── EFUSE read (station MAC), rtl8xxxu rtl8xxxu_read_efuse / 8188eu parse ─────
+const REG_EFUSE_CTRL:       u16 = 0x0030; // [+1]=addr lo, [+2][1:0]=addr hi, [+3] bit7=read, [0] data+BIT31 valid
+const REG_EFUSE_ACCESS:     u16 = 0x00cf;
+const EFUSE_ACCESS_ENABLE:  u8  = 0x69;
+const EFUSE_ACCESS_DISABLE: u8  = 0x00;
+const REG_9346CR:           u16 = 0x000a;
+const REG_SYS_ISO_CTRL:     u16 = 0x0000;
+const SYS_ISO_PWC_EV12V:    u16 = 1 << 15;
+const SYS_FUNC_ELDR:        u16 = 1 << 12; // REG_SYS_FUNC_EN bit (loader reset)
+const REG_SYS_CLKR:         u16 = 0x0008;
+const SYS_CLK_ANA8M:        u16 = 1 << 1;
+const SYS_CLK_LOADER_ENABLE: u16 = 1 << 5;
+const EFUSE_MAP_LEN:        usize = 512;
+const EFUSE_MAX_WORD_UNIT:  usize = 4;
+const EFUSE_8188EU_MAC_OFFSET: usize = 0xd7;
+const EFUSE_8188EU_RTL_ID:  u16 = 0x8129;
 
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
@@ -548,6 +840,7 @@ pub fn bring_up_radio(x: &mut Xhci, dev: &mut UsbDevice) {
     init_phy_bb(x, dev);
     crate::binfo!("wifi", "radio init: rf (radioa {})", tables::RADIOA_INIT.len());
     init_phy_rf(x, dev);
+    tx_engine_post_rf(x, dev);
     rx_enable(x, dev);
     crate::binfo!("wifi", "radio init done");
 }
@@ -618,6 +911,7 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         let mut in_iface = false;
         let mut ep_in: Option<(u8, u16)> = None;
         let mut ep_out: Option<(u8, u16)> = None;
+        let mut nr_out_eps = 0u8;
         while pos + 2 <= n {
             let blen = rd(pos) as usize;
             if blen == 0 || pos + blen > n { break; }
@@ -629,6 +923,7 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
                     in_iface = true;
                     ep_in = None;
                     ep_out = None;
+                    nr_out_eps = 0;
                 }
                 5 if in_iface && pos + 7 <= n => {
                     let addr = rd(pos + 2);
@@ -636,7 +931,7 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
                     let mps = rd16(pos + 4);
                     if attr & 0x03 == 2 { // bulk
                         if addr & 0x80 != 0 { ep_in.get_or_insert((addr, mps)); }
-                        else { ep_out.get_or_insert((addr, mps)); }
+                        else { ep_out.get_or_insert((addr, mps)); nr_out_eps += 1; }
                     }
                 }
                 _ => {}
@@ -658,15 +953,15 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
             Some(v) => crate::binfo!("wifi", "rtl8188eu sys_cfg=0x{:08x} (transport ok)", v),
             None    => crate::bwarn!("wifi", "sys_cfg read failed (verify vendor req on HW)"),
         }
-        crate::binfo!("wifi", "rtl8188eu iface={} ep_in=0x{:02x} ep_out=0x{:02x} mps_in={} mps_out={}",
-            iface_num, ep_in, ep_out, mps_in, mps_out);
+        crate::binfo!("wifi", "rtl8188eu iface={} ep_in=0x{:02x} ep_out=0x{:02x} mps_in={} mps_out={} out_eps={}",
+            iface_num, ep_in, ep_out, mps_in, mps_out, nr_out_eps);
 
         // SP2: attempt chip bring-up (power-on + firmware upload). Failure does
         // NOT abort the bind — the slot is still registered so later subprojects
         // can retry. UNVERIFIED on hardware.
         // Chip bring-up (power-on + firmware + MAC/BB/RF + scan) is LAZY — it runs
         // on the first `wifiscan` (run_scan), not here, so boot stays fast.
-        Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out })
+        Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out, nr_out_eps })
     })();
     crate::memory::dma::dealloc(buf);
     result
@@ -777,14 +1072,10 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
         ring_in, enq_in: 0, cyc_in: true,
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
-        radio_up: false, tx_seq: 0, mac: [0; 6],
+        radio_up: false, tx_seq: 0, mac: [0; 6], nr_out_eps: wi.nr_out_eps,
     })
 }
 
-/// Build the 40-byte RTL TX descriptor for an 802.11 management frame of
-/// `frame_len` bytes. Sets packet size, header offset, first/last segment and
-/// the management queue. Other fields (rate, macid) left default. From the
-/// rtl8xxxu txdesc40 layout — UNVERIFIED on hardware.
 /// 16-bit XOR checksum over the first 32 bytes (csum field zeroed during compute).
 /// rtl8xxxu_calc_tx_desc_csum — a wrong/missing csum hangs TX.
 fn tx_desc_csum(d: &mut [u8; TX_DESC_SIZE]) {
@@ -943,10 +1234,20 @@ pub fn run_scan(out: &mut [u8]) -> usize {
 
     if !st.radio_up {
         crate::binfo!("wifi", "wifiscan: bring-up (power-on + firmware + radio)");
-        bring_up(x, &mut dev);
+        bring_up(x, &mut dev, st.nr_out_eps);
         bring_up_radio(x, &mut dev);
-        for i in 0..6u16 {
-            st.mac[i as usize] = reg_read8(x, &mut dev, REG_MACID + i).unwrap_or(0);
+        // Station MAC comes from EFUSE; program it into REG_MACID so the chip's
+        // RX address filter matches our SA. Fall back to whatever REG_MACID holds.
+        match read_efuse_mac(x, &mut dev) {
+            Some(mac) => {
+                for i in 0..6u16 { reg_write8(x, &mut dev, REG_MACID + i, mac[i as usize]); }
+                st.mac = mac;
+            }
+            None => {
+                for i in 0..6u16 {
+                    st.mac[i as usize] = reg_read8(x, &mut dev, REG_MACID + i).unwrap_or(0);
+                }
+            }
         }
         crate::binfo!("wifi", "mac={:02x?}", st.mac);
         st.radio_up = true;

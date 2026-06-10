@@ -40,8 +40,8 @@ pub fn boot_cd_port() -> Option<usize> { *BOOT_CD_PORT.lock() }
 /// Boot-HBA port index already mounted at `/mnt` (a live FAT SATA disk). Set by
 /// `boot::phases::storage` after the FAT mount; read by `acquire_atapi_port` so
 /// its ATAPI scan SKIPS this port — a second `bringup` would reprogram the live
-/// port's PxCLB/PxFB and corrupt the mounted volume's in-flight DMA. (Needed
-/// because `media_bin` now runs the ATAPI scan AFTER `/mnt` is mounted.)
+/// port's PxCLB/PxFB and corrupt the mounted volume's in-flight DMA. (The ATAPI
+/// acquire path is now dormant and no longer used for /bin.)
 static MOUNTED_SATA_PORT: Mutex<Option<usize>> = Mutex::new(None);
 pub fn set_mounted_sata_port(idx: usize) { *MOUNTED_SATA_PORT.lock() = Some(idx); }
 

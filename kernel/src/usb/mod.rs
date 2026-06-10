@@ -61,8 +61,8 @@ pub fn dump_ports() -> alloc::vec::Vec<(u8, u8, bool, bool, u8, bool, u8)> {
 /// connected but not yet enumerated. `usb::init` seeds connected ports ONCE at
 /// controller start; on real hardware a device (e.g. the boot USB stick) can
 /// read disconnected at that instant (USB3 link training / USB2 debounce) and,
-/// if its Port-Status-Change event was missed, never gets enumerated. The
-/// `media_bin` pump calls this each iteration so a late/missed connect is still
+/// if its Port-Status-Change event was missed, never gets enumerated. The USB
+/// enumeration pump calls this each iteration so a late/missed connect is still
 /// picked up. No-op without a controller.
 pub fn reseed_connected_ports() {
     let cell = match CTRLS.get() { Some(c) => c, None => return };

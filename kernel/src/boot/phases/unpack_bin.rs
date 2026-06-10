@@ -17,6 +17,7 @@ pub fn init() -> Result<(), BootError> {
         None => {
             crate::bwarn!("unpack_bin", "bin.bgz module missing → rescue fallback");
             rescue_fallback();
+            // rescue_fallback() panica o popola /bin; poi cadiamo su Ok(())
         }
     }
     Ok(())
@@ -66,16 +67,20 @@ fn unpack(bytes: &[u8]) {
 
 fn rescue_fallback() {
     let mut n = 0usize;
+    let mut fail = 0usize;
     for (name, data) in crate::modules::rescue_all() {
         let path = format!("/bin/{}", name);
         if write_file(&path, data).is_ok() {
             n += 1;
+        } else {
+            fail += 1;
+            crate::bwarn!("unpack_bin", "rescue write {} failed", name);
         }
     }
     if n == 0 {
         panic!("unpack_bin: bin.bgz unusable AND no /rescue/ modules — system has no /bin");
     }
-    crate::binfo!("unpack_bin", "rescue: {} fallback bins in /bin", n);
+    crate::binfo!("unpack_bin", "rescue: {} fallback bins in /bin ({} failed)", n, fail);
 }
 
 fn write_file(path: &str, bytes: &[u8]) -> Result<(), vfs::VfsError> {

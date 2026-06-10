@@ -11,11 +11,9 @@ pub fn init() -> Result<(), BootError> {
     // Eseguito in OGNI caso (anche senza HBA AHCI), come closure così da poterlo
     // chiamare sia nel path "HBA assente" sia DOPO `ahci::init()`.
     let mount_userspace = || {
-        // Carica i moduli Limine in tmpfs: init.sh, init.wasm, /root e il set
-        // minimo /bin (shell.wasm + bootstrap) come rete di sicurezza. Il resto
-        // di `/bin` è off-boot: lo sovrappone la fase `media_bin` (dopo l'USB)
-        // leggendo l'ISO9660 da CD ATAPI o chiavetta USB. Spostato lì perché
-        // l'USB-MSC si enumera DOPO questa fase.
+        // Carica i moduli Limine in tmpfs: init.sh, init.wasm, /root. `/bin` è
+        // popolato dalla fase `unpack_bin` (subito dopo fs) decomprimendo bin.bgz;
+        // storage non è più coinvolto in /bin.
         let n = crate::modules::mount_all();
         crate::binfo!("storage", "mounted {} boot modules into tmpfs", n);
     };
@@ -84,11 +82,10 @@ pub fn init() -> Result<(), BootError> {
             };
             match mounted {
                 Ok(())  => {
-                    // Record the live /mnt port so the later `media_bin` phase's
-                    // ATAPI scan does NOT re-bringup it — a second bringup would
-                    // reprogram this port's PxCLB/PxFB and corrupt the mounted
-                    // FAT's in-flight DMA (the reorder moved acquire_atapi_port
-                    // to AFTER this mount).
+                    // Records the live /mnt port so `set_mounted_sata_port` can
+                    // guard against a second bringup that would reprogram PxCLB/PxFB
+                    // and corrupt the mounted FAT's in-flight DMA. The ATAPI scan
+                    // path is dormant; this guard is kept for safety.
                     crate::ahci::set_mounted_sata_port(idx as usize);
                     crate::binfo!("fat32", "mnt mounted FAT");
                 }

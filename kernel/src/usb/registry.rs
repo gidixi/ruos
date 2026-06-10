@@ -70,8 +70,8 @@ pub fn pop_action() -> Option<UsbAction> { WORK.lock().pop_front() }
 
 pub fn insert(ctrl: u8, slot: u8, e: SlotEntry) { SLOTS.lock()[gidx(ctrl, slot)] = Some(e); }
 
-/// First mass-storage device as `(ctrl, slot)`, if any. Used by `media_bin` to
-/// mount `/bin` off-boot from a USB stick.
+/// First mass-storage device as `(ctrl, slot)`, if any. Part of the now-dormant
+/// USB-MSC /bin path — kept for future USB storage support.
 pub fn first_msc_slot() -> Option<(u8, u8)> {
     let g = SLOTS.lock();
     for c in 0..MAX_XHCI as u8 {

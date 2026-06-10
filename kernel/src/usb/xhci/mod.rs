@@ -238,8 +238,8 @@ fn bringup(dev: pci::PciDevice, idx: u8) -> Option<Xhci> {
     // but essential on real machines. Set PP on every root port — preserving
     // every RW1C change bit (write 0 so the read-modify-write does not clear
     // them) — then wait the power-on-to-power-good settle before devices are
-    // polled for connect. Real ports debounce after this; `media_bin`'s pump
-    // (and the executor) re-scan for the late connect.
+    // polled for connect. Real ports debounce after this; the USB enumeration
+    // pump (and the executor) re-scan for the late connect.
     for port in 1..=max_ports {
         regs.port_register_set.update_volatile_at((port - 1) as usize, |p| {
             p.portsc.set_port_power();

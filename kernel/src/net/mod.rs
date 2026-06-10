@@ -164,7 +164,13 @@ pub fn poll() {
                                     .iter()
                                     .map(|a| IpAddress::Ipv4(*a))
                                     .collect();
-                                dns_socket.update_servers(&addrs[..]);
+                                // smoltcp's DNS socket holds at most DNS_MAX_SERVER_COUNT
+                                // servers (default 1) in a heapless Vec; update_servers
+                                // UNWRAPS and PANICS if handed more. A DHCP lease can carry
+                                // several (VBox NAT offers 2) — cap to the first.
+                                const DNS_CAP: usize = 1; // smoltcp DNS_MAX_SERVER_COUNT
+                                let n = addrs.len().min(DNS_CAP);
+                                dns_socket.update_servers(&addrs[..n]);
                             }
                         }
                         if !net.dhcp_bound {

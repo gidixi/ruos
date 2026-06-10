@@ -14,9 +14,13 @@ the raw host ABI it wraps; reach for them only for advanced needs.
 
 | Runtime | App kind | Pages |
 |---------|----------|-------|
-| **Wasmtime AOT** (`.cwasm`) | GUI window apps (the SDK) | **[ruos-window](ruos-window.md)** (start here) → raw [`wm`](wm.md) · [`sys`](sys.md) · [`term`](term.md) |
+| **Wasmtime AOT** (`.cwasm`) | GUI window apps (the SDK) | **[ruos-window](ruos-window.md)** (start here) → raw [`wm`](wm.md) · [`sys`](sys.md) · [`term`](term.md) · [`gfx`](gfx.md) |
 | **wasmi** (`.wasm`) | CLI tools | [`ruos`](ruos.md) · [`wasi`](wasi.md) |
 | **Component model** (WIT) | typed bridge | [`wit`](wit.md) |
+
+> **Note on Runtimes vs Interfaces:** 
+> - **Wasmtime** and **wasmi** are execution engines (the "how"). Wasmtime compiles apps Ahead-of-Time for maximum GUI performance, while wasmi interprets CLI tools.
+> - **WASI Preview 1** and **WIT** are API standards (the "what"). They define the signatures of functions (like `fd_read` or `clock_time_get`) that an app expects the OS to provide. In short, Wasmtime *runs* your app, but WASI is the *vocabulary* your app uses to talk to RuOS.
 
 ## Conventions
 
@@ -34,7 +38,7 @@ the raw host ABI it wraps; reach for them only for advanced needs.
 ## Index
 
 - **GUI app author API** — [ruos-window.md](ruos-window.md) ← start here
-- **GUI raw host ABI** — [wm.md](wm.md), [sys.md](sys.md), [term.md](term.md)
+- **GUI raw host ABI** — [wm.md](wm.md), [sys.md](sys.md), [term.md](term.md), [gfx.md](gfx.md)
 - **CLI tools** — [ruos.md](ruos.md), [wasi.md](wasi.md)
 - **Component model** — [wit.md](wit.md)
 

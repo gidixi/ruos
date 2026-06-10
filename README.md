@@ -100,7 +100,7 @@ new one by appending its crate name to `BIN_TOOLS` in the `Makefile`.
 | System & process | `ps kill pkill uname whoami id uptime free dmesg lscpu service rtop` |
 | Network | `ip ifconfig ping nc wget lspci` |
 | Disk & install | `mkdisk mkboot install` |
-| SMP & misc | `smptest spinloop readdirtest date` |
+| SMP & misc | `date client server lsusb umount disks init ruos-rt` |
 
 ## Prerequisites
 
@@ -161,7 +161,6 @@ make run-ssh-test              # SSH client w/ ed25519 pubkey, exec + interactiv
 make run-passwd-test           # SSH password from /mnt/passwd (sshpass)
 make run-passwd-diskless-test  # SSH password fallback, no -drive (diskless)
 make run-pipe-test             # shell pipeline `a | b` over a PTY
-make run-fuel-test             # WASM fuel metering kills a runaway compute loop
 make run-ctrlc-test            # Ctrl-C kills the foreground app, prompt returns
 make run-ssh-idle-test         # idle SSH session survives the PTY watchdog
 ```
@@ -170,7 +169,6 @@ SMP, the monitor, and USB:
 
 ```bash
 make run-smp-test              # SMP bring-up: every AP comes online
-make run-smp2-test             # SMP compute pool: parallel speedup over APs
 make run-rtop-test             # rtop over SSH: auto-refresh + clean quit
 make run-usb-key-test          # USB keyboard (root port) types into the shell
 make run-usb-hub-test          # USB keyboard behind a hub enumerates + types
@@ -189,7 +187,6 @@ it boots the authored SSD standalone under OVMF/UEFI):
 ```bash
 make run-gpt-test              # GPT-partitioned SATA disk parsed + /mnt mounted
 make run-m2a-test              # `mkdisk` authors a GPT+FAT32 disk (host-verified)
-make run-m2b1-test             # boot tree copied onto the ESP (LFN, byte-identity)
 make run-m2b2-test             # install to SSD, then boot standalone from it
 ```
 

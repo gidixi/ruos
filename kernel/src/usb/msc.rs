@@ -99,9 +99,10 @@ pub struct MscState {
     pub max_lun:     u8,
 }
 
-// CSW lands at this page offset, clear of the largest data payload (a 2048-byte
-// ISO sector read by SectorScale; READ CAPACITY = 8 B; INQUIRY = 36 B).
-const CSW_OFF: usize = 3072;
+// CSW lands at this page offset, clear of the largest data payload.
+// We use 2048 to force `max_per` to 4 sectors (a power of 2). Many physical flash
+// drives crash or STALL if you request a non-power-of-2 sector count (like 6).
+const CSW_OFF: usize = 2048;
 
 /// Configure the device's two bulk endpoints (one xHCI Configure Endpoint
 /// command), GET MAX LUN, then bring the LUN up (TEST UNIT READY + READ

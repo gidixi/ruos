@@ -20,6 +20,7 @@ You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 | `environ_get(environ_ptr, environ_buf_ptr) -> i32` | `KEY=VALUE\0` strings. Includes `PWD=<cwd>` (set by the kernel at exec). |
 | `proc_exit(code) -> !` | Terminate the tool with `code`. |
 | `poll_oneoff(in_ptr, out_ptr, nsubs, nevents_ptr) -> i32` | Clock subscriptions (sleep) only; suspends. `28` EINVAL. |
+| `sched_yield() -> i32` | Cooperative yield (no-op on single-core). |
 
 > `environ_get`/`PWD` + the `ruos_rt::init()` shim are how a tool's relative paths
 > resolve against the shell's cwd. See [path resolution](#path-resolution).

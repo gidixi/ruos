@@ -8,7 +8,7 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-09 (19 functions).
+**Last reviewed:** 2026-06-09 (20 functions).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -39,6 +39,9 @@ This window instance's unique id (stable for the window's life).
 
 ### `close()`
 Request the compositor tear down this window. The process is despawned.
+
+### `tick()`
+Bump the call counter (used for spike instrumentation). Returns nothing.
 
 ### `minimize()`
 Hide the window into the taskbar.

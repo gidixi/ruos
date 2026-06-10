@@ -22,10 +22,6 @@ kernel/src/wasm/wt/*.cwasm
 # (auto-bundled into the ISO /bin by the Makefile glob hook).
 /apps/*.cwasm
 
-# Demo/skeleton app SDK (separate repo-in-waiting; builds .cwasm apps without
-# touching the OS sources — apps land in apps/ via its deploy script).
-/demo-apps-sdk/
-
 # OS / misc
 .DS_Store
 Thumbs.db

@@ -1,0 +1,13 @@
+# Only the 4 scripts + README are tracked. Everything `bootstrap.ps1` generates
+# when run in-place (no -Path) is local/regenerable and stays out of git.
+/Cargo.toml
+/Cargo.lock
+/rust-toolchain.toml
+/.cargo/
+/templates/
+/apps/
+/vendor/
+/target/
+/deploy/
+/api/
+/APP-API.md

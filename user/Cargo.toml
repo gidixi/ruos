@@ -21,6 +21,7 @@ members = [
     "umount",
     "disks",
     "wifiscan",
+    "wificonnect",
     "ruos-rt",
 ]
 

@@ -128,6 +128,8 @@ pub struct WifiState {
     pub mac: [u8; 6],
     /// Bulk-OUT endpoint count (TX queue layout). See `WifiIface::nr_out_eps`.
     pub nr_out_eps: u8,
+    /// Next H2C mailbox index (0..H2C_MAX_MBOX), round-robin per command.
+    pub h2c_mbox: u8,
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -701,6 +703,18 @@ const EFUSE_MAX_WORD_UNIT:  usize = 4;
 const EFUSE_8188EU_MAC_OFFSET: usize = 0xd7;
 const EFUSE_8188EU_RTL_ID:  u16 = 0x8129;
 
+// ── SP-WIFI-2: STA opmode + BSSID + AID + H2C media-connect (rtl8xxxu ref) ────
+const REG_MSR:              u16 = 0x0102; // media-status: link type, port0 bits[1:0]
+const MSR_LINKTYPE_STATION: u8  = 0x2;
+const REG_BSSID:            u16 = 0x0618; // 6 bytes
+const REG_BCN_MAX_ERR:      u16 = 0x055d;
+const REG_BCN_PSR_RPT:      u16 = 0x06a8; // joinbss: 0xc000 | AID
+const REG_HMBOX_0:          u16 = 0x01d0; // H2C mailbox 0 (4 bytes), +4 per box
+const REG_HMTFR:            u16 = 0x01cc; // H2C mailbox busy flags (bit per box)
+const H2C_MAX_MBOX:         u8  = 4;
+const H2C_MEDIA_STATUS_RPT: u8  = 0x01;   // gen2 H2C command
+const H2C_MACID_ROLE_AP:    u8  = 2;      // from the STA, macid 0 = the AP
+
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
 #[allow(dead_code)]
@@ -1073,6 +1087,7 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
         radio_up: false, tx_seq: 0, mac: [0; 6], nr_out_eps: wi.nr_out_eps,
+        h2c_mbox: 0,
     })
 }
 
@@ -1232,26 +1247,7 @@ pub fn run_scan(out: &mut [u8]) -> usize {
     let mut dev = match crate::usb::registry::dev_copy(ctrl, slot) { Some(d) => d, None => return 0 };
     let mut st = match crate::usb::registry::wifi_state(ctrl, slot) { Some(s) => s, None => return 0 };
 
-    if !st.radio_up {
-        crate::binfo!("wifi", "wifiscan: bring-up (power-on + firmware + radio)");
-        bring_up(x, &mut dev, st.nr_out_eps);
-        bring_up_radio(x, &mut dev);
-        // Station MAC comes from EFUSE; program it into REG_MACID so the chip's
-        // RX address filter matches our SA. Fall back to whatever REG_MACID holds.
-        match read_efuse_mac(x, &mut dev) {
-            Some(mac) => {
-                for i in 0..6u16 { reg_write8(x, &mut dev, REG_MACID + i, mac[i as usize]); }
-                st.mac = mac;
-            }
-            None => {
-                for i in 0..6u16 {
-                    st.mac[i as usize] = reg_read8(x, &mut dev, REG_MACID + i).unwrap_or(0);
-                }
-            }
-        }
-        crate::binfo!("wifi", "mac={:02x?}", st.mac);
-        st.radio_up = true;
-    }
+    ensure_radio_up(x, &mut dev, &mut st);
     let results = scan(x, &mut dev, &mut st);
     // Persist advanced EP0 cursors + ring cursors + the radio_up latch.
     crate::usb::registry::set_dev(ctrl, slot, dev);
@@ -1260,6 +1256,175 @@ pub fn run_scan(out: &mut [u8]) -> usize {
     let mut s = alloc::string::String::new();
     for r in &results {
         let _ = write!(s, "{}\t{}\t{}\n", r.ssid, r.channel, r.security.as_str());
+    }
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(out.len());
+    out[..n].copy_from_slice(&bytes[..n]);
+    n
+}
+
+/// Lazily bring the chip up on the first scan/connect: power-on + firmware +
+/// MAC/BB/RF, then read the station MAC from EFUSE into REG_MACID. The
+/// `radio_up` latch keeps subsequent calls fast.
+fn ensure_radio_up(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState) {
+    if st.radio_up { return; }
+    crate::binfo!("wifi", "bring-up (power-on + firmware + radio)");
+    bring_up(x, dev, st.nr_out_eps);
+    bring_up_radio(x, dev);
+    // Station MAC comes from EFUSE; program REG_MACID so the chip's RX address
+    // filter matches our SA. Fall back to whatever REG_MACID already holds.
+    match read_efuse_mac(x, dev) {
+        Some(mac) => {
+            for i in 0..6u16 { reg_write8(x, dev, REG_MACID + i, mac[i as usize]); }
+            st.mac = mac;
+        }
+        None => {
+            for i in 0..6u16 { st.mac[i as usize] = reg_read8(x, dev, REG_MACID + i).unwrap_or(0); }
+        }
+    }
+    crate::binfo!("wifi", "mac={:02x?}", st.mac);
+    st.radio_up = true;
+}
+
+// ── SP-WIFI-2: STA association ───────────────────────────────────────────────
+
+/// Outcome of an association attempt (up to assoc — the 4-way handshake and key
+/// install are SP-WIFI-3/4). `None` status = no response received.
+pub struct ConnectOutcome {
+    pub found: bool,
+    pub auth_status: Option<u16>,
+    pub assoc_status: Option<u16>,
+    pub aid: u16,
+}
+
+/// Set port-0 operating mode to STATION (REG_MSR link type).
+fn set_opmode_sta(x: &mut Xhci, dev: &mut UsbDevice) {
+    let v = reg_read8(x, dev, REG_MSR).unwrap_or(0) & 0x0c;
+    reg_write8(x, dev, REG_MSR, v | MSR_LINKTYPE_STATION);
+}
+
+/// Program the BSSID of the AP we're joining (REG_BSSID, 6 bytes).
+fn set_bssid_reg(x: &mut Xhci, dev: &mut UsbDevice, bssid: [u8; 6]) {
+    for i in 0..6u16 { reg_write8(x, dev, REG_BSSID + i, bssid[i as usize]); }
+}
+
+/// Send one gen2 H2C mailbox command word. Polls REG_HMTFR for the box free
+/// (bounded), writes the 4-byte mailbox, advances the round-robin index.
+fn h2c_cmd(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState, word: u32) {
+    let nr = st.h2c_mbox % H2C_MAX_MBOX;
+    for _ in 0..100 {
+        if reg_read8(x, dev, REG_HMTFR).unwrap_or(0xff) & (1 << nr) == 0 { break; }
+    }
+    reg_write32(x, dev, REG_HMBOX_0 + (nr as u16) * 4, word);
+    st.h2c_mbox = (nr + 1) % H2C_MAX_MBOX;
+}
+
+/// H2C media-status report (rtl8xxxu_gen2_report_connect): cmd 0x01, parm =
+/// connect(bit0) | role<<4, macid 0 (= the AP, from the STA's perspective).
+fn report_connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState, connect: bool) {
+    let parm = (if connect { 1u32 } else { 0 }) | ((H2C_MACID_ROLE_AP as u32) << 4);
+    let word = (H2C_MEDIA_STATUS_RPT as u32) | (parm << 8); // macid 0 in byte 2
+    h2c_cmd(x, dev, st, word);
+}
+
+/// Connect (open-system auth → WPA2 assoc) to `ssid`. SP-WIFI-2: stops after
+/// association + the joinbss/media-connect — the 4-way handshake (needs the
+/// `password`) and CCMP key install are SP-WIFI-3/4. `password` is accepted now
+/// but unused until then.
+pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
+               ssid: &[u8], _password: &[u8]) -> ConnectOutcome {
+    let mut out = ConnectOutcome { found: false, auth_status: None, assoc_status: None, aid: 0 };
+
+    // 1. Locate the AP (BSSID + channel) via a scan.
+    let aps = scan(x, dev, st);
+    let (bssid, channel) = match aps.iter().find(|r| r.ssid.as_bytes() == ssid) {
+        Some(a) => (a.bssid, a.channel),
+        None => { crate::bwarn!("wifi", "connect: ssid not found"); return out; }
+    };
+    out.found = true;
+    crate::binfo!("wifi", "connect: ap {:02x?} ch={}", bssid, channel);
+
+    // 2. Tune to the AP channel, set STA opmode + BSSID.
+    config_channel(x, dev, channel);
+    crate::boot::clock::mdelay(10);
+    set_opmode_sta(x, dev);
+    set_bssid_reg(x, dev, bssid);
+
+    let mut buf = [0u8; 512];
+
+    // 3. Open-system authentication.
+    'auth: for _ in 0..4 {
+        let seq = next_seq(st);
+        let frame = ieee80211::build_auth_request(st.mac, bssid, seq);
+        send_frame(x, st, &frame, seq, false);
+        for _ in 0..20 {
+            if let Some(n) = recv_frame(x, st, &mut buf, 50) {
+                if let Some(status) = ieee80211::parse_auth_response(&buf[..n]) {
+                    out.auth_status = Some(status);
+                    break 'auth;
+                }
+            }
+        }
+    }
+    match out.auth_status {
+        Some(0) => crate::binfo!("wifi", "auth ok"),
+        Some(s) => { crate::bwarn!("wifi", "auth rejected status={}", s); return out; }
+        None    => { crate::bwarn!("wifi", "auth no response"); return out; }
+    }
+
+    // 4. Association (carries the WPA2-PSK RSN IE).
+    'assoc: for _ in 0..4 {
+        let seq = next_seq(st);
+        let frame = ieee80211::build_assoc_request(st.mac, bssid, ssid, seq);
+        send_frame(x, st, &frame, seq, false);
+        for _ in 0..20 {
+            if let Some(n) = recv_frame(x, st, &mut buf, 50) {
+                if let Some((status, aid)) = ieee80211::parse_assoc_response(&buf[..n]) {
+                    out.assoc_status = Some(status);
+                    out.aid = aid;
+                    break 'assoc;
+                }
+            }
+        }
+    }
+    match out.assoc_status {
+        Some(0) => crate::binfo!("wifi", "assoc ok aid={}", out.aid),
+        Some(s) => { crate::bwarn!("wifi", "assoc rejected status={}", s); return out; }
+        None    => { crate::bwarn!("wifi", "assoc no response"); return out; }
+    }
+
+    // 5. joinbss: AID register + H2C media-connect (firmware enables rate control).
+    reg_write8(x, dev, REG_BCN_MAX_ERR, 0xff);
+    reg_write16(x, dev, REG_BCN_PSR_RPT, 0xc000 | out.aid);
+    report_connect(x, dev, st, true);
+    crate::binfo!("wifi", "media-connect sent (aid={})", out.aid);
+    out
+}
+
+/// `wificonnect` command entry. Lazily brings the chip up, then runs the
+/// open-auth → WPA2-assoc sequence to `ssid`. Writes a one-line status into
+/// `out` and returns the byte count (0 = no device).
+pub fn run_connect(ssid: &[u8], password: &[u8], out: &mut [u8]) -> usize {
+    use core::fmt::Write as _;
+    let (ctrl, slot) = match crate::usb::registry::first_wifi_slot() { Some(s) => s, None => return 0 };
+    let cell = match crate::usb::CTRLS.get() { Some(c) => c, None => return 0 };
+    let mut g = cell.lock();
+    let x = match g.get_mut(ctrl as usize) { Some(x) => x, None => return 0 };
+    let mut dev = match crate::usb::registry::dev_copy(ctrl, slot) { Some(d) => d, None => return 0 };
+    let mut st = match crate::usb::registry::wifi_state(ctrl, slot) { Some(s) => s, None => return 0 };
+
+    ensure_radio_up(x, &mut dev, &mut st);
+    let o = connect(x, &mut dev, &mut st, ssid, password);
+    crate::usb::registry::set_dev(ctrl, slot, dev);
+    crate::usb::registry::set_wifi_state(ctrl, slot, st);
+
+    let mut s = alloc::string::String::new();
+    if !o.found {
+        let _ = write!(s, "ssid not found\n");
+    } else {
+        let auth = match o.auth_status { Some(0) => "ok", Some(_) => "rejected", None => "no-response" };
+        let assoc = match o.assoc_status { Some(0) => "ok", Some(_) => "rejected", None => "no-response" };
+        let _ = write!(s, "auth={} assoc={} aid={}\n", auth, assoc, o.aid);
     }
     let bytes = s.as_bytes();
     let n = bytes.len().min(out.len());

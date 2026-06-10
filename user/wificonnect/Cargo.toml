@@ -1,0 +1,8 @@
+[package]
+name = "wificonnect"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wificonnect"
+path = "src/main.rs"

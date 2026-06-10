@@ -41,9 +41,12 @@ pub struct ScanResult {
 }
 
 // 802.11 frame-control first byte (protocol ver 0): type<<2 | subtype<<4.
+const FC_ASSOC_REQ:   u8 = 0x00; // mgmt(0), subtype assoc-req(0)
+const FC_ASSOC_RESP:  u8 = 0x10; // mgmt(0), subtype assoc-resp(1)
 const FC_PROBE_REQ:   u8 = 0x40; // mgmt(0), subtype probe-req(4)
 const FC_BEACON:      u8 = 0x80; // mgmt(0), subtype beacon(8)
 const FC_PROBE_RESP:  u8 = 0x50; // mgmt(0), subtype probe-resp(5)
+const FC_AUTH:        u8 = 0xB0; // mgmt(0), subtype auth(11)
 
 // Information-element ids.
 const IE_SSID:        u8 = 0;
@@ -132,4 +135,90 @@ pub fn parse_beacon(frame: &[u8]) -> Option<ScanResult> {
     };
 
     Some(ScanResult { ssid, bssid, channel, security })
+}
+
+// ── MLME: authentication + association (SP-WIFI-2) ───────────────────────────
+// Standard 802.11 management frames, chip-independent. In Linux these live in
+// mac80211; ruos builds them itself. The 24-byte MAC header for a frame TO the
+// AP: Addr1 = BSSID (the AP), Addr2 = SA (us), Addr3 = BSSID.
+
+/// Capability info advertised in the assoc-request: ESS + Privacy (WPA2).
+const CAP_ESS: u16 = 1 << 0;
+
+/// Push the common 24-byte management header for a frame addressed to `bssid`.
+fn push_mgmt_header(f: &mut Vec<u8>, fc0: u8, sa: [u8; 6], bssid: [u8; 6], seq: u16) {
+    f.extend_from_slice(&[fc0, 0x00, 0x00, 0x00]); // FC + Duration
+    f.extend_from_slice(&bssid);                   // Addr1 = DA = BSSID
+    f.extend_from_slice(&sa);                       // Addr2 = SA
+    f.extend_from_slice(&bssid);                    // Addr3 = BSSID
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes()); // seq ctrl
+}
+
+/// Build an open-system authentication request (algorithm 0, transaction 1).
+pub fn build_auth_request(sa: [u8; 6], bssid: [u8; 6], seq: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(30);
+    push_mgmt_header(&mut f, FC_AUTH, sa, bssid, seq);
+    f.extend_from_slice(&0u16.to_le_bytes());  // auth algorithm = Open System
+    f.extend_from_slice(&1u16.to_le_bytes());  // transaction sequence = 1
+    f.extend_from_slice(&0u16.to_le_bytes());  // status code = 0
+    f
+}
+
+/// The WPA2-PSK / CCMP RSN information element (suite OUI 00-0F-AC):
+/// group + pairwise = CCMP(4), AKM = PSK(2).
+fn push_rsn_ie_wpa2_psk(f: &mut Vec<u8>) {
+    f.push(IE_RSN);
+    f.push(20);                                  // length
+    f.extend_from_slice(&1u16.to_le_bytes());    // RSN version 1
+    f.extend_from_slice(&[0x00, 0x0f, 0xac, 0x04]); // group cipher = CCMP
+    f.extend_from_slice(&1u16.to_le_bytes());    // pairwise count
+    f.extend_from_slice(&[0x00, 0x0f, 0xac, 0x04]); // pairwise = CCMP
+    f.extend_from_slice(&1u16.to_le_bytes());    // AKM count
+    f.extend_from_slice(&[0x00, 0x0f, 0xac, 0x02]); // AKM = PSK
+    f.extend_from_slice(&0u16.to_le_bytes());    // RSN capabilities
+}
+
+/// Build an association request carrying the WPA2-PSK RSN IE.
+pub fn build_assoc_request(sa: [u8; 6], bssid: [u8; 6], ssid: &[u8], seq: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(28 + ssid.len() + 32);
+    push_mgmt_header(&mut f, FC_ASSOC_REQ, sa, bssid, seq);
+    f.extend_from_slice(&(CAP_ESS | CAP_PRIVACY).to_le_bytes()); // capability info
+    f.extend_from_slice(&10u16.to_le_bytes());                   // listen interval
+    // SSID IE.
+    f.push(IE_SSID);
+    f.push(ssid.len() as u8);
+    f.extend_from_slice(ssid);
+    // Supported-rates IE (b/g set).
+    f.push(IE_SUPP_RATES);
+    f.push(8);
+    f.extend_from_slice(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);
+    // RSN IE (WPA2-PSK / CCMP) — required or a WPA2 AP rejects the association.
+    push_rsn_ie_wpa2_psk(&mut f);
+    f
+}
+
+/// Parse an authentication response. Returns the status code (0 = success) if
+/// this is an open-system auth frame with transaction sequence 2, else None.
+pub fn parse_auth_response(frame: &[u8]) -> Option<u16> {
+    if frame.len() < 30 || frame[0] != FC_AUTH {
+        return None;
+    }
+    let algo = u16::from_le_bytes([frame[24], frame[25]]);
+    let txn  = u16::from_le_bytes([frame[26], frame[27]]);
+    let status = u16::from_le_bytes([frame[28], frame[29]]);
+    if algo != 0 || txn != 2 {
+        return None;
+    }
+    Some(status)
+}
+
+/// Parse an association response. Returns (status code, AID) — AID valid only
+/// when status == 0. None if this isn't an assoc-response.
+pub fn parse_assoc_response(frame: &[u8]) -> Option<(u16, u16)> {
+    if frame.len() < 30 || frame[0] != FC_ASSOC_RESP {
+        return None;
+    }
+    let status = u16::from_le_bytes([frame[26], frame[27]]);
+    let aid = u16::from_le_bytes([frame[28], frame[29]]) & 0x3FFF;
+    Some((status, aid))
 }

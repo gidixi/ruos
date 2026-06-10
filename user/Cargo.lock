@@ -624,3 +624,11 @@ dependencies = [
 [[package]]
 name = "whoami"
 version = "0.1.0"
+
+[[package]]
+name = "wificonnect"
+version = "0.1.0"
+
+[[package]]
+name = "wifiscan"
+version = "0.1.0"

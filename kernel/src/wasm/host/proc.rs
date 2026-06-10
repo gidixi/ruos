@@ -434,6 +434,47 @@ fn ruos_wifi_scan(
     Ok(n as i32)
 }
 
+/// `wifi_connect(ssid_ptr, ssid_len, pass_ptr, pass_len, buf_ptr, buf_cap) -> i32`:
+/// open-system auth → WPA2 association to `ssid`. Lazily brings the chip up on
+/// first call. Fills `buf` with a one-line status (`auth=.. assoc=.. aid=N`).
+/// Returns byte count, `0` no device, `-1` bad args / buffer too small.
+/// (The 4-way handshake + key install are SP-WIFI-3/4 — not yet wired, so this
+/// associates but does not yet pass traffic.)
+fn ruos_wifi_connect(
+    mut caller: Caller<'_, RuntimeState>,
+    ssid_ptr: i32,
+    ssid_len: i32,
+    pass_ptr: i32,
+    pass_len: i32,
+    buf_ptr: i32,
+    buf_cap: i32,
+) -> Result<i32, Error> {
+    if buf_cap <= 0 || ssid_len <= 0 {
+        return Ok(-1);
+    }
+    let ssid = match crate::wasm::host::mem::guest_read(&caller, ssid_ptr, ssid_len) {
+        Ok(b) => b,
+        Err(_) => return Ok(-1),
+    };
+    let pass = if pass_len > 0 {
+        match crate::wasm::host::mem::guest_read(&caller, pass_ptr, pass_len) {
+            Ok(b) => b,
+            Err(_) => return Ok(-1),
+        }
+    } else {
+        Vec::new()
+    };
+    let mut buf = alloc::vec![0u8; buf_cap as usize];
+    let n = crate::usb::wifi::run_connect(&ssid, &pass, &mut buf);
+    if n == 0 {
+        return Ok(0);
+    }
+    if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &buf[..n]) {
+        return Ok(e);
+    }
+    Ok(n as i32)
+}
+
 /// ruos_net_iface(buf_ptr, buf_len, used_ptr) -> errno.
 /// Pre-formatted output:
 ///   "lo    127.0.0.1/8\n"
@@ -896,6 +937,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "usb_list", ruos_usb_list)?
         .func_wrap("ruos", "sata_list", ruos_sata_list)?
         .func_wrap("ruos", "wifi_scan", ruos_wifi_scan)?
+        .func_wrap("ruos", "wifi_connect", ruos_wifi_connect)?
         .func_wrap("ruos", "net_iface", ruos_net_iface)?
         .func_wrap("ruos", "net_set_static", ruos_net_set_static)?
         .func_wrap("ruos", "net_dhcp_renew", ruos_net_dhcp_renew)?

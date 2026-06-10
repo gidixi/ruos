@@ -26,12 +26,18 @@ pub fn write_archive(entries: &[(&str, &[u8])], level: u8) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
+    // Guard: numero entry deve stare in u32.
+    debug_assert!(entries.len() <= u32::MAX as usize, "troppe entry");
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, data) in entries {
         let nb = name.as_bytes();
+        // Guard: il nome deve stare in u16.
+        debug_assert!(nb.len() <= u16::MAX as usize, "nome entry troppo lungo");
         out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         out.extend_from_slice(nb);
         let gz = compress(data, level);
+        // Guard: il membro gzip deve stare in u32.
+        debug_assert!(gz.len() <= u32::MAX as usize, "membro gzip troppo grande");
         out.extend_from_slice(&(gz.len() as u32).to_le_bytes());
         out.extend_from_slice(&gz);
     }
@@ -71,22 +77,33 @@ impl<'a> Iterator for ArchiveIter<'a> {
         self.remaining -= 1;
         let d = self.data;
         let mut p = self.pos;
-        if p + 2 > d.len() {
+        // Controllo overflow-safe: 2 byte per name_len.
+        if p.saturating_add(2) > d.len() {
+            // Avvelena l'iteratore: le chiamate successive restituiranno None.
+            self.remaining = 0;
             return Some(Err(PackError::Truncated));
         }
         let nlen = u16::from_le_bytes([d[p], d[p + 1]]) as usize;
         p += 2;
-        if p + nlen + 4 > d.len() {
+        // Controllo overflow-safe: name + 4 byte per gz_len.
+        if p.saturating_add(nlen).saturating_add(4) > d.len() {
+            self.remaining = 0;
             return Some(Err(PackError::Truncated));
         }
         let name = match core::str::from_utf8(&d[p..p + nlen]) {
             Ok(s) => s,
-            Err(_) => return Some(Err(PackError::Truncated)),
+            Err(_) => {
+                // Nome non UTF-8 → entry malformata, avvelena l'iteratore.
+                self.remaining = 0;
+                return Some(Err(PackError::Truncated));
+            }
         };
         p += nlen;
         let glen = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
         p += 4;
-        if p + glen > d.len() {
+        // Controllo overflow-safe: dati gzip.
+        if p.saturating_add(glen) > d.len() {
+            self.remaining = 0;
             return Some(Err(PackError::Truncated));
         }
         let gz = &d[p..p + glen];
@@ -104,7 +121,6 @@ pub fn decompress_member(gz: &[u8]) -> Result<Vec<u8>, GzError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     #[test]
     fn roundtrip_two_files() {

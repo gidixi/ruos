@@ -9,7 +9,7 @@ pub mod usb;
 pub mod devices;
 pub mod fs;
 pub mod storage;
-pub mod media_bin;
+pub mod unpack_bin;
 pub mod userland;
 
 use spin::Mutex;

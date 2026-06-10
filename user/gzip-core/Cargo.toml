@@ -1,0 +1,11 @@
+[package]
+name = "gzip-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+miniz_oxide = "0.8"
+
+[lib]
+name = "gzip_core"
+path = "src/lib.rs"

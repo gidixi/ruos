@@ -102,9 +102,18 @@ legge la lista di file da impacchettare (`user-bin/*.wasm` + i `.cwasm` da
 formato sopra. Argomenti: lista path in input + path output.
 
 - **Makefile**: nuovo target `bin.bgz` che dipende da `$(BIN_WASMS)` + i `.cwasm`;
-  ricostruito quando cambia un qualunque bin. L'ISO copia **solo** `bin.bgz` in
-  `iso_root/` (non più i 67 file in `iso_root/bin/`).
+  ricostruito quando cambia un qualunque bin. `mkbinpack` si compila come tool
+  host via cargo (stesso pattern del precompilatore AOT e del tool `limine`).
+  Recipe: dopo che tutti i bin sono in `iso_root/bin/`, `mkbinpack iso_root/bin/* →
+  iso_root/bin.bgz`. Il target `iso` assembla l'immagine con **solo `bin.bgz`**
+  (non più i 67 file in `iso_root/bin/` loose).
 - Riduce anche la dimensione ISO (un blob compresso vs 132MB loose).
+
+**`build-iso.ps1` — INVARIATO.** È solo un orchestratore: provisiona deps
+(apt/rustup/submodule) e invoca `make iso` dentro WSL. Tutta la generazione di
+`bin.bgz` vive nel Makefile come prerequisito di `iso`, quindi `.\build-iso.ps1`
+la attiva senza modifiche. `mkbinpack` è un binario host Rust **std** → compila
+con la toolchain WSL già presente, nessuna dipendenza apt nuova.
 
 ### Limine (`limine.conf`)
 
@@ -193,4 +202,5 @@ Logica:
 - `kernel/src/boot/phases/media_bin.rs` (rimosso dal flusso)
 - `limine.conf`
 - `Makefile` (target bin.bgz, ISO ship solo bin.bgz)
+- `build-iso.ps1` — **non toccato** (orchestratore: chiama `make iso`)
 - `docs/api/` — **non toccato** (nessuna host fn app-facing nuova)

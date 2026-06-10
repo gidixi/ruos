@@ -20,6 +20,14 @@ use limine::request::ModulesRequest;
 /// Module cmdline prefix marking a boot artifact (see module docs).
 const PAYLOAD_PREFIX: &str = "/payload/";
 
+/// Module cmdline prefix per l'archivio /bin compresso (bin.bgz). Skippato dal
+/// tmpfs-mount come `/payload/`; recuperato via `archive()`.
+const ARCHIVE_PREFIX: &str = "/archive/";
+
+/// Module cmdline prefix per il set rescue (shell + tool minimi). Tenuto in
+/// HHDM, scritto in /bin SOLO se l'unpack di bin.bgz fallisce (`rescue_all()`).
+const RESCUE_PREFIX: &str = "/rescue/";
+
 #[used]
 #[link_section = ".requests"]
 static MODULES: ModulesRequest = ModulesRequest::new();
@@ -39,8 +47,11 @@ pub fn mount_all() -> usize {
         // m.data() is the HHDM-mapped module buffer (guaranteed valid for
         // kernel lifetime). m.cmdline() is the path declared in limine.conf.
         let path = m.cmdline();
-        if path.starts_with(PAYLOAD_PREFIX) {
-            // Boot artifact — not a userspace file. Skip the tmpfs copy.
+        if path.starts_with(PAYLOAD_PREFIX)
+            || path.starts_with(ARCHIVE_PREFIX)
+            || path.starts_with(RESCUE_PREFIX)
+        {
+            // Boot artifact / archivio / rescue — non file tmpfs diretti.
             payloads += 1;
             continue;
         }
@@ -124,6 +135,42 @@ pub fn all() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
             let cmdline = unsafe { core::mem::transmute::<&str, &'static str>(m.cmdline()) };
             let data = unsafe { core::mem::transmute::<&[u8], &'static [u8]>(m.data()) };
             out.push((cmdline, data));
+        }
+    }
+    out
+}
+
+/// Bytes del modulo archivio `/archive/<name>` (es. `bin.bgz`), HHDM-mapped e
+/// valido per tutta la vita kernel (vedi `payload`). `None` se assente.
+pub fn archive(name: &str) -> Option<&'static [u8]> {
+    let resp = MODULES.response()?;
+    for m in resp.modules() {
+        if let Some(stripped) = m.cmdline().strip_prefix(ARCHIVE_PREFIX) {
+            if stripped == name {
+                // SAFETY: `m.data()` borrows the HHDM-mapped module buffer.
+                // That buffer lives for the whole kernel lifetime (Limine
+                // never reclaims loaded modules and `MODULES` is `static`),
+                // so widening the borrow to `'static` is sound.
+                return Some(unsafe { core::mem::transmute::<&[u8], &'static [u8]>(m.data()) });
+            }
+        }
+    }
+    None
+}
+
+/// Tutti i moduli rescue come `(basename, data)` (es. `("shell.wasm", &[..])`).
+/// Usati per popolare `/bin` quando bin.bgz manca/è corrotto.
+pub fn rescue_all() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(resp) = MODULES.response() {
+        for m in resp.modules() {
+            if let Some(name) = m.cmdline().strip_prefix(RESCUE_PREFIX) {
+                // SAFETY: see `payload()` — the module buffer and cmdline string
+                // both live for the kernel lifetime; widen the borrows to `'static`.
+                let name = unsafe { core::mem::transmute::<&str, &'static str>(name) };
+                let data = unsafe { core::mem::transmute::<&[u8], &'static [u8]>(m.data()) };
+                out.push((name, data));
+            }
         }
     }
     out

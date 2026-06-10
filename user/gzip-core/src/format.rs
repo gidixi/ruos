@@ -7,13 +7,9 @@ use crate::crc32::crc32;
 
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CM_DEFLATE: u8 = 8;
-#[allow(dead_code)]
 const FHCRC: u8 = 2;
-#[allow(dead_code)]
 const FEXTRA: u8 = 4;
-#[allow(dead_code)]
 const FNAME: u8 = 8;
-#[allow(dead_code)]
 const FCOMMENT: u8 = 16;
 
 #[derive(Debug, PartialEq, Eq)]

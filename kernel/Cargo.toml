@@ -44,6 +44,7 @@ sunset = { path = "../third_party/sunset", default-features = false }
 # getrandom needs an explicit custom backend on bare-metal — we wire it
 # to crate::rng via register_custom_getrandom! in ssh/rng_bridge.rs.
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+gzip-core = { path = "../user/gzip-core", default-features = false }
 log = { version = "0.4", default-features = false }
 xhci = "0.9"
 

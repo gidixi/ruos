@@ -1,0 +1,14 @@
+[package]
+name = "mkbinpack"
+version = "0.1.0"
+edition = "2021"
+
+# Isolate from any parent workspace (tools are standalone host binaries).
+[workspace]
+
+[dependencies]
+gzip-core = { path = "../../user/gzip-core" }
+
+[[bin]]
+name = "mkbinpack"
+path = "src/main.rs"

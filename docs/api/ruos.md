@@ -100,13 +100,15 @@ Interface list, e.g. `lo  127.0.0.1/8\n`, `eth0  10.0.2.15/24 mac=… gw=…\n`.
 Perform a Wi-Fi scan and write results to `buf`. Returns the number of bytes written, or `-1` if the buffer is too small.
 
 ### `wifi_connect(ssid_ptr, ssid_len, pass_ptr, pass_len, buf_ptr, buf_cap) -> i32`
-Associate with a WPA2 network on the RTL8188EU dongle: lazily brings the chip up,
-scans for `ssid`, then runs open-system authentication + WPA2 association (the
-assoc-request carries the WPA2-PSK / CCMP RSN IE). Writes a one-line status into
-`buf` (`auth=<ok|rejected|no-response> assoc=<…> aid=<N>`, or `ssid not found`).
-Returns the byte count, `0` no device, `-1` bad args / buffer too small. `pass`
-may be empty (the 4-way handshake + CCMP key install are SP-WIFI-3/4 and not yet
-wired, so the link associates but does not pass traffic yet).
+Connect to a WPA2-PSK network on the RTL8188EU dongle: lazily brings the chip up,
+scans for `ssid`, runs open-system authentication + WPA2 association (assoc-request
+carries the WPA2-PSK / CCMP RSN IE), then — when `pass` is non-empty — the WPA2
+4-way handshake (HMAC-SHA1 PTK/MIC, AES GTK unwrap) and installs the CCMP PTK+GTK
+into the chip's HW key CAM. Writes a one-line status into `buf`
+(`auth=<ok|rejected|no-response> assoc=<…> aid=<N> 4way=<ok|failed|skipped>`, or
+`ssid not found`). Returns the byte count, `0` no device, `-1` bad args / buffer
+too small. With an empty `pass` the handshake is skipped (`4way=skipped`). The
+encrypted data path + DHCP (smoltcp over the Wi-Fi link) is SP-WIFI-5.
 
 ### `net_set_static(ip0, ip1, ip2, ip3, prefix, gw0, gw1, gw2, gw3, gw_present) -> i32`
 Set a static IP on the active NIC. `0` OK, `8` no iface, `22` EINVAL.

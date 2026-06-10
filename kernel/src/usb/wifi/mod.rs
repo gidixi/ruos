@@ -27,6 +27,10 @@ pub mod tables;
 #[allow(dead_code)]
 pub mod wpa2;
 
+// EAPOL-Key framing for the WPA2 4-way handshake (SP-WIFI-4).
+#[allow(dead_code)]
+pub mod eapol;
+
 use crate::usb::control::{control_in, control_out_data, Setup};
 use crate::usb::device::UsbDevice;
 use crate::usb::xhci::Xhci;
@@ -715,6 +719,21 @@ const H2C_MAX_MBOX:         u8  = 4;
 const H2C_MEDIA_STATUS_RPT: u8  = 0x01;   // gen2 H2C command
 const H2C_MACID_ROLE_AP:    u8  = 2;      // from the STA, macid 0 = the AP
 
+// ── SP-WIFI-4: HW CCMP key CAM + security config (rtl8xxxu reference) ─────────
+const REG_CAM_CMD:        u16 = 0x0670;
+const CAM_CMD_POLLING:    u32 = 1 << 31;
+const CAM_CMD_WRITE:      u32 = 1 << 16;
+const CAM_CMD_KEY_SHIFT:  u32 = 3;        // 8 dwords per CAM key entry
+const REG_CAM_WRITE:      u16 = 0x0674;
+const CAM_WRITE_VALID:    u32 = 1 << 15;
+const REG_SECURITY_CFG:   u16 = 0x0680;
+// TX/RX sec enable + default-key (uni + broadcast). rtl8xxxu set_key value 0xCF.
+const SEC_CFG_VAL:        u8  = 0xCF;
+const CR_SECURITY_ENABLE: u16 = 1 << 9;
+const CCMP_CIPHER_NIBBLE: u32 = 0x04;     // WLAN_CIPHER_SUITE_CCMP & 0x0f
+// TX queue selector for EAPOL data frames (best-effort), vs QSEL_MGMT.
+const QSEL_BE:            u32 = 0x00;
+
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
 #[allow(dead_code)]
@@ -1100,14 +1119,15 @@ fn tx_desc_csum(d: &mut [u8; TX_DESC_SIZE]) {
     d[28..30].copy_from_slice(&c.to_le_bytes());
 }
 
-/// Build the 32-byte `rtl8xxxu_txdesc32` for a management frame: `frame_len`
-/// payload bytes, sequence `seq`, `bcast` = DA is broadcast/multicast.
-fn tx_desc_mgmt(frame_len: usize, seq: u16, bcast: bool) -> [u8; TX_DESC_SIZE] {
+/// Build the 32-byte `rtl8xxxu_txdesc32` for `frame_len` payload bytes on TX
+/// queue `qsel` (QSEL_MGMT for management, QSEL_BE for EAPOL data), sequence
+/// `seq`, `bcast` = DA is broadcast/multicast.
+fn tx_desc(frame_len: usize, seq: u16, bcast: bool, qsel: u32) -> [u8; TX_DESC_SIZE] {
     let mut d = [0u8; TX_DESC_SIZE];
     d[0..2].copy_from_slice(&(frame_len as u16).to_le_bytes());       // pkt_size
     d[2] = TX_DESC_SIZE as u8;                                        // pkt_offset = 32
     d[3] = 0x80 | 0x08 | 0x04 | if bcast { 0x01 } else { 0 };         // OWN|FSG|LSG[|BMC]
-    d[4..8].copy_from_slice(&(QSEL_MGMT << 8).to_le_bytes());         // txdw1: QSEL<<8
+    d[4..8].copy_from_slice(&(qsel << 8).to_le_bytes());             // txdw1: QSEL<<8
     d[8..12].copy_from_slice(&0x0301_0000u32.to_le_bytes());          // txdw2: ANT_A|ANT_B|AGG_BREAK
     d[12..16].copy_from_slice(&(((seq as u32) & 0xFFF) << 16).to_le_bytes()); // txdw3: seq
     d[16..20].copy_from_slice(&0x0000_0100u32.to_le_bytes());         // txdw4: USE_DRIVER_RATE
@@ -1117,13 +1137,13 @@ fn tx_desc_mgmt(frame_len: usize, seq: u16, bcast: bool) -> [u8; TX_DESC_SIZE] {
     d
 }
 
-/// Send one 802.11 frame on the bulk-OUT pipe (txdesc32 prepended). `seq` must
-/// match the frame's header sequence; `bcast` for a broadcast/multicast DA.
-/// Returns the bulk completion code (1 = Success).
-pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool) -> u8 {
+/// Send one 802.11 frame on the bulk-OUT pipe (txdesc32 prepended) on TX queue
+/// `qsel`. `seq` must match the frame's header sequence; `bcast` for a
+/// broadcast/multicast DA. Returns the bulk completion code (1 = Success).
+fn send_frame_q(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool, qsel: u32) -> u8 {
     let total = TX_DESC_SIZE + frame.len();
     if total > 4096 { return 0; }
-    let desc = tx_desc_mgmt(frame.len(), seq, bcast);
+    let desc = tx_desc(frame.len(), seq, bcast, qsel);
     unsafe {
         let p = st.data.virt.as_ptr::<u8>() as *mut u8;
         core::ptr::copy_nonoverlapping(desc.as_ptr(), p, TX_DESC_SIZE);
@@ -1136,6 +1156,16 @@ pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcas
         Some((code, _)) => code,
         None => 0,
     }
+}
+
+/// Send a management frame (probe/auth/assoc) on the MGMT TX queue.
+pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool) -> u8 {
+    send_frame_q(x, st, frame, seq, bcast, QSEL_MGMT)
+}
+
+/// Send an 802.11 data frame (EAPOL) on the best-effort TX queue.
+fn send_data_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16) -> u8 {
+    send_frame_q(x, st, frame, seq, false, QSEL_BE)
 }
 
 /// Next 802.11 sequence number (12-bit, wrapping).
@@ -1295,6 +1325,9 @@ pub struct ConnectOutcome {
     pub auth_status: Option<u16>,
     pub assoc_status: Option<u16>,
     pub aid: u16,
+    /// WPA2 4-way handshake result: None = not attempted (open net / no password),
+    /// Some(true) = complete + keys installed, Some(false) = failed.
+    pub four_way: Option<bool>,
 }
 
 /// Set port-0 operating mode to STATION (REG_MSR link type).
@@ -1327,13 +1360,121 @@ fn report_connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState, connect
     h2c_cmd(x, dev, st, word);
 }
 
-/// Connect (open-system auth → WPA2 assoc) to `ssid`. SP-WIFI-2: stops after
-/// association + the joinbss/media-connect — the 4-way handshake (needs the
-/// `password`) and CCMP key install are SP-WIFI-3/4. `password` is accepted now
-/// but unused until then.
+/// Write a 16-byte CCMP key into the chip's security CAM (rtl8xxxu_cam_write):
+/// 6 dwords per entry at `hw_idx`, `keyidx` = the 802.11 key index, `mac` = the
+/// peer address (BSSID), `group` selects the group-key flag.
+fn cam_write_key(x: &mut Xhci, dev: &mut UsbDevice, hw_idx: u8, keyidx: u8,
+                 key: &[u8; 16], mac: [u8; 6], group: bool) {
+    let addr = (hw_idx as u32) << CAM_CMD_KEY_SHIFT;
+    let mut ctrl = (CCMP_CIPHER_NIBBLE << 2) | (keyidx as u32) | CAM_WRITE_VALID;
+    if group { ctrl |= 1 << 6; }
+    for j in (0..6u32).rev() {
+        let val32 = match j {
+            0 => ctrl | ((mac[0] as u32) << 16) | ((mac[1] as u32) << 24),
+            1 => (mac[2] as u32) | ((mac[3] as u32) << 8)
+                 | ((mac[4] as u32) << 16) | ((mac[5] as u32) << 24),
+            _ => {
+                let i = ((j - 2) * 4) as usize;
+                (key[i] as u32) | ((key[i + 1] as u32) << 8)
+                | ((key[i + 2] as u32) << 16) | ((key[i + 3] as u32) << 24)
+            }
+        };
+        reg_write32(x, dev, REG_CAM_WRITE, val32);
+        reg_write32(x, dev, REG_CAM_CMD, CAM_CMD_POLLING | CAM_CMD_WRITE | (addr + j));
+        crate::boot::clock::udelay(100);
+    }
+}
+
+/// Turn on HW security (rtl8xxxu set_key prologue): CR security-enable +
+/// SEC_CFG TX/RX encrypt + default-key for uni and broadcast.
+fn enable_hw_security(x: &mut Xhci, dev: &mut UsbDevice) {
+    if let Some(v) = reg_read16(x, dev, REG_CR) {
+        reg_write16(x, dev, REG_CR, v | CR_SECURITY_ENABLE);
+    }
+    reg_write8(x, dev, REG_SECURITY_CFG, SEC_CFG_VAL);
+}
+
+/// Receive the next EAPOL-Key frame from the AP matching `want`/`mask` on the
+/// key_info bits (e.g. ACK set + MIC clear = msg1). Bounded poll. None on timeout.
+fn recv_eapol(x: &mut Xhci, st: &mut WifiState, buf: &mut [u8],
+              want: u16, mask: u16) -> Option<eapol::KeyFrame> {
+    for _ in 0..80 { // ~80 * 50ms = 4 s
+        if let Some(n) = recv_frame(x, st, buf, 50) {
+            if let Some(payload) = ieee80211::parse_eapol_data(&buf[..n]) {
+                if let Some(kf) = eapol::parse(payload) {
+                    if kf.key_info & mask == want {
+                        return Some(kf);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run the WPA2-PSK 4-way handshake after association. Returns the installed
+/// PTK + (GTK key-index, GTK) on success. Drives EAPOL over 802.11 data frames;
+/// the crypto is `wpa2`. A MIC mismatch on msg-3 means the wrong passphrase.
+fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
+                      pmk: &[u8; 32], bssid: [u8; 6]) -> Option<(wpa2::Ptk, u8, alloc::vec::Vec<u8>)> {
+    let mut buf = [0u8; 600];
+
+    // msg1 (AP→STA): ANonce. key_info: ACK set, MIC clear.
+    let m1 = recv_eapol(x, st, &mut buf, eapol::KEY_INFO_ACK,
+                        eapol::KEY_INFO_ACK | eapol::KEY_INFO_MIC)?;
+    let anonce = m1.nonce;
+
+    // Generate SNonce, derive PTK.
+    let mut snonce = [0u8; 32];
+    crate::rng::fill(&mut snonce);
+    let ptk = wpa2::derive_ptk(pmk, &bssid, &st.mac, &anonce, &snonce);
+
+    // msg2 (STA→AP): SNonce + our RSN IE + MIC.
+    let ki2 = eapol::KEY_DESC_VERSION_2 | eapol::KEY_INFO_KEY_TYPE | eapol::KEY_INFO_MIC;
+    let rsn = ieee80211::rsn_ie_wpa2_psk();
+    let mut m2 = eapol::build(ki2, 16, &m1.replay_counter, &snonce, &rsn);
+    let mic = wpa2::eapol_mic(&ptk.kck, &m2);
+    m2[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN].copy_from_slice(&mic);
+    let seq = next_seq(st);
+    send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m2, seq), seq);
+
+    // msg3 (AP→STA): MIC + SECURE + ENCRYPTED key data (GTK). MIC clear-check first.
+    let m3 = recv_eapol(x, st, &mut buf,
+                        eapol::KEY_INFO_MIC | eapol::KEY_INFO_ACK | eapol::KEY_INFO_ENCRYPTED,
+                        eapol::KEY_INFO_MIC | eapol::KEY_INFO_ACK | eapol::KEY_INFO_ENCRYPTED)?;
+    // Verify the msg3 MIC over the exact received bytes with the MIC field
+    // zeroed (proves the PMK / passphrase).
+    let mut m3_chk = m3.raw.clone();
+    if m3_chk.len() < eapol::MIC_OFFSET + eapol::MIC_LEN { return None; }
+    for b in &mut m3_chk[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN] { *b = 0; }
+    if wpa2::eapol_mic(&ptk.kck, &m3_chk) != m3.mic {
+        crate::bwarn!("wifi", "4way: msg3 MIC mismatch (wrong passphrase?)");
+        return None;
+    }
+    // Unwrap the encrypted key data with the KEK → extract the GTK KDE.
+    let plain = wpa2::aes_unwrap(&ptk.kek, &m3.key_data)?;
+    let (gtk_idx, gtk) = eapol::extract_gtk(&plain)?;
+
+    // msg4 (STA→AP): MIC + SECURE, empty key data.
+    let ki4 = eapol::KEY_DESC_VERSION_2 | eapol::KEY_INFO_KEY_TYPE
+            | eapol::KEY_INFO_MIC | eapol::KEY_INFO_SECURE;
+    let mut m4 = eapol::build(ki4, 16, &m3.replay_counter, &[0u8; 32], &[]);
+    let mic4 = wpa2::eapol_mic(&ptk.kck, &m4);
+    m4[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN].copy_from_slice(&mic4);
+    let seq = next_seq(st);
+    send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m4, seq), seq);
+
+    crate::binfo!("wifi", "4-way complete (gtk idx={} len={})", gtk_idx, gtk.len());
+    Some((ptk, gtk_idx, gtk))
+}
+
+/// Connect to `ssid`: open-system auth → WPA2 association → (if `password` set)
+/// the WPA2-PSK 4-way handshake + CCMP key install in the HW CAM.
 pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
-               ssid: &[u8], _password: &[u8]) -> ConnectOutcome {
-    let mut out = ConnectOutcome { found: false, auth_status: None, assoc_status: None, aid: 0 };
+               ssid: &[u8], password: &[u8]) -> ConnectOutcome {
+    let mut out = ConnectOutcome {
+        found: false, auth_status: None, assoc_status: None, aid: 0, four_way: None,
+    };
 
     // 1. Locate the AP (BSSID + channel) via a scan.
     let aps = scan(x, dev, st);
@@ -1398,6 +1539,26 @@ pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     reg_write16(x, dev, REG_BCN_PSR_RPT, 0xc000 | out.aid);
     report_connect(x, dev, st, true);
     crate::binfo!("wifi", "media-connect sent (aid={})", out.aid);
+
+    // 6. WPA2-PSK 4-way handshake + CCMP key install (skipped for an open net).
+    if !password.is_empty() {
+        let pmk = wpa2::pmk(password, ssid);
+        match four_way_handshake(x, dev, st, &pmk, bssid) {
+            Some((ptk, gtk_idx, gtk)) if gtk.len() >= 16 => {
+                enable_hw_security(x, dev);
+                cam_write_key(x, dev, 0, 0, &ptk.tk, bssid, false); // pairwise (PTK TK)
+                let mut gk = [0u8; 16];
+                gk.copy_from_slice(&gtk[..16]);
+                cam_write_key(x, dev, 1, gtk_idx, &gk, bssid, true); // group (GTK)
+                crate::binfo!("wifi", "cam: ptk+gtk installed (gtk idx={})", gtk_idx);
+                out.four_way = Some(true);
+            }
+            _ => {
+                crate::bwarn!("wifi", "4-way failed");
+                out.four_way = Some(false);
+            }
+        }
+    }
     out
 }
 
@@ -1424,7 +1585,8 @@ pub fn run_connect(ssid: &[u8], password: &[u8], out: &mut [u8]) -> usize {
     } else {
         let auth = match o.auth_status { Some(0) => "ok", Some(_) => "rejected", None => "no-response" };
         let assoc = match o.assoc_status { Some(0) => "ok", Some(_) => "rejected", None => "no-response" };
-        let _ = write!(s, "auth={} assoc={} aid={}\n", auth, assoc, o.aid);
+        let key = match o.four_way { Some(true) => "ok", Some(false) => "failed", None => "skipped" };
+        let _ = write!(s, "auth={} assoc={} aid={} 4way={}\n", auth, assoc, o.aid, key);
     }
     let bytes = s.as_bytes();
     let n = bytes.len().min(out.len());

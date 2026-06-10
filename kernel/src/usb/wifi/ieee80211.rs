@@ -222,3 +222,45 @@ pub fn parse_assoc_response(frame: &[u8]) -> Option<(u16, u16)> {
     let aid = u16::from_le_bytes([frame[28], frame[29]]) & 0x3FFF;
     Some((status, aid))
 }
+
+/// The WPA2-PSK / CCMP RSN information element as a standalone byte vector — the
+/// assoc-request and the 4-way msg-2 must carry the *same* IE (the AP checks it).
+pub fn rsn_ie_wpa2_psk() -> Vec<u8> {
+    let mut f = Vec::with_capacity(22);
+    push_rsn_ie_wpa2_psk(&mut f);
+    f
+}
+
+// ── 802.11 data frames carrying EAPOL (SP-WIFI-4) ────────────────────────────
+const FC_DATA:    u8 = 0x08;        // type data(2), subtype data(0)
+const FC1_TODS:   u8 = 0x01;        // ToDS: STA -> AP
+const LLC_SNAP_EAPOL: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
+
+/// Wrap an EAPOL payload in an 802.11 data frame (ToDS, STA→AP) + LLC/SNAP.
+/// Addr1 = BSSID (RA), Addr2 = SA (us), Addr3 = DA = AP.
+pub fn build_eapol_data(sa: [u8; 6], bssid: [u8; 6], eapol: &[u8], seq: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(24 + 8 + eapol.len());
+    f.extend_from_slice(&[FC_DATA, FC1_TODS, 0x00, 0x00]);
+    f.extend_from_slice(&bssid); // Addr1 = RA = BSSID
+    f.extend_from_slice(&sa);    // Addr2 = TA = us
+    f.extend_from_slice(&bssid); // Addr3 = DA = AP
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    f.extend_from_slice(&LLC_SNAP_EAPOL);
+    f.extend_from_slice(eapol);
+    f
+}
+
+/// Extract the EAPOL payload from a received 802.11 data frame (FromDS, AP→STA).
+/// Handles both plain data (24B header) and QoS data (26B). None if not an
+/// EAPOL-bearing data frame.
+pub fn parse_eapol_data(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 24 + 8 || frame[0] & 0x0C != 0x08 {
+        return None; // not a data-type frame
+    }
+    let qos = frame[0] & 0xF0 == 0x80; // subtype 8 = QoS data → 2 extra header bytes
+    let hdr = if qos { 26 } else { 24 };
+    if frame.len() < hdr + 8 || frame[hdr..hdr + 8] != LLC_SNAP_EAPOL {
+        return None;
+    }
+    Some(&frame[hdr + 8..])
+}

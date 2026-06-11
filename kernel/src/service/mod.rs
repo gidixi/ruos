@@ -33,6 +33,7 @@ use spin::Mutex;
 pub mod schedule;
 pub mod unitfile;
 pub mod yaml;
+pub mod json;
 #[cfg(feature = "boot-checks")]
 pub mod checks;
 

@@ -738,22 +738,28 @@ async fn ssh_pty_dispatcher_task() {
 /// queues by service name rather than by absolute path.
 #[embassy_executor::task]
 async fn service_dispatcher_task() {
-    use crate::service::{WaitForServiceRequest, mark_running, mark_exited, mark_failed, path_of};
+    use crate::service::{WaitForServiceRequest, UnitReq, mark_running, mark_exited, mark_failed, path_of};
     let _ = crate::proc::register_kernel("svc-dispatch");
     loop {
-        let name = WaitForServiceRequest.await;
-        let path = match path_of(name) {
+        let name = match WaitForServiceRequest.await {
+            UnitReq::Start(n) => n,
+            other => {
+                crate::bwarn!("svc", "dispatcher: {:?} not yet implemented", other);
+                continue;
+            }
+        };
+        let path = match path_of(&name) {
             Some(p) => p,
             None    => {
                 crate::bwarn!("svc", "dispatcher: unknown name '{}'", name);
                 continue;
             }
         };
-        let bytes = match crate::wasm::read_all(path).await {
+        let bytes = match crate::wasm::read_all(&path).await {
             Ok(b) => b,
             Err(_) => {
                 kprintln!("svc: read {} failed", path);
-                mark_failed(name, "read");
+                mark_failed(&name, "read");
                 continue;
             }
         };
@@ -761,18 +767,18 @@ async fn service_dispatcher_task() {
             Ok(f) => f,
             Err(e) => {
                 kprintln!("svc: instantiate {}: {}", path, e);
-                mark_failed(name, "instantiate");
+                mark_failed(&name, "instantiate");
                 continue;
             }
         };
         fb.set_args(alloc::vec![name.as_bytes().to_vec()]);
-        let pid = crate::proc::register(alloc::string::String::from(name));
+        let pid = crate::proc::register(name.clone());
         fb.set_pid(pid);
-        mark_running(name, pid);
+        mark_running(&name, pid);
         crate::binfo!("svc", "start name={} pid={} path={}", name, pid, path);
         let code = fb.run().await;
         crate::proc::unregister(pid);
-        mark_exited(name, code);
+        mark_exited(&name, code);
         crate::binfo!("svc", "exit name={} code={}", name, code);
     }
 }

@@ -1,33 +1,27 @@
-//! Service manager (init/systemd-lite).
+//! Unit manager (init/systemd-lite).
 //!
-//! Registry of "named runnable units" — each entry maps a stable name
-//! (e.g. `"ssh"`) to either a `.wasm` path or a builtin marker. The
-//! userspace `service` tool reads the registry via three host fns
-//! (`ruos_service_list`/`_start`/`_status`).
+//! Registry di "unit" nominate — oneshot o daemon, builtin o `.wasm`/`.cwasm`
+//! da file — con restart policy, dipendenze (after/requires), target di
+//! attivazione (boot/post-boot/manual) e timer (vedi `schedule`).
+//! Spec: docs/superpowers/specs/2026-06-09-init-units-timers-design.md.
 //!
 //! Design notes:
 //!
-//! * The registry is a single `Vec<Service>` behind a `spin::Mutex`. The
-//!   kernel is single-CPU + cooperative async, so the only contention is
-//!   nested locks within the same fiber. Keep the critical sections tiny
-//!   (no `.await` while the mutex is held).
+//! * Owner = BSP. Due registry `UNITS`/`TIMERS` dietro `spin::Mutex`,
+//!   sezioni critiche minime, mai `.await` con il lock tenuto.
 //!
-//! * `start(name)` posts to [`SERVICE_QUEUE`] and returns immediately —
-//!   the actual fiber spawn happens in `executor::service_dispatcher_task`,
-//!   mirroring the SSH PTY dispatcher pattern. Status moves to `Running`
-//!   when the worker pulls the request; back to `Exited`/`Failed` when
-//!   the fiber finishes.
+//! * `start(name)` posta `UnitReq::Start` in [`SERVICE_QUEUE`] e ritorna
+//!   subito — spawn/exec avvengono in `executor::service_dispatcher_task`
+//!   (oneshot inline) o in un `unit_runner_task` (daemon supervisionati).
+//!   `Persist`/`Reload` viaggiano sulla stessa queue: le host fn wasmi sono
+//!   sync, le scritture VFS sono async → le delega il dispatcher.
 //!
-//! * No `stop()` of a running service: we have no generic cancellation
-//!   primitive for wasm fibers (the cooperative-kill flag in
-//!   `crate::proc` would need every host fn to check it, which is best-
-//!   effort). The CLI subcommand is reserved but the kernel surface
-//!   returns `ServiceError::NotSupported`. See note on `stop`.
+//! * `stop(name)` è cooperativo: `stop_requested` + `proc::request_kill` —
+//!   il child esce al prossimo check del kill flag (host call); il runner
+//!   vede il flag e non riavvia. Best-effort per design (no preemption).
 //!
-//! * SSH is treated as a "builtin" service: it is hardcoded-spawned from
-//!   `boot::phases::userland::init`, so its registry entry has path
-//!   `"<builtin>"` and gets marked `Running` directly after
-//!   `ssh::spawn()` succeeds (see [`mark_running`]).
+//! * SSH resta un "builtin": spawnato da `boot::phases::userland::init`,
+//!   entry con path `"<builtin>"`, marcato `Running` dal boot phase.
 
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
@@ -36,44 +30,80 @@ use core::fmt;
 use core::task::Waker;
 use spin::Mutex;
 
-/// Marker path used for the SSH entry — it is not actually spawned via
-/// the wasm dispatcher; the kernel boot phase starts the sunset task
-/// directly. The userspace tool just displays this verbatim.
+pub mod schedule;
+
+/// Marker path per le entry builtin (es. SSH) — non spawnabili dal
+/// dispatcher, il kernel le avvia direttamente al boot.
 pub const BUILTIN_PATH: &str = "<builtin>";
 
+/// Max daemon supervisionati in parallelo (pool di `unit_runner_task`).
+pub const MAX_DAEMONS: usize = 8;
+
+/// Directory dei file unit persistenti.
+pub const UNITS_DIR: &str = "/mnt/etc/units";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitKind { Oneshot, Daemon }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartPolicy { No, OnFailure, Always }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivateTarget { Boot, PostBoot, Manual }
+
 #[derive(Clone, Debug)]
-pub enum ServiceStatus {
+pub enum UnitStatus {
     Idle,
     Running,
     Exited(i32),
     Failed(&'static str),
+    Restarting,
 }
 
-impl ServiceStatus {
+impl UnitStatus {
     pub fn label(&self) -> &'static str {
         match self {
-            ServiceStatus::Idle       => "Idle",
-            ServiceStatus::Running    => "Running",
-            ServiceStatus::Exited(_)  => "Exited",
-            ServiceStatus::Failed(_)  => "Failed",
+            UnitStatus::Idle       => "Idle",
+            UnitStatus::Running    => "Running",
+            UnitStatus::Exited(_)  => "Exited",
+            UnitStatus::Failed(_)  => "Failed",
+            UnitStatus::Restarting => "Restarting",
         }
     }
 }
 
-/// Internal registry record. Names and paths are `'static` so the boot
-/// registration sites can use string literals; this keeps allocations
-/// out of the registry's hot path (snapshots clone into `String`).
 #[derive(Clone)]
-pub struct Service {
-    pub name:    &'static str,
-    pub path:    &'static str,
-    pub on_boot: bool,
-    pub status:  ServiceStatus,
-    pub pid:     Option<u32>,
-    pub runs:    u32,
+pub struct Unit {
+    pub name:     String,
+    pub path:     String,            // "/mnt/bin/foo.wasm|.cwasm" | "<builtin>"
+    pub kind:     UnitKind,
+    pub restart:  RestartPolicy,
+    pub after:    Vec<String>,
+    pub requires: Vec<String>,
+    pub target:   ActivateTarget,
+    pub enabled:  bool,
+    pub status:   UnitStatus,
+    pub pid:      Option<u32>,
+    pub runs:     u32,
+    pub restarts: u32,
+    pub stop_requested: bool,
+    /// File sorgente in /mnt/etc/units (None = registrata da codice/CLI).
+    pub file:     Option<String>,
 }
 
-/// Owned snapshot shipped to userspace via `ruos_service_list`/`_status`.
+#[derive(Clone)]
+pub struct Timer {
+    pub name:      String,
+    pub unit:      String,
+    pub schedule:  schedule::Schedule,
+    pub enabled:   bool,
+    /// Tick (EveryTicks/BootPlus) o unix epoch (calendario) del prossimo scatto.
+    pub next_fire: u64,
+    pub last_fire: Option<u64>,
+    pub file:      Option<String>,
+}
+
+/// Snapshot owned per la ABI `service_list`/`service_status` (tool legacy).
 #[derive(Clone)]
 pub struct ServiceInfo {
     pub name:   String,
@@ -87,18 +117,21 @@ pub struct ServiceInfo {
 pub enum ServiceError {
     NotFound,
     AlreadyRunning,
-    /// `stop()` of a running fiber — no cancellation primitive yet.
     NotSupported,
+    NoSlot,
+    Parse,
     Internal,
 }
 
 impl ServiceError {
-    /// Errno-like wire code for the host fn ABI.
+    /// Errno-like wire code per la host fn ABI.
     pub fn errno(&self) -> i32 {
         match self {
             ServiceError::NotFound       => 1,
             ServiceError::AlreadyRunning => 2,
             ServiceError::NotSupported   => 3,
+            ServiceError::NoSlot         => 4,
+            ServiceError::Parse          => 5,
             ServiceError::Internal       => 99,
         }
     }
@@ -110,121 +143,129 @@ impl fmt::Display for ServiceError {
             ServiceError::NotFound       => write!(f, "service: not found"),
             ServiceError::AlreadyRunning => write!(f, "service: already running"),
             ServiceError::NotSupported   => write!(f, "service: operation not supported"),
+            ServiceError::NoSlot         => write!(f, "service: no free daemon slot"),
+            ServiceError::Parse          => write!(f, "service: parse error"),
             ServiceError::Internal       => write!(f, "service: internal error"),
         }
     }
 }
 
-static REGISTRY: Mutex<Vec<Service>> = Mutex::new(Vec::new());
+static UNITS:  Mutex<Vec<Unit>>  = Mutex::new(Vec::new());
+static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
 
-/// Pending start requests + waker for the dispatcher task. Single-CPU,
-/// so a simple `VecDeque` behind a `Mutex` is sufficient.
+/// Richiesta per il dispatcher (BSP). Le host fn cross-core postano qui e
+/// svegliano il worker — non mutano i registry direttamente.
+#[derive(Clone, Debug)]
+pub enum UnitReq {
+    Start(String),
+    Persist(String),
+    Reload,
+}
+
 pub struct ServiceQueue {
-    pub pending:       Mutex<VecDeque<&'static str>>,
-    pub worker_waker:  Mutex<Option<Waker>>,
+    pub pending:      Mutex<VecDeque<UnitReq>>,
+    pub worker_waker: Mutex<Option<Waker>>,
 }
 
 pub static SERVICE_QUEUE: ServiceQueue = ServiceQueue {
-    pending:       Mutex::new(VecDeque::new()),
-    worker_waker:  Mutex::new(None),
+    pending:      Mutex::new(VecDeque::new()),
+    worker_waker: Mutex::new(None),
 };
 
-/// Add a service to the registry. Idempotent on `name` collisions — the
-/// later registration is dropped with a warning so a typo in boot code
-/// doesn't silently shadow an earlier entry.
-pub fn register(name: &'static str, path: &'static str, on_boot: bool) {
-    let mut r = REGISTRY.lock();
+/// Registra una unit da codice (builtin/seed). Idempotente sul nome.
+pub fn register(name: &str, path: &str, kind: UnitKind, target: ActivateTarget, enabled: bool) {
+    let mut r = UNITS.lock();
     if r.iter().any(|s| s.name == name) {
         crate::bwarn!("svc", "register: name '{}' already exists, skipping", name);
         return;
     }
-    r.push(Service {
-        name,
-        path,
-        on_boot,
-        status: ServiceStatus::Idle,
-        pid:    None,
-        runs:   0,
+    r.push(Unit {
+        name: name.to_string(), path: path.to_string(),
+        kind, restart: RestartPolicy::No, after: Vec::new(), requires: Vec::new(),
+        target, enabled,
+        status: UnitStatus::Idle, pid: None, runs: 0, restarts: 0,
+        stop_requested: false, file: None,
     });
-    crate::binfo!("svc", "register name={} path={} on_boot={}", name, path, on_boot);
+    crate::binfo!("svc", "register name={} path={}", name, path);
 }
 
-/// Snapshot the whole registry for userspace display.
+/// Snapshot dell'intero registry per il tool `service` legacy.
 pub fn list() -> Vec<ServiceInfo> {
-    REGISTRY.lock().iter().map(snapshot).collect()
+    UNITS.lock().iter().map(snapshot).collect()
 }
 
-/// Snapshot a single entry by name.
+/// Snapshot di una singola entry per nome.
 pub fn status(name: &str) -> Option<ServiceInfo> {
-    REGISTRY.lock().iter().find(|s| s.name == name).map(snapshot)
+    UNITS.lock().iter().find(|s| s.name == name).map(snapshot)
 }
 
-fn snapshot(s: &Service) -> ServiceInfo {
+fn snapshot(s: &Unit) -> ServiceInfo {
     let status = match &s.status {
-        ServiceStatus::Idle       => "Idle".to_string(),
-        ServiceStatus::Running    => "Running".to_string(),
-        ServiceStatus::Exited(c)  => alloc::format!("Exited({})", c),
-        ServiceStatus::Failed(m)  => alloc::format!("Failed({})", m),
+        UnitStatus::Exited(c) => alloc::format!("Exited({})", c),
+        UnitStatus::Failed(m) => alloc::format!("Failed({})", m),
+        other => other.label().to_string(),
     };
     ServiceInfo {
-        name:   s.name.to_string(),
-        path:   s.path.to_string(),
+        name:   s.name.clone(),
+        path:   s.path.clone(),
         status,
         pid:    s.pid,
         runs:   s.runs,
     }
 }
 
-/// Queue a service start. Returns immediately; the dispatcher picks it up.
-///
-/// Refuses to enqueue a service whose status is already `Running` (the
-/// caller would otherwise re-spawn the same wasm in parallel). Refuses
-/// to start the SSH builtin via this path — it has no wasm payload.
+/// Accoda uno start. Ritorna subito; il dispatcher fa il resto.
 pub fn start(name: &str) -> Result<(), ServiceError> {
-    // Lookup + status update + path capture in one critical section.
-    let static_name: &'static str = {
-        let mut r = REGISTRY.lock();
-        let entry = r.iter_mut().find(|s| s.name == name)
+    {
+        let r = UNITS.lock();
+        let entry = r.iter().find(|s| s.name == name)
             .ok_or(ServiceError::NotFound)?;
-        if matches!(entry.status, ServiceStatus::Running) {
+        if matches!(entry.status, UnitStatus::Running | UnitStatus::Restarting) {
             return Err(ServiceError::AlreadyRunning);
         }
         if entry.path == BUILTIN_PATH {
-            // Builtins (e.g. SSH) cannot be (re)started through this
-            // path — they have no wasm module to load. Treat as NotSupported
-            // so the CLI can print a meaningful message.
             return Err(ServiceError::NotSupported);
         }
-        entry.name
-    };
-
-    SERVICE_QUEUE.pending.lock().push_back(static_name);
+    }
+    SERVICE_QUEUE.pending.lock().push_back(UnitReq::Start(name.to_string()));
     if let Some(w) = SERVICE_QUEUE.worker_waker.lock().take() {
         w.wake();
     }
-    crate::binfo!("svc", "queued start name={}", static_name);
+    crate::binfo!("svc", "queued start name={}", name);
     Ok(())
 }
 
-/// Force `stop()` of a running fiber. NOT IMPLEMENTED — see module docs.
-/// Reserved for symmetry; returns `NotSupported` so the CLI can print a
-/// meaningful diagnostic without us having to grow new state.
-pub fn stop(_name: &str) -> Result<(), ServiceError> {
-    Err(ServiceError::NotSupported)
+/// Stop cooperativo: setta stop_requested e (se c'è un pid) request_kill.
+/// Best-effort: un daemon in CPU-loop puro senza host call non si ferma.
+pub fn stop(name: &str) -> Result<(), ServiceError> {
+    let pid = {
+        let mut r = UNITS.lock();
+        let entry = r.iter_mut().find(|s| s.name == name)
+            .ok_or(ServiceError::NotFound)?;
+        if entry.path == BUILTIN_PATH { return Err(ServiceError::NotSupported); }
+        entry.stop_requested = true;
+        entry.pid
+    };
+    if let Some(pid) = pid { let _ = crate::proc::request_kill(pid); }
+    Ok(())
 }
 
-/// Resolve `name` to its static path. Used by the dispatcher task.
-pub fn path_of(name: &str) -> Option<&'static str> {
-    REGISTRY.lock().iter().find(|s| s.name == name).map(|s| s.path)
+/// Risolve `name` nel path. Usato dal dispatcher e dal runner.
+pub fn path_of(name: &str) -> Option<String> {
+    UNITS.lock().iter().find(|s| s.name == name).map(|s| s.path.clone())
 }
 
-/// Transition `name` to `Running`, record its PID, bump the run counter.
-/// Called by the dispatcher just before driving the fiber, and by
-/// `boot::phases::userland` for the SSH builtin.
+/// Snapshot (kind, restart, path) per dispatcher/runner — una sezione critica.
+pub fn exec_info_of(name: &str) -> Option<(UnitKind, RestartPolicy, String)> {
+    UNITS.lock().iter().find(|s| s.name == name)
+        .map(|s| (s.kind, s.restart, s.path.clone()))
+}
+
+/// Transita a `Running`, registra pid, bumpa il run counter.
 pub fn mark_running(name: &str, pid: u32) {
-    let mut r = REGISTRY.lock();
+    let mut r = UNITS.lock();
     if let Some(s) = r.iter_mut().find(|s| s.name == name) {
-        s.status = ServiceStatus::Running;
+        s.status = UnitStatus::Running;
         s.pid    = Some(pid);
         s.runs   = s.runs.saturating_add(1);
     } else {
@@ -232,49 +273,92 @@ pub fn mark_running(name: &str, pid: u32) {
     }
 }
 
-/// Transition `name` to `Exited(code)`, clear the PID.
+/// Transita a `Exited(code)`, azzera pid e stop_requested.
 pub fn mark_exited(name: &str, code: i32) {
-    let mut r = REGISTRY.lock();
+    let mut r = UNITS.lock();
     if let Some(s) = r.iter_mut().find(|s| s.name == name) {
-        s.status = ServiceStatus::Exited(code);
+        s.status = UnitStatus::Exited(code);
         s.pid    = None;
+        s.stop_requested = false;
     }
 }
 
-/// Transition `name` to `Failed(reason)`, clear the PID.
+/// Transita a `Failed(reason)`, azzera pid.
 pub fn mark_failed(name: &str, reason: &'static str) {
-    let mut r = REGISTRY.lock();
+    let mut r = UNITS.lock();
     if let Some(s) = r.iter_mut().find(|s| s.name == name) {
-        s.status = ServiceStatus::Failed(reason);
+        s.status = UnitStatus::Failed(reason);
         s.pid    = None;
     }
 }
 
-/// Wait for a service-start request. Used by the executor's
-/// `service_dispatcher_task`. Mirrors `WaitForRequest` in `exec_queue.rs`.
+/// Transita a `Restarting` (tra exit e re-spawn del runner), azzera pid.
+pub fn mark_restarting(name: &str) {
+    let mut r = UNITS.lock();
+    if let Some(s) = r.iter_mut().find(|s| s.name == name) {
+        s.status = UnitStatus::Restarting;
+        s.pid    = None;
+    }
+}
+
+/// Setta uno status arbitrario. Ritorna false se la unit non esiste.
+pub fn mark_status(name: &str, st: UnitStatus) -> bool {
+    let mut r = UNITS.lock();
+    match r.iter_mut().find(|s| s.name == name) {
+        Some(s) => { s.status = st; true }
+        None => false,
+    }
+}
+
+/// Legge e consuma il flag stop. Chiamata dal runner all'uscita del child.
+pub fn take_stop_requested(name: &str) -> bool {
+    let mut r = UNITS.lock();
+    r.iter_mut().find(|s| s.name == name)
+        .map(|s| core::mem::replace(&mut s.stop_requested, false))
+        .unwrap_or(false)
+}
+
+/// Incrementa e ritorna il contatore restart (per il backoff).
+pub fn bump_restarts(name: &str) -> u32 {
+    let mut r = UNITS.lock();
+    r.iter_mut().find(|s| s.name == name)
+        .map(|s| { s.restarts = s.restarts.saturating_add(1); s.restarts })
+        .unwrap_or(0)
+}
+
+/// Azzera il contatore restart (daemon rimasto su oltre la soglia).
+pub fn reset_restarts(name: &str) {
+    let mut r = UNITS.lock();
+    if let Some(s) = r.iter_mut().find(|s| s.name == name) { s.restarts = 0; }
+}
+
+/// Attesa di una richiesta dal dispatcher. Pattern `WaitForRequest`.
 pub struct WaitForServiceRequest;
 
 impl core::future::Future for WaitForServiceRequest {
-    type Output = &'static str;
+    type Output = UnitReq;
 
     fn poll(
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<&'static str> {
-        if let Some(name) = SERVICE_QUEUE.pending.lock().pop_front() {
-            return core::task::Poll::Ready(name);
+    ) -> core::task::Poll<UnitReq> {
+        if let Some(req) = SERVICE_QUEUE.pending.lock().pop_front() {
+            return core::task::Poll::Ready(req);
         }
         *SERVICE_QUEUE.worker_waker.lock() = Some(cx.waker().clone());
         core::task::Poll::Pending
     }
 }
 
-/// Boot-time registry seeding. Called from `boot::phases::userland::init`
-/// before the SSH server is spawned. Add new always-known services here.
+/// Carica /mnt/etc/units/*.{yaml,yml,json}. Implementazione al Task 11
+/// del piano init-units (stub per far girare init_units_task prima).
+pub async fn load_from_disk() {}
+
+/// Seeding boot del registry. Chiamato da `boot::phases::userland::init`
+/// prima dello spawn SSH.
 pub fn init() {
-    register("ssh", BUILTIN_PATH, true);
-    // Example startable service for the userspace CLI — a no-op tool
-    // already on the ISO. Lets `service start whoami` exercise the full
-    // dispatcher path without shipping a dedicated fixture.
-    register("whoami", "/bin/whoami.wasm", false);
+    register("ssh",    BUILTIN_PATH,       UnitKind::Daemon,  ActivateTarget::Boot,   true);
+    // Oneshot di esempio già sull'ISO: `service start whoami` / `unitctl
+    // start whoami` esercitano il path dispatcher senza fixture dedicate.
+    register("whoami", "/bin/whoami.wasm", UnitKind::Oneshot, ActivateTarget::Manual, false);
 }

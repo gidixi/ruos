@@ -379,9 +379,56 @@ impl core::future::Future for WaitForServiceRequest {
     }
 }
 
-/// Carica /mnt/etc/units/*.{yaml,yml,json}. Implementazione al Task 11
-/// del piano init-units (stub per far girare init_units_task prima).
-pub async fn load_from_disk() {}
+/// Parse di /mnt/etc/units/*.{yaml,yml,json} → registry. File malformato:
+/// log + skip (le altre unit proseguono — no boot-loop). Dir assente: solo
+/// builtin. Timer: next_fire armato qui.
+pub async fn load_from_disk() {
+    let entries = match crate::vfs::readdir(UNITS_DIR).await {
+        Ok(e) => e,
+        Err(_) => { crate::binfo!("svc", "{} absent — builtin only", UNITS_DIR); return; }
+    };
+    let ticks = crate::timer::ticks();
+    let epoch = crate::rtc::to_unix_epoch(&crate::rtc::now());
+    let mut n_units = 0u32;
+    let mut n_timers = 0u32;
+    for ent in entries {
+        let fname = ent.name.as_str();
+        let is_yaml = fname.ends_with(".yaml") || fname.ends_with(".yml");
+        let is_json = fname.ends_with(".json");
+        if !is_yaml && !is_json { continue; }
+        let path = alloc::format!("{}/{}", UNITS_DIR, fname);
+        let bytes = match crate::wasm::read_all(&path).await {
+            Ok(b) => b,
+            Err(_) => { crate::bwarn!("svc", "load: read {} failed", path); continue; }
+        };
+        let Ok(text) = core::str::from_utf8(&bytes) else {
+            crate::bwarn!("svc", "load: {} not utf8", path); continue;
+        };
+        let doc = if is_yaml { yaml::parse(text) } else { json::parse(text) };
+        let parsed = doc.and_then(|d| unitfile::build(&d, Some(&path)));
+        match parsed {
+            Ok(unitfile::Parsed::U(u)) => {
+                let mut r = UNITS.lock();
+                if r.iter().any(|x| x.name == u.name) {
+                    crate::bwarn!("svc", "load: duplicate unit '{}' ({}) skipped", u.name, path);
+                } else {
+                    r.push(u); n_units += 1;
+                }
+            }
+            Ok(unitfile::Parsed::T(mut t)) => {
+                t.next_fire = schedule::compute_next(&t.schedule, epoch, ticks);
+                let mut g = TIMERS.lock();
+                if g.iter().any(|x| x.name == t.name) {
+                    crate::bwarn!("svc", "load: duplicate timer '{}' ({}) skipped", t.name, path);
+                } else {
+                    g.push(t); n_timers += 1;
+                }
+            }
+            Err(e) => crate::bwarn!("svc", "load: {} parse error: {}", path, e),
+        }
+    }
+    crate::binfo!("svc", "loaded {} units + {} timers from {}", n_units, n_timers, UNITS_DIR);
+}
 
 /// "Su" = daemon/builtin → Running; oneshot → Exited(0).
 pub fn is_up(name: &str) -> bool {

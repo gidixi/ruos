@@ -20,6 +20,7 @@ pub mod ieee80211;
 // RTL8188EU init register tables (MAC/PHY_REG/AGC/RADIO_A), ported verbatim from
 // rtl8xxxu 8188e.c. Applied by init_mac/init_phy_bb/init_phy_rf in SP3c-3.
 pub mod tables;
+pub mod tables_fu;
 
 // WPA2-PSK 4-way-handshake supplicant crypto (SP-WIFI-3). Pure offline math,
 // consumed by the association/key path in SP-WIFI-2/4. Allowed dead until then;
@@ -38,11 +39,13 @@ use crate::memory::dma::DmaRegion;
 
 /// RTL8188EU firmware blob, uploaded into the chip's 8051 RAM during bring-up
 /// (SP2). 15262 bytes, 32-byte header (signature 0x88e1) + body.
-static FW: &[u8] = include_bytes!("fw/rtl8188eufw.bin");
+static FW_EU: &[u8] = include_bytes!("fw/rtl8188eufw.bin");
+static FW_FU: &[u8] = include_bytes!("fw/rtl8188fufw.bin");
 
 /// USB vendor identifiers for the supported dongle.
 pub const WIFI_VID: u16 = 0x0BDA;
-pub const WIFI_PID: u16 = 0x8179;
+pub const WIFI_PID_EU: u16 = 0x8179;
+pub const WIFI_PID_FU: u16 = 0xF179;
 
 /// rtl8xxxu register-access vendor request: bRequest=0x05, wIndex=0; a read uses
 /// bmRequestType 0xC0 (Dev→Host, Vendor, Device), a write 0x40, wValue = offset.
@@ -102,6 +105,8 @@ pub struct WifiIface {
     /// Number of bulk-OUT endpoints exposed — selects the TX queue layout
     /// (rtl8xxxu config_endpoints_no_sie). We drive mgmt frames on the first.
     pub nr_out_eps: u8,
+    /// True if the dongle is RTL8188FU (PID 0xF179), false for EU (0x8179).
+    pub is_fu: bool,
 }
 
 /// Per-slot state kept in the USB registry. `Copy` (DmaRegion is Copy, like
@@ -134,6 +139,8 @@ pub struct WifiState {
     pub nr_out_eps: u8,
     /// Next H2C mailbox index (0..H2C_MAX_MBOX), round-robin per command.
     pub h2c_mbox: u8,
+    /// Indicates whether the dongle is RTL8188FU (true) or RTL8188EU (false).
+    pub is_fu: bool,
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -203,11 +210,12 @@ fn reg_set8(x: &mut Xhci, dev: &mut UsbDevice, addr: u16, mask: u8, set: bool) {
 /// ⚠️ UNVERIFIED on hardware — SP1 transport (vendor reg I/O) has not yet been
 /// confirmed on a real dongle.
 #[allow(dead_code)]
-pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
-    if FW.len() < FW_HDR_SIZE { crate::bwarn!("wifi", "fw blob too small"); return false; }
-    let sig = (FW[0] as u16) | ((FW[1] as u16) << 8);
-    let body = if sig == FW_SIG { &FW[FW_HDR_SIZE..] } else { &FW[..] };
-    crate::binfo!("wifi", "fw {} bytes, body {} (sig {:#06x})", FW.len(), body.len(), sig);
+pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) -> bool {
+    let fw = if st.is_fu { FW_FU } else { FW_EU };
+    if fw.len() < FW_HDR_SIZE { crate::bwarn!("wifi", "fw blob too small"); return false; }
+    let sig = (fw[0] as u16) | ((fw[1] as u16) << 8);
+    let body = if sig == FW_SIG { &fw[FW_HDR_SIZE..] } else { &fw[..] };
+    crate::binfo!("wifi", "fw dl size={} page={}", fw.len(), FW_PAGE);
 
     // Enter download mode (rtl8xxxu_download_firmware order):
     // 1. Enable the 8051 CPU — 16-bit SYS_FUNC, BIT10 (SYS_FUNC_CPU_ENABLE).
@@ -232,20 +240,15 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
     // verified on hardware — so cap each control transfer at FW_BLOCK bytes.
     const FW_BLOCK: usize = 64;
     let buf = match crate::memory::dma::alloc(1) { Some(b) => b, None => return false };
-    let pages = body.len().div_ceil(FW_PAGE);
     let mut ok = true;
-    'pages: for p in 0..pages {
-        if let Some(v) = reg_read8(x, dev, REG_MCUFWDL + 2) {
-            reg_write8(x, dev, REG_MCUFWDL + 2, (v & 0xF8) | (p as u8 & 0x07));
-        }
-        let page_off = p * FW_PAGE;
-        let page_len = FW_PAGE.min(body.len() - page_off);
+    for (p, chunk) in body.chunks(FW_PAGE).enumerate() {
+        reg_write8(x, dev, REG_MCUFWDL + 2, (p as u8 & 0x07));
         let mut o = 0;
-        while o < page_len {
-            let csz = (page_len - o).min(FW_BLOCK);
+        while o < chunk.len() {
+            let csz = (chunk.len() - o).min(FW_BLOCK);
             unsafe {
                 let dst = buf.virt.as_ptr::<u8>() as *mut u8;
-                for i in 0..csz { core::ptr::write_volatile(dst.add(i), body[page_off + o + i]); }
+                for i in 0..csz { core::ptr::write_volatile(dst.add(i), chunk[o + i]); }
             }
             let s = Setup {
                 req_type: REQ_TYPE_WRITE, request: VENDOR_REQ,
@@ -254,13 +257,13 @@ pub fn download_firmware(x: &mut Xhci, dev: &mut UsbDevice) -> bool {
             if !control_out_data(x, dev, s, &buf) {
                 crate::bwarn!("wifi", "fw page {} off {} write failed", p, o);
                 ok = false;
-                break 'pages;
+                break;
             }
             o += csz;
         }
+        if !ok { break; }
     }
     crate::memory::dma::dealloc(buf);
-    crate::binfo!("wifi", "fw upload pages={} ok={}", pages, ok);
     if !ok { return false; }
 
     // 8. Leave download mode — 16-bit clear of MCU_FW_DL_ENABLE.
@@ -515,7 +518,7 @@ fn read_efuse8(x: &mut Xhci, dev: &mut UsbDevice, offset: u16) -> Option<u8> {
 /// Decode the EFUSE into a 512-byte map and return the station MAC (8188eu MAC
 /// at map offset 0xd7, gated on rtl_id 0x8129). Mirrors rtl8xxxu_read_efuse +
 /// rtl8188eu_parse_efuse. Returns None on a transport/format error.
-fn read_efuse_mac(x: &mut Xhci, dev: &mut UsbDevice) -> Option<[u8; 6]> {
+fn read_efuse_mac(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) -> Option<[u8; 6]> {
     // Loader clock / 1.2V power / reset gates the EFUSE controller needs.
     reg_write8(x, dev, REG_EFUSE_ACCESS, EFUSE_ACCESS_ENABLE);
     if let Some(v) = reg_read16(x, dev, REG_9346CR) { let _ = v; }
@@ -558,8 +561,9 @@ fn read_efuse_mac(x: &mut Xhci, dev: &mut UsbDevice) -> Option<[u8; 6]> {
     reg_write8(x, dev, REG_EFUSE_ACCESS, EFUSE_ACCESS_DISABLE);
 
     let rtl_id = (map[0] as u16) | ((map[1] as u16) << 8);
-    if rtl_id != EFUSE_8188EU_RTL_ID {
-        crate::bwarn!("wifi", "efuse rtl_id=0x{:04x} (want 0x{:04x})", rtl_id, EFUSE_8188EU_RTL_ID);
+    let expected_id = if st.is_fu { 0x8181 } else { EFUSE_8188EU_RTL_ID }; // 8181 is a guess for FU, update if different
+    if rtl_id != expected_id {
+        crate::bwarn!("wifi", "efuse rtl_id=0x{:04x} (want 0x{:04x})", rtl_id, expected_id);
         return None;
     }
     let mut mac = [0u8; 6];
@@ -570,10 +574,10 @@ fn read_efuse_mac(x: &mut Xhci, dev: &mut UsbDevice) -> Option<[u8; 6]> {
 /// SP2 bring-up: power-on, TX-engine pre-firmware init, then upload firmware.
 /// ⚠️ UNVERIFIED on hardware — the register transport (SP1) has not yet been
 /// confirmed on a real dongle.
-pub fn bring_up(x: &mut Xhci, dev: &mut UsbDevice, nr_out_eps: u8) -> bool {
+pub fn bring_up(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState, nr_out_eps: u8) -> bool {
     if !power_on(x, dev) { return false; }
     tx_engine_pre_fw(x, dev, nr_out_eps);
-    download_firmware(x, dev)
+    download_firmware(x, dev, st)
 }
 
 // ── SP3c-1: RF register access (FPGA0 LSSI/HSSI 3-wire, path A) ───────────────
@@ -823,26 +827,36 @@ fn rf_selftest(x: &mut Xhci, dev: &mut UsbDevice) {
 //    rtl8xxxu_init_phy_rf), applied after `fw ready` to bring the radio alive. ──
 
 /// MAC init: apply the MAC reg table + 8188E max-aggregation default.
-fn init_mac(x: &mut Xhci, dev: &mut UsbDevice) {
-    apply_reg8_table(x, dev, tables::MAC_INIT);
+fn init_mac(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) {
+    if st.is_fu {
+        apply_reg8_table(x, dev, tables_fu::MAC_INIT_TABLE_FU);
+    } else {
+        apply_reg8_table(x, dev, tables::MAC_INIT);
+    }
     reg_write16(x, dev, REG_MAX_AGGR_NUM, 0x0707);
 }
 
 /// Baseband init (rtl8188eu_init_phy_bb): BB/RF reset release, then the PHY_REG
 /// and AGC tables.
-fn init_phy_bb(x: &mut Xhci, dev: &mut UsbDevice) {
+fn init_phy_bb(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) {
     if let Some(v) = reg_read16(x, dev, REG_SYS_FUNC_EN) {
         reg_write16(x, dev, REG_SYS_FUNC_EN, v | SYSF_BB_GLB_RSTN | SYSF_BBRSTB | SYSF_DIO_RF);
     }
     reg_write8(x, dev, REG_RF_CTRL, RF_CTRL_VAL);
     reg_write8(x, dev, REG_SYS_FUNC_EN, (SYSF_USBA | SYSF_USBD | SYSF_BB_GLB_RSTN | SYSF_BBRSTB) as u8);
-    apply_reg32_table(x, dev, tables::PHY_INIT);
-    apply_reg32_table(x, dev, tables::AGC_TAB);
+    
+    if st.is_fu {
+        apply_reg32_table(x, dev, tables_fu::PHY_REG_ARRAY_FU);
+        apply_reg32_table(x, dev, tables_fu::AGC_TAB_ARRAY_FU);
+    } else {
+        apply_reg32_table(x, dev, tables::PHY_INIT);
+        apply_reg32_table(x, dev, tables::AGC_TAB);
+    }
 }
 
 /// RF path-A init (rtl8xxxu_init_phy_rf, RF_A): RF_INT_OE / 3-wire-len preamble,
 /// the RADIO_A table, then restore RFENV.
-fn init_phy_rf(x: &mut Xhci, dev: &mut UsbDevice) {
+fn init_phy_rf(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) {
     let rfsi = reg_read16(x, dev, REG_FPGA0_XA_RF_SW_CTRL).unwrap_or(0) & FPGA0_RF_RFENV;
     if let Some(v) = reg_read32(x, dev, REG_FPGA0_XA_RF_INT_OE) {
         reg_write32(x, dev, REG_FPGA0_XA_RF_INT_OE, v | (1 << 20));
@@ -860,7 +874,13 @@ fn init_phy_rf(x: &mut Xhci, dev: &mut UsbDevice) {
         reg_write32(x, dev, REG_FPGA0_XA_HSSI_PARM2, v & !HSSI_3WIRE_DATA_LEN);
     }
     crate::boot::clock::udelay(1);
-    apply_rf_table(x, dev, tables::RADIOA_INIT);
+    
+    if st.is_fu {
+        apply_rf_table(x, dev, tables_fu::RADIO_A_ARRAY_FU);
+    } else {
+        apply_rf_table(x, dev, tables::RADIOA_INIT);
+    }
+    
     if let Some(v) = reg_read16(x, dev, REG_FPGA0_XA_RF_SW_CTRL) {
         reg_write16(x, dev, REG_FPGA0_XA_RF_SW_CTRL, (v & !FPGA0_RF_RFENV) | rfsi);
     }
@@ -871,13 +891,17 @@ fn init_phy_rf(x: &mut Xhci, dev: &mut UsbDevice) {
 /// NOTE: synchronous + ~0.5-1s (≈420 register writes + RADIO_A msleep markers).
 /// TEMP: invoked at enumeration for SP3c-3 validation; moves behind a lazy
 /// `wifiscan` command in SP3c-6/7 so normal boots stay fast.
-pub fn bring_up_radio(x: &mut Xhci, dev: &mut UsbDevice) {
-    crate::binfo!("wifi", "radio init: mac ({} rows)", tables::MAC_INIT.len());
-    init_mac(x, dev);
-    crate::binfo!("wifi", "radio init: bb (phy {} + agc {})", tables::PHY_INIT.len(), tables::AGC_TAB.len());
-    init_phy_bb(x, dev);
-    crate::binfo!("wifi", "radio init: rf (radioa {})", tables::RADIOA_INIT.len());
-    init_phy_rf(x, dev);
+pub fn bring_up_radio(x: &mut Xhci, dev: &mut UsbDevice, st: &WifiState) {
+    let mac_len = if st.is_fu { tables_fu::MAC_INIT_TABLE_FU.len() } else { tables::MAC_INIT.len() };
+    crate::binfo!("wifi", "radio init: mac ({} rows)", mac_len);
+    init_mac(x, dev, st);
+    let phy_len = if st.is_fu { tables_fu::PHY_REG_ARRAY_FU.len() } else { tables::PHY_INIT.len() };
+    let agc_len = if st.is_fu { tables_fu::AGC_TAB_ARRAY_FU.len() } else { tables::AGC_TAB.len() };
+    crate::binfo!("wifi", "radio init: bb (phy {} + agc {})", phy_len, agc_len);
+    init_phy_bb(x, dev, st);
+    let rf_len = if st.is_fu { tables_fu::RADIO_A_ARRAY_FU.len() } else { tables::RADIOA_INIT.len() };
+    crate::binfo!("wifi", "radio init: rf (radioa {})", rf_len);
+    init_phy_rf(x, dev, st);
     tx_engine_post_rf(x, dev);
     rx_enable(x, dev);
     crate::binfo!("wifi", "radio init done");
@@ -931,7 +955,8 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         if control_in(x, dev, sd, &buf)? < 18 { return None; }
         let vid = rd16(8);
         let pid = rd16(10);
-        if vid != WIFI_VID || pid != WIFI_PID { return None; }
+        if vid != WIFI_VID || (pid != WIFI_PID_EU && pid != WIFI_PID_FU) { return None; }
+        let is_fu = pid == WIFI_PID_FU;
 
         // ── 2. Config header → wTotalLength + bConfigurationValue ─────────────
         let s9 = Setup { req_type: 0x80, request: 6, value: 0x0200, index: 0, length: 9 };
@@ -999,7 +1024,7 @@ pub fn configure_wifi(x: &mut Xhci, dev: &mut UsbDevice) -> Option<WifiIface> {
         // can retry. UNVERIFIED on hardware.
         // Chip bring-up (power-on + firmware + MAC/BB/RF + scan) is LAZY — it runs
         // on the first `wifiscan` (run_scan), not here, so boot stays fast.
-        Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out, nr_out_eps })
+        Some(WifiIface { iface: iface_num, ep_in, ep_out, mps_in, mps_out, nr_out_eps, is_fu })
     })();
     crate::memory::dma::dealloc(buf);
     result
@@ -1111,7 +1136,7 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
         radio_up: false, tx_seq: 0, mac: [0; 6], nr_out_eps: wi.nr_out_eps,
-        h2c_mbox: 0,
+        h2c_mbox: 0, is_fu: wi.is_fu,
     })
 }
 
@@ -1304,11 +1329,11 @@ pub fn run_scan(out: &mut [u8]) -> usize {
 fn ensure_radio_up(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState) {
     if st.radio_up { return; }
     crate::binfo!("wifi", "bring-up (power-on + firmware + radio)");
-    bring_up(x, dev, st.nr_out_eps);
-    bring_up_radio(x, dev);
+    bring_up(x, dev, st, st.nr_out_eps);
+    bring_up_radio(x, dev, st);
     // Station MAC comes from EFUSE; program REG_MACID so the chip's RX address
     // filter matches our SA. Fall back to whatever REG_MACID already holds.
-    match read_efuse_mac(x, dev) {
+    match read_efuse_mac(x, dev, st) {
         Some(mac) => {
             for i in 0..6u16 { reg_write8(x, dev, REG_MACID + i, mac[i as usize]); }
             st.mac = mac;

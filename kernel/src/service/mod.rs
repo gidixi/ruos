@@ -31,6 +31,10 @@ use core::task::Waker;
 use spin::Mutex;
 
 pub mod schedule;
+pub mod unitfile;
+pub mod yaml;
+#[cfg(feature = "boot-checks")]
+pub mod checks;
 
 /// Marker path per le entry builtin (es. SSH) — non spawnabili dal
 /// dispatcher, il kernel le avvia direttamente al boot.

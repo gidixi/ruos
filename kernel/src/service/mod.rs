@@ -425,6 +425,65 @@ pub fn timer_fired(idx: usize, epoch_now: u64, ticks_now: u64) -> Option<String>
     Some(t.unit.clone())
 }
 
+/// Riga TSV estesa per `unit_list`/`unit_status`:
+/// `name\tkind\tstatus\tpid\truns\trestarts\ttarget\tenabled\tpath\tfile\n`
+pub fn list_tsv() -> String {
+    let r = UNITS.lock();
+    let mut out = String::new();
+    for u in r.iter() { unit_row(&mut out, u); }
+    out
+}
+
+pub fn status_tsv(name: &str) -> Option<String> {
+    let r = UNITS.lock();
+    r.iter().find(|u| u.name == name).map(|u| {
+        let mut s = String::new(); unit_row(&mut s, u); s
+    })
+}
+
+fn unit_row(out: &mut String, u: &Unit) {
+    use core::fmt::Write;
+    let status = match &u.status {
+        UnitStatus::Exited(c) => alloc::format!("Exited({})", c),
+        UnitStatus::Failed(m) => alloc::format!("Failed({})", m),
+        other => other.label().to_string(),
+    };
+    let _ = writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        u.name,
+        match u.kind { UnitKind::Oneshot => "oneshot", UnitKind::Daemon => "daemon" },
+        status,
+        u.pid.map(|p| alloc::format!("{}", p)).unwrap_or_else(|| "-".to_string()),
+        u.runs, u.restarts,
+        match u.target { ActivateTarget::Boot => "boot", ActivateTarget::PostBoot => "post-boot", ActivateTarget::Manual => "manual" },
+        u.enabled,
+        u.path,
+        u.file.as_deref().unwrap_or("-"));
+}
+
+/// `name\tunit\tschedule\tenabled\tnext_fire\tlast_fire\n` — fire in tick
+/// (monotoni) o unix epoch (calendario), raw; il tool mostra schedule+raw.
+pub fn timers_tsv() -> String {
+    use core::fmt::Write;
+    let g = TIMERS.lock();
+    let mut out = String::new();
+    for t in g.iter() {
+        let sched = match &t.schedule {
+            schedule::Schedule::EveryTicks(n) => alloc::format!("every {}s", n / 100),
+            schedule::Schedule::BootPlus(n)   => alloc::format!("boot+{}s", n / 100),
+            schedule::Schedule::Hourly { minute } => alloc::format!("hourly :{:02}", minute),
+            schedule::Schedule::Daily { hour, minute } => alloc::format!("daily {:02}:{:02}", hour, minute),
+            schedule::Schedule::Weekly { dow, hour, minute } => {
+                const D: [&str; 7] = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+                alloc::format!("weekly {} {:02}:{:02}", D[*dow as usize % 7], hour, minute)
+            }
+        };
+        let _ = writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}",
+            t.name, t.unit, sched, t.enabled, t.next_fire,
+            t.last_fire.map(|v| alloc::format!("{}", v)).unwrap_or_else(|| "-".to_string()));
+    }
+    out
+}
+
 /// Attesa di una richiesta dal dispatcher. Pattern `WaitForRequest`.
 pub struct WaitForServiceRequest;
 

@@ -13,7 +13,7 @@ Convention: `*_ptr`/`*_len` are guest addresses; functions that fill a buffer ta
 `(buf, len, used_ptr)` and return `8` (ENOBUFS) with the required size at `used_ptr`
 so the caller resizes + retries. Return `i32` = errno (`0` OK) unless noted.
 
-**Last reviewed:** 2026-06-10.
+**Last reviewed:** 2026-06-11.
 
 ---
 
@@ -161,6 +161,23 @@ Halt / restart. Never return.
 | `service_start(name_ptr, name_len) -> i32` | Start a service (async). `1` NotFound, `2` Already, `3` NotSupported, `99` Internal. |
 | `service_status(name_ptr, name_len, buf, len, used) -> i32` | One service's TSV row. `1` NotFound. |
 | `smp_bench(buf, len, used) -> i32` | Parallel-vs-sequential hash benchmark report. |
+
+## Unit manager  (`unit.rs` — CLI `unitctl`)
+
+Init system (spec `2026-06-09-init-units-timers-design.md`): unit oneshot/daemon
+con restart policy, dipendenze, target boot/post-boot/manual, timer. Errno:
+`1` NotFound, `2` AlreadyRunning, `3` NotSupported (builtin), `4` NoSlot
+(pool daemon pieno), `5` Parse, `8` ENOBUFS, `99` Internal.
+
+| Function | Meaning |
+|----------|---------|
+| `unit_list(buf, len, used) -> i32` | TSV `name\tkind\tstatus\tpid\truns\trestarts\ttarget\tenabled\tpath\tfile\n`, una riga per unit. |
+| `unit_status(name_ptr, name_len, buf, len, used) -> i32` | Riga TSV della singola unit. `1` NotFound. |
+| `unit_start(name_ptr, name_len) -> i32` | Avvia (async via queue): daemon/restart≠no → runner supervisionato, oneshot → dispatcher. |
+| `unit_stop(name_ptr, name_len) -> i32` | Stop cooperativo (`request_kill` + no-restart). Best-effort: senza host call il child non si ferma. |
+| `unit_enable(name_ptr, name_len, on) -> i32` | enabled on/off nel registry + riscrittura del file sorgente (persistente al reboot). |
+| `timer_list(buf, len, used) -> i32` | TSV `name\tunit\tschedule\tenabled\tnext_fire\tlast_fire\n` (fire raw: tick per every/boot+, unix epoch per il calendario). |
+| `unit_reload() -> i32` | Ri-parsa `/mnt/etc/units` (add/update; le Running tengono la config fino al prossimo restart). Sempre `0` (async, errori nel klog). |
 
 > Some entries in this last group are helper host fns added incrementally; verify
 > the exact signature against the source file before relying on it, and refine this

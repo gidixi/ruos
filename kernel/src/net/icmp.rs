@@ -27,7 +27,7 @@ pub async fn ping(target: Ipv4Address, timeout_ticks: u64) -> Result<u64, &'stat
         let mut g = crate::net::NET.lock();
         let net = g.as_mut().ok_or("net not initialized")?;
         // Need an Ethernet iface to send ICMP (loopback ignored).
-        if net.iface_net.is_none() && net.iface_nic.is_none() {
+        if net.iface_net.is_none() && net.iface_nic.is_none() && net.iface_wifi.is_none() {
             return Err("no ethernet iface");
         }
         let rx_meta = alloc::vec![IcmpPacketMetadata::EMPTY; 4];

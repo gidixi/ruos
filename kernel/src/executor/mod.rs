@@ -241,6 +241,7 @@ pub fn run_core(cpu: u32) -> ! {
         spawner.spawn(supervisor_task()).unwrap();
         spawner.spawn(net_poll_task()).unwrap();
         spawner.spawn(usb_poll_task()).unwrap();
+        spawner.spawn(wifi_poll_task()).unwrap();
         spawner.spawn(console_drain_task()).unwrap();
         // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
         // and server/client.wasm live under /root/ as runnable demo blobs
@@ -631,6 +632,19 @@ async fn usb_poll_task() {
     loop {
         crate::usb::poll();
         delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
+    }
+}
+
+/// SP-WIFI-5: drive the encrypted WiFi datapath. Once a WPA2 connect has armed
+/// the datapath, pump the radio (drain TX queue, fill RX queue) holding ONLY the
+/// CTRLS lock — never NET. No-op until attached, so it's cheap pre-connect.
+#[embassy_executor::task]
+async fn wifi_poll_task() {
+    loop {
+        if crate::usb::wifi::datapath::is_attached() {
+            crate::usb::wifi::poll_io();
+        }
+        delay::Delay::ticks(2).await; // ~20 ms @ 100 Hz
     }
 }
 

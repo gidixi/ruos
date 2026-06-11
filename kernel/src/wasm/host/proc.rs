@@ -585,8 +585,11 @@ pub fn ruos_net_set_static(
 
     let mut g = crate::net::NET.lock();
     let net = match g.as_mut() { Some(n) => n, None => return Ok(8) };
-    // Apply to whichever Ethernet iface exists.
-    let iface_opt = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
+    // Apply to whichever Ethernet iface is active — WiFi first when attached
+    // (it has taken over networking), else the wired one.
+    let iface_opt = net.iface_wifi.as_mut()
+        .or_else(|| net.iface_net.as_mut())
+        .or_else(|| net.iface_nic.as_mut());
     let iface = match iface_opt { Some(i) => i, None => return Ok(8) };
     iface.update_ip_addrs(|a| {
         a.clear();

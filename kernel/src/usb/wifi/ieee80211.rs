@@ -264,3 +264,84 @@ pub fn parse_eapol_data(frame: &[u8]) -> Option<&[u8]> {
     }
     Some(&frame[hdr + 8..])
 }
+
+// ── Encrypted datapath: 802.3 ↔ 802.11 data frames (SP-WIFI-5) ───────────────
+const FC1_PROTECTED:  u8 = 0x40; // FC byte1: frame body is/was CCMP-protected
+const CCMP_HDR_LEN:   usize = 8;
+const CCMP_MIC_LEN:   usize = 8;
+/// LLC/SNAP prefix (RFC 1042): the EtherType follows these 6 bytes.
+const LLC_SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
+
+/// Build the 8-byte CCMP header for an encrypted TX frame (mac80211 layout:
+/// SW writes the header + PN, HW does AES-CCM). `pn` is the 48-bit packet number,
+/// `key_id` the pairwise key index (0). The Ext-IV bit (0x20) is always set.
+pub fn ccmp_header(pn: u64, key_id: u8) -> [u8; 8] {
+    [
+        (pn & 0xff) as u8,            // PN0
+        ((pn >> 8) & 0xff) as u8,     // PN1
+        0x00,                         // reserved
+        (key_id << 6) | 0x20,         // KeyID | Ext-IV
+        ((pn >> 16) & 0xff) as u8,    // PN2
+        ((pn >> 24) & 0xff) as u8,    // PN3
+        ((pn >> 32) & 0xff) as u8,    // PN4
+        ((pn >> 40) & 0xff) as u8,    // PN5
+    ]
+}
+
+/// Wrap an Ethernet-II frame (`eth` = dst[6] src[6] ethertype[2] payload…) into
+/// an 802.11 data frame to the AP (ToDS, Protected): Addr1=RA=BSSID, Addr2=TA=us,
+/// Addr3=DA=the Ethernet dst. Inserts the 8-byte CCMP header + LLC/SNAP; the HW
+/// encrypts the body + appends the MIC. STA→AP is always Addr1=BSSID, so even a
+/// broadcast Ethernet dst rides the pairwise key (the AP relays).
+pub fn build_data_frame(sa: [u8; 6], bssid: [u8; 6], eth: &[u8], seq: u16, ccmp: &[u8; 8]) -> Vec<u8> {
+    if eth.len() < 14 {
+        return Vec::new();
+    }
+    let payload = &eth[14..];
+    let mut f = Vec::with_capacity(24 + CCMP_HDR_LEN + 8 + payload.len());
+    f.extend_from_slice(&[0x08, FC1_TODS | FC1_PROTECTED, 0x00, 0x00]); // FC(data,ToDS,Prot)+Dur
+    f.extend_from_slice(&bssid);          // Addr1 = RA = BSSID
+    f.extend_from_slice(&sa);             // Addr2 = TA = us
+    f.extend_from_slice(&eth[0..6]);      // Addr3 = DA = Ethernet dst
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    f.extend_from_slice(ccmp);            // CCMP header (HW encrypts past here)
+    f.extend_from_slice(&LLC_SNAP_PREFIX);
+    f.extend_from_slice(&eth[12..14]);    // EtherType
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Decapsulate a HW-decrypted RX 802.11 data frame (FromDS, AP→STA) into an
+/// Ethernet-II frame for smoltcp. Strips the MAC header (24/26B), the CCMP
+/// header (8B, when Protected) + trailing MIC (8B), and the LLC/SNAP. Returns
+/// `dst src ethertype payload`, or None if not a SNAP-bearing data frame.
+pub fn parse_data_frame(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 24 || frame[0] & 0x0C != 0x08 {
+        return None; // not a data-type frame
+    }
+    let qos = frame[0] & 0xF0 == 0x80;          // subtype 8 = QoS data
+    let protected = frame[1] & FC1_PROTECTED != 0;
+    let hdr = if qos { 26 } else { 24 };
+    // FromDS infra: Addr1 = DA (us / bcast), Addr3 = SA.
+    let mut da = [0u8; 6];
+    let mut sa = [0u8; 6];
+    da.copy_from_slice(&frame[4..10]);
+    sa.copy_from_slice(&frame[16..22]);
+    let mut off = hdr;
+    if protected { off += CCMP_HDR_LEN; }
+    if frame.len() < off + 8 || frame[off..off + 6] != LLC_SNAP_PREFIX {
+        return None;
+    }
+    let ethertype = [frame[off + 6], frame[off + 7]];
+    let body_start = off + 8;
+    let body_end = if protected { frame.len().checked_sub(CCMP_MIC_LEN)? } else { frame.len() };
+    if body_end <= body_start {
+        return None;
+    }
+    let mut out = Vec::with_capacity(14 + (body_end - body_start));
+    out.extend_from_slice(&da);
+    out.extend_from_slice(&sa);
+    out.extend_from_slice(&ethertype);
+    out.extend_from_slice(&frame[body_start..body_end]);
+    Some(out)
+}

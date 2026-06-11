@@ -32,7 +32,7 @@ pub async fn resolve(name: &str) -> Result<Vec<Ipv4Address>, DnsError> {
         if net.dns_servers.is_empty() {
             return Err(DnsError::NoServers);
         }
-        let (dns_h, iface) = match (net.dns, net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut())) {
+        let (dns_h, iface) = match (net.dns, net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut()).or_else(|| net.iface_wifi.as_mut())) {
             (Some(h), Some(i)) => (h, i),
             _ => return Err(DnsError::Failed),
         };

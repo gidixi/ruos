@@ -13,7 +13,7 @@ Convention: `*_ptr`/`*_len` are guest addresses; functions that fill a buffer ta
 `(buf, len, used_ptr)` and return `8` (ENOBUFS) with the required size at `used_ptr`
 so the caller resizes + retries. Return `i32` = errno (`0` OK) unless noted.
 
-**Last reviewed:** 2026-06-10.
+**Last reviewed:** 2026-06-11.
 
 ---
 
@@ -108,7 +108,9 @@ too small. With an empty `pass` the handshake is skipped (`4way=skipped`). The
 encrypted data path + DHCP (smoltcp over the Wi-Fi link) is SP-WIFI-5.
 
 ### `net_set_static(ip0, ip1, ip2, ip3, prefix, gw0, gw1, gw2, gw3, gw_present) -> i32`
-Set a static IP on the active NIC. `0` OK, `8` no iface, `22` EINVAL.
+Set a static IP on the active interface — the Wi-Fi iface when attached (it has
+taken over networking), else the wired NIC. Cancels DHCP. `0` OK, `8` no iface,
+`22` EINVAL.
 
 ### `net_dhcp_renew() -> i32`
 Restart the DHCP client. `0` OK, `8` no iface.

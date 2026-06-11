@@ -31,6 +31,10 @@ pub mod wpa2;
 #[allow(dead_code)]
 pub mod eapol;
 
+// RX/TX frame queues decoupling smoltcp (NET lock) from the radio (CTRLS lock)
+// for the encrypted datapath (SP-WIFI-5).
+pub mod datapath;
+
 use crate::usb::control::{control_in, control_out_data, Setup};
 use crate::usb::device::UsbDevice;
 use crate::usb::xhci::Xhci;
@@ -134,6 +138,18 @@ pub struct WifiState {
     pub nr_out_eps: u8,
     /// Next H2C mailbox index (0..H2C_MAX_MBOX), round-robin per command.
     pub h2c_mbox: u8,
+    /// BSSID of the joined AP (Addr1/Addr3 for data frames). Valid when associated.
+    pub bssid: [u8; 6],
+    /// True once the WPA2 4-way completed + CCMP keys are in the CAM: the data
+    /// path (`poll_io`) may now frame/encrypt traffic to the AP.
+    pub associated: bool,
+    /// CCMP transmit packet number (48-bit, monotonic per pairwise key). Written
+    /// into the CCMP header of every encrypted data TX; must never go backwards
+    /// while associated (the AP drops replays).
+    pub tx_pn: u64,
+    /// Association ID from the assoc response (TIM bitmap position — lets RX
+    /// diagnostics check whether the AP holds power-save-buffered unicast for us).
+    pub aid: u16,
 }
 
 /// Read `len` (1/2/4) register bytes via a vendor control-IN. Returns the value
@@ -738,6 +754,13 @@ const CR_SECURITY_ENABLE: u16 = 1 << 9;
 const CCMP_CIPHER_NIBBLE: u32 = 0x04;     // WLAN_CIPHER_SUITE_CCMP & 0x0f
 // TX queue selector for EAPOL data frames (best-effort), vs QSEL_MGMT.
 const QSEL_BE:            u32 = 0x00;
+// txdw1 sec field = AES/CCMP (bits 22:23 = 0b11): the chip encrypts the payload
+// with the CAM key matching the destination MAC + appends the MIC. We supply the
+// plaintext 802.11 frame + the CCMP header; HW does AES-CCM. (rtl8xxxu txdesc32)
+const TXDESC_SEC_AES:     u32 = 0x00c0_0000;
+// rxdesc16 dw0 `security` (bits 20:22) value for an AES/CCMP frame. "Decrypted
+// OK" = swdec==0 && security!=NONE (rtl8xxxu core.c:6346). We accept only AES.
+const RX_DESC_ENC_AES:    u32 = 4;
 
 /// Write a 20-bit RF register (path A) via the LSSI interface (rtl8xxxu
 /// write_rfreg). Used by the RADIO_A init table + config_channel (SP3c-3/6).
@@ -1111,7 +1134,7 @@ pub fn configure_endpoints(x: &mut Xhci, dev: &mut UsbDevice, wi: &WifiIface) ->
         ring_out, enq_out: 0, cyc_out: true,
         data, mps_in: wi.mps_in, mps_out: wi.mps_out,
         radio_up: false, tx_seq: 0, mac: [0; 6], nr_out_eps: wi.nr_out_eps,
-        h2c_mbox: 0,
+        h2c_mbox: 0, bssid: [0; 6], associated: false, tx_pn: 0, aid: 0,
     })
 }
 
@@ -1125,30 +1148,36 @@ fn tx_desc_csum(d: &mut [u8; TX_DESC_SIZE]) {
 }
 
 /// Build the 32-byte `rtl8xxxu_txdesc32` for `frame_len` payload bytes on TX
-/// queue `qsel` (QSEL_MGMT for management, QSEL_BE for EAPOL data), sequence
-/// `seq`, `bcast` = DA is broadcast/multicast.
-fn tx_desc(frame_len: usize, seq: u16, bcast: bool, qsel: u32) -> [u8; TX_DESC_SIZE] {
+/// queue `qsel` (QSEL_MGMT for management, QSEL_BE for data), sequence `seq`,
+/// `bcast` = DA is broadcast/multicast, `encrypt` = HW CCMP (sets the sec field).
+fn tx_desc(frame_len: usize, seq: u16, bcast: bool, qsel: u32, encrypt: bool) -> [u8; TX_DESC_SIZE] {
     let mut d = [0u8; TX_DESC_SIZE];
     d[0..2].copy_from_slice(&(frame_len as u16).to_le_bytes());       // pkt_size
     d[2] = TX_DESC_SIZE as u8;                                        // pkt_offset = 32
-    d[3] = 0x80 | 0x08 | 0x04 | if bcast { 0x01 } else { 0 };         // OWN|FSG|LSG[|BMC]
-    d[4..8].copy_from_slice(&(qsel << 8).to_le_bytes());             // txdw1: QSEL<<8
+    // OWN|FSG|LSG [|BMC]. NEVER set BMC on an encrypted STA→AP uplink: the RA
+    // (Addr1) is the unicast BSSID, but with SEC_CFG_TXBC_USE_DEFKEY the BMC bit
+    // diverts HW key-selection to the broadcast DEFAULT key instead of the
+    // pairwise PTK (matched by RA in the CAM) → AP CCMP MIC fails → frame dropped.
+    d[3] = 0x80 | 0x08 | 0x04 | if bcast && !encrypt { 0x01 } else { 0 };
+    let txdw1 = (qsel << 8) | if encrypt { TXDESC_SEC_AES } else { 0 };
+    d[4..8].copy_from_slice(&txdw1.to_le_bytes());                    // txdw1: QSEL<<8 [|SEC_AES]
     d[8..12].copy_from_slice(&0x0301_0000u32.to_le_bytes());          // txdw2: ANT_A|ANT_B|AGG_BREAK
     d[12..16].copy_from_slice(&(((seq as u32) & 0xFFF) << 16).to_le_bytes()); // txdw3: seq
     d[16..20].copy_from_slice(&0x0000_0100u32.to_le_bytes());         // txdw4: USE_DRIVER_RATE
     d[20..24].copy_from_slice(&0x001A_0000u32.to_le_bytes());         // txdw5: rate1M|retry6|RL_EN
     d[30..32].copy_from_slice(&0x2000u16.to_le_bytes());              // txdw7: ANT_C
-    tx_desc_csum(&mut d);
+    tx_desc_csum(&mut d);                                             // csum LAST (after SEC bit)
     d
 }
 
 /// Send one 802.11 frame on the bulk-OUT pipe (txdesc32 prepended) on TX queue
 /// `qsel`. `seq` must match the frame's header sequence; `bcast` for a
-/// broadcast/multicast DA. Returns the bulk completion code (1 = Success).
-fn send_frame_q(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool, qsel: u32) -> u8 {
+/// broadcast/multicast DA; `encrypt` for HW CCMP. Returns the bulk completion
+/// code (1 = Success).
+fn send_frame_q(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool, qsel: u32, encrypt: bool) -> u8 {
     let total = TX_DESC_SIZE + frame.len();
     if total > 4096 { return 0; }
-    let desc = tx_desc(frame.len(), seq, bcast, qsel);
+    let desc = tx_desc(frame.len(), seq, bcast, qsel, encrypt);
     unsafe {
         let p = st.data.virt.as_ptr::<u8>() as *mut u8;
         core::ptr::copy_nonoverlapping(desc.as_ptr(), p, TX_DESC_SIZE);
@@ -1163,14 +1192,17 @@ fn send_frame_q(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast:
     }
 }
 
-/// Send a management frame (probe/auth/assoc) on the MGMT TX queue.
+/// Send a management frame (probe/auth/assoc) on the MGMT TX queue (plaintext).
 pub fn send_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool) -> u8 {
-    send_frame_q(x, st, frame, seq, bcast, QSEL_MGMT)
+    send_frame_q(x, st, frame, seq, bcast, QSEL_MGMT, false)
 }
 
-/// Send an 802.11 data frame (EAPOL) on the best-effort TX queue.
-fn send_data_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16) -> u8 {
-    send_frame_q(x, st, frame, seq, false, QSEL_BE)
+/// Send an 802.11 data frame on the best-effort TX queue. `bcast` for a
+/// broadcast/multicast L2 destination (sets the TXDESC BMC bit, like rtl8xxxu);
+/// `encrypt` selects HW CCMP: false for the 4-way EAPOL (sent before keys), true
+/// for the datapath.
+fn send_data_frame(x: &mut Xhci, st: &mut WifiState, frame: &[u8], seq: u16, bcast: bool, encrypt: bool) -> u8 {
+    send_frame_q(x, st, frame, seq, bcast, QSEL_BE, encrypt)
 }
 
 /// Next 802.11 sequence number (12-bit, wrapping).
@@ -1205,6 +1237,132 @@ pub fn recv_frame(x: &mut Xhci, st: &mut WifiState, out: &mut [u8], timeout_ms: 
         core::ptr::copy_nonoverlapping(st.data.virt.as_ptr::<u8>().add(start), out.as_mut_ptr(), n);
     }
     Some(n)
+}
+
+/// Receive one frame and return it (the 802.11 frame in `out`) ONLY if it is a
+/// Poll result of `recv_data`: a consumed-but-rejected frame (beacon, mgmt,
+/// foreign key, crc error) is NOT the same as an empty bulk-IN — the drain loop
+/// must keep going on `Rejected` or one beacon stalls the whole poll and the
+/// chip RX FIFO overflows, dropping the next unicast data frame (e.g. DHCP ACK).
+enum RxPoll {
+    /// Clean HW-decrypted CCMP data frame, `n` bytes copied into `out`.
+    Frame(usize),
+    /// A frame was consumed off the ring but failed the filters.
+    Rejected,
+    /// Bulk-IN produced nothing within the timeout — stop draining.
+    Empty,
+}
+
+/// clean, HW-decrypted CCMP data frame — for the datapath. Drops on crc32/ICV
+/// error; requires swdec==0 && security==AES (rtl8xxxu "decrypted OK"), which
+/// also rejects beacons + firmware C2H reports (security==NONE).
+fn recv_data(x: &mut Xhci, st: &mut WifiState, out: &mut [u8], timeout_ms: u64) -> RxPoll {
+    let Some((code, residual)) = crate::usb::xhci::bulk::bulk_xfer_timeout(
+        x, st.slot_id, st.dci_in, &st.ring_in, &mut st.enq_in, &mut st.cyc_in,
+        st.data.phys.as_u64(), 4096, timeout_ms,
+    ) else { return RxPoll::Empty; };
+    if code != 1 && code != 13 { return RxPoll::Rejected; }
+    let got = (4096u32.saturating_sub(residual)) as usize;
+    if got < RX_DESC_SIZE { return RxPoll::Rejected; }
+    let rd = |o: usize| unsafe { read_volatile(st.data.virt.as_ptr::<u8>().add(o)) };
+    let dw0 = (rd(0) as u32) | ((rd(1) as u32) << 8) | ((rd(2) as u32) << 16) | ((rd(3) as u32) << 24);
+    // rxdesc16 dw0: pkt_len[0:13] crc32[14] icverr[15] drvinfo[16:19]
+    //               security[20:22] shift[24:25] swdec[27].
+    let crc = (dw0 >> 14) & 1;
+    let icv = (dw0 >> 15) & 1;
+    let sec = (dw0 >> 20) & 0x7;
+    let swdec = (dw0 >> 27) & 1;
+    let pkt_len = (dw0 & 0x3FFF) as usize;
+    let drvinfo = ((dw0 >> 16) & 0x0F) as usize * 8;
+    let shift = ((dw0 >> 24) & 0x03) as usize;
+    let start = RX_DESC_SIZE + drvinfo + shift;
+    // DIAGNOSTIC (capped): log every frame the chip delivers during the datapath
+    // with its rxdesc classification, so we can tell "AP silent" from "frame
+    // arrived but rejected". fc0 = 802.11 frame-control byte 0 (0x08=data, 0x80=beacon).
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static RX_DBG: AtomicU32 = AtomicU32::new(0);
+        let fc0 = if start < got { rd(start) } else { 0xFF };
+        // Skip beacons (0x80) — they'd fill the cap; we want data frames (OFFER).
+        if fc0 != 0x80 && RX_DBG.load(Ordering::Relaxed) < 24 {
+            RX_DBG.fetch_add(1, Ordering::Relaxed);
+            // RA = Addr1 (start+4, the receiver: our MAC 50:3e:aa or bcast ff),
+            // TA = Addr2 (start+10, the transmitter: our AP e0:63:da or foreign).
+            let b = |o: usize| if start + o < got { rd(start + o) } else { 0 };
+            crate::binfo!("wifi", "rx raw len={} fc0={:02x} sec={} swdec={} ra={:02x}:{:02x}:{:02x} ta={:02x}:{:02x}:{:02x}",
+                pkt_len, fc0, sec, swdec, b(4), b(5), b(6), b(10), b(11), b(12));
+        }
+    }
+    // DIAGNOSTIC (debug DHCP no-ACK): three targeted read-only probes that
+    // survive the general RX_DBG cap above. They answer: (a) does the AP think
+    // we're in power-save (TIM bit for our AID = it buffers our unicast)?
+    // (b) is the AP telling us something via mgmt (deauth/disassoc/action)?
+    // (c) does ANY unicast data reach the chip after the DHCP OFFER?
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        let b = |o: usize| if start + o < got { rd(start + o) } else { 0 };
+        let fc0 = if start < got { rd(start) } else { 0xFF };
+        let ra_us  = (0..6).all(|i| b(4 + i) == st.mac[i]);
+        let ta_bss = (0..6).all(|i| b(10 + i) == st.bssid[i]);
+        // (a) beacon from OUR AP: walk IEs to the TIM (id 5), test our AID bit.
+        // Logs only transitions (buffered 0↔1), capped.
+        if fc0 == 0x80 && ta_bss && st.aid != 0 {
+            static TIM_STATE: AtomicU32 = AtomicU32::new(0); // 0=unseen 1=clear 2=set
+            static TIM_LOGS:  AtomicU32 = AtomicU32::new(0);
+            let mut o = 24 + 12; // hdr + (timestamp 8 + interval 2 + capability 2)
+            while start + o + 2 <= got {
+                let (id, l) = (b(o), b(o + 1) as usize);
+                if id == 5 && l >= 4 {
+                    let bmc = b(o + 4);
+                    let first_aid = ((bmc & 0xFE) as usize) * 8; // partial-bitmap offset, in bits
+                    let aid = (st.aid & 0x3FFF) as usize;
+                    let nbits = (l - 3) * 8;
+                    let bit = if aid >= first_aid && aid - first_aid < nbits {
+                        (b(o + 5 + (aid - first_aid) / 8) >> ((aid - first_aid) % 8)) & 1
+                    } else { 0 };
+                    let prev = TIM_STATE.swap(bit as u32 + 1, Ordering::Relaxed);
+                    if prev != bit as u32 + 1 && TIM_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                        crate::binfo!("wifi", "tim: aid={} buffered={} dtim={}/{}",
+                            aid, bit, b(o + 2), b(o + 3));
+                    }
+                    break;
+                }
+                if l == 0 && id == 0 { break; } // malformed guard
+                o += 2 + l;
+            }
+        }
+        // (b) deauth (c0) / disassoc (a0) / action (d0) addressed to us or
+        // broadcast from our AP. Body u16 = reason code (deauth/disassoc) or
+        // category+action.
+        if fc0 & 0x0C == 0x00 && matches!(fc0 & 0xF0, 0xC0 | 0xA0 | 0xD0) {
+            let ra_bcast = (0..6).all(|i| b(4 + i) == 0xFF);
+            if ra_us || (ra_bcast && ta_bss) {
+                static MGMT_DBG: AtomicU32 = AtomicU32::new(0);
+                if MGMT_DBG.fetch_add(1, Ordering::Relaxed) < 16 {
+                    let body = u16::from_le_bytes([b(24), b(25)]);
+                    crate::bwarn!("wifi", "mgmt to us: fc0={:02x} body={:04x} ta_bss={}",
+                        fc0, body, ta_bss);
+                }
+            }
+        }
+        // (c) unicast data to our MAC, own cap.
+        if fc0 & 0x0C == 0x08 && ra_us {
+            static UNI_DBG: AtomicU32 = AtomicU32::new(0);
+            if UNI_DBG.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::binfo!("wifi", "rx unicast len={} fc0={:02x} sec={} swdec={}",
+                    pkt_len, fc0, sec, swdec);
+            }
+        }
+    }
+    if crc != 0 || icv != 0 { return RxPoll::Rejected; } // crc32 / ICV error
+    if swdec != 0 || sec != RX_DESC_ENC_AES { return RxPoll::Rejected; } // not HW-decrypted CCMP
+    let end = (start + pkt_len).min(got);
+    if end <= start { return RxPoll::Rejected; }
+    let n = (end - start).min(out.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(st.data.virt.as_ptr::<u8>().add(start), out.as_mut_ptr(), n);
+    }
+    RxPoll::Frame(n)
 }
 
 /// Active scan on the *current* channel: broadcast a probe-request, then poll
@@ -1454,7 +1612,7 @@ fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     let mic = wpa2::eapol_mic(&ptk.kck, &m2);
     m2[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN].copy_from_slice(&mic);
     let seq = next_seq(st);
-    let c2 = send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m2, seq), seq);
+    let c2 = send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m2, seq), seq, false, false);
     crate::binfo!("wifi", "4way: msg2 sent code={}", c2);
 
     // msg3 (AP→STA): MIC + ENCRYPTED key data (GTK).
@@ -1491,7 +1649,7 @@ fn four_way_handshake(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
     let mic4 = wpa2::eapol_mic(&ptk.kck, &m4);
     m4[eapol::MIC_OFFSET..eapol::MIC_OFFSET + eapol::MIC_LEN].copy_from_slice(&mic4);
     let seq = next_seq(st);
-    send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m4, seq), seq);
+    send_data_frame(x, st, &ieee80211::build_eapol_data(st.mac, bssid, &m4, seq), seq, false, false);
 
     crate::binfo!("wifi", "4-way complete (gtk idx={} len={})", gtk_idx, gtk.len());
     Some((ptk, gtk_idx, gtk))
@@ -1578,11 +1736,22 @@ pub fn connect(x: &mut Xhci, dev: &mut UsbDevice, st: &mut WifiState,
         match four_way_handshake(x, dev, st, &pmk, bssid) {
             Some((ptk, gtk_idx, gtk)) if gtk.len() >= 16 => {
                 enable_hw_security(x, dev);
+                // CAM entry index MUST equal the key id: SEC_CFG has TX/RX
+                // USE_DEFKEY, so the HW indexes the CAM by the frame's key id.
+                // PTK is key id 0 → entry 0; the GTK's key id (from msg3, e.g. 2)
+                // → entry gtk_idx. Putting the GTK at a fixed entry 1 left CAM[2]
+                // empty → group/broadcast RX failed to decrypt (swdec=1).
                 cam_write_key(x, dev, 0, 0, &ptk.tk, bssid, false); // pairwise (PTK TK)
                 let mut gk = [0u8; 16];
                 gk.copy_from_slice(&gtk[..16]);
-                cam_write_key(x, dev, 1, gtk_idx, &gk, bssid, true); // group (GTK)
-                crate::binfo!("wifi", "cam: ptk+gtk installed (gtk idx={})", gtk_idx);
+                cam_write_key(x, dev, gtk_idx, gtk_idx, &gk, bssid, true); // group (GTK) at CAM[keyid]
+                crate::binfo!("wifi", "cam: ptk(0)+gtk({}) installed", gtk_idx);
+                // Latch association so the data path (poll_io) can frame traffic.
+                // CCMP TX PN starts at 1 — PN 0 is rejected by the AP as a replay.
+                st.bssid = bssid;
+                st.associated = true;
+                st.tx_pn = 1;
+                st.aid = out.aid;
                 out.four_way = Some(true);
             }
             _ => {
@@ -1610,6 +1779,14 @@ pub fn run_connect(ssid: &[u8], password: &[u8], out: &mut [u8]) -> usize {
     let o = connect(x, &mut dev, &mut st, ssid, password);
     crate::usb::registry::set_dev(ctrl, slot, dev);
     crate::usb::registry::set_wifi_state(ctrl, slot, st);
+    let mac = st.mac;
+    drop(g); // release CTRLS BEFORE taking NET — the two locks must never nest
+
+    // On a successful WPA2 connect (keys in CAM), bring up the smoltcp WiFi
+    // interface + its DHCP client. attach_wifi takes NET, hence after drop(g).
+    if o.four_way == Some(true) {
+        crate::net::attach_wifi(mac);
+    }
 
     let mut s = alloc::string::String::new();
     if !o.found {
@@ -1624,4 +1801,134 @@ pub fn run_connect(ssid: &[u8], password: &[u8], out: &mut [u8]) -> usize {
     let n = bytes.len().min(out.len());
     out[..n].copy_from_slice(&bytes[..n]);
     n
+}
+
+/// SP-WIFI-5 datapath pump (USB side). Called by `wifi_poll_task` each tick once
+/// the datapath is attached. Grabs the controller (run_scan/MSC pattern), drains
+/// the TX queue (Ethernet → HW-encrypted 802.11 to the AP) and fills the RX queue
+/// (HW-decrypted 802.11 → Ethernet), both bounded so input enumeration isn't
+/// starved. Holds ONLY CTRLS + the datapath queue leaves — NEVER NET. No-op until
+/// a connect() has associated the slot.
+/// DIAGNOSTIC: DHCP message type (option 53: 1=DISCOVER 2=OFFER 3=REQUEST
+/// 5=ACK 6=NAK) of an Ethernet-II IPv4/UDP frame on ports 67/68, else None.
+fn dhcp_msg_type(eth: &[u8]) -> Option<u8> {
+    if eth.len() < 38 || u16::from_be_bytes([eth[12], eth[13]]) != 0x0800 { return None; }
+    let ihl = (eth[14] & 0x0f) as usize * 4;
+    if eth[23] != 17 || eth.len() < 14 + ihl + 8 { return None; }
+    let sp = u16::from_be_bytes([eth[14 + ihl], eth[14 + ihl + 1]]);
+    let dp = u16::from_be_bytes([eth[14 + ihl + 2], eth[14 + ihl + 3]]);
+    if !(sp == 67 && dp == 68) && !(sp == 68 && dp == 67) { return None; }
+    // BOOTP fixed part (236 bytes after the UDP header) + magic cookie, then
+    // TLV options (0x00 = single-byte pad).
+    let mut o = 14 + ihl + 8 + 236;
+    if eth.len() < o + 4 || eth[o..o + 4] != [0x63, 0x82, 0x53, 0x63] { return None; }
+    o += 4;
+    while o + 2 <= eth.len() {
+        let (t, l) = (eth[o], eth[o + 1] as usize);
+        if t == 0xff { break; }
+        if t == 0 { o += 1; continue; }
+        if t == 53 { return eth.get(o + 2).copied(); }
+        o += 2 + l;
+    }
+    None
+}
+
+pub fn poll_io() {
+    const TX_PER_POLL: usize = 8;
+    const RX_PER_POLL: usize = 8;
+    let (ctrl, slot) = match crate::usb::registry::first_wifi_slot() { Some(s) => s, None => return };
+    let cell = match crate::usb::CTRLS.get() { Some(c) => c, None => return };
+    let mut g = cell.lock();
+    let x = match g.get_mut(ctrl as usize) { Some(x) => x, None => return };
+    let mut st = match crate::usb::registry::wifi_state(ctrl, slot) { Some(s) => s, None => return };
+    if !st.associated { return; }
+
+    // TX: queued Ethernet frames → encrypted 802.11 data to the AP (Addr1=BSSID,
+    // pairwise key; a 48-bit monotonic PN per frame).
+    let mut tx_n = 0u32;
+    let mut last_code = 0u8;
+    let mut tx_et = 0u16;
+    let mut tx_bc = false;
+    for _ in 0..TX_PER_POLL {
+        let eth = match datapath::tx_pop() { Some(e) => e, None => break };
+        if eth.len() < 14 { continue; }
+        let bcast = eth[0] & 0x01 != 0; // broadcast/multicast L2 destination
+        tx_bc = bcast;
+        tx_et = u16::from_be_bytes([eth[12], eth[13]]);
+        // DIAGNOSTIC (capped): DHCP egress — type 1=DISCOVER means smoltcp is
+        // (re)soliciting, type 3=REQUEST means it ACCEPTED the OFFER. This
+        // discriminates "OFFER rejected inside dhcpv4::process" (no REQUEST,
+        // periodic re-DISCOVER) from "REQUEST/ACK leg lost over the air".
+        if tx_et == 0x0800 {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static TX_DBG: AtomicU32 = AtomicU32::new(0);
+            if TX_DBG.load(Ordering::Relaxed) < 12 {
+                if let Some(t) = dhcp_msg_type(&eth) {
+                    TX_DBG.fetch_add(1, Ordering::Relaxed);
+                    crate::binfo!("wifi", "dhcp tx type={} ethlen={}", t, eth.len());
+                }
+            }
+        }
+        let seq = next_seq(&mut st);
+        let ccmp = ieee80211::ccmp_header(st.tx_pn, 0);
+        st.tx_pn = st.tx_pn.wrapping_add(1) & 0xFFFF_FFFF_FFFF; // 48-bit
+        let frame = ieee80211::build_data_frame(st.mac, st.bssid, &eth, seq, &ccmp);
+        if !frame.is_empty() {
+            last_code = send_data_frame(x, &mut st, &frame, seq, bcast, true);
+            tx_n += 1;
+        }
+    }
+
+    // RX: decrypted data frames → Ethernet into the smoltcp ingress queue.
+    let mut buf = [0u8; 2048];
+    let mut rx_n = 0u32;
+    let mut rx_raw = 0u32;
+    let mut rx_et = 0u16;
+    for _ in 0..RX_PER_POLL {
+        match recv_data(x, &mut st, &mut buf, 5) {
+            RxPoll::Frame(n) => {
+                rx_raw += 1;
+                if let Some(eth) = ieee80211::parse_data_frame(&buf[..n]) {
+                    if eth.len() >= 14 { rx_et = u16::from_be_bytes([eth[12], eth[13]]); }
+                    // DIAGNOSTIC (capped): for IPv4 frames, log the IP/UDP shape +
+                    // DHCP message type (2=OFFER 5=ACK 6=NAK) so we can confirm a
+                    // valid OFFER/ACK reaches smoltcp intact (catches MIC/FCS/length
+                    // parse errors AND an ACK that arrives but never binds).
+                    if rx_et == 0x0800 && eth.len() >= 38 {
+                        use core::sync::atomic::{AtomicU32, Ordering};
+                        static IP_DBG: AtomicU32 = AtomicU32::new(0);
+                        if IP_DBG.load(Ordering::Relaxed) < 12 {
+                            IP_DBG.fetch_add(1, Ordering::Relaxed);
+                            let ihl = (eth[14] & 0x0f) as usize * 4;
+                            let proto = eth[23];
+                            let (sp, dp) = if proto == 17 && eth.len() >= 14 + ihl + 4 {
+                                (u16::from_be_bytes([eth[14 + ihl], eth[14 + ihl + 1]]),
+                                 u16::from_be_bytes([eth[14 + ihl + 2], eth[14 + ihl + 3]]))
+                            } else { (0, 0) };
+                            crate::binfo!("wifi", "ip ethlen={} ipv={:02x} ihl={} proto={} udp {}->{} dhcp={}",
+                                eth.len(), eth[14], ihl, proto, sp, dp,
+                                dhcp_msg_type(&eth).unwrap_or(0));
+                        }
+                    }
+                    datapath::rx_push(eth);
+                    rx_n += 1;
+                }
+            }
+            // Consumed-but-rejected (beacon/mgmt/foreign key): keep draining.
+            // Breaking here let one beacon stall the poll → chip FIFO overflow
+            // → lost unicast data frames (DHCP ACK never seen).
+            RxPoll::Rejected => continue,
+            RxPoll::Empty => break,
+        }
+    }
+    // Diagnostic: log only non-idle polls (DHCP sends a few DISCOVERs then waits).
+    // et = EtherType (0800=IPv4/DHCP, 0806=ARP); bc = broadcast TX.
+    if tx_n > 0 || rx_raw > 0 {
+        crate::binfo!("wifi", "dp tx={} code={} et={:04x} bc={} | rx_dec={} parsed={} et={:04x}",
+            tx_n, last_code, tx_et, tx_bc, rx_raw, rx_n, rx_et);
+    }
+
+    // Persist advanced ring cursors + tx_seq + tx_pn. (poll_io does no EP0/dev I/O,
+    // so no dev_copy/set_dev needed.) CTRLS (g) releases on scope exit.
+    crate::usb::registry::set_wifi_state(ctrl, slot, st);
 }

@@ -10,6 +10,7 @@ pub mod netconsole;
 pub mod nic;
 pub mod sockets;
 pub mod virtio;
+pub mod wifi;
 
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
@@ -27,6 +28,11 @@ pub struct NetState {
     pub dev_net:   Option<virtio::VirtioNet>,
     pub iface_nic: Option<Interface>,
     pub dev_nic:   Option<nic::Nic>,
+    // USB-WiFi (RTL8188EU). Created LAZILY by attach_wifi() after a WPA2 connect
+    // (USB enum + 4-way happen long after net::init). Only attached when no wired
+    // iface is up, so at most one Ethernet iface owns the DHCP lease.
+    pub iface_wifi: Option<Interface>,
+    pub dev_wifi:   Option<wifi::WifiPhy>,
     // App TCP sockets currently route through iface_lo only (sockets::connect
     // uses iface_lo.context()), i.e. loopback. Wiring app sockets over the
     // Ethernet iface is a Step 16 (SSH) item.
@@ -94,6 +100,8 @@ pub fn init() {
         dev_net,
         iface_nic,
         dev_nic,
+        iface_wifi: None,
+        dev_wifi:   None,
         sockets,
         net_sockets,
         dhcp,
@@ -119,16 +127,26 @@ pub fn poll() {
         #[cfg(feature = "netconsole")]
         netconsole::on_poll(&mut net.net_sockets);
 
-        // Poll whichever Ethernet interface is active (virtio xor nic).
-        if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_mut()) {
+        // Poll the active Ethernet interface against net_sockets. Once WiFi is
+        // attached it TAKES OVER networking (DHCP/DNS/sockets) and the wired iface
+        // goes dormant — sharing one SocketSet across two ifaces would let the
+        // wired one hog the DHCP socket so WiFi could never bind. (WifiPhy moves
+        // frames via the datapath queues only — no USB here.)
+        if let (Some(iface), Some(dev)) = (net.iface_wifi.as_mut(), net.dev_wifi.as_mut()) {
             let _ = iface.poll(t, dev, &mut net.net_sockets);
-        }
-        if let (Some(iface), Some(dev)) = (net.iface_nic.as_mut(), net.dev_nic.as_mut()) {
-            let _ = iface.poll(t, dev, &mut net.net_sockets);
+        } else {
+            if let (Some(iface), Some(dev)) = (net.iface_net.as_mut(), net.dev_net.as_mut()) {
+                let _ = iface.poll(t, dev, &mut net.net_sockets);
+            }
+            if let (Some(iface), Some(dev)) = (net.iface_nic.as_mut(), net.dev_nic.as_mut()) {
+                let _ = iface.poll(t, dev, &mut net.net_sockets);
+            }
         }
 
         // Process DHCP events: extract the event (releasing the socket borrow)
-        // before touching whichever iface owns the DHCP lease (virtio xor nic).
+        // before touching whichever iface owns the lease. WiFi reuses the single
+        // DHCP socket (attach_wifi resets/creates it); the lease applies to
+        // whichever iface is active (WiFi preferred when up).
         if let Some(h) = net.dhcp {
             let event = net.net_sockets.get_mut::<dhcpv4::Socket>(h).poll();
             let action: Option<(
@@ -144,8 +162,11 @@ pub fn poll() {
                 None => None,
             };
 
-            // Apply to whichever iface was created at init.
-            let iface = net.iface_net.as_mut().or_else(|| net.iface_nic.as_mut());
+            // Apply the lease to the active Ethernet iface — WiFi preferred when
+            // up (it has taken over networking), else the wired iface.
+            let iface = net.iface_wifi.as_mut()
+                .or_else(|| net.iface_net.as_mut())
+                .or_else(|| net.iface_nic.as_mut());
             if let (Some(action), Some(iface)) = (action, iface) {
                 match action {
                     (Some(addr), router, dns_srvs) => {
@@ -197,5 +218,36 @@ pub fn poll() {
                 }
             }
         }
+    });
+}
+
+/// Bring up the smoltcp WiFi interface after a successful WPA2 connect (SP-WIFI-5):
+/// build an Ethernet iface bound to `mac`, add a dedicated DHCPv4 socket, and arm
+/// the datapath so `wifi_poll_task` starts moving frames. Idempotent. Skipped when
+/// a wired NIC is already up (avoids a second default route / lease owner).
+/// MUST be called with CTRLS NOT held (it takes NET — the two never nest).
+pub fn attach_wifi(mac: [u8; 6]) {
+    use x86_64::instructions::interrupts::without_interrupts;
+    without_interrupts(|| {
+        let mut g = NET.lock();
+        let Some(net) = g.as_mut() else { return; };
+        if net.dev_wifi.is_some() {
+            return; // already attached
+        }
+        let mut dev = wifi::WifiPhy;
+        let cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        let iface = Interface::new(cfg, &mut dev, now());
+        net.iface_wifi = Some(iface);
+        net.dev_wifi   = Some(dev);
+        // Reuse the single DHCP socket for WiFi (resetting any wired lease) or
+        // create it if the box has no wired NIC. From now poll() drives it over
+        // WiFi and the wired iface is dormant.
+        match net.dhcp {
+            Some(h) => net.net_sockets.get_mut::<dhcpv4::Socket>(h).reset(),
+            None    => net.dhcp = Some(net.net_sockets.add(dhcpv4::Socket::new())),
+        }
+        net.dhcp_bound = false;
+        crate::usb::wifi::datapath::set_attached(true);
+        crate::binfo!("net", "wifi iface up mac={:02x?} — taking over, dhcp starting", mac);
     });
 }

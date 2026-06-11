@@ -8,7 +8,40 @@ pub fn run() {
     check_schedule();
     check_unitfile();
     check_compute_next();
+    check_topo();
     crate::binfo!("svc-check", "init-units checks OK");
+}
+
+fn check_topo() {
+    use super::topo::topo_sort;
+    use alloc::vec;
+    // A after B → ordine [B, A]
+    let (order, cyc) = topo_sort(&[
+        ("a".to_string(), vec!["b".to_string()]),
+        ("b".to_string(), vec![]),
+    ]);
+    assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+    assert!(cyc.is_empty());
+    // catena transitiva c→b→a
+    let (order, _) = topo_sort(&[
+        ("c".to_string(), vec!["b".to_string()]),
+        ("a".to_string(), vec![]),
+        ("b".to_string(), vec!["a".to_string()]),
+    ]);
+    assert_eq!(order, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    // ciclo a↔b rilevato; c indipendente prosegue
+    let (order, cyc) = topo_sort(&[
+        ("a".to_string(), vec!["b".to_string()]),
+        ("b".to_string(), vec!["a".to_string()]),
+        ("c".to_string(), vec![]),
+    ]);
+    assert_eq!(order, vec!["c".to_string()]);
+    assert_eq!(cyc.len(), 2);
+    // dep esterna al set (es. builtin già Running) → ignorata, non blocca
+    let (order, cyc) = topo_sort(&[("a".to_string(), vec!["ssh".to_string()])]);
+    assert_eq!(order, vec!["a".to_string()]);
+    assert!(cyc.is_empty());
+    crate::binfo!("svc-check", "topo OK");
 }
 
 fn check_compute_next() {

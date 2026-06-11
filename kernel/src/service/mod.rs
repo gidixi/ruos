@@ -34,6 +34,7 @@ pub mod schedule;
 pub mod unitfile;
 pub mod yaml;
 pub mod json;
+pub mod topo;
 #[cfg(feature = "boot-checks")]
 pub mod checks;
 

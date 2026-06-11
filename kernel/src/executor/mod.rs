@@ -291,7 +291,9 @@ pub fn run_core(cpu: u32) -> ! {
         // Supervisor 6-detect: BSP polls per-core heartbeats every ~1 s and
         // logs any mute core. Detection only; recovery is 6-recover.
         spawner.spawn(supervisor_task()).unwrap();
-        spawner.spawn(net_poll_task()).unwrap();
+        // Net polling is pinned OFF the BSP onto a ComputeApp core (the spawner
+        // bootstraps it once that AP is up); ≤2-core falls back to BSP-local.
+        spawner.spawn(net_poll_spawner_task()).unwrap();
         spawner.spawn(usb_poll_task()).unwrap();
         spawner.spawn(console_drain_task()).unwrap();
         // Normal boot: only shell.wasm auto-spawns. init.wasm stays at /init.wasm
@@ -672,11 +674,48 @@ async fn ssh_serve_task() {
     crate::ssh::server::serve_loop_pub().await;
 }
 
-#[embassy_executor::task]
-async fn net_poll_task() {
+/// The actual 10 ms network poll loop. Plain async fn so it can be either
+/// spawned as a task (`net_poll_task`) on a ComputeApp core or awaited inline
+/// on the BSP (the ≤2-core fallback in `net_poll_spawner_task`).
+async fn net_poll_loop() {
     loop {
         crate::net::poll();
         delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
+    }
+}
+
+#[embassy_executor::task]
+async fn net_poll_task() {
+    net_poll_loop().await;
+}
+
+/// Bootstrap (runs on the BSP) that pins network polling OFF the BSP onto the
+/// first ComputeApp core, freeing the BSP I/O hub from the 100 Hz `net::poll()`
+/// under sustained traffic.
+///
+/// Safe to move: `net_poll_task` is `Send` (no wasmi state), `NET` is a
+/// `spin::Mutex` already accessed cross-core (socket recv/send run from wasm
+/// fibers on compute cores today), and the NIC drivers are pure-polling — there
+/// is no RX IRQ to co-locate with the poll. So an AP can drive it lock-safely.
+///
+/// It only bootstraps: retries `spawn_on` until the target AP has published its
+/// executor, then exits. On ≤2-core systems (no ComputeApp core) it falls back
+/// to polling inline on the BSP (the old behaviour).
+#[embassy_executor::task]
+async fn net_poll_spawner_task() {
+    match crate::cpu::first_compute_app_core() {
+        Some(core) => loop {
+            match spawn_on(core, net_poll_task()) {
+                Ok(()) => {
+                    crate::binfo!("net", "net_poll pinned to core{}", core);
+                    return;
+                }
+                // AP's executor not published yet — retry in 10 ms.
+                Err(_) => delay::Delay::ticks(1).await,
+            }
+        },
+        // ≤2-core: no ComputeApp core — poll on the BSP (fallback).
+        None => net_poll_loop().await,
     }
 }
 

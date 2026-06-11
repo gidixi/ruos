@@ -25,17 +25,19 @@ the raw host ABI it wraps; reach for them only for advanced needs.
 ## `.cwasm` compatibility (IMPORTANT for prebuilt apps)
 
 A `.cwasm` is **machine code tied to the exact Wasmtime engine config** (the
-"tunables": `memory_reservation`, guard size, …) it was precompiled with. The
-kernel checks them at load and **rejects a mismatching file** (serial log:
-`WARN wm ... deserialize failed: Module was compiled with a memory reservation
-of 'X' but 'Y' is expected`). The rejected app silently disappears from the
-launcher — the WARN line is the only symptom.
+"tunables": `memory_reservation`, guard size, `epoch_interruption`, …) it was
+precompiled with. The kernel checks them at load and **rejects a mismatching
+file** (serial log: `WARN wm ... deserialize failed: Module was compiled with
+a memory reservation of 'X' but 'Y' is expected`, or the equivalent for any
+other tunable). The rejected app silently disappears from the launcher — the
+WARN line is the only symptom.
 
 System apps are rebuilt by `make iso` every time, so they never drift. **Your
 prebuilt apps do**: the ones in the OS repo's `apps/` drop folder and any copy
 on the disk's `/mnt/apps`. Whenever the kernel's Wasmtime tunables change
 (`kernel/src/wasm/wt/mod.rs::engine_config` + `tools/wt-precompile` — e.g.
-CHANGELOG 422), **re-run the AOT step for every external `.cwasm`**:
+CHANGELOG 422 `memory_reservation`, CHANGELOG 455 `epoch_interruption`),
+**re-run the AOT step for every external `.cwasm`**:
 
 - SDK route (always safe): `.\build.ps1 -App <app> -Id <id>` then `.\deploy.ps1`
   — build.ps1 recompiles `wt-precompile` from the ruos checkout on every run,

@@ -47,29 +47,19 @@ static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
 /// A reactor that calls `wm.close()` after a few frames (for the despawn
 /// boot-check and the [X]-equivalent demo). Built by `tools/wt-reactor-close`.
 static REACTOR_CLOSE_CWASM: &[u8] = include_bytes!("reactor_close.cwasm");
-/// A wasm32-wasip1 STD reactor (egui SP-A probe): proves a std/WASI guest runs
-/// as a compositor window. Built by `tools/wt-wasip1-probe`; needs `_initialize`
-/// run before its first `frame()` (see `run_initialize`).
-static PROBE_CWASM: &[u8] = include_bytes!("probe.cwasm");
 /// The egui CSD demo window (SP-B): a wasm32-wasip1 std reactor that draws its own
 /// egui window (CSD title bar + counter) via gui-core's raster, over the `wm`
 /// surface protocol. Built from `ruos-desktop/compositor-app`; like the probe it
 /// needs `_initialize` run before its first `frame()`. The FIRST launcher-visible
 /// app (`show_in_launcher: true`).
 static EGUI_DEMO_CWASM: &[u8] = include_bytes!("egui_demo.cwasm");
-/// Phase-0.5 GATE app (Blitz HTML/CSS style+layout benchmark). Embedded ONLY under
-/// `boot-checks` — it is ~51 MB of AOT Stylo native code, so production builds must
-/// not carry it. Its guest `frame()` runs the bench once and prints a table to
-/// serial via stdout (`fd_write` → console). Built by the demo-apps SDK
-/// (`apps/viewer-gate`) and copied in as `viewer-gate.cwasm`.
+/// Spinning reactor (epoch-watchdog boot-check): commits one healthy frame,
+/// then busy-loops forever inside `frame()`. Built by `tools/wt-spin-reactor`.
+/// (The Blitz GATE + embedded-viewer blobs that used to sit here were retired
+/// with the boot-check cleanup — changelog 456: 55+77 MB of AOT Stylo per blob
+/// exhausted the test VM's frames; the real viewer ships in `apps/`.)
 #[cfg(feature = "boot-checks")]
-static GATE_CWASM: &[u8] = include_bytes!("viewer-gate.cwasm");
-/// Phase-2 viewer app (Blitz parse→style→layout→vello_cpu paint of an embedded
-/// HTML page). Embedded ONLY under `boot-checks` — ~63 MB of AOT Stylo+vello_cpu
-/// native code, so production builds must not carry it. Built by the demo-apps
-/// SDK (`apps/viewer`) and copied in as `viewer.cwasm`.
-#[cfg(feature = "boot-checks")]
-static VIEWER_CWASM: &[u8] = include_bytes!("viewer.cwasm");
+static SPIN_REACTOR_CWASM: &[u8] = include_bytes!("spin_reactor.cwasm");
 
 /// A launchable app: a display name + its precompiled `.cwasm` bytes.
 pub struct AppEntry {
@@ -88,7 +78,6 @@ pub static APPS: &[AppEntry] = &[
     AppEntry { name: "react-A", cwasm: REACTOR_CWASM, show_in_launcher: false },
     AppEntry { name: "react-B", cwasm: REACTOR_CWASM, show_in_launcher: false },
     AppEntry { name: "selfclose", cwasm: REACTOR_CLOSE_CWASM, show_in_launcher: false },
-    AppEntry { name: "wasip1-probe", cwasm: PROBE_CWASM, show_in_launcher: false },
     AppEntry { name: "egui-demo", cwasm: EGUI_DEMO_CWASM, show_in_launcher: true },
 ];
 
@@ -256,6 +245,8 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
             limits: wasmtime::StoreLimits::default(), // throwaway probe: unlimited
         },
     );
+    // Watchdog: a hostile/broken .cwasm must not hang the ~1 Hz catalog scan.
+    store.set_epoch_deadline(crate::wasm::wt::PROBE_DEADLINE_TICKS);
     // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("cld", options(nostack)); }
@@ -860,6 +851,19 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // Wasm return type so never-type fallback stays `()` (matches `gui.rs`).
     linker.func_wrap("wm", "poweroff",
         |_caller: Caller<'_, T>| -> () { crate::power::poweroff() })?;
+    // wm.reboot(): the calling window (the shell's reboot button) asks the kernel
+    // to restart the machine. Twin of `wm.poweroff`; same primitive `ruos:gui/power.
+    // reboot` uses (`gui.rs`). Never returns; the `-> ()` annotation pins the
+    // closure's Wasm return type so never-type fallback stays `()`.
+    linker.func_wrap("wm", "reboot",
+        |_caller: Caller<'_, T>| -> () { crate::power::reboot() })?;
+    // wm.exit_to_shell(): the calling window (the shell's "back to console" button)
+    // asks the compositor to tear down and hand the framebuffer back to the text
+    // console. Sets a flag the run loop reads next iteration (it can't tear down
+    // mid-frame — `self` owns the calling guest's Store). Returns normally; the
+    // exit happens just after this frame.
+    linker.func_wrap("wm", "exit_to_shell",
+        |_caller: Caller<'_, T>| { EXIT_TO_SHELL.store(true, core::sync::atomic::Ordering::Release); })?;
     // wm.surface_size() -> i64: the full framebuffer size, packed (w<<32)|h. The
     // background shell sizes ITSELF to this (the bg window is forced full-screen
     // by the compositor; this lets the guest's egui raster match the screen).
@@ -964,60 +968,22 @@ static WINDOW_SNAPSHOT: crate::sync::IrqMutex<Vec<(u32, u32, String)>> =
 /// instantiates a window instance MUST call this right after `instantiate` and
 /// BEFORE the first `frame()`. The no_std reactors export no `_initialize`, so
 /// the `Ok` arm is simply skipped — safe + necessary only for wasip1 reactors.
-fn run_initialize(store: &mut Store<AppState>, inst: &Instance) {
+/// Returns `false` if `_initialize` trapped (incl. the epoch WATCHDOG): the
+/// guest's std runtime is in an arbitrary half-initialized state, so the
+/// caller must NOT keep the window (a zombie that faults on its first alloc).
+fn run_initialize(store: &mut Store<AppState>, inst: &Instance) -> bool {
     if let Ok(init) = inst.get_typed_func::<(), ()>(&mut *store, "_initialize") {
+        store.set_epoch_deadline(crate::wasm::wt::INIT_DEADLINE_TICKS);
         if let Err(e) = init.call(&mut *store, ()) {
-            crate::bwarn!("wm", "_initialize trapped: {:?}", e);
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+                crate::bwarn!("wm", "_initialize WATCHDOG (epoch deadline): killed");
+            } else {
+                crate::bwarn!("wm", "_initialize trapped: {:?}", e);
+            }
+            return false;
         }
     }
-}
-
-/// SPIKE: instantiate ONE reactor instance, call `frame()` 5× on it, return
-/// `(tick, first_pixel_byte0, pixels_len)`. Proves a persistent instance +
-/// repeated export call AND that the committed surface buffer arrives intact.
-pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
-    let engine = engine();
-    // SAFETY: produced by wt-precompile for this exact engine Config.
-    let module = match unsafe { Module::deserialize(engine, cwasm) } {
-        Ok(m) => m,
-        Err(_) => return (0, 0, 0),
-    };
-    let mut store = Store::new(
-        engine,
-        AppState {
-            wasi: WtState::new(alloc::vec![b"win".to_vec()]),
-            win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0, stay_awake_request: false, wake_pty: -1 },
-            limits: wasmtime::StoreLimits::default(), // spike harness: unlimited
-        },
-    );
-    let mut linker: Linker<AppState> = Linker::new(engine);
-    crate::wasm::wt::wasi::add_to_linker(&mut linker).expect("wasi linker");
-    if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
-    if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
-    if crate::wasm::wt::sys::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
-    if crate::wasm::wt::net::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
-    // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
-    // BACKWARD if DF=1, silently corrupting copied data.
-    #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("cld", options(nostack)); }
-    let instance = match linker.instantiate(&mut store, &module) {
-        Ok(i) => i,
-        Err(_) => return (0, 0, 0),
-    };
-    // wasip1 std reactors need `_initialize` run before their first heap alloc.
-    run_initialize(&mut store, &instance);
-    let frame = match instance.get_typed_func::<(), ()>(&mut store, "frame") {
-        Ok(f) => f,
-        Err(_) => return (0, 0, 0),
-    };
-    for _ in 0..5 {
-        if frame.call(&mut store, ()).is_err() { break; }
-    }
-    (
-        store.data().win.tick,
-        store.data().win.pixels.first().copied().unwrap_or(0),
-        store.data().win.pixels.len(),
-    )
+    true
 }
 
 // --- Canonical compositor types (interface contract) ----------------------
@@ -1092,6 +1058,11 @@ pub struct Compositor {
     pub dirty: bool,
     /// Contatore di frame del run loop (per il grace/debounce dello sleep).
     pub frame_no: u32,
+    /// SOLO boot-check: rimpiazza il deadline epoch di `frame_all` (i self-test
+    /// gate/viewer eseguono un intero benchmark dentro UN `frame()`, e QEMU TCG
+    /// dilata i tempi 10-30× — col deadline standard sarebbero falsi WATCHDOG).
+    /// `None` = deadline normali (produzione).
+    frame_deadline_override: Option<u64>,
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -1142,6 +1113,7 @@ impl Compositor {
             next_id: 0,
             dirty: true,
             frame_no: 0,
+            frame_deadline_override: None,
         };
 
         // Initial window = the userspace desktop SHELL. Prefer the VFS
@@ -1186,6 +1158,7 @@ impl Compositor {
             next_id: 0,
             dirty: true,
             frame_no: 0,
+            frame_deadline_override: None,
         }
     }
 
@@ -1426,7 +1399,11 @@ impl Compositor {
             }
         };
         // wasip1 std reactors need `_initialize` run before their first frame().
-        run_initialize(&mut store, &inst);
+        if !run_initialize(&mut store, &inst) {
+            self.free_ids.push(id);
+            crate::bwarn!("wm", "spawn '{}': _initialize failed — aborted", name);
+            return None;
+        }
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
         // fully overlap. CSD = no title-bar offset; just clamp on-screen (keeping
         // a small bottom margin).
@@ -1560,12 +1537,30 @@ impl Compositor {
             w.awake = true;
             w.last_active_frame = fno;
             if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
+                // Watchdog: riarma il deadline epoch PRIMA di ogni entry nel
+                // guest (è relativo all'epoch corrente). Primo frame più largo
+                // (parse/font-atlas/init pesanti); a regime un guest che sfora
+                // viene trappato e chiuso — il desktop non si congela mai.
+                let ticks = self.frame_deadline_override.unwrap_or(if w.framed_once {
+                    crate::wasm::wt::FRAME_DEADLINE_TICKS
+                } else {
+                    crate::wasm::wt::FIRST_FRAME_DEADLINE_TICKS
+                });
+                w.store.set_epoch_deadline(ticks);
                 match frame.call(&mut w.store, ()) {
                     Ok(()) => {}
                     Err(e) => {
                         // Anche un proc_exit volontario arriva qui come trap —
-                        // il log distingue "app crashata" da "mai partita".
-                        crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
+                        // il log distingue "app crashata" da "mai partita";
+                        // il marker WATCHDOG distingue il kill da deadline.
+                        if matches!(e.downcast_ref::<wasmtime::Trap>(),
+                                    Some(wasmtime::Trap::Interrupt)) {
+                            crate::bwarn!("wm",
+                                "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed",
+                                w.id, w.title);
+                        } else {
+                            crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
+                        }
                         w.store.data_mut().win.close_requested = true;
                     }
                 }
@@ -1744,7 +1739,7 @@ impl Compositor {
     /// Cursor source = `gfx::mouse_pos()` ONLY (kept current by `fold_mouse`);
     /// it is NOT re-tracked from kind-1 events. Focus is shown by the title-bar
     /// colour (blue focused / grey unfocused), so there is no focus border.
-    pub fn run(mut self) -> ! {
+    pub fn run(mut self) {
         crate::kprintln!("[wm] compositor SP3: window manager ({} windows)", self.wins.len());
         // Telemetria one-shot a compositor-ready: quanti shootdown TLB (e quanti
         // full-flush CR3 remoti) è costato arrivare alla GUI — la metrica del fix
@@ -1759,6 +1754,14 @@ impl Compositor {
         let mut btn_l = false;
         let mut marker_done = false;
         loop {
+            // "Torna alla shell" (wm.exit_to_shell): la finestra di sfondo (la shell
+            // SP-D) ha premuto il pulsante console. Esci dal loop → teardown sotto:
+            // l'intero Compositor viene droppato (libera istanze + memoria guest) e
+            // il framebuffer torna alla console testuale. Re-eseguire `compositor`
+            // dalla shell ricostruisce un compositor pulito.
+            if EXIT_TO_SHELL.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                break;
+            }
             self.frame_no = self.frame_no.wrapping_add(1);
             // Supervisor 6-detect: bump the GUI core's heartbeat each compositor
             // frame so the supervisor never false-mutes it. The GUI core owns the
@@ -2009,6 +2012,15 @@ impl Compositor {
             // which enables interrupts), so `hlt` is guaranteed to be woken by an IRQ.
             x86_64::instructions::hlt();
         }
+
+        // Teardown su "torna alla shell": chiudi ogni finestra (le istanze guest e
+        // la loro memoria lineare sono liberate quando `self` viene droppato al
+        // return) e ridai il framebuffer alla console testuale, che ridisegna il
+        // prossimo prompt. Il chiamante (`gui_worker_loop`) torna ad attendere il
+        // prossimo hand-off di `compositor`.
+        self.wins.clear();
+        crate::gfx::leave();
+        crate::binfo!("wm", "compositor exited to shell");
     }
 }
 
@@ -2026,9 +2038,19 @@ fn should_wake(framed_once: bool, has_events: bool, stay_awake: bool,
         || frame_no.wrapping_sub(last_active) < grace
 }
 
+/// Set by the `wm.exit_to_shell` host fn (the shell's "back to console" button):
+/// the compositor run loop sees it at the next iteration, breaks, tears itself
+/// down and hands the framebuffer back to the text console. Single producer (any
+/// guest via the host fn) + single consumer (the GUI core's run loop).
+static EXIT_TO_SHELL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Entry point (the executor router calls EXACTLY this name; do NOT rename).
-/// Builds the canonical `Compositor` and runs its input-routed loop forever.
-pub fn run_compositor_gate(cwasm: &[u8]) -> ! {
+/// Builds the canonical `Compositor` and runs its input-routed loop. Returns when
+/// the guest asks to exit to the shell (`wm.exit_to_shell`); otherwise loops until
+/// power-off. The caller (gui_worker_loop / exec-worker fallback) handles the
+/// return by waiting for the next `compositor` hand-off.
+pub fn run_compositor_gate(cwasm: &[u8]) {
     crate::gfx::enter();
     Compositor::new(cwasm).run()
 }
@@ -2081,7 +2103,12 @@ pub fn gui_worker_loop() -> ! {
             // Acquire-load all three. The compositor never returns, so the leak is
             // permanent and correct.
             let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-            run_compositor_gate(bytes); // -> !
+            run_compositor_gate(bytes);
+            // The gate returned → the compositor exited to the shell (wm.exit_to_shell).
+            // Clear the mailbox so we wait for the NEXT `compositor` hand-off instead
+            // of immediately re-running the same (stale) bytes; the text console now
+            // owns the framebuffer until then.
+            COMPOSITOR_MAILBOX.ready.store(false, core::sync::atomic::Ordering::Release);
         }
         // Not ready yet: halt until the hand-off IPI (wake_core → VEC_WAKE)
         // wakes us. The sti+hlt sequence is race-free: if the IPI fires between
@@ -2159,25 +2186,6 @@ pub fn lifecycle_self_test() -> (u32, u32, u32) {
     (spawns, peak, final_live)
 }
 
-/// Boot self-test (SP-A): spawn the wasip1 STD probe as a compositor window,
-/// drive one frame, and report the committed surface length. Builds an empty
-/// (headless, no `gfx::enter`) compositor, finds the `"wasip1-probe"` registry
-/// entry, `spawn_app`s it (which instantiates against the unified
-/// `Linker<AppState>` and runs `_initialize` via `run_initialize`), then
-/// `frame_all()` calls the guest's `frame()` once. A non-zero return =
-/// 307200 (320×240×4) proves the std/wasip1 guest instantiated, ran its std
-/// heap alloc inside `frame()`, and `wm.commit`ed against the WASI+wm linker.
-/// 0 = the entry is missing, instantiate failed (a needed WASI import isn't
-/// registered), or `frame()`/commit trapped.
-pub fn wasip1_probe_self_test() -> usize {
-    let mut c = Compositor::new_empty();
-    let idx = APPS.iter().position(|a| a.name == "wasip1-probe").unwrap_or(usize::MAX);
-    if idx == usize::MAX { return 0; }
-    if c.spawn_app(idx).is_none() { return 0; }
-    c.frame_all();
-    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
-}
-
 /// Boot self-test (SP-B): spawn the egui CSD demo as a compositor window and drive
 /// one frame; returns the committed surface length. Builds an empty (headless, no
 /// `gfx::enter`) compositor, finds the `"egui-demo"` registry entry, `spawn_app`s
@@ -2195,41 +2203,34 @@ pub fn egui_demo_self_test() -> usize {
     c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
 }
 
-/// Boot self-test (SP-GATE, Phase-0.5): spawn the Blitz GATE app as a compositor
-/// window and drive ONE frame. The guest's first `frame()` runs the Blitz
-/// style+layout benchmark (Stylo + Taffy on synthetic pages of growing size) and
-/// prints a table — `rows | nodes | avg_resolve_ms | heap_peak_KiB` — to serial via
-/// stdout. The numbers quantify how long a `resolve()` would FREEZE the single-core
-/// synchronous compositor (`frame.call`) and the heap a `StoreLimits` cap must hold.
-/// Returns the committed surface length (non-zero = the Blitz guest instantiated
-/// against the unified WASI+wm `Linker<AppState>` and ran). RNG must already be live
-/// (Stylo seeds HashMaps via WASI `random_get`) — the caller seeds it first.
-/// Resolves the module from the EMBEDDED blob (`/bin` isn't mounted this early).
+/// Boot self-test (epoch watchdog): spawn the deliberately-spinning reactor +
+/// a healthy reactor, drive frame/reap rounds, and prove the runaway guest is
+/// TRAPPED (`Trap::Interrupt` → `WATCHDOG` log → reap) while the healthy
+/// reactor keeps ticking — i.e. "runaway frame()" no longer freezes the loop.
+/// Returns (spinner_reaped, healthy_tick).
 #[cfg(feature = "boot-checks")]
-pub fn gate_self_test() -> usize {
+pub fn watchdog_self_test() -> (bool, u32) {
     let mut c = Compositor::new_empty();
-    let module = match module_for(GATE_CWASM) { Some(m) => m, None => return 0 };
-    if c.spawn_named("viewer-gate", module).is_none() { return 0; }
-    c.frame_all();
-    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
-}
-
-/// Boot self-test (SP-VIEWER, Phase-2): spawn the Blitz viewer app and drive TWO
-/// frames. The guest's first `frame()` parses+styles+lays out its embedded HTML
-/// page, paints it with vello_cpu into an RGBA buffer and uploads it as an egui
-/// texture (printing `viewer: <nodes> nodes · resolve <ms> · paint <ms>` to
-/// serial via stdout); the second frame draws the textured image. Returns the
-/// committed surface length (non-zero = the full parse→style→layout→paint
-/// pipeline ran in-kernel). RNG must already be live (Stylo seeds HashMaps via
-/// WASI `random_get`). Resolves the module from the EMBEDDED blob.
-#[cfg(feature = "boot-checks")]
-pub fn viewer_self_test() -> usize {
-    let mut c = Compositor::new_empty();
-    let module = match module_for(VIEWER_CWASM) { Some(m) => m, None => return 0 };
-    if c.spawn_named("viewer", module).is_none() { return 0; }
-    c.frame_all();
-    c.frame_all(); // 2nd frame: the texture uploaded on frame 1 is drawn here
-    c.wins.last().map(|w| w.store.data().win.pixels.len()).unwrap_or(0)
+    let healthy = match module_for(REACTOR_CWASM) { Some(m) => m, None => return (false, 0) };
+    let spin = match module_for(SPIN_REACTOR_CWASM) { Some(m) => m, None => return (false, 0) };
+    if c.spawn_named("react-A", healthy).is_none() { return (false, 0); }
+    let spin_id = match c.spawn_named("spinner", spin) { Some(id) => id, None => return (false, 0) };
+    // Round 1: both commit (spinner frame 1 is healthy). Round 2: the spinner
+    // enters its infinite loop and must trap after FRAME_DEADLINE_TICKS
+    // (~300 ms wall — the 100 Hz timer keeps bumping the epoch under us).
+    // Extra rounds prove the healthy reactor still advances after the kill.
+    for _ in 0..4 {
+        c.reap();
+        c.frame_all();
+        c.frame_no = c.frame_no.wrapping_add(1);
+    }
+    c.reap();
+    let reaped = c.wins.iter().all(|w| w.id != spin_id);
+    let tick = c.wins.iter()
+        .find(|w| w.title == "react-A")
+        .map(|w| w.store.data().win.tick)
+        .unwrap_or(0);
+    (reaped, tick)
 }
 
 /// Boot self-test (SP-C): prove the `wm.spawn` deferred-spawn MECHANISM grows the

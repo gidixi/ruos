@@ -12,7 +12,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-# `wat` lets us precompile .wat sources directly (hello/gfxtest demos), so the
+# `wat` lets us precompile .wat sources directly (hello demo), so the
 # kernel boot-check .cwasm need not be committed — they regenerate at build.
 wasmtime = { version = "=45.0.0", default-features = false, features = ["runtime", "cranelift", "wat", "component-model"] }
 raw-cpuid = "11.5.0"

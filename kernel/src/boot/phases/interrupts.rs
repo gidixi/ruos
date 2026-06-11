@@ -207,11 +207,6 @@ pub fn init() -> Result<(), BootError> {
         // Component Model bring-up: prove the no_std AOT component path runs.
         let cc = crate::wasm::wt::run_bringup_demo();
         crate::binfo!("wt", "component bringup run={}", cc);
-        // Compositor GATE spike: a PERSISTENT reactor instance whose `frame()`
-        // export is called 5× → tick==5. Also verifies the committed surface
-        // buffer (commit_b0==0x05, pixels==307200) arrives intact in the kernel.
-        let (calls, b0, plen) = crate::wasm::wt::run_reactor_spike_demo();
-        crate::binfo!("wm", "reactor spike calls={} commit_b0=0x{:02X} pixels={}", calls, b0, plen);
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();
@@ -223,11 +218,6 @@ pub fn init() -> Result<(), BootError> {
         // confirm it tears itself down (final_live==0) + the id is recycled.
         let (sp, peak, fin) = crate::wasm::wt::run_lifecycle_demo();
         crate::binfo!("wm", "lifecycle spawns={} peak_live={} final_live={}", sp, peak, fin);
-        // SP-A: spawn the wasip1 STD probe as a window + drive one frame. A
-        // non-zero pixels=307200 proves a std/wasip1 guest instantiates + runs
-        // its std heap alloc + commits against the unified Linker<AppState>.
-        let pn = crate::wasm::wt::run_wasip1_probe_demo();
-        crate::binfo!("wm", "wasip1 probe spawn ok pixels={}", pn);
         // SP-B: spawn the egui CSD demo as a window + drive one frame. A non-zero
         // pixels=614400 (480×320×4) proves the egui guest instantiated against the
         // unified Linker<AppState>, ran one egui ctx.run + tessellate + raster, and
@@ -238,19 +228,16 @@ pub fn init() -> Result<(), BootError> {
         crate::rng::init();
         let en = crate::wasm::wt::run_egui_demo_demo();
         crate::binfo!("wm", "egui demo spawn ok pixels={}", en);
-        // SP-GATE (Phase-0.5): spawn the Blitz HTML/CSS style+layout GATE as a window
-        // + drive one frame. The guest prints its own benchmark table to serial
-        // (rows | nodes | avg_resolve_ms | heap_peak_KiB) bracketed by "== Blitz GATE"
-        // and "GATE done". Quantifies the compositor freeze + heap of a real Stylo
-        // relayout. RNG seeded above (Stylo seeds HashMaps via WASI random_get).
-        let gn = crate::wasm::wt::run_gate_demo();
-        crate::binfo!("wm", "blitz gate spawn ok pixels={}", gn);
+        // (The Blitz GATE + embedded-viewer boot-checks were retired with the
+        // boot-check cleanup — changelog 456. Their 55+77 MB blobs exhausted the
+        // frame allocator under -m 1024; the GATE numbers are archived in
+        // CHANGELOG 425 / ruos-test GATE.md, and the real viewer ships in apps/.)
 
-        // SP-VIEWER (Phase-2): spawn the Blitz viewer app + drive two frames. The
-        // guest renders its embedded HTML page (Stylo+Taffy+vello_cpu) into an
-        // egui texture and prints "viewer: <nodes> nodes · resolve … · paint …".
-        let vn = crate::wasm::wt::run_viewer_demo();
-        crate::binfo!("wm", "blitz viewer spawn ok pixels={}", vn);
+        // Epoch watchdog: the deliberately-spinning reactor must be trapped
+        // (frame() WATCHDOG in the log) + reaped while a healthy reactor keeps
+        // ticking — a runaway guest can no longer freeze the compositor loop.
+        let (wd_reaped, wd_tick) = crate::wasm::wt::run_watchdog_demo();
+        crate::binfo!("wm", "epoch watchdog spinner_reaped={} healthy_tick={}", wd_reaped, wd_tick);
 
         // RNG per-core distinct-streams check: draw a value on the BSP (core 0 →
         // RNG[0]) and one on a ComputeApp AP via the message bus; they must differ.

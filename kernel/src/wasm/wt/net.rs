@@ -17,10 +17,19 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use wasmtime::{Caller, Linker};
 
 use crate::sync::IrqMutex;
+
+/// Rotating ephemeral local-port source for `net.dial`. The old idx-based port
+/// (`49152 + idx`) reused the SAME local port whenever a pool slot was reclaimed,
+/// so a fresh connect to a remote we'd just closed collided with the prior
+/// 4-tuple still lingering in smoltcp (TIME_WAIT / closing) → intermittent RST /
+/// premature close / truncated transfer. A monotonic counter walks all 16384
+/// ephemeral ports before any reuse, far outliving any lingering socket.
+static NEXT_EPHEMERAL: AtomicU32 = AtomicU32::new(0);
 
 // ---- DNS request slots -----------------------------------------------------
 
@@ -35,7 +44,7 @@ enum Slot {
 static RESOLVES: IrqMutex<Vec<Option<Slot>>> = IrqMutex::new(Vec::new());
 
 /// Resolve `name` on the BSP executor and park the first A record in the slot.
-#[embassy_executor::task(pool_size = 4)]
+#[embassy_executor::task(pool_size = 8)]
 async fn dns_task(slot: usize, name: String) {
     let result = crate::net::dns::resolve(&name).await;
     let mut g = RESOLVES.lock();
@@ -124,8 +133,10 @@ pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()>
                 IpAddress::v4(ip0 as u8, ip1 as u8, ip2 as u8, ip3 as u8),
                 port as u16,
             );
-            // Ephemeral local port, deterministic per slot (mirrors ruos.tcp_dial).
-            let local_port: u16 = 49152u16.wrapping_add((idx as u16) & 0x3FFF);
+            // Rotating ephemeral local port: walk 49152..=65535 monotonically so a
+            // reclaimed pool slot never reuses a port still lingering in smoltcp.
+            let n = NEXT_EPHEMERAL.fetch_add(1, Ordering::Relaxed);
+            let local_port: u16 = 49152u16.wrapping_add((n % 16384) as u16);
             match crate::net::sockets::connect_start(handle, remote, local_port) {
                 Ok(()) => idx as i64,
                 Err(_) => {
@@ -146,12 +157,12 @@ pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()>
         })?;
 
     // net.read(sock, ptr, len) -> n>0 bytes | 0 peer closed | -1 would-block |
-    // -2 invalid. Copies at most 4096 bytes per call (socket buffer size).
+    // -2 invalid. Copies at most RX_BUF_SIZE bytes per call (socket RX buffer).
     linker.func_wrap("net", "read",
         |mut caller: Caller<'_, T>, sock: i32, ptr: i32, len: i32| -> i32 {
             if sock < 0 || len <= 0 { return -2; }
             let Some(h) = crate::net::sockets::POOL.handle(sock as usize) else { return -2; };
-            let want = (len as usize).min(4096);
+            let want = (len as usize).min(crate::net::sockets::RX_BUF_SIZE);
             let mut buf = alloc::vec![0u8; want];
             match crate::net::sockets::try_recv(h, &mut buf) {
                 Some(0) => 0,
@@ -179,14 +190,14 @@ pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()>
             }
         })?;
 
-    // net.close(sock): close both halves. The pool slot is not reclaimed (same
-    // policy as the wasmi tcp_dial path — bounded by MAX-ish usage patterns).
+    // net.close(sock): graceful close + release the pool slot. The socket is
+    // reclaimed (removed from the SocketSet, slot reusable) once the FIN
+    // handshake reaches Closed — required for real pages, which open dozens
+    // of connections per load. The handle is invalid after this call.
     linker.func_wrap("net", "close",
         |_caller: Caller<'_, T>, sock: i32| {
             if sock < 0 { return; }
-            if let Some(h) = crate::net::sockets::POOL.handle(sock as usize) {
-                crate::net::sockets::close(h);
-            }
+            crate::net::sockets::POOL.release(sock as usize);
         })?;
 
     Ok(())

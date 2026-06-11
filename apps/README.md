@@ -24,8 +24,9 @@ The `.cwasm` stem must equal the app's `manifest()` id (the spawn key), e.g.
 A `.cwasm` is AOT machine code bound to the **exact engine config** it was
 precompiled with (`memory_reservation` & co.). If the kernel's config changes
 (`kernel/src/wasm/wt/mod.rs::engine_config` + `tools/wt-precompile`, e.g.
-CHANGELOG 422 on 2026-06-10), every `.cwasm` in this folder — and any copy on
-the disk's `/mnt/apps` — is **rejected at load** and vanishes from the
+CHANGELOG 422 on 2026-06-10 — `memory_reservation` — and CHANGELOG 455 on
+2026-06-11 — `epoch_interruption`), every `.cwasm` in this folder — and any
+copy on the disk's `/mnt/apps` — is **rejected at load** and vanishes from the
 launcher. The only symptom is a serial line:
 
 ```

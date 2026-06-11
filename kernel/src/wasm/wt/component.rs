@@ -35,6 +35,9 @@ pub fn run_component(cwasm: &[u8]) -> i32 {
         Err(e) => { kprintln!("ruos: component deserialize err: {:?}", e); return -1; }
     };
     let mut store = Store::new(engine, BringupHost);
+    // Bring-up boot-check, not a compositor window: no watchdog (the default
+    // deadline 0 would trap the first guest instruction otherwise).
+    store.set_epoch_deadline(crate::wasm::wt::NO_DEADLINE_TICKS);
     let mut linker: Linker<BringupHost> = Linker::new(engine);
     if let Err(e) = Bringup::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s) {
         kprintln!("ruos: component link err: {:?}", e); return -2;

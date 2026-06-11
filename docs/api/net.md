@@ -5,7 +5,7 @@ fully synchronous (the compositor calls `frame()` inline; no fiber, no epoch), s
 **no fn here ever blocks** — a blocking fetch would freeze the whole desktop.
 Call from the frame loop and treat every fn as one poll step.
 
-**Last reviewed:** 2026-06-10 (7 functions).
+**Last reviewed:** 2026-06-11 (7 functions).
 
 ```rust
 #[link(wasm_import_module = "net")]
@@ -24,7 +24,7 @@ extern "C" {
 
 ### `resolve_start(name_ptr, name_len) -> i32`
 Begin resolving a hostname (≤253 bytes, UTF-8). Returns a request handle
-(`>= 0`) or `-1` (invalid name / resolver busy — ≤4 in flight). The resolve runs
+(`>= 0`) or `-1` (invalid name / resolver busy — ≤8 in flight). The resolve runs
 on the BSP executor (`net::dns::resolve`, UDP against the DHCP-provided server).
 
 ### `resolve_poll(req, ip_out_ptr) -> i32`
@@ -46,17 +46,18 @@ ephemeral (49152 + slot).
 or finished) · `-1` = invalid handle.
 
 ### `read(sock, ptr, len) -> i32`
-`> 0` bytes copied into guest memory (≤4096 per call) · `0` = peer closed the
-read side · `-1` = no data right now (would-block; try next frame) · `-2` =
-invalid args/handle.
+`> 0` bytes copied into guest memory (≤64 KiB per call — the socket RX buffer
+size) · `0` = peer closed the read side · `-1` = no data right now
+(would-block; try next frame) · `-2` = invalid args/handle.
 
 ### `write(sock, ptr, len) -> i32`
 `> 0` bytes accepted into the TX buffer (may be < len; advance and retry) ·
 `0` = closed for write · `-1` = TX buffer full (would-block) · `-2` = invalid.
 
 ### `close(sock)`
-Close both halves. The pool slot is not currently reclaimed (matches the wasmi
-`ruos.tcp_dial` policy).
+Graceful close + release. The kernel reclaims the socket (and frees the slot
+for reuse) once the FIN handshake completes. The handle is **invalid** after
+this call — do not pass it to `read`/`write`/`state` again.
 
 ## Typical fetch (frame-loop state machine)
 

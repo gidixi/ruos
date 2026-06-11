@@ -114,14 +114,13 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 # under the `boot-checks` feature). Regenerated into the source tree from their
 # .wat/.wasm inputs so the (large) .cwasm need not be committed.
 WT_KDIR    := kernel/src/wasm/wt
-WT_KCWASMS := $(WT_KDIR)/hello.cwasm $(WT_KDIR)/gfxtest.cwasm \
-              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm
+WT_KCWASMS := $(WT_KDIR)/hello.cwasm \
+              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm \
+              $(WT_KDIR)/spin_reactor.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/spin.cwasm: tools/wt-spin/spin.wat $(WT_PRECOMPILE)
-	$(WT_PRECOMPILE) $< $@
-$(WT_KDIR)/gfxtest.cwasm: tools/wt-gfxtest/gfx.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/echo.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
@@ -221,15 +220,15 @@ kernel/src/wasm/wt/reactor_close.cwasm: tools/wt-reactor-close/src/lib.rs tools/
 		cargo build --release --target wasm32-unknown-unknown
 	$(WT_PRECOMPILE) tools/wt-reactor-close/target/wasm32-unknown-unknown/release/wt_reactor_close.wasm kernel/src/wasm/wt/reactor_close.cwasm
 
-# wasip1 STD reactor probe (egui SP-A): proves a std/wasip1 guest runs as a
-# compositor window. Built wasm32-wasip1 (std), precompiled to a CORE .cwasm.
-kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1-probe/Cargo.toml $(WT_PRECOMPILE)
+# Spinning reactor (epoch-watchdog boot-check): commits one frame then busy-loops
+# forever in frame() — the watchdog must trap + reap it. no_std wasm32-unknown-unknown.
+kernel/src/wasm/wt/spin_reactor.cwasm: tools/wt-spin-reactor/src/lib.rs tools/wt-spin-reactor/Cargo.toml $(WT_PRECOMPILE)
 	@mkdir -p build
-	source $$HOME/.cargo/env && cd tools/wt-wasip1-probe && \
-		cargo build --release --target wasm32-wasip1
-	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
+	source $$HOME/.cargo/env && cd tools/wt-spin-reactor && \
+		cargo build --release --target wasm32-unknown-unknown
+	$(WT_PRECOMPILE) tools/wt-spin-reactor/target/wasm32-unknown-unknown/release/wt_spin_reactor.wasm kernel/src/wasm/wt/spin_reactor.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -496,7 +495,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \

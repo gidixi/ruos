@@ -37,6 +37,9 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         // fetch_add returns the *previous* value, so add 1 to get "now".
         let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         crate::console::fb::tick_cursor();
+        // Wasm epoch watchdog: 1 epoch = 1 tick (10 ms). Single-writer come il
+        // wall clock (inv. 8); one Relaxed fetch_add, IRQ-safe (Once::get).
+        crate::wasm::wt::epoch_tick();
         n
     } else {
         // APs: read the shared clock (never increment it -- single-writer inv. 8).

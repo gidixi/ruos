@@ -38,6 +38,10 @@ fn main() {
     // (frames on touch) instead of MallocMemory from the kernel heap.
     config.signals_based_traps(false);
     config.memory_init_cow(false);
+    // Epoch watchdog (kernel compositor): hashed tunable, MUST match the
+    // kernel's engine_config — flipping it invalidates every existing .cwasm
+    // (see docs/api/README.md §".cwasm compatibility").
+    config.epoch_interruption(true);
     config.memory_reservation(256 << 20);
     config.memory_guard_size(0);
     // Runtime-only (not hashed): keep 0 here, the kernel sets its own.

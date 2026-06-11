@@ -10,7 +10,11 @@ use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use x86_64::instructions::interrupts::without_interrupts;
 
-const BUF_SIZE: usize = 4096;
+/// TCP receive buffer = advertised window. 4 KiB starved real-world HTTP
+/// (tiny window → mille poll-round per page); 64 KiB keeps the pipe full.
+pub const RX_BUF_SIZE: usize = 64 * 1024;
+/// TCP transmit buffer. Requests are small; 8 KiB is plenty.
+pub const TX_BUF_SIZE: usize = 8 * 1024;
 
 /// Dispatch by `POOL.is_ethernet(handle)`: route to the matching SocketSet.
 #[inline]
@@ -33,6 +37,10 @@ pub struct SockEntry {
     /// `true` if the socket lives in `net.net_sockets` (Ethernet),
     /// `false` if in `net.sockets` (loopback).
     pub ethernet: bool,
+    /// Set by [`SockPool::release`]: the owner is done with the socket. The
+    /// TCP socket stays in its SocketSet until the FIN handshake reaches
+    /// `Closed`, then `reclaim()` removes it and frees this slot.
+    pub closing: bool,
 }
 
 pub struct SockPool {
@@ -52,8 +60,9 @@ impl SockPool {
 
     fn alloc_tcp_in(&self, ethernet: bool) -> usize {
         without_interrupts(|| {
-            let rx = SocketBuffer::new(alloc::vec![0u8; BUF_SIZE]);
-            let tx = SocketBuffer::new(alloc::vec![0u8; BUF_SIZE]);
+            self.reclaim();
+            let rx = SocketBuffer::new(alloc::vec![0u8; RX_BUF_SIZE]);
+            let tx = SocketBuffer::new(alloc::vec![0u8; TX_BUF_SIZE]);
             let socket = TcpSocket::new(rx, tx);
             let mut g = crate::net::NET.lock();
             let net = g.as_mut().expect("net not initialized");
@@ -64,7 +73,7 @@ impl SockPool {
             };
             drop(g);
             let mut inner = self.inner.lock();
-            let entry = SockEntry { handle, ethernet };
+            let entry = SockEntry { handle, ethernet, closing: false };
             for (i, slot) in inner.iter_mut().enumerate() {
                 if slot.is_none() {
                     *slot = Some(entry);
@@ -85,6 +94,57 @@ impl SockPool {
     pub fn handle(&self, idx: usize) -> Option<SocketHandle> {
         let g = self.inner.lock();
         g.get(idx).and_then(|x| x.as_ref()).map(|e| e.handle)
+    }
+
+    /// Owner is done with the socket: graceful close + mark the slot for
+    /// reclaim. The smoltcp socket stays in its SocketSet until the FIN
+    /// handshake completes; the next `alloc_tcp*` then removes it and frees
+    /// the slot index. After this call the idx must not be used again —
+    /// once reclaimed it can be handed out to a new connection.
+    pub fn release(&self, idx: usize) {
+        let handle = {
+            let mut g = self.inner.lock();
+            match g.get_mut(idx).and_then(|x| x.as_mut()) {
+                Some(e) => { e.closing = true; e.handle }
+                None => return,
+            }
+        };
+        close(handle);
+    }
+
+    /// Reap released sockets that reached `Closed`: remove them from their
+    /// SocketSet (frees the 72 KiB of buffers) and clear the pool slot.
+    /// Never holds the pool lock and NET at the same time.
+    fn reclaim(&self) {
+        use smoltcp::socket::tcp::State;
+        let candidates: Vec<(usize, SocketHandle, bool)> = {
+            let g = self.inner.lock();
+            g.iter().enumerate()
+                .filter_map(|(i, s)| s.as_ref()
+                    .filter(|e| e.closing)
+                    .map(|e| (i, e.handle, e.ethernet)))
+                .collect()
+        };
+        if candidates.is_empty() { return; }
+        let mut dead: Vec<usize> = Vec::new();
+        {
+            let mut g = crate::net::NET.lock();
+            let Some(net) = g.as_mut() else { return };
+            for (i, h, eth) in candidates {
+                let closed = if eth {
+                    net.net_sockets.get::<TcpSocket>(h).state() == State::Closed
+                } else {
+                    net.sockets.get::<TcpSocket>(h).state() == State::Closed
+                };
+                if closed {
+                    if eth { net.net_sockets.remove(h); }
+                    else   { net.sockets.remove(h); }
+                    dead.push(i);
+                }
+            }
+        }
+        let mut g = self.inner.lock();
+        for i in dead { g[i] = None; }
     }
 }
 

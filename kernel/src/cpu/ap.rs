@@ -26,6 +26,13 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // Load this core's GDT/TSS (slot cpu_id) and the shared IDT.
     crate::gdt::init(cpu_id);
     crate::idt::load();
+    // Program IA32_PAT on THIS core. PAT is per-core: the BSP inherits Limine's
+    // layout (index 5 = WC, used by the framebuffer mapping) but an AP boots
+    // with the reset default where index 5 = WT. Compute/GUI cores blit to the
+    // framebuffer, so without this every present from an AP writes VRAM
+    // write-through (uncombined) — fluid in VMs, slideshow on real hardware.
+    // Must precede any framebuffer access on this core.
+    crate::cpu::init_pat();
     // Enable SSE/AVX on THIS core. CR0/CR4 SIMD-enable bits are PER-CPU; the BSP
     // set them in `arch::init` but each AP boots with SIMD disabled (CR0.EM set).
     // Without this, the first SSE instruction in AOT cranelift float code (e.g.

@@ -121,6 +121,42 @@ static RDTSCP_OK: AtomicBool = AtomicBool::new(false);
 /// IA32_TSC_AUX MSR.
 const IA32_TSC_AUX: u32 = 0xC000_0103;
 
+/// IA32_PAT MSR.
+const IA32_PAT: u32 = 0x277;
+
+/// Program IA32_PAT with the Limine x86-64 entry layout: PA0=WB, PA1=WT,
+/// PA2=UC-, PA3=UC, PA4=WP, PA5=WC, PA6=UC-, PA7=UC. Limine guarantees this
+/// layout on the BSP and maps the framebuffer write-combining through PAT
+/// index 5, but the PAT MSR is PER-CORE and the hardware reset default has
+/// index 5 = WT. A core that blits with the reset PAT therefore writes the
+/// framebuffer write-through instead of write-combining — on real hardware
+/// (VRAM behind PCIe) present bandwidth collapses from ~GB/s to ~MB/s, while
+/// VMs back the framebuffer with host RAM so the regression is invisible
+/// there. MUST run on each core before its first framebuffer access. Reloads
+/// CR3 afterwards because the TLB caches the effective memory type per entry.
+pub fn init_pat() {
+    const PAT_LIMINE: u64 = 0x0007_0105_0007_0406;
+    // SAFETY: ring 0; WRMSR to the architectural PAT MSR with a layout whose
+    // entries are all valid memory types. This core has not yet cached lines
+    // from any page mapped through the indices that change (4: WB→WP, 5:
+    // WT→WC — only the framebuffer selects those, and it is touched only
+    // after this runs), so the SDM cache-flush dance for PAT changes is not
+    // needed. Rewriting CR3 with its current value is always valid and fully
+    // flushes this core's TLB (no GLOBAL mappings, no PCID — see memory/tlb.rs).
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_PAT,
+            in("eax") PAT_LIMINE as u32,
+            in("edx") (PAT_LIMINE >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+        use x86_64::registers::control::Cr3;
+        let (frame, flags) = Cr3::read();
+        Cr3::write(frame, flags);
+    }
+}
+
 /// Detect RDTSCP once (call on the BSP, after lapic init). Records the result;
 /// does NOT yet enable the fast path on its own — `set_tsc_aux` must run on a
 /// core before that core trusts RDTSCP.

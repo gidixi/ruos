@@ -9,6 +9,10 @@ pub fn init() -> Result<(), BootError> {
     // Enable SSE/AVX AFTER the IDT so any #GP here is reported, not a triple fault.
     enable_simd();
     crate::binfo!("arch", "SIMD enabled");
+    // PAT: Limine already programs the BSP, but set it here too so every core's
+    // PAT layout comes from the same kernel-owned place (APs do it in ap_entry).
+    crate::cpu::init_pat();
+    crate::binfo!("arch", "PAT programmed (PA5=WC)");
 
     // Smoke: software breakpoint — INT3 is handled by the IDT, not maskable
     // by IF, so we can test it before STI. Gated by feature to keep default

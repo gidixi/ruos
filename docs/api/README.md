@@ -22,6 +22,29 @@ the raw host ABI it wraps; reach for them only for advanced needs.
 > - **Wasmtime** and **wasmi** are execution engines (the "how"). Wasmtime compiles apps Ahead-of-Time for maximum GUI performance, while wasmi interprets CLI tools.
 > - **WASI Preview 1** and **WIT** are API standards (the "what"). They define the signatures of functions (like `fd_read` or `clock_time_get`) that an app expects the OS to provide. In short, Wasmtime *runs* your app, but WASI is the *vocabulary* your app uses to talk to RuOS.
 
+## `.cwasm` compatibility (IMPORTANT for prebuilt apps)
+
+A `.cwasm` is **machine code tied to the exact Wasmtime engine config** (the
+"tunables": `memory_reservation`, guard size, …) it was precompiled with. The
+kernel checks them at load and **rejects a mismatching file** (serial log:
+`WARN wm ... deserialize failed: Module was compiled with a memory reservation
+of 'X' but 'Y' is expected`). The rejected app silently disappears from the
+launcher — the WARN line is the only symptom.
+
+System apps are rebuilt by `make iso` every time, so they never drift. **Your
+prebuilt apps do**: the ones in the OS repo's `apps/` drop folder and any copy
+on the disk's `/mnt/apps`. Whenever the kernel's Wasmtime tunables change
+(`kernel/src/wasm/wt/mod.rs::engine_config` + `tools/wt-precompile` — e.g.
+CHANGELOG 422), **re-run the AOT step for every external `.cwasm`**:
+
+- SDK route (always safe): `.\build.ps1 -App <app> -Id <id>` then `.\deploy.ps1`
+  — build.ps1 recompiles `wt-precompile` from the ruos checkout on every run,
+  so it uses the same tunables as that kernel by construction.
+- AOT-only route (faster, no app rebuild): rebuild `tools/wt-precompile`, then
+  `wt-precompile <app>.wasm <app>.cwasm`. Your `.wasm` sources stay valid —
+  only the precompile output is config-bound.
+- Replace stale copies on `/mnt/apps` too: a new ISO does not touch the disk.
+
 ## Conventions
 
 - **Signatures** are shown as the guest-side Rust `extern "C"` declaration. Pointers

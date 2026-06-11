@@ -106,7 +106,13 @@ fn module_for(cwasm: &'static [u8]) -> Option<Module> {
         return Some(m.clone());
     }
     // SAFETY: produced by wt-precompile for this exact engine Config.
-    let m = unsafe { Module::deserialize(engine(), cwasm) }.ok()?;
+    let m = match unsafe { Module::deserialize(engine(), cwasm) } {
+        Ok(m) => m,
+        Err(e) => {
+            crate::bwarn!("wm", "module_for: deserialize failed ({} bytes): {:?}", cwasm.len(), e);
+            return None;
+        }
+    };
     cache.insert(key, m.clone());
     Some(m)
 }
@@ -149,7 +155,13 @@ fn module_by_name(name: &str) -> Option<Module> {
     if let Some(m) = NAME_CACHE.lock().get(name) { return Some(m.clone()); }
     let bytes = read_app_bytes(name)?;
     // SAFETY: wt-precompile output for this exact engine Config.
-    let m = unsafe { Module::deserialize(engine(), &bytes) }.ok()?;
+    let m = match unsafe { Module::deserialize(engine(), &bytes) } {
+        Ok(m) => m,
+        Err(e) => {
+            crate::bwarn!("wm", "module_by_name '{}': deserialize failed ({} bytes): {:?}", name, bytes.len(), e);
+            return None;
+        }
+    };
     NAME_CACHE.lock().insert(String::from(name), m.clone());
     Some(m)
 }
@@ -215,7 +227,13 @@ static LAST_SCAN: crate::sync::IrqMutex<f64> = crate::sync::IrqMutex::new(-1.0e9
 fn module_at_path(path: &str) -> Option<Module> {
     let bytes = crate::vfs::block_on(crate::wasm::read_all(path)).ok()?;
     // SAFETY: wt-precompile output for this exact engine Config.
-    unsafe { Module::deserialize(engine(), &bytes) }.ok()
+    match unsafe { Module::deserialize(engine(), &bytes) } {
+        Ok(m) => Some(m),
+        Err(e) => {
+            crate::bwarn!("wm", "probe '{}': deserialize failed ({} bytes): {:?}", path, bytes.len(), e);
+            None
+        }
+    }
 }
 
 /// Instantiate `module` on a THROWAWAY store and call its `manifest()` export to
@@ -948,7 +966,9 @@ static WINDOW_SNAPSHOT: crate::sync::IrqMutex<Vec<(u32, u32, String)>> =
 /// the `Ok` arm is simply skipped — safe + necessary only for wasip1 reactors.
 fn run_initialize(store: &mut Store<AppState>, inst: &Instance) {
     if let Ok(init) = inst.get_typed_func::<(), ()>(&mut *store, "_initialize") {
-        let _ = init.call(&mut *store, ());
+        if let Err(e) = init.call(&mut *store, ()) {
+            crate::bwarn!("wm", "_initialize trapped: {:?}", e);
+        }
     }
 }
 
@@ -1542,7 +1562,12 @@ impl Compositor {
             if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
                 match frame.call(&mut w.store, ()) {
                     Ok(()) => {}
-                    Err(_) => { w.store.data_mut().win.close_requested = true; }
+                    Err(e) => {
+                        // Anche un proc_exit volontario arriva qui come trap —
+                        // il log distingue "app crashata" da "mai partita".
+                        crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
+                        w.store.data_mut().win.close_requested = true;
+                    }
                 }
             }
             // Considera la finestra "avviata" solo quando ha prodotto una surface:

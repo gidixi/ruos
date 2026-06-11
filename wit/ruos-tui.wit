@@ -1,0 +1,77 @@
+package ruos:tui;
+
+/// Declarative TUI canvas exported by the shared `tui.cwasm` provider
+/// (ratatui + ANSI diff renderer, AOT-compiled). Resource-free on purpose:
+/// the kernel links app imports to provider exports with plain func shims,
+/// so no cross-component resource-handle proxying is needed. One terminal
+/// per app instance (the provider keeps singleton state).
+interface canvas {
+    record rect { x: u16, y: u16, w: u16, h: u16 }
+    record color { r: u8, g: u8, b: u8 }
+
+    /// (Re)initialize the terminal back buffer to width × height cells.
+    init: func(width: u16, height: u16);
+
+    /// Clear the back buffer (next flush repaints everything).
+    clear: func();
+
+    /// One line of text at area origin, clipped to the area, colored fg.
+    draw-text: func(text: string, area: rect, fg: color);
+
+    /// ASCII progress bar `[###---] NN%` filling the area width.
+    draw-bar: func(pct: u8, area: rect, fg: color);
+
+    /// Table with a reversed-video header row; column widths in cells.
+    draw-table: func(headers: list<string>, rows: list<list<string>>, widths: list<u16>, area: rect);
+
+    /// Diff the back buffer against what was last flushed and return the
+    /// ANSI escape string for the changes. The app writes it to the tty
+    /// via host.write-tty. Returns the full repaint on first call/after clear.
+    flush: func() -> string;
+}
+
+/// Kernel-side services for component TUI apps (implemented in
+/// kernel/src/wasm/wt/component.rs). Blob layouts match the wasmi "ruos"
+/// host fns (kernel/src/wasm/host/sysinfo.rs) so parsers are shared.
+interface host {
+    /// cpustat blob: ncores u32, tsc-per-ms u64, then per core busy/idle u64.
+    cpustat: func() -> list<u8>;
+    /// proc table blob: count u32, then per-proc records (see sysinfo.rs).
+    proc-stat: func() -> list<u8>;
+    /// meminfo blob: heap-total/heap-used/frames-total/frames-used u64.
+    meminfo: func() -> list<u8>;
+    /// Uptime in centiseconds.
+    uptime: func() -> u64;
+
+    /// Wait up to timeout-ticks (100 Hz) for one stdin byte.
+    /// Returns: -1 = EOF/no-tty, 0 = timeout (redraw), 1..=256 = byte+1.
+    poll-key: func(timeout-ticks: s64) -> s32;
+
+    /// Enter/leave raw mode (clear/restore ICANON|ECHO|ISIG on the app's pty).
+    set-raw: func(raw: bool);
+
+    /// Write bytes to the app's tty (flush output, alt-screen escapes, --once text).
+    write-tty: func(s: string);
+}
+
+/// Implemented by tools/wt-tui → tui.cwasm.
+world tui-provider {
+    export canvas;
+}
+
+/// Implemented by component TUI apps (rtop). The kernel satisfies `host`
+/// itself and `canvas` by forwarding to the tui-provider instance.
+world tui-app {
+    import canvas;
+    import host;
+
+    /// Entry point. once=true → single text snapshot to the tty, no loop.
+    /// Returns the process exit code.
+    export run: func(once: bool) -> s32;
+}
+
+/// Kernel-bindgen helper world: lets component.rs generate typed Host
+/// bindings for `host` alone (canvas is linked manually with func shims).
+world tui-host {
+    import host;
+}

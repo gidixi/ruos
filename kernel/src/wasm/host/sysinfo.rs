@@ -52,14 +52,11 @@ pub fn ruos_uptime(_: Caller<'_, RuntimeState>) -> Result<i64, Error> {
     Ok(crate::timer::ticks() as i64)
 }
 
-/// ruos_meminfo(buf_ptr) -> errno
-/// Writes 4 u64 little-endian:
+/// meminfo blob: 4 u64 little-endian —
 ///   heap_total_bytes, heap_used_bytes (0 if unavailable),
-///   frames_total, frames_used
-pub fn ruos_meminfo(
-    mut caller: Caller<'_, RuntimeState>,
-    buf_ptr: i32,
-) -> Result<i32, Error> {
+///   frames_total, frames_used.
+/// Shared by the wasmi "ruos" host fn and the wt component `ruos:tui/host`.
+pub fn meminfo_blob() -> [u8; 32] {
     let heap_total = crate::memory::HEAP_SIZE as u64;
     // talc 4.x does not expose a stable "bytes in use" API in our cfg, so
     // we leave heap_used as 0 — userspace `free` prints "?" for that
@@ -71,6 +68,15 @@ pub fn ruos_meminfo(
     out[8..16].copy_from_slice(&heap_used.to_le_bytes());
     out[16..24].copy_from_slice(&frames.total.to_le_bytes());
     out[24..32].copy_from_slice(&frames.used.to_le_bytes());
+    out
+}
+
+/// ruos_meminfo(buf_ptr) -> errno
+pub fn ruos_meminfo(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+) -> Result<i32, Error> {
+    let out = meminfo_blob();
     if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &out) {
         return Ok(e);
     }
@@ -178,6 +184,27 @@ pub fn ruos_proc_kill(_: Caller<'_, RuntimeState>, pid: i32) -> Result<i32, Erro
     if crate::proc::request_kill(pid as u32) { Ok(0) } else { Ok(3) }
 }
 
+/// proc_stat blob (shared wasmi/wt):
+///   u32 count
+///   for each: u32 pid, u64 start_tick, u64 cpu_tsc, u64 mem_bytes,
+///             u16 name_len, u16 pad, name_bytes
+pub fn proc_stat_blob() -> alloc::vec::Vec<u8> {
+    let procs = crate::proc::list();
+    let mut blob = alloc::vec::Vec::new();
+    blob.extend_from_slice(&(procs.len() as u32).to_le_bytes());
+    for p in &procs {
+        blob.extend_from_slice(&p.pid.to_le_bytes());
+        blob.extend_from_slice(&p.start_tick.to_le_bytes());
+        blob.extend_from_slice(&p.cpu_tsc.to_le_bytes());
+        blob.extend_from_slice(&p.mem_bytes.to_le_bytes());
+        let name = p.name.as_bytes();
+        blob.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        blob.extend_from_slice(&[0u8, 0u8]); // pad
+        blob.extend_from_slice(name);
+    }
+    blob
+}
+
 /// ruos_proc_stat(buf_ptr, buf_len, used_ptr) -> errno
 ///
 /// Like proc_list but each row carries cpu_tsc + mem_bytes:
@@ -192,19 +219,7 @@ pub fn ruos_proc_stat(
     buf_len: i32,
     used_ptr: i32,
 ) -> Result<i32, Error> {
-    let procs = crate::proc::list();
-    let mut blob = alloc::vec::Vec::new();
-    blob.extend_from_slice(&(procs.len() as u32).to_le_bytes());
-    for p in &procs {
-        blob.extend_from_slice(&p.pid.to_le_bytes());
-        blob.extend_from_slice(&p.start_tick.to_le_bytes());
-        blob.extend_from_slice(&p.cpu_tsc.to_le_bytes());
-        blob.extend_from_slice(&p.mem_bytes.to_le_bytes());
-        let name = p.name.as_bytes();
-        blob.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        blob.extend_from_slice(&[0u8, 0u8]); // pad
-        blob.extend_from_slice(name);
-    }
+    let blob = proc_stat_blob();
     let n = blob.len().min(buf_len.max(0) as usize);
     if let Err(e) = crate::wasm::host::mem::guest_write(&mut caller, buf_ptr, &blob[..n]) {
         return Ok(e);
@@ -222,11 +237,9 @@ pub fn ruos_proc_stat(
 ///   u64 tsc_per_ms
 ///   for each core: u64 busy_tsc, u64 idle_tsc
 /// ncores = 1 (BSP) + online APs. Returns 0, or 8 (ERANGE) if buf too small.
-pub fn ruos_cpustat(
-    mut caller: Caller<'_, RuntimeState>,
-    buf_ptr: i32,
-    buf_len: i32,
-) -> Result<i32, Error> {
+/// cpustat blob (shared wasmi/wt): u32 ncores, u64 tsc_per_ms, then per
+/// core u64 busy_tsc, u64 idle_tsc. ncores = 1 (BSP) + online APs.
+pub fn cpustat_blob() -> alloc::vec::Vec<u8> {
     let ncores = 1 + crate::cpu::cpus_online() as usize;
     let mut blob = alloc::vec::Vec::new();
     blob.extend_from_slice(&(ncores as u32).to_le_bytes());
@@ -236,6 +249,15 @@ pub fn ruos_cpustat(
         blob.extend_from_slice(&busy.to_le_bytes());
         blob.extend_from_slice(&idle.to_le_bytes());
     }
+    blob
+}
+
+pub fn ruos_cpustat(
+    mut caller: Caller<'_, RuntimeState>,
+    buf_ptr: i32,
+    buf_len: i32,
+) -> Result<i32, Error> {
+    let blob = cpustat_blob();
     if (buf_len.max(0) as usize) < blob.len() {
         return Ok(8); // ERANGE
     }

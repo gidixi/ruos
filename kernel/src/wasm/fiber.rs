@@ -52,6 +52,10 @@ pub async fn exec_cwasm_parallel(
     let pid = crate::proc::register(
         alloc::string::String::from(path.trim_start_matches('/')),
     );
+    // Foreground tracking (the wasmi exec_worker already does this): lets
+    // cooked-VINTR and `kill <pid>` reach the child — component TUI apps
+    // poll `is_kill_pending(foreground)` inside `host.poll-key`.
+    crate::pty::set_foreground(term_pts, Some(pid));
 
     let code = match crate::executor::pick_compute_core() {
         Some(core) => {
@@ -84,6 +88,7 @@ pub async fn exec_cwasm_parallel(
         }
     };
 
+    crate::pty::set_foreground(term_pts, None);
     crate::proc::unregister(pid);
     code
 }

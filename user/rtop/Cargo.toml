@@ -3,9 +3,8 @@ name = "rtop"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "rtop"
-path = "src/main.rs"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ratatui = { version = "0.29", default-features = false }
+wit-bindgen = "0.24"

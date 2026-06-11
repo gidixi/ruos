@@ -27,7 +27,6 @@ BIN_TOOLS  := shell ls cat echo \
               sort uniq cut tr tee \
               ifconfig nc date wget ping resolve \
               service \
-              rtop \
               mkdisk mkboot install umount disks wifiscan wificonnect \
               gzip gunzip zcat
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
@@ -225,7 +224,31 @@ kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1
 		cargo build --release --target wasm32-wasip1
 	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm
+# Shared TUI provider component: ratatui renderer exporting ruos:tui/canvas.
+# wasm32-unknown-unknown core module -> componentized (no WASI imports, so no
+# adapter) -> AOT component. Reused at runtime by every component TUI app.
+build/tui.cwasm: tools/wt-tui/Cargo.toml tools/wt-tui/src/lib.rs wit/ruos-tui.wit $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/wt-tui && \
+		cargo build --release --target wasm32-unknown-unknown
+	source $$HOME/.cargo/env && wasm-tools component new \
+		tools/wt-tui/target/wasm32-unknown-unknown/release/wt_tui.wasm \
+		-o build/wt-tui.component.wasm
+	$(WT_PRECOMPILE) --component build/wt-tui.component.wasm build/tui.cwasm
+
+# rtop as a ruos:tui/tui-app component: cdylib, wasm32-unknown-unknown (NO
+# wasip1 — all I/O goes through the ruos:tui/host WIT imports), componentized
+# and AOT-compiled. The kernel links its canvas imports to tui.cwasm at runtime.
+build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml wit/ruos-tui.wit $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd user && \
+		cargo build --release --target wasm32-unknown-unknown -p rtop
+	source $$HOME/.cargo/env && wasm-tools component new \
+		user/target/wasm32-unknown-unknown/release/rtop.wasm \
+		-o build/rtop.component.wasm
+	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
+
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -244,6 +267,8 @@ iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm b
 	cp kernel/src/wasm/wt/reactor.cwasm build/binstage/compositor.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm build/binstage/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm build/binstage/shell.cwasm
+	cp build/tui.cwasm build/binstage/tui.cwasm
+	cp build/rtop.cwasm build/binstage/rtop.cwasm
 	# App drop-folder esterne (apps/*.cwasm): nel pack se presenti. No-op se vuoto.
 	-cp apps/*.cwasm build/binstage/ 2>/dev/null || true
 	$(MKBINPACK) $(ISO_ROOT)/bin.bgz build/binstage/*
@@ -492,7 +517,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/tui.cwasm build/rtop.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \
@@ -518,6 +543,8 @@ test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm k
 	cp kernel/src/wasm/wt/reactor.cwasm $(ISO_ROOT)/bin/compositor.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm $(ISO_ROOT)/bin/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm $(ISO_ROOT)/bin/shell.cwasm
+	cp build/tui.cwasm $(ISO_ROOT)/bin/tui.cwasm
+	cp build/rtop.cwasm $(ISO_ROOT)/bin/rtop.cwasm
 	# Prebuilt drop-folder apps (apps/*.cwasm, built by any external SDK): bundle
 	# into /bin so the compositor's manifest() scan discovers them. App-agnostic
 	# hook — new apps need NO change here. No-op when the dir is empty.

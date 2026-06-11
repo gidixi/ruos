@@ -214,6 +214,17 @@ pub fn engine() -> &'static wasmtime::Engine {
 pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
     use wasmtime::{Module, Store, Linker};
     let engine = engine();
+    // Component artifacts (e.g. rtop.cwasm, `ruos:tui/tui-app` world) take the
+    // component runner: dynamic-link against the shared /bin/tui.cwasm
+    // provider. Core-module artifacts continue below on the WASI path.
+    if matches!(wasmtime::Engine::detect_precompiled(cwasm), Some(wasmtime::Precompiled::Component)) {
+        let tui = match crate::vfs::block_on(crate::wasm::read_all("/bin/tui.cwasm")) {
+            Ok(b) => b,
+            Err(_) => { kprintln!("ruos: /bin/tui.cwasm missing (tui provider)"); return 127; }
+        };
+        let once = args.iter().any(|a| a.as_slice() == b"--once");
+        return component::run_tui_component(cwasm, &tui, once, pts);
+    }
     // SAFETY: cwasm produced by tools/wt-precompile for this exact config.
     let module = match unsafe { Module::deserialize(engine, cwasm) } {
         Ok(m) => m,

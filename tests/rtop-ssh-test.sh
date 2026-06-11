@@ -31,24 +31,35 @@ for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$PORT " && sleep 1 || b
 cp "$KEY" /tmp/ruos_id && chmod 600 /tmp/ruos_id
 rm -f "$SERIAL" "$CLIENT"
 
-timeout 70 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+# -smp 4: rtop is a wasmtime component now — its interactive poll-key
+# spin-waits on a ComputeApp core, so the run needs APs (single-core boots
+# degrade rtop to one frame + exit, by design).
+# -serial file: (not stdio): backgrounded qemu has no usable stdin, and a
+# file-redirected stdout is fully buffered — the log vanished on kill -9.
+# The file chardev writes through, so the serial log survives the teardown.
+timeout 70 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -boot d -cdrom "$ISO" \
+  -serial file:"$SERIAL" -display none -no-reboot -m 1024 -device qemu-xhci \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22 \
   -device virtio-net-pci,netdev=net0 \
   -drive file="$DISK",format=raw,if=none,id=disk0 \
   -device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
-  > "$SERIAL" 2>&1 &
+  > build/rtop-qemu.log 2>&1 &
 QEMUPID=$!
 sleep 15
 
-echo "--- ssh -tt: run rtop, idle 3.5s (expect auto-refresh), then 'q' ---"
+echo "--- ssh -tt: run rtop, idle ~6s (expect auto-refresh), then 'q' ---"
 # No newline after 'q': rtop reads it as a raw keystroke and exits immediately.
-( printf 'rtop\n'; sleep 4; printf 'q'; sleep 2; printf 'exit\n'; sleep 1 ) | \
+# 6 s idle: rtop spends ~1 s on the warm-up double-snapshot before the first
+# frame, then refreshes at ~1 Hz → >=3 frames land well inside the window.
+( printf 'rtop\n'; sleep 6; printf 'q'; sleep 2; printf 'exit\n'; sleep 1 ) | \
   timeout 30 ssh -tt -p "$PORT" -i /tmp/ruos_id \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=5 root@127.0.0.1 > "$CLIENT" 2>/dev/null || true
 
+# $QEMUPID is the `timeout` wrapper — killing it ORPHANS qemu, which then
+# holds port $PORT and breaks the next run. Kill the actual qemu too.
 kill -9 "$QEMUPID" 2>/dev/null || true
+pkill -9 -f "qemu-system-x86_64.*hostfwd=tcp:127.0.0.1:$PORT" 2>/dev/null || true
 
 echo "client bytes: $(wc -c < "$CLIENT")"
 
@@ -56,13 +67,12 @@ fail() { echo "TEST_FAIL_RTOP_$1"; exit 1; }
 
 grep -qF $'\x1b[?1049h' "$CLIENT" || fail ALTSCREEN_ENTER
 grep -qF $'\x1b[?1049l' "$CLIENT" || fail ALTSCREEN_LEAVE
-# Count frame redraws. ratatui writes each cell with its own cursor-move, so
-# the on-screen text is never contiguous in the byte stream — we instead count
-# the hide-cursor (\x1b[?25l) that ratatui emits at the END of every draw().
-# One belongs to the alt-screen enter; idle 3.5 s at ~1 Hz adds >=3 more.
-frames=$(grep -oF $'\x1b[?25l' "$CLIENT" | wc -l)
-echo "draw frames (hide-cursor count): $frames"
+# Count frame redraws. The diff renderer repaints only changed cells, so we
+# count the cursor-park sequence (\x1b[24;80H) rtop appends to EVERY frame
+# flush. Idle 3.5 s at ~1 Hz must produce >=3 frames.
+frames=$(grep -oF $'\x1b[24;80H' "$CLIENT" | wc -l)
+echo "draw frames (cursor-park count): $frames"
 [ "$frames" -ge 3 ] || fail NO_AUTOREFRESH
-grep -qF 'ruos:/$' "$CLIENT" || fail NO_PROMPT_AFTER
+grep -qiF 'ruos:/$' "$CLIENT" || fail NO_PROMPT_AFTER
 
 echo TEST_PASS_RTOP

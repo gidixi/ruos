@@ -1,7 +1,8 @@
-//! ruos host-fn bindings + little-endian blob parsers for rtop.
+//! Little-endian blob parsers for rtop (cpustat / proc_stat / meminfo).
 //!
-//! The host fns (`cpustat`, `proc_stat`, `meminfo`, `uptime`) are imported
-//! from module "ruos". The parsers are pure and unit-tested on the host.
+//! Blob layouts are produced kernel-side (kernel/src/wasm/host/sysinfo.rs)
+//! and arrive via the `ruos:tui/host` WIT imports. Parsers are pure and
+//! unit-tested on the host.
 
 extern crate alloc;
 
@@ -87,59 +88,14 @@ pub fn parse_meminfo(b: &[u8]) -> MemInfo {
     }
 }
 
-#[link(wasm_import_module = "ruos")]
-extern "C" {
-    fn cpustat(buf_ptr: u32, buf_len: u32) -> i32;
-    fn proc_stat(buf_ptr: u32, buf_len: u32, used_ptr: u32) -> i32;
-    fn meminfo(buf_ptr: u32) -> i32;
-    fn uptime() -> i64;
-    fn poll_stdin(buf_ptr: u32, timeout_ticks: i64) -> i32;
-}
-
-/// Wait up to `timeout_ticks` (100 Hz) for one stdin byte. Returns `(code,
-/// byte)`: code 1 = `byte` is a keystroke, 0 = timeout (redraw), -1 = EOF.
-#[cfg(target_arch = "wasm32")]
-pub fn poll_key(timeout_ticks: i64) -> (i32, u8) {
-    let mut b = [0u8; 1];
-    let r = unsafe { poll_stdin(b.as_mut_ptr() as u32, timeout_ticks) };
-    (r, b[0])
-}
-
-/// Max cores we size the cpustat buffer for (matches kernel MAX_CPUS).
-pub const MAX_CORES: usize = 16;
-
-/// One full system snapshot read from the kernel.
+/// One full system snapshot (blobs come from the `ruos:tui/host` WIT
+/// imports — see lib.rs `read_snapshot`; layouts unchanged from the old
+/// "ruos" module host fns, so the parsers above are identical).
 pub struct Snapshot {
     pub cpu: CpuStat,
     pub procs: alloc::vec::Vec<Proc>,
     pub mem: MemInfo,
     pub uptime_cs: u64,
-}
-
-/// Read a snapshot via the ruos host fns. Returns None if cpustat fails.
-#[cfg(target_arch = "wasm32")]
-pub fn read_snapshot() -> Option<Snapshot> {
-    use alloc::vec;
-    // cpustat
-    let mut cbuf = vec![0u8; 4 + 8 + 16 * MAX_CORES];
-    let rc = unsafe { cpustat(cbuf.as_mut_ptr() as u32, cbuf.len() as u32) };
-    if rc != 0 { return None; }
-    let cpu = parse_cpustat(&cbuf)?;
-    // proc_stat (grow-and-retry once)
-    let mut pbuf = vec![0u8; 8192];
-    let mut used: u32 = 0;
-    let _ = unsafe { proc_stat(pbuf.as_mut_ptr() as u32, pbuf.len() as u32, &mut used as *mut u32 as u32) };
-    if used as usize > pbuf.len() {
-        pbuf = vec![0u8; used as usize];
-        let _ = unsafe { proc_stat(pbuf.as_mut_ptr() as u32, pbuf.len() as u32, &mut used as *mut u32 as u32) };
-    }
-    let procs = parse_proc_stat(&pbuf, (used as usize).min(pbuf.len()));
-    // meminfo
-    let mut mbuf = [0u8; 32];
-    let _ = unsafe { meminfo(mbuf.as_mut_ptr() as u32) };
-    let mem = parse_meminfo(&mbuf);
-    let uptime_cs = unsafe { uptime() } as u64;
-    Some(Snapshot { cpu, procs, mem, uptime_cs })
 }
 
 #[cfg(test)]

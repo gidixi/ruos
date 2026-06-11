@@ -6,7 +6,51 @@ pub fn run() {
     check_yaml();
     check_json();
     check_schedule();
+    check_unitfile();
     crate::binfo!("svc-check", "init-units checks OK");
+}
+
+fn check_unitfile() {
+    use super::unitfile::{build, Parsed};
+    use super::{UnitKind, RestartPolicy, ActivateTarget};
+    let doc = super::yaml::parse(
+        "name: sshd\ntype: daemon\nexec: /mnt/bin/sshd.wasm\nrestart: on-failure\ntarget: boot\nenabled: true\nafter: [net]\nrequires: [net]\n"
+    ).unwrap();
+    match build(&doc, Some("sshd.yaml")).expect("build unit") {
+        Parsed::U(u) => {
+            assert_eq!(u.name, "sshd");
+            assert_eq!(u.kind, UnitKind::Daemon);
+            assert_eq!(u.restart, RestartPolicy::OnFailure);
+            assert_eq!(u.target, ActivateTarget::Boot);
+            assert!(u.enabled);
+            assert_eq!(u.after, alloc::vec!["net".to_string()]);
+            assert_eq!(u.file.as_deref(), Some("sshd.yaml"));
+        }
+        _ => panic!("expected unit"),
+    }
+    let tdoc = super::yaml::parse(
+        "name: backup\nkind: timer\nunit: backup-job\nschedule: daily 03:00\nenabled: true\n"
+    ).unwrap();
+    match build(&tdoc, None).expect("build timer") {
+        Parsed::T(t) => {
+            assert_eq!(t.unit, "backup-job");
+            assert_eq!(t.schedule, super::schedule::Schedule::Daily { hour: 3, minute: 0 });
+        }
+        _ => panic!("expected timer"),
+    }
+    // difetti: manca name → Err; manca exec → Err; defaults
+    assert!(build(&super::yaml::parse("type: daemon\n").unwrap(), None).is_err());
+    assert!(build(&super::yaml::parse("name: x\n").unwrap(), None).is_err());
+    match build(&super::yaml::parse("name: x\nexec: /bin/x.wasm\n").unwrap(), None).unwrap() {
+        Parsed::U(u) => {
+            assert_eq!(u.kind, UnitKind::Oneshot);          // default
+            assert_eq!(u.restart, RestartPolicy::No);        // default
+            assert_eq!(u.target, ActivateTarget::Manual);    // default
+            assert!(!u.enabled);                             // default
+        }
+        _ => panic!("expected unit"),
+    }
+    crate::binfo!("svc-check", "unitfile OK");
 }
 
 fn check_schedule() {

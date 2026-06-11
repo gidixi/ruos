@@ -835,20 +835,21 @@ git commit -m "feat(init): builder UnitDoc->Unit|Timer + boot-checks verdi in QE
 ```rust
 fn check_compute_next() {
     use super::schedule::{compute_next, Schedule};
-    // 2026-06-09 14:30:00 UTC = 1780929000 (martedì, dow=2)
+    // 2026-06-08 14:30:00 UTC = 1780929000 (lunedì, dow=1) — verificato con
+    // `[DateTimeOffset]::FromUnixTimeSeconds` / `date -u -d @N`.
     let now: u64 = 1_780_929_000;
     assert_eq!(compute_next(&Schedule::Daily { hour: 3, minute: 0 }, now, 0),
-               1_780_974_000);              // 2026-06-10 03:00:00
+               1_780_974_000);              // 2026-06-09 03:00:00 (domani)
     assert_eq!(compute_next(&Schedule::Hourly { minute: 0 }, now, 0),
                1_780_930_800);              // 15:00:00
     assert_eq!(compute_next(&Schedule::Hourly { minute: 45 }, now, 0),
                1_780_929_900);              // 14:45:00 (stessa ora, futuro)
-    // weekly Mon 09:30 → lunedì 2026-06-15 09:30:00 = 1_781_429_400
-    assert_eq!(compute_next(&Schedule::Weekly { dow: 1, hour: 9, minute: 30 }, now, 0),
-               1_781_429_400);
-    // weekly Tue (oggi) ma orario passato → +7 giorni: 2026-06-16 14:00 = 1_781_532_000
+    // weekly Tue 14:00 → domani: 2026-06-09 14:00:00
     assert_eq!(compute_next(&Schedule::Weekly { dow: 2, hour: 14, minute: 0 }, now, 0),
-               1_781_532_000);
+               1_781_013_600);
+    // weekly Mon 09:30 → oggi è lunedì ma orario passato → +7g: 2026-06-15 09:30:00
+    assert_eq!(compute_next(&Schedule::Weekly { dow: 1, hour: 9, minute: 30 }, now, 0),
+               1_781_515_800);
     // rollover anno: 2026-12-31 23:59:00 = 1_798_761_540 → daily 00:00 = 1_798_761_600
     assert_eq!(compute_next(&Schedule::Daily { hour: 0, minute: 0 }, 1_798_761_540, 0),
                1_798_761_600);

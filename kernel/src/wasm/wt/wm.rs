@@ -235,6 +235,7 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
                            minimize_request: false, maximize_request: false,
                            activate_request: VecDeque::new(), target_w: 0, target_h: 0,
                            stay_awake_request: false, wake_pty: -1 },
+            limits: wasmtime::StoreLimits::default(), // throwaway probe: unlimited
         },
     );
     // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
@@ -341,6 +342,7 @@ fn scan_apps() {
         if add_to_linker(&mut linker).is_err() { return; }
         if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return; }
         if crate::wasm::wt::sys::add_to_linker(&mut linker).is_err() { return; }
+        if crate::wasm::wt::net::add_to_linker(&mut linker).is_err() { return; }
         for (stem, path, size) in need_probe {
             let m = module_at_path(&path)
                 .and_then(|module| extract_manifest(&linker, &module));
@@ -732,7 +734,18 @@ impl HasWindow for WmState {
 pub struct AppState {
     pub wasi: WtState,
     pub win: WmState,
+    /// Per-store resource cap (`Store::limiter` points here). Live windows get
+    /// [`WINDOW_MEM_CAP`] on linear memory so one runaway app (e.g. a huge page
+    /// in the Blitz viewer) OOMs ITSELF instead of eating kernel RAM and taking
+    /// the desktop down; throwaway probe stores keep the unlimited default.
+    pub limits: wasmtime::StoreLimits,
 }
+
+/// Linear-memory cap for a LIVE window store (bytes). Apps link with a 48 MiB
+/// initial memory (`.cargo/config.toml` in the SDK), and the heaviest measured
+/// guest (Blitz viewer, 6.4k-node page) peaks ~16 MiB of heap — 128 MiB leaves
+/// generous growth headroom while still bounding a runaway window.
+pub const WINDOW_MEM_CAP: usize = 128 * 1024 * 1024;
 
 impl HasWasi for AppState {
     fn wasi(&mut self) -> &mut WtState { &mut self.wasi }
@@ -954,6 +967,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
         AppState {
             wasi: WtState::new(alloc::vec![b"win".to_vec()]),
             win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0, events: VecDeque::new(), close_requested: false, move_requested: false, spawn_request: VecDeque::new(), bg_request: false, committed: false, minimize_request: false, maximize_request: false, activate_request: VecDeque::new(), target_w: 0, target_h: 0, stay_awake_request: false, wake_pty: -1 },
+            limits: wasmtime::StoreLimits::default(), // spike harness: unlimited
         },
     );
     let mut linker: Linker<AppState> = Linker::new(engine);
@@ -961,6 +975,7 @@ pub fn run_reactor_spike(cwasm: &[u8]) -> (u32, u8, usize) {
     if add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     if crate::wasm::wt::term::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     if crate::wasm::wt::sys::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
+    if crate::wasm::wt::net::add_to_linker(&mut linker).is_err() { return (0, 0, 0); }
     // SysV ABI requires DF=0; cranelift/Rust code uses `rep movs` which run
     // BACKWARD if DF=1, silently corrupting copied data.
     #[cfg(target_arch = "x86_64")]
@@ -1094,6 +1109,7 @@ impl Compositor {
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
         crate::wasm::wt::term::add_to_linker(&mut linker).expect("term linker");
         crate::wasm::wt::sys::add_to_linker(&mut linker).expect("sys linker");
+        crate::wasm::wt::net::add_to_linker(&mut linker).expect("net linker");
 
         let mut c = Compositor {
             wins: Vec::new(),
@@ -1137,6 +1153,7 @@ impl Compositor {
         add_to_linker(&mut linker).expect("wm linker"); // wm::add_to_linker (this module)
         crate::wasm::wt::term::add_to_linker(&mut linker).expect("term linker");
         crate::wasm::wt::sys::add_to_linker(&mut linker).expect("sys linker");
+        crate::wasm::wt::net::add_to_linker(&mut linker).expect("net linker");
         let module = module_for(REACTOR_CWASM).expect("reactor module");
         Compositor {
             wins: Vec::new(),
@@ -1368,8 +1385,15 @@ impl Compositor {
                                minimize_request: false, maximize_request: false,
                                activate_request: VecDeque::new(), target_w: 0, target_h: 0,
                                stay_awake_request: false, wake_pty: -1 },
+                limits: wasmtime::StoreLimitsBuilder::new()
+                    .memory_size(WINDOW_MEM_CAP)
+                    .build(),
             },
         );
+        // Bound the guest's linear memory: a `memory.grow` past WINDOW_MEM_CAP
+        // fails inside the GUEST (its allocator sees OOM and the app aborts);
+        // the kernel heap and the other windows are untouched.
+        store.limiter(|s| &mut s.limits);
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("cld", options(nostack)); }

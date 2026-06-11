@@ -8,7 +8,7 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-10 (20 functions; gfx-event kind 5 = wheel added).
+**Last reviewed:** 2026-06-11 (22 functions; `reboot()` + `exit_to_shell()` added).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -131,6 +131,16 @@ wall clock).
 
 ### `poweroff()`
 Power off the machine. Never returns.
+
+### `reboot()`
+Restart the machine. Never returns. Twin of `poweroff()` (the shell's reboot button).
+
+### `exit_to_shell()`
+Tear the compositor down and hand the framebuffer back to the text console (the
+shell's "back to console" button). All windows close; control returns to the
+console shell (which keeps running on its own core). Re-running `compositor` from
+that shell rebuilds a fresh desktop. The kernel defers the teardown to just after
+the current frame.
 
 ---
 

@@ -14,6 +14,7 @@ pub mod wm;
 pub mod term;
 pub mod compose;
 pub mod sys;
+pub mod net;
 
 use crate::kprintln;
 use alloc::vec::Vec;
@@ -64,29 +65,8 @@ pub fn run_spin_demo() -> i32 {
 #[cfg(feature = "boot-checks")]
 static CAT_CWASM: &[u8] = include_bytes!("cat.cwasm");
 
-/// Embedded GUI host-fn smoke (tools/wt-gfxtest/gfx.wat precompiled): calls
-/// gfx_info then gfx_blit a 2×2 red square. Exercises the ruos_gfx Linker path.
-#[cfg(feature = "boot-checks")]
-static GFXTEST_CWASM: &[u8] = include_bytes!("gfxtest.cwasm");
-
 #[cfg(feature = "boot-checks")]
 static BRINGUP_CWASM: &[u8] = include_bytes!("bringup.cwasm");
-
-/// Embedded reactor guest (`tools/wt-reactor` → `wasm32-unknown-unknown` →
-/// precompiled). Exercises the compositor GATE: a PERSISTENT wasm instance whose
-/// `frame()` export is called repeatedly (the core risk of the multi-window
-/// compositor).
-#[cfg(feature = "boot-checks")]
-static REACTOR_CWASM: &[u8] = include_bytes!("reactor.cwasm");
-
-/// Boot self-test: a reactor instance whose `frame()` is called 5× → tick==5.
-/// Proves the kernel can hold a persistent instance and call an exported
-/// function on it repeatedly, and that the committed surface buffer arrives
-/// intact in the kernel (commit_b0 == 0x05, pixels == 307200).
-#[cfg(feature = "boot-checks")]
-pub fn run_reactor_spike_demo() -> (u32, u8, usize) {
-    crate::wasm::wt::wm::run_reactor_spike(REACTOR_CWASM)
-}
 
 /// Boot self-test: SP3 window-manager pure-logic selftest (decoration geometry +
 /// hit-test + z-order + drag math, NO wasm instances). Returns a 5-bit flag word
@@ -117,14 +97,6 @@ pub fn run_lifecycle_demo() -> (u32, u32, u32) {
     crate::wasm::wt::wm::lifecycle_self_test()
 }
 
-/// Boot self-test (egui SP-A): spawn the wasip1 STD probe as a compositor window
-/// and drive one frame; returns the committed surface length (307200 on success
-/// = the std/wasip1 guest ran against the unified WASI+wm `Linker<AppState>`).
-#[cfg(feature = "boot-checks")]
-pub fn run_wasip1_probe_demo() -> usize {
-    crate::wasm::wt::wm::wasip1_probe_self_test()
-}
-
 /// Boot self-test (egui SP-B): spawn the egui CSD demo as a compositor window and
 /// drive one frame; returns the committed surface length (614400 on success =
 /// 480×320×4 — the egui guest instantiated against the unified WASI+wm
@@ -134,21 +106,12 @@ pub fn run_egui_demo_demo() -> usize {
     crate::wasm::wt::wm::egui_demo_self_test()
 }
 
-/// Boot self-test (SP-GATE, Phase-0.5): spawn the Blitz style+layout GATE as a
-/// window + drive one frame; the guest prints its benchmark table to serial.
-/// Returns the committed surface length (non-zero = the Blitz/Stylo guest ran).
+/// Boot self-test (epoch watchdog): a deliberately-spinning window must be
+/// trapped + reaped while a healthy reactor keeps ticking. Returns
+/// (spinner_reaped, healthy_tick).
 #[cfg(feature = "boot-checks")]
-pub fn run_gate_demo() -> usize {
-    crate::wasm::wt::wm::gate_self_test()
-}
-
-/// Boot self-test (SP-VIEWER, Phase-2): spawn the Blitz viewer (full
-/// parse→style→layout→vello_cpu-paint pipeline on an embedded HTML page) as a
-/// window + drive two frames; the guest prints its timing line to serial.
-/// Returns the committed surface length (non-zero = the pipeline ran).
-#[cfg(feature = "boot-checks")]
-pub fn run_viewer_demo() -> usize {
-    crate::wasm::wt::wm::viewer_self_test()
+pub fn run_watchdog_demo() -> (bool, u32) {
+    crate::wasm::wt::wm::watchdog_self_test()
 }
 
 /// Boot self-test (egui SP-C): exercise the `wm.spawn` deferred-spawn mechanism +
@@ -171,14 +134,6 @@ pub fn run_spd_demo() -> i64 {
     crate::wasm::wt::wm::spd_self_test()
 }
 
-/// Boot self-test: run the embedded gfx test; returns its exit code. The caller
-/// inspects `crate::gfx::blit_count()` / `last_pixel()` (set during gfx_blit,
-/// not cleared by the console restore) to confirm the host-fn path ran.
-#[cfg(feature = "boot-checks")]
-pub fn run_gfxtest_demo() -> i32 {
-    run_cwasm(GFXTEST_CWASM, alloc::vec![b"gfxtest".to_vec()], None)
-}
-
 /// Boot self-test: seed a tmpfs file with a known marker, then `cat` it. The
 /// marker reaches the serial log via cat's stdout; the caller greps it.
 #[cfg(feature = "boot-checks")]
@@ -195,10 +150,49 @@ pub fn run_cat_demo() -> i32 {
     run_cwasm(CAT_CWASM, alloc::vec![b"cat".to_vec(), b"/wt-cat-test.txt".to_vec()], None)
 }
 
+// --- Epoch watchdog (spec 2026-06-11-wt-epoch-interruption-design) ----------
+//
+// The engine has `epoch_interruption(true)`: AOT guest code checks an engine
+// atomic at function entries + loop backedges and TRAPS (`Trap::Interrupt`)
+// once the per-Store deadline expires. The BSP timer IRQ bumps the epoch at
+// 100 Hz → 1 tick = 10 ms. There is NO resume (wasmtime `async` is off):
+// the watchdog turns "desktop frozen forever" into "guilty window killed".
+//
+// CRITICAL: with epoch_interruption on, a Store that never calls
+// `set_epoch_deadline` traps IMMEDIATELY (default deadline 0). Every
+// `Store::new` site must arm one of these:
+
+/// Steady-state `frame()` budget (~300 ms): generous enough for a legitimate
+/// heavy relayout (GATE: 6400 nodes = 28 ms native; 50k ≈ 220 ms), still
+/// converts a runaway guest into a ~0.3 s blip. NB: QEMU TCG inflates guest
+/// time 10-30× — values are tuned to avoid false kills there too.
+pub const FRAME_DEADLINE_TICKS: u64 = 30;
+/// First `frame()` of a window (~3 s): parse/style/layout + font atlas + egui
+/// init all land here (viewer ≈ 30-60 ms native, seconds under QEMU TCG).
+pub const FIRST_FRAME_DEADLINE_TICKS: u64 = 300;
+/// `_initialize` (std static ctors), one-shot per window (~3 s).
+pub const INIT_DEADLINE_TICKS: u64 = 300;
+/// Throwaway `manifest()` probe (~1 s): const data in the guest data segment,
+/// near-instant; protects the ~1 Hz catalog scan from a hostile .cwasm.
+pub const PROBE_DEADLINE_TICKS: u64 = 100;
+/// Effectively-infinite deadline for non-compositor stores (CLI tools, boot
+/// checks, component bring-up): they may legitimately run for a long time.
+pub const NO_DEADLINE_TICKS: u64 = u64::MAX / 2;
+
+static ENGINE: spin::Once<wasmtime::Engine> = spin::Once::new();
+
 /// Shared engine (config is fixed; building it once avoids repeat cost).
 pub fn engine() -> &'static wasmtime::Engine {
-    static ENGINE: spin::Once<wasmtime::Engine> = spin::Once::new();
     ENGINE.call_once(|| wasmtime::Engine::new(&engine_config()).expect("wt engine"))
+}
+
+/// Bump the wasm epoch — called from the BSP timer IRQ (100 Hz). IRQ-safe:
+/// `increment_epoch` is one Relaxed `fetch_add`, and `Once::get` (never
+/// `call_once`) guarantees we never CONSTRUCT the engine in IRQ context.
+pub fn epoch_tick() {
+    if let Some(e) = ENGINE.get() {
+        e.increment_epoch();
+    }
 }
 
 /// Load and run a precompiled WASI `.cwasm` command (`_start`) with `args`.
@@ -239,6 +233,9 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
         }
     }
     let mut store = Store::new(engine, state);
+    // CLI tools may run as long as they like — the watchdog is for the
+    // compositor only. Without this the default deadline (0) traps at once.
+    store.set_epoch_deadline(NO_DEADLINE_TICKS);
     let mut linker = Linker::new(engine);
     if let Err(e) = wasi::add_to_linker(&mut linker) {
         kprintln!("ruos: wt wasi link err: {}", e);
@@ -295,6 +292,10 @@ fn engine_config() -> wasmtime::Config {
     // settings hash matches.
     config.signals_based_traps(false);
     config.memory_init_cow(false);
+    // Watchdog sui guest del compositor (hashato nel .cwasm! — cambiarlo
+    // invalida ogni .cwasm esistente, vedi docs/api/README.md §compatibilità
+    // e spec 2026-06-11-wt-epoch-interruption-design).
+    config.epoch_interruption(true);
     // memory_reservation > 0 forza il path MmapMemory (wasmtime memory.rs:
     // signals||guard||reservation||cow): la linear memory passa da
     // wasmtime_mmap_new → demand paging → FRAME allocator (RAM−heap), non più
@@ -334,6 +335,7 @@ pub fn run_hello(cwasm: &[u8]) -> bool {
 
     // Store data = "did we see print(42)?" flag.
     let mut store = Store::new(&engine, false);
+    store.set_epoch_deadline(NO_DEADLINE_TICKS); // boot-check, not watched
     let mut linker = Linker::new(&engine);
     let _ = linker.func_wrap(
         "ruos",

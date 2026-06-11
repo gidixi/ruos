@@ -3,6 +3,10 @@ KERNEL    := kernel/target/x86_64-unknown-none/release/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
+# ISO separata per i target di test: run-test/run-test-usb buildano e bootano
+# QUESTA (init = smoke.sh), così build/os.iso resta sempre quella pulita di
+# `make iso` (init minimale) e si può flashare senza la batteria di test.
+TEST_ISO  := build/os-test.iso
 DISK_IMG  := build/disk.img
 DISK_MB   := 64
 HELLO     := shell: init.sh complete
@@ -26,7 +30,7 @@ BIN_TOOLS  := shell ls cat echo \
               touch wc clear which \
               sort uniq cut tr tee \
               ifconfig nc date wget ping resolve \
-              service \
+              service unitctl \
               mkdisk mkboot install umount disks wifiscan wificonnect \
               gzip gunzip zcat
 BIN_WASMS  := $(BIN_TOOLS:%=user-bin/%.wasm)
@@ -109,14 +113,13 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 # under the `boot-checks` feature). Regenerated into the source tree from their
 # .wat/.wasm inputs so the (large) .cwasm need not be committed.
 WT_KDIR    := kernel/src/wasm/wt
-WT_KCWASMS := $(WT_KDIR)/hello.cwasm $(WT_KDIR)/gfxtest.cwasm \
-              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm
+WT_KCWASMS := $(WT_KDIR)/hello.cwasm \
+              $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm \
+              $(WT_KDIR)/spin_reactor.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/spin.cwasm: tools/wt-spin/spin.wat $(WT_PRECOMPILE)
-	$(WT_PRECOMPILE) $< $@
-$(WT_KDIR)/gfxtest.cwasm: tools/wt-gfxtest/gfx.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/echo.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
@@ -216,13 +219,13 @@ kernel/src/wasm/wt/reactor_close.cwasm: tools/wt-reactor-close/src/lib.rs tools/
 		cargo build --release --target wasm32-unknown-unknown
 	$(WT_PRECOMPILE) tools/wt-reactor-close/target/wasm32-unknown-unknown/release/wt_reactor_close.wasm kernel/src/wasm/wt/reactor_close.cwasm
 
-# wasip1 STD reactor probe (egui SP-A): proves a std/wasip1 guest runs as a
-# compositor window. Built wasm32-wasip1 (std), precompiled to a CORE .cwasm.
-kernel/src/wasm/wt/probe.cwasm: tools/wt-wasip1-probe/src/lib.rs tools/wt-wasip1-probe/Cargo.toml $(WT_PRECOMPILE)
+# Spinning reactor (epoch-watchdog boot-check): commits one frame then busy-loops
+# forever in frame() — the watchdog must trap + reap it. no_std wasm32-unknown-unknown.
+kernel/src/wasm/wt/spin_reactor.cwasm: tools/wt-spin-reactor/src/lib.rs tools/wt-spin-reactor/Cargo.toml $(WT_PRECOMPILE)
 	@mkdir -p build
-	source $$HOME/.cargo/env && cd tools/wt-wasip1-probe && \
-		cargo build --release --target wasm32-wasip1
-	$(WT_PRECOMPILE) tools/wt-wasip1-probe/target/wasm32-wasip1/release/wt_wasip1_probe.wasm kernel/src/wasm/wt/probe.cwasm
+	source $$HOME/.cargo/env && cd tools/wt-spin-reactor && \
+		cargo build --release --target wasm32-unknown-unknown
+	$(WT_PRECOMPILE) tools/wt-spin-reactor/target/wasm32-unknown-unknown/release/wt_spin_reactor.wasm kernel/src/wasm/wt/spin_reactor.cwasm
 
 # Shared TUI provider component: ratatui renderer exporting ruos:tui/canvas.
 # wasm32-unknown-unknown core module -> componentized (no WASI imports, so no
@@ -248,7 +251,7 @@ build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml
 		-o build/rtop.component.wasm
 	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -298,9 +301,9 @@ run: iso $(DISK_IMG)
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
 
 run-test: $(DISK_IMG)
-	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh ISO=$(TEST_ISO)
 	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
-	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(TEST_ISO) -serial stdio -display none -no-reboot -m 1024 \
 		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
@@ -327,10 +330,10 @@ run-test: $(DISK_IMG)
 # Asserts the shell comes up and bin.bgz was unpacked successfully.
 .PHONY: run-test-usb
 run-test-usb:
-	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh ISO=$(TEST_ISO)
 	@echo "--- usb-msc serial (timeout 240s) ---"
 	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -m 1024 -no-reboot -display none -serial stdio \
-		-drive if=none,id=stick,file=$(ISO),format=raw \
+		-drive if=none,id=stick,file=$(TEST_ISO),format=raw \
 		-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
 		-device usb-kbd,bus=xhci.0 \
 		-netdev user,id=net0 -device $(NIC),netdev=net0 \
@@ -517,7 +520,7 @@ run-console-test: iso
 	@timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
 		2>&1 | tee build/console-test.log | grep -q 'CONSOLE_TEST: OK' && echo CONSOLE_TEST_PASS || { echo CONSOLE_TEST_FAIL; tail -40 build/console-test.log; exit 1; }
 
-test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/probe.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/tui.cwasm build/rtop.cwasm
+test-boot: limine $(USER_WASMS) $(WT_KCWASMS) kernel/src/wasm/wt/bringup.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/tui.cwasm build/rtop.cwasm
 	@echo "--- build with boot-checks feature ---"
 	source $$HOME/.cargo/env && cd kernel && cargo build --release \
 		-Zbuild-std=core,compiler_builtins,alloc \

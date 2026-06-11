@@ -1,10 +1,10 @@
-# 430 — WiFi debug DHCP no-ACK: probe TIM/deauth/unicast + static IP su iface wifi
+# 469 — WiFi debug DHCP no-ACK: probe TIM/deauth/unicast + static IP su iface wifi
 
 **Data:** 2026-06-11
 
 ## Cosa
 
-Test HW post-fix-drain (CHANGELOG 426) ha ristretto il bug: DISCOVER→OFFER ok,
+Test HW post-fix-drain (CHANGELOG 465) ha ristretto il bug: DISCOVER→OFFER ok,
 REQUEST inviata (tipo 3, retry smoltcp a +5s puntuale), **ACK mai ricevuto** —
 e dopo l'OFFER **zero unicast RX** mentre il multicast GTK continua a fluire
 (drain fix verificato funzionante: junk drenato a raffica). Sintomo compatibile

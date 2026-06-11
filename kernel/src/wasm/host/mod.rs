@@ -8,6 +8,7 @@ pub mod proc;
 pub mod term;
 pub mod sysinfo;
 pub mod service;
+pub mod unit;
 pub mod mem;
 pub mod smp;
 
@@ -25,6 +26,7 @@ pub fn install(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
     term::link(linker)?;
     sysinfo::link(linker)?;
     service::link(linker)?;
+    unit::link(linker)?;
     smp::link(linker)?;
     Ok(())
 }

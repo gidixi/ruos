@@ -1,4 +1,4 @@
-# 425 — Spec multi-tenant hardening (epoch watchdog, Spectre, quote, PKU)
+# 464 — Spec multi-tenant hardening (epoch watchdog, Spectre, quote, PKU)
 
 **Data:** 2026-06-10
 

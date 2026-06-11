@@ -1,4 +1,4 @@
-# 429 — poll-key hlt + kill cooperativo TUI; FIX race tabella FD globale
+# 468 — poll-key hlt + kill cooperativo TUI; FIX race tabella FD globale
 
 **Data:** 2026-06-11
 

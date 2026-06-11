@@ -1,4 +1,4 @@
-# 427 — rtop su Component Model: tui.cwasm condiviso + dynamic linking kernel
+# 466 — rtop su Component Model: tui.cwasm condiviso + dynamic linking kernel
 
 **Data:** 2026-06-11
 

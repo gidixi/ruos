@@ -137,6 +137,58 @@ pub async fn run_app_on_core(
     reply.complete(code);
 }
 
+/// Parallel `.wasm` (wasmi) exec on a ComputeApp core — the wasmi sibling of
+/// [`run_app_on_core`]. Builds the `Fiber` ON the target core (wasmi `Store`/
+/// `Instance` are `!Send`, so only the Send `bytes`/`argv`/`cwd`/`name` cross the
+/// core boundary, never the fiber). Mirrors the `.wasm` branch of
+/// `exec_worker_task` exactly — including the interactive PTY setup (cooked
+/// termios + foreground pid) so an interactive tool (rtop) receives keys and
+/// `^C` works — then signals the awaiting shell fiber via `reply.complete`.
+///
+/// Without this, every `.wasm` ran on the single global `exec_worker_task`: a
+/// long-running interactive tool parked that worker for its whole lifetime and
+/// every other terminal's command queued behind it on EXEC_QUEUE and never ran.
+#[embassy_executor::task(pool_size = 4)]
+pub async fn run_wasmi_on_core(
+    bytes:    alloc::boxed::Box<[u8]>,
+    argv:     alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd:      alloc::string::String,
+    term_pts: usize,
+    name:     alloc::string::String,
+    reply:    alloc::sync::Arc<ExecReply>,
+) {
+    let cpu = crate::cpu::cpu_id();
+    let code: i32 = match crate::wasm::fiber::Fiber::new(&bytes) {
+        Err(e) => {
+            kprintln!("ruos: run_wasmi_on_core: instantiate {} failed: {}", name, e);
+            126 // cannot execute
+        }
+        Ok(mut child) => {
+            child.set_args(argv);
+            child.set_cwd(cwd);
+            // Bind the child's stdio to the caller's PTY so output reaches the
+            // right terminal (e.g. /dev/pts/N) instead of the boot pts/0.
+            child.rebind_stdio_pty(term_pts);
+            let pid = crate::proc::register(name);
+            child.set_pid(pid);
+            // Interactive setup (mirrors exec_worker_task): give the child a
+            // cooked terminal + mark it foreground so VINTR (^C) targets it.
+            // Apps wanting raw (rtop, nano) flip it themselves and restore on
+            // exit; we restore the caller's termios + clear foreground after.
+            let saved_termios = crate::pty::termios_snapshot(term_pts);
+            crate::pty::force_cooked(term_pts);
+            crate::pty::set_foreground(term_pts, Some(pid));
+            let code = child.run().await;
+            crate::pty::set_foreground(term_pts, None);
+            crate::pty::set_termios(term_pts, saved_termios);
+            crate::proc::unregister(pid);
+            code
+        }
+    };
+    crate::binfo!("exec-ap", "wasmi ran_on=core{} code={}", cpu, code);
+    reply.complete(code);
+}
+
 /// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
 /// core's run loop before each poll. (Was a single global AtomicBool — single-core.)
 static WAKE_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] = {
@@ -239,7 +291,9 @@ pub fn run_core(cpu: u32) -> ! {
         // Supervisor 6-detect: BSP polls per-core heartbeats every ~1 s and
         // logs any mute core. Detection only; recovery is 6-recover.
         spawner.spawn(supervisor_task()).unwrap();
-        spawner.spawn(net_poll_task()).unwrap();
+        // Net polling is pinned OFF the BSP onto a ComputeApp core (the spawner
+        // bootstraps it once that AP is up); ≤2-core falls back to BSP-local.
+        spawner.spawn(net_poll_spawner_task()).unwrap();
         spawner.spawn(usb_poll_task()).unwrap();
         spawner.spawn(wifi_poll_task()).unwrap();
         spawner.spawn(console_drain_task()).unwrap();
@@ -253,6 +307,8 @@ pub fn run_core(cpu: u32) -> ! {
         spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
         spawner.spawn(pty_watchdog_task()).unwrap();
         spawner.spawn(service_dispatcher_task()).unwrap();
+        spawner.spawn(unit_scheduler_task()).unwrap();
+        spawner.spawn(init_units_task()).unwrap();
         crate::binfo!("user", "executor: core 0 tasks spawned");
     }
 
@@ -619,11 +675,48 @@ async fn ssh_serve_task() {
     crate::ssh::server::serve_loop_pub().await;
 }
 
-#[embassy_executor::task]
-async fn net_poll_task() {
+/// The actual 10 ms network poll loop. Plain async fn so it can be either
+/// spawned as a task (`net_poll_task`) on a ComputeApp core or awaited inline
+/// on the BSP (the ≤2-core fallback in `net_poll_spawner_task`).
+async fn net_poll_loop() {
     loop {
         crate::net::poll();
         delay::Delay::ticks(1).await; // 10 ms @ 100 Hz
+    }
+}
+
+#[embassy_executor::task]
+async fn net_poll_task() {
+    net_poll_loop().await;
+}
+
+/// Bootstrap (runs on the BSP) that pins network polling OFF the BSP onto the
+/// first ComputeApp core, freeing the BSP I/O hub from the 100 Hz `net::poll()`
+/// under sustained traffic.
+///
+/// Safe to move: `net_poll_task` is `Send` (no wasmi state), `NET` is a
+/// `spin::Mutex` already accessed cross-core (socket recv/send run from wasm
+/// fibers on compute cores today), and the NIC drivers are pure-polling — there
+/// is no RX IRQ to co-locate with the poll. So an AP can drive it lock-safely.
+///
+/// It only bootstraps: retries `spawn_on` until the target AP has published its
+/// executor, then exits. On ≤2-core systems (no ComputeApp core) it falls back
+/// to polling inline on the BSP (the old behaviour).
+#[embassy_executor::task]
+async fn net_poll_spawner_task() {
+    match crate::cpu::first_compute_app_core() {
+        Some(core) => loop {
+            match spawn_on(core, net_poll_task()) {
+                Ok(()) => {
+                    crate::binfo!("net", "net_poll pinned to core{}", core);
+                    return;
+                }
+                // AP's executor not published yet — retry in 10 ms.
+                Err(_) => delay::Delay::ticks(1).await,
+            }
+        },
+        // ≤2-core: no ComputeApp core — poll on the BSP (fallback).
+        None => net_poll_loop().await,
     }
 }
 
@@ -752,22 +845,38 @@ async fn ssh_pty_dispatcher_task() {
 /// queues by service name rather than by absolute path.
 #[embassy_executor::task]
 async fn service_dispatcher_task() {
-    use crate::service::{WaitForServiceRequest, mark_running, mark_exited, mark_failed, path_of};
+    use crate::service::{WaitForServiceRequest, UnitReq, mark_running, mark_exited, mark_failed, path_of};
     let _ = crate::proc::register_kernel("svc-dispatch");
     loop {
-        let name = WaitForServiceRequest.await;
-        let path = match path_of(name) {
-            Some(p) => p,
-            None    => {
+        let name = match WaitForServiceRequest.await {
+            UnitReq::Start(n)   => n,
+            UnitReq::Persist(n) => { crate::service::persist(&n).await; continue; }
+            UnitReq::Reload     => { crate::service::reload().await;    continue; }
+        };
+        // Daemon o unit con restart policy → runner supervisionato (pool);
+        // oneshot senza policy → exec inline qui sotto.
+        let (kind, policy, path) = match crate::service::exec_info_of(&name) {
+            Some(t) => t,
+            None => {
                 crate::bwarn!("svc", "dispatcher: unknown name '{}'", name);
                 continue;
             }
         };
-        let bytes = match crate::wasm::read_all(path).await {
+        let supervised = matches!(kind, crate::service::UnitKind::Daemon)
+            || !matches!(policy, crate::service::RestartPolicy::No);
+        if supervised {
+            if spawn_on(0, unit_runner_task(name.clone())).is_err() {
+                crate::bwarn!("svc", "start {}: no free daemon slot (max {})",
+                    name, crate::service::MAX_DAEMONS);
+                mark_failed(&name, "noslot");
+            }
+            continue;
+        }
+        let bytes = match crate::wasm::read_all(&path).await {
             Ok(b) => b,
             Err(_) => {
                 kprintln!("svc: read {} failed", path);
-                mark_failed(name, "read");
+                mark_failed(&name, "read");
                 continue;
             }
         };
@@ -775,19 +884,117 @@ async fn service_dispatcher_task() {
             Ok(f) => f,
             Err(e) => {
                 kprintln!("svc: instantiate {}: {}", path, e);
-                mark_failed(name, "instantiate");
+                mark_failed(&name, "instantiate");
                 continue;
             }
         };
         fb.set_args(alloc::vec![name.as_bytes().to_vec()]);
-        let pid = crate::proc::register(alloc::string::String::from(name));
+        let pid = crate::proc::register(name.clone());
         fb.set_pid(pid);
-        mark_running(name, pid);
+        mark_running(&name, pid);
         crate::binfo!("svc", "start name={} pid={} path={}", name, pid, path);
         let code = fb.run().await;
         crate::proc::unregister(pid);
-        mark_exited(name, code);
+        mark_exited(&name, code);
         crate::binfo!("svc", "exit name={} code={}", name, code);
+    }
+}
+
+/// Orchestrazione boot delle unit: carica i file, attiva il target Boot,
+/// poi PostBoot quando shell/compositor hanno avuto modo di partire.
+#[embassy_executor::task]
+async fn init_units_task() {
+    let _ = crate::proc::register_kernel("init-units");
+    crate::service::load_from_disk().await;
+    crate::service::activate_target(crate::service::ActivateTarget::Boot).await;
+    delay::Delay::ticks(300).await;   // ~3s: shell + compositor su
+    crate::service::activate_target(crate::service::ActivateTarget::PostBoot).await;
+    crate::binfo!("svc", "unit activation complete");
+}
+
+/// Scheduler dei timer unit: polling 1s (robusto a drift/cambi RTC), "fire
+/// if due, recompute to future" → niente doppio scatto, niente backfill.
+#[embassy_executor::task]
+async fn unit_scheduler_task() {
+    let _ = crate::proc::register_kernel("unit-sched");
+    loop {
+        delay::Delay::ticks(100).await; // ~1s @100Hz
+        let ticks = crate::timer::ticks();
+        let epoch = crate::rtc::to_unix_epoch(&crate::rtc::now());
+        for (idx, sched, next_fire) in crate::service::timers_due_snapshot() {
+            let due = match sched {
+                crate::service::schedule::Schedule::EveryTicks(_)
+                | crate::service::schedule::Schedule::BootPlus(_) => ticks >= next_fire,
+                _ => epoch >= next_fire,
+            };
+            if !due { continue; }
+            if let Some(unit) = crate::service::timer_fired(idx, epoch, ticks) {
+                crate::binfo!("svc", "timer fired -> start {}", unit);
+                if let Err(e) = crate::service::start(&unit) {
+                    crate::bwarn!("svc", "timer start {}: {}", unit, e);
+                }
+            }
+        }
+    }
+}
+
+/// Runner di un'unità supervisionata: esegue il child, applica la restart
+/// policy con backoff esponenziale, esce su stop_requested o policy esaurita.
+/// I daemon non hanno PTY: stdout → console (pts 0). `.cwasm` gira su un
+/// compute core via `exec_cwasm_inner`; `.wasm` inline (wasmi) sul BSP.
+#[embassy_executor::task(pool_size = 8)] // = service::MAX_DAEMONS (l'attr vuole un letterale)
+async fn unit_runner_task(name: alloc::string::String) {
+    use crate::service::{self, RestartPolicy};
+    loop {
+        let Some((_kind, policy, path)) = service::exec_info_of(&name) else { return; };
+        let bytes = match crate::wasm::read_all(&path).await {
+            Ok(b) => b,
+            Err(_) => { service::mark_failed(&name, "read"); return; }
+        };
+        let pid = crate::proc::register(name.clone());
+        service::mark_running(&name, pid);
+        let started = crate::timer::ticks();
+        crate::binfo!("svc", "runner start name={} pid={} path={}", name, pid, path);
+
+        let code = if path.ends_with(".cwasm") {
+            crate::wasm::fiber::exec_cwasm_inner(
+                bytes, alloc::vec![name.as_bytes().to_vec()], 0).await
+        } else {
+            match crate::wasm::fiber::Fiber::new(&bytes) {
+                Ok(mut fb) => {
+                    fb.set_args(alloc::vec![name.as_bytes().to_vec()]);
+                    fb.set_pid(pid);
+                    fb.run().await
+                }
+                Err(_) => {
+                    service::mark_failed(&name, "instantiate");
+                    crate::proc::unregister(pid);
+                    return;
+                }
+            }
+        };
+        crate::proc::unregister(pid);
+        crate::binfo!("svc", "runner exit name={} code={}", name, code);
+
+        // Uptime > 60s → crash transitorio recuperato: reset del backoff.
+        if crate::timer::ticks().saturating_sub(started) > 6_000 {
+            service::reset_restarts(&name);
+        }
+        if service::take_stop_requested(&name) {
+            service::mark_exited(&name, code);
+            return;
+        }
+        let restart = matches!(policy, RestartPolicy::Always)
+            || (matches!(policy, RestartPolicy::OnFailure) && code != 0);
+        if !restart {
+            service::mark_exited(&name, code);
+            return;
+        }
+        service::mark_restarting(&name);
+        let n = service::bump_restarts(&name);
+        let wait = crate::service::schedule::backoff_ticks(n.saturating_sub(1));
+        crate::binfo!("svc", "restart name={} #{} in {} ticks", name, n, wait);
+        delay::Delay::ticks(wait).await;
     }
 }
 

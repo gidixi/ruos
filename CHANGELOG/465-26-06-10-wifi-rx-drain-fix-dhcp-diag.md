@@ -1,4 +1,4 @@
-# 426 — WiFi RX drain: non fermarsi sui frame scartati + diagnostica tipo DHCP
+# 465 — WiFi RX drain: non fermarsi sui frame scartati + diagnostica tipo DHCP
 
 **Data:** 2026-06-10
 

@@ -23,6 +23,25 @@ static GFX_W:     AtomicU32 = AtomicU32::new(0);
 static GFX_H:     AtomicU32 = AtomicU32::new(0);
 static GFX_FMT:   AtomicU32 = AtomicU32::new(0); // 0 = RGB, 1 = BGR
 
+// RAM shadow of the last presented frame, in GUEST format (RGBA8888, stride =
+// width*4 — independent of the panel's pitch/layout). Two jobs:
+//  1. Diff present: `blit` memcmp's each incoming row against the shadow and
+//     skips the VRAM write when unchanged. On real hardware the framebuffer
+//     is write-combining VRAM behind PCIe, so unwritten rows are the cheapest
+//     rows; in VMs it's host RAM and the memcmp is still ~free.
+//  2. Cursor background: the software cursor saves/restores the pixels it
+//     covers from the shadow, never from the framebuffer — VRAM reads are
+//     uncached (≈µs each) even under a WC mapping.
+// Null when the panel is not 32-bpp (the cursor was already 32-bpp-only) or
+// if the boot-time allocation failed; everything degrades to unconditional
+// writes and a disabled cursor.
+static SHADOW: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+// While set, `blit` writes every row unconditionally (the framebuffer content
+// is unknown — e.g. console text right after `enter()` — so a row that merely
+// equals the stale shadow must still be painted). Cleared by the first blit
+// that covers the whole screen.
+static FORCE_FULL: AtomicBool = AtomicBool::new(true);
+
 /// Capture the real framebuffer geometry. Called once in the devices boot phase.
 pub fn init(info: FbInfo) {
     GFX_VIRT.store(info.addr, Ordering::Release);
@@ -31,6 +50,11 @@ pub fn init(info: FbInfo) {
     GFX_W.store(info.width, Ordering::Release);
     GFX_H.store(info.height, Ordering::Release);
     GFX_FMT.store(match info.pixel { PixelLayout::Rgb => 0, PixelLayout::Bgr => 1 }, Ordering::Release);
+    if info.bpp == 32 && SHADOW.load(Ordering::Acquire).is_null() {
+        let bytes = info.width as usize * info.height as usize * 4;
+        SHADOW.store(alloc::vec![0u8; bytes].leak().as_mut_ptr(), Ordering::Release);
+    }
+    FORCE_FULL.store(true, Ordering::Release);
     crate::binfo!(
         "gfx", "init {}x{} pitch={} bpp={} fmt={}",
         info.width, info.height, info.pitch, info.bpp,
@@ -48,6 +72,9 @@ pub fn gui_mode() -> bool { GUI_MODE.load(Ordering::Acquire) }
 /// Centre the software mouse cursor so it's visible from the first frame.
 pub fn enter() {
     GUI_MODE.store(true, Ordering::Release);
+    // The screen shows console text the shadow knows nothing about: force the
+    // next full-screen blit to repaint every row regardless of the diff.
+    FORCE_FULL.store(true, Ordering::Release);
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
     MOUSE_X.store(sw / 2, Ordering::Relaxed);
@@ -63,7 +90,10 @@ pub fn leave() {
     if !GUI_MODE.swap(false, Ordering::AcqRel) {
         return;
     }
-    cursor_erase();
+    {
+        let _g = CUR_LOCK.lock();
+        cursor_erase();
+    }
     let mut c = crate::console::CONSOLE.lock();
     if let Some(fb) = &mut c.fb {
         fb.clear();
@@ -102,13 +132,10 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
     let sh = GFX_H.load(Ordering::Acquire);
     if w == 0 || h == 0 { return; }
 
-    // Lift the software cursor BEFORE mutating the framebuffer: this restores the
-    // true background it was covering, so the post-blit cursor_repaint() saves
-    // real pixels, never the sprite. Critical with dirty-rect partial blits that
-    // usually do NOT overlap the cursor — otherwise the saved "background" would
-    // be the sprite itself and the next cursor move would leave a trail of arrows
-    // (denser the slower you move). No-op when no cursor is currently drawn.
-    cursor_erase();
+    // No cursor pre-erase needed: the sprite lives on the framebuffer only,
+    // never in the RAM shadow, so the background the cursor restores/saves is
+    // always the true one. Rows the blit rewrites lose the sprite; the
+    // post-blit cursor_repaint() redraws it (idempotent on untouched rows).
 
     if buf.len() >= 4 {
         LAST_PIXEL.store(
@@ -126,15 +153,30 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
 
     // Fast path: 32-bpp framebuffer. A whole visible row is contiguous on both
     // sides, so RGB blits with a single row memcpy and BGR with a tight per-pixel
-    // swap — no per-pixel screen-bounds branch. (egui blits the full screen every
-    // frame; the old per-pixel loop with per-pixel clamps was the hot host cost.)
+    // swap — no per-pixel screen-bounds branch. Diff present: each row is first
+    // memcmp'd against the RAM shadow and skipped when unchanged, so a mostly
+    // static frame costs RAM reads only — no VRAM traffic (egui presents the
+    // full screen every frame; on real hardware unwritten WC rows are the
+    // cheapest rows).
     if bpp == 4 {
+        let shadow = SHADOW.load(Ordering::Acquire);
+        let force = FORCE_FULL.load(Ordering::Acquire) || shadow.is_null();
         for row in 0..vis_h {
             let src_off = row * src_stride;
             let end = src_off + vis_w * 4;
             if end > buf.len() { break; }
-            let dst_off = (y as usize + row) * pitch + (x as usize) * 4;
             let src_row = &buf[src_off..end];
+            if !shadow.is_null() {
+                let sh_off = ((y as usize + row) * sw as usize + x as usize) * 4;
+                // SAFETY: (x..x+vis_w, y+row) is within the screen (clipped
+                // above) and the shadow is width*height*4 bytes, stride sw*4.
+                let sh_row = unsafe {
+                    core::slice::from_raw_parts_mut(shadow.add(sh_off), vis_w * 4)
+                };
+                if !force && sh_row == src_row { continue; }
+                sh_row.copy_from_slice(src_row);
+            }
+            let dst_off = (y as usize + row) * pitch + (x as usize) * 4;
             // SAFETY: dst_off + vis_w*4 ≤ (y+row+1)*pitch ≤ sh*pitch (clipped above);
             // framebuffer is 4 bpp.
             let dst_row = unsafe {
@@ -153,6 +195,13 @@ pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
                     dst_row[s + 2] = src_row[s];
                 }
             }
+        }
+        // First full-screen blit after init()/enter(): screen and shadow are
+        // now in sync, the diff can be trusted from the next frame on.
+        if force && !shadow.is_null()
+            && x == 0 && y == 0 && vis_w as u32 == sw && vis_h as u32 == sh
+        {
+            FORCE_FULL.store(false, Ordering::Release);
         }
         cursor_repaint();
         return;
@@ -281,9 +330,12 @@ pub fn fold_mouse() {
 // --- Software mouse cursor -----------------------------------------------
 // A small arrow drawn directly on the framebuffer in GUI mode. Responsive
 // (redrawn on each mouse move, no egui re-render) and composited over the
-// full-frame blit. Save/restore the background under the sprite so moving it
-// leaves no trail. Assumes 32-bpp framebuffer (GFX_BPP=32); black/white sprite
-// pixels are RGB/BGR-agnostic.
+// full-frame blit. The sprite is drawn on the framebuffer ONLY — the RAM
+// shadow always holds the true background, so erasing restores from the
+// shadow and painting never reads the framebuffer (VRAM reads are uncached,
+// ≈µs each, even under a write-combining mapping). Requires the 32-bpp
+// shadow; without it the cursor is disabled. Black/white sprite pixels are
+// RGB/BGR-agnostic.
 
 const CUR_W: usize = 12;
 const CUR_H: usize = 19;
@@ -313,61 +365,75 @@ const CUR: [&[u8; CUR_W]; CUR_H] = [
 static CUR_X: AtomicI32 = AtomicI32::new(0);
 static CUR_Y: AtomicI32 = AtomicI32::new(0);
 static CUR_VALID: AtomicBool = AtomicBool::new(false);
-static CUR_SAVE: crate::sync::IrqMutex<[u32; CUR_W * CUR_H]> =
-    crate::sync::IrqMutex::new([0; CUR_W * CUR_H]);
+// Serializes erase/paint sequences (cursor_move, cursor_repaint, leave) so two
+// cores can't interleave them and leave a stray sprite behind.
+static CUR_LOCK: crate::sync::IrqMutex<()> = crate::sync::IrqMutex::new(());
 
-/// Restore the framebuffer pixels saved under the cursor (erase it).
+/// Erase the cursor: restore the true background under the sprite from the RAM
+/// shadow (the sprite is never written there). Caller holds CUR_LOCK.
 fn cursor_erase() {
     if !CUR_VALID.swap(false, Ordering::AcqRel) {
         return;
     }
     let base = GFX_VIRT.load(Ordering::Acquire);
-    if base.is_null() {
+    let shadow = SHADOW.load(Ordering::Acquire);
+    if base.is_null() || shadow.is_null() {
         return;
     }
     let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
+    let bgr = GFX_FMT.load(Ordering::Acquire) == 1;
     let cx = CUR_X.load(Ordering::Relaxed);
     let cy = CUR_Y.load(Ordering::Relaxed);
-    let save = CUR_SAVE.lock();
     for row in 0..CUR_H as i32 {
         let py = cy + row;
         if py < 0 || py >= sh { continue; }
         for col in 0..CUR_W as i32 {
             let px = cx + col;
             if px < 0 || px >= sw { continue; }
+            // Transparent sprite pixels were never drawn — nothing to restore.
+            if CUR[row as usize][col as usize] == b' ' { continue; }
+            let s_off = ((py as usize) * (sw as usize) + px as usize) * 4;
             let off = (py as usize) * pitch + (px as usize) * 4;
-            // SAFETY: (px,py) is within the framebuffer.
-            unsafe { *(base.add(off) as *mut u32) = save[(row as usize) * CUR_W + col as usize]; }
+            // SAFETY: (px,py) is within the screen for both buffers.
+            unsafe {
+                let s = shadow.add(s_off); // RGBA8888
+                let d = base.add(off);
+                if bgr {
+                    *d = *s.add(2);
+                    *d.add(1) = *s.add(1);
+                    *d.add(2) = *s;
+                } else {
+                    *d = *s;
+                    *d.add(1) = *s.add(1);
+                    *d.add(2) = *s.add(2);
+                }
+            }
         }
     }
 }
 
-/// Save the background under (x,y) and draw the cursor sprite. Assumes the
-/// previous cursor has already been erased (or its save buffer invalidated).
+/// Draw the cursor sprite at (x,y) — framebuffer only, write-only (the shadow
+/// keeps the background). No-op without the shadow (erase would be impossible
+/// and the sprite would smear). Caller holds CUR_LOCK.
 fn cursor_paint(x: i32, y: i32) {
     let base = GFX_VIRT.load(Ordering::Acquire);
-    if base.is_null() {
+    if base.is_null() || SHADOW.load(Ordering::Acquire).is_null() {
         return;
     }
     let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
     let sw = GFX_W.load(Ordering::Acquire) as i32;
     let sh = GFX_H.load(Ordering::Acquire) as i32;
-    let mut save = CUR_SAVE.lock();
     for row in 0..CUR_H as i32 {
         let py = y + row;
+        if py < 0 || py >= sh { continue; }
         for col in 0..CUR_W as i32 {
             let px = x + col;
-            let idx = (row as usize) * CUR_W + col as usize;
-            if px < 0 || px >= sw || py < 0 || py >= sh {
-                save[idx] = 0;
-                continue;
-            }
+            if px < 0 || px >= sw { continue; }
             let off = (py as usize) * pitch + (px as usize) * 4;
             // SAFETY: (px,py) is within the framebuffer.
             let p = unsafe { base.add(off) as *mut u32 };
-            save[idx] = unsafe { *p };
             match CUR[row as usize][col as usize] {
                 b'X' => unsafe { *p = 0x0000_0000; }, // black outline
                 b'.' => unsafe { *p = 0x00FF_FFFF; }, // white fill
@@ -383,18 +449,18 @@ fn cursor_paint(x: i32, y: i32) {
 /// Move the cursor to (x,y): erase the old, paint the new. GUI-mode only.
 pub fn cursor_move(x: i32, y: i32) {
     if !gui_mode() { return; }
+    let _g = CUR_LOCK.lock();
     cursor_erase();
     cursor_paint(x, y);
 }
 
-/// Repaint the cursor at its current position after a blit. `blit()` calls
-/// `cursor_erase()` BEFORE it writes, so the framebuffer under the cursor is the
-/// true background (sprite already lifted) when `cursor_paint` saves it here —
-/// never the sprite. Without that pre-erase, a partial (dirty-rect) blit that
-/// does not cover the cursor would save the sprite as background, and the next
-/// cursor move would restore it → a trail of arrows (worse the slower you move).
+/// Repaint the cursor at its current position after a blit. Rows the blit
+/// rewrote lost the sprite (fresh background straight from the source frame);
+/// rows it skipped still show it — repainting is idempotent either way, and
+/// the background never needs saving because the shadow is canonical.
 fn cursor_repaint() {
     if !gui_mode() { return; }
+    let _g = CUR_LOCK.lock();
     cursor_paint(CUR_X.load(Ordering::Relaxed), CUR_Y.load(Ordering::Relaxed));
 }
 

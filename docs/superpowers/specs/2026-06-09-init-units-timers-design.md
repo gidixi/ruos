@@ -1,6 +1,9 @@
 # Init system — units, timers, supervisione — design
 
 **Data:** 2026-06-09
+**Stato:** implementato 2026-06-11 (CHANGELOG 429-443, piano
+`docs/superpowers/plans/2026-06-11-init-units-timers.md`; boot-checks
+`svc-check` tutti verdi in QEMU; checklist manuale e2e da eseguire).
 **Topic:** sistema di init nativo ruos (stile systemd+cron, non copia Linux):
 unit con tipo/restart/dipendenze, timer (interval + calendario RTC), supervisione
 daemon, config su file (YAML-subset + JSON), CLI `unitctl`.

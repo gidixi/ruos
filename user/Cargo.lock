@@ -520,6 +520,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "unitctl"
+version = "0.1.0"
+
+[[package]]
 name = "uptime"
 version = "0.1.0"
 

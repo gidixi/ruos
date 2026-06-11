@@ -54,16 +54,14 @@ pub fn init() -> Result<(), BootError> {
         // Real `cat` over the WASI file path (needs the VFS, hence this phase).
         let cc = crate::wasm::wt::run_cat_demo();
         crate::binfo!("wt", "wasmtime WASI cat exit={}", cc);
-        // gfx service: direct blit + pixel readback.
+        // gfx service: direct blit + pixel readback. (The legacy `gfxtest.cwasm`
+        // host-fn smoke was retired with the boot-check cleanup — changelog 456;
+        // the ruos_gfx ABI belongs to the retired pre-compositor gui.cwasm model.)
         let g = crate::gfx::geom();
         crate::binfo!("gfx", "geom w={} h={} stride={} fmt={}", g.width, g.height, g.stride, g.format);
         let gok = crate::gfx::self_test();
         crate::binfo!("gfx", "gfx blit self-test {} (count={} last=0x{:08X})",
             if gok { "ok" } else { "FAIL" }, crate::gfx::blit_count(), crate::gfx::last_pixel());
-        // gfx host-fn path: a .cwasm calling gfx_info + gfx_blit (red).
-        let _ = crate::wasm::wt::run_gfxtest_demo();
-        let hok = crate::gfx::blit_count() > 0 && crate::gfx::last_pixel() == 0xFF0000FF;
-        crate::binfo!("gfx", "gfx host self-test {}", if hok { "ok" } else { "FAIL" });
     }
 
     Ok(())

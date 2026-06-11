@@ -14,6 +14,12 @@ pub const EINVAL: i32 = 28;
 pub const EFAULT: i32 = 21;
 
 /// Pure bound check — no wasmi types, host-testable. Returns Ok((off,len)) or errno.
+///
+/// `#[inline]`: attraversata da ogni host fn che tocca la memoria guest ed è
+/// `pub(crate)` (chiamata cross-module → cross-codegen-unit). Il suggerimento
+/// rende l'inline affidabile fondendo il check col chiamante. NON `inline(always)`:
+/// lasciamo a LLVM la decisione sui cold path per non gonfiare la i-cache.
+#[inline]
 pub(crate) fn check_bounds(ptr: i32, len: i32, size: u64) -> Result<(usize, usize), i32> {
     if ptr < 0 || len < 0 { return Err(EINVAL); }
     let end = (ptr as u64).checked_add(len as u64).ok_or(EFAULT)?;

@@ -6,7 +6,7 @@ Runtime: **wasmi**. Sources: `kernel/src/wasm/host/{lifecycle,clock,random,fd,pa
 You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 `std::time`, `println!`) does. Listed for completeness.
 
-**Last reviewed:** 2026-06-09.
+**Last reviewed:** 2026-06-11.
 
 ---
 
@@ -31,6 +31,16 @@ You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 |----------|---------|
 | `clock_time_get(clock_id, precision, time_ptr) -> i32` | `u64` ns since boot (10 ms resolution @ 100 Hz). |
 | `clock_res_get(clock_id, res_ptr) -> i32` | Resolution (`10_000_000` ns). |
+
+> **Window apps (Wasmtime, `kernel/src/wasm/wt/wasi.rs` shim):** same surface,
+> but `clock_id 0` (REALTIME) returns **unix-epoch ns** (anchored to the RTC at
+> first use) so `SystemTime::now()` is wall-clock — required by in-app TLS
+> (rustls) for certificate-validity checks. Other ids stay ns-since-boot.
+>
+> **Window-app stdout/stderr** (`println!` → `fd_write`): serial + framebuffer
+> console **and** the kernel log ring (`dmesg`) **and** netconsole (when the
+> feature is on) — so app prints stay visible on real hardware where the
+> desktop covers the framebuffer and there is no serial port.
 
 ## Random  (`random.rs`)
 

@@ -11,6 +11,11 @@ pub fn init() -> Result<core::convert::Infallible, BootError> {
     // SSH spawn so the "ssh" builtin entry exists when we mark_running.
     crate::service::init();
 
+    // Self-test dell'init system (parser/schedule/topo): funzioni pure,
+    // gira prima dell'executor. Panic su mismatch = run-test rosso.
+    #[cfg(feature = "boot-checks")]
+    crate::service::checks::run();
+
     // SSH server (Step 16). Non-fatal: stub returns NotImplemented until
     // Tasks 2-8 of `docs/superpowers/specs/2026-05-30-rust-step16-ssh-design.md`
     // land. Log the outcome so we can see how far the chain reached. On

@@ -57,7 +57,22 @@ pub async fn exec_cwasm_parallel(
     // poll `is_kill_pending(foreground)` inside `host.poll-key`.
     crate::pty::set_foreground(term_pts, Some(pid));
 
-    let code = match crate::executor::pick_compute_core() {
+    let code = exec_cwasm_inner(bytes, argv, term_pts).await;
+
+    crate::pty::set_foreground(term_pts, None);
+    crate::proc::unregister(pid);
+    code
+}
+
+/// Esegue bytes `.cwasm` già letti, con pid già registrato dal chiamante
+/// (l'unit runner deve possedere il pid per `request_kill`). Stessa logica
+/// di [`exec_cwasm_parallel`] ma senza register/unregister.
+pub async fn exec_cwasm_inner(
+    bytes:    alloc::vec::Vec<u8>,
+    argv:     alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    term_pts: usize,
+) -> i32 {
+    match crate::executor::pick_compute_core() {
         Some(core) => {
             let reply = crate::executor::ExecReply::new();
             let boxed = bytes.into_boxed_slice();
@@ -86,11 +101,58 @@ pub async fn exec_cwasm_parallel(
             // 1-2 core system: no ComputeApp AP — run inline on the calling fiber.
             crate::wasm::wt::run_cwasm(&bytes, argv, Some(term_pts))
         }
-    };
+    }
+}
 
-    crate::pty::set_foreground(term_pts, None);
-    crate::proc::unregister(pid);
-    code
+/// Parallel `.wasm` (wasmi) exec — the wasmi analogue of [`exec_cwasm_parallel`].
+///
+/// Reads the bytes on the calling fiber, then hands them to `run_wasmi_on_core`
+/// on a ComputeApp core (the fiber is built there — wasmi types are `!Send`).
+/// The calling shell fiber yields on `ExecReplyFuture` while the child runs on
+/// its own core, so a long-running interactive `.wasm` (rtop) no longer parks
+/// the single global `exec_worker_task` and starves every other terminal.
+///
+/// Fallbacks preserve the old behaviour where the parallel path is unavailable:
+///   - no ComputeApp core (1-2 CPU system) → the single-slot `EXEC_QUEUE`.
+///   - pool exhausted (pool_size=4, rare) → exit 127 (mirrors the cwasm path).
+pub async fn exec_wasmi_parallel(
+    path:     alloc::string::String,
+    argv:     alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd:      alloc::string::String,
+    term_pts: usize,
+) -> i32 {
+    match crate::executor::pick_compute_core() {
+        Some(core) => {
+            let bytes = match crate::wasm::read_all(&path).await {
+                Ok(b) => b,
+                Err(_) => {
+                    kprintln!("ruos: exec_wasmi_parallel: read {} failed", path);
+                    return 127; // command not found
+                }
+            };
+            let name = alloc::string::String::from(path.trim_start_matches('/'));
+            let reply = crate::executor::ExecReply::new();
+            let boxed = bytes.into_boxed_slice();
+            match crate::executor::spawn_on(
+                core,
+                crate::executor::run_wasmi_on_core(boxed, argv, cwd, term_pts, name, reply.clone()),
+            ) {
+                Ok(()) => crate::executor::ExecReplyFuture(reply).await,
+                Err(_) => {
+                    crate::bwarn!("exec-ap",
+                        "spawn_on({}) failed — pool busy; .wasm exec dropped", core);
+                    reply.complete(127);
+                    127
+                }
+            }
+        }
+        // 1-2 core system: no ComputeApp AP — fall back to the single-slot queue
+        // (re-reads the path itself). Keeps small configs working, at the cost of
+        // the old serialization on those (non-target) machines.
+        None => crate::wasm::exec_queue::EXEC_QUEUE
+            .post_and_wait(path, argv, cwd, term_pts)
+            .await,
+    }
 }
 
 /// Per-host-call fuel budget. A pure-compute loop with no host calls burns this
@@ -511,18 +573,22 @@ impl Fiber {
                 //
                 // The cwd arg is unused for .cwasm (run_cwasm gets argv only); it
                 // is still forwarded to EXEC_QUEUE for .wasm (the wasmi fiber uses it).
-                let code = if path.ends_with(".cwasm")
-                    && !path.ends_with("compositor.cwasm")
-                {
-                    // Non-compositor .cwasm: take the parallel per-request path.
-                    // Each concurrent exec has its own Arc<ExecReply> + AP task.
-                    exec_cwasm_parallel(path, argv, term_pts).await
-                } else {
-                    // .wasm (wasmi fiber) or compositor.cwasm: delegate to the
-                    // exec_worker_task via the single-slot EXEC_QUEUE (unchanged).
+                let code = if path.ends_with("compositor.cwasm") {
+                    // The compositor is a singleton that owns the GUI core — it
+                    // must go through EXEC_QUEUE (exec_worker_task hands it off).
                     crate::wasm::exec_queue::EXEC_QUEUE
                         .post_and_wait(path, argv, cwd, term_pts)
                         .await
+                } else if path.ends_with(".cwasm") {
+                    // Non-compositor .cwasm: parallel per-request path on a
+                    // ComputeApp core (own Arc<ExecReply> + AP task).
+                    exec_cwasm_parallel(path, argv, term_pts).await
+                } else {
+                    // .wasm (wasmi): parallel per-request path too, so a
+                    // long-running interactive tool (rtop) runs on its own core
+                    // instead of monopolizing the single global exec worker and
+                    // starving every other terminal's commands.
+                    exec_wasmi_parallel(path, argv, cwd, term_pts).await
                 };
                 let _ = self.write_u32(exit_code_ptr, code as u32);
                 0

@@ -44,9 +44,15 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
                     None => {
                         if let Ok(s) = core::str::from_utf8(&bytes) {
                             use core::fmt::Write as _;
-                            let mut c = crate::console::CONSOLE.lock();
-                            let _ = c.write_str(s);
+                            let _ = crate::console::CONSOLE.lock().write_str(s);
                         }
+                        // CONSOLE è solo serial+framebuffer — e col desktop su,
+                        // il fb è coperto dalla GUI: su HW reale senza seriale
+                        // lo stdout di un'app finestra sarebbe INVISIBILE.
+                        // Spingilo anche nel ring dmesg e su netconsole.
+                        crate::klog::push(&bytes);
+                        #[cfg(feature = "netconsole")]
+                        crate::net::netconsole::enqueue(&bytes);
                     }
                 }
                 total += len;
@@ -255,11 +261,15 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
     linker.func_wrap("wasi_snapshot_preview1", "environ_get",
         |_caller: Caller<'_, T>, _e: i32, _b: i32| -> i32 { OK })?;
 
-    // clock_time_get(id, precision, time_out) -> errno. Monotonic-ish ns from
-    // the 100 Hz timer (10 ms/tick). Good enough for std/egui time bookkeeping.
+    // clock_time_get(id, precision, time_out) -> errno.
+    // id 0 (REALTIME): unix-epoch ns, anchored to the RTC once at first use —
+    // TLS in-app (rustls) validates certificate windows against SystemTime,
+    // so this must be wall-clock, not uptime. Other ids: monotonic-ish ns from
+    // the 100 Hz timer (10 ms/tick), good enough for std/egui bookkeeping.
     linker.func_wrap("wasi_snapshot_preview1", "clock_time_get",
-        |mut caller: Caller<'_, T>, _id: i32, _prec: i64, out: i32| -> i32 {
-            let ns: u64 = crate::timer::ticks().wrapping_mul(10_000_000);
+        |mut caller: Caller<'_, T>, id: i32, _prec: i64, out: i32| -> i32 {
+            let mono: u64 = crate::timer::ticks().wrapping_mul(10_000_000);
+            let ns = if id == 0 { boot_epoch_ns().wrapping_add(mono) } else { mono };
             if mem::write(&mut caller, out as u32, &ns.to_le_bytes()) { OK } else { EINVAL }
         })?;
 
@@ -277,6 +287,21 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
         |_caller: Caller<'_, T>| -> i32 { OK })?;
 
     Ok(())
+}
+
+/// Unix-epoch ns at boot (epoch_now − monotonic_now), cached on first call so
+/// the CMOS RTC is read once, not on every guest `SystemTime::now()`.
+fn boot_epoch_ns() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static BOOT_EPOCH_NS: AtomicU64 = AtomicU64::new(0);
+    let mut v = BOOT_EPOCH_NS.load(Ordering::Relaxed);
+    if v == 0 {
+        let epoch_s = crate::rtc::to_unix_epoch(&crate::rtc::now());
+        let mono = crate::timer::ticks().wrapping_mul(10_000_000);
+        v = epoch_s.wrapping_mul(1_000_000_000).wrapping_sub(mono);
+        BOOT_EPOCH_NS.store(v, Ordering::Relaxed);
+    }
+    v
 }
 
 fn kind_to_filetype(k: vfs::VfsKind) -> u8 {

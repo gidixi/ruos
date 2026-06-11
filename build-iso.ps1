@@ -233,14 +233,13 @@ if [ "$DO_CLEAN" = "True" ]; then
 fi
 
 echo "==> [4/5] kernel-embedded .cwasm guests (build-order safe)"
-# The kernel include_bytes!'s these four unconditionally; build them before
+# The kernel include_bytes!'s these unconditionally; build them before
 # `make iso` compiles the kernel (the Makefile lists them as siblings to the
 # right of the kernel target, so a from-clean `make iso` would compile the
 # kernel first and fail on the missing files). egui_demo.cwasm needs the
 # ruos-desktop submodule, hence after step 3.
 make kernel/src/wasm/wt/reactor.cwasm \
      kernel/src/wasm/wt/reactor_close.cwasm \
-     kernel/src/wasm/wt/probe.cwasm \
      kernel/src/wasm/wt/egui_demo.cwasm
 
 if echo " $FEATURES " | grep -q " boot-checks "; then
@@ -250,9 +249,10 @@ if echo " $FEATURES " | grep -q " boot-checks "; then
     cargo install wasm-tools
   fi
   make kernel/src/wasm/wt/hello.cwasm \
-       kernel/src/wasm/wt/gfxtest.cwasm \
        kernel/src/wasm/wt/echo.cwasm \
        kernel/src/wasm/wt/cat.cwasm \
+       kernel/src/wasm/wt/spin.cwasm \
+       kernel/src/wasm/wt/spin_reactor.cwasm \
        kernel/src/wasm/wt/bringup.cwasm
 fi
 

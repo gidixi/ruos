@@ -4,7 +4,15 @@
 //! exit code and signals completion.
 //!
 //! Design: single-slot (one child at a time). Shell waits on completion
-//! before issuing the next exec. Sufficient for a sequential init script.
+//! before issuing the next exec.
+//!
+//! Scope (since CHANGELOG 444): this single-slot path now serves only
+//! `compositor.cwasm` (hand-off to the GUI core) and the ≤2-core fallback for
+//! `.wasm`. The common paths exec in PARALLEL on ComputeApp cores instead and
+//! bypass this queue entirely: `.cwasm` via `exec_cwasm_parallel`, `.wasm` via
+//! `exec_wasmi_parallel` (both in `wasm/fiber.rs`). So a long-running
+//! interactive `.wasm` (rtop) no longer monopolizes this slot and starves
+//! every other terminal's commands.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};

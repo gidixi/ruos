@@ -137,6 +137,58 @@ pub async fn run_app_on_core(
     reply.complete(code);
 }
 
+/// Parallel `.wasm` (wasmi) exec on a ComputeApp core — the wasmi sibling of
+/// [`run_app_on_core`]. Builds the `Fiber` ON the target core (wasmi `Store`/
+/// `Instance` are `!Send`, so only the Send `bytes`/`argv`/`cwd`/`name` cross the
+/// core boundary, never the fiber). Mirrors the `.wasm` branch of
+/// `exec_worker_task` exactly — including the interactive PTY setup (cooked
+/// termios + foreground pid) so an interactive tool (rtop) receives keys and
+/// `^C` works — then signals the awaiting shell fiber via `reply.complete`.
+///
+/// Without this, every `.wasm` ran on the single global `exec_worker_task`: a
+/// long-running interactive tool parked that worker for its whole lifetime and
+/// every other terminal's command queued behind it on EXEC_QUEUE and never ran.
+#[embassy_executor::task(pool_size = 4)]
+pub async fn run_wasmi_on_core(
+    bytes:    alloc::boxed::Box<[u8]>,
+    argv:     alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd:      alloc::string::String,
+    term_pts: usize,
+    name:     alloc::string::String,
+    reply:    alloc::sync::Arc<ExecReply>,
+) {
+    let cpu = crate::cpu::cpu_id();
+    let code: i32 = match crate::wasm::fiber::Fiber::new(&bytes) {
+        Err(e) => {
+            kprintln!("ruos: run_wasmi_on_core: instantiate {} failed: {}", name, e);
+            126 // cannot execute
+        }
+        Ok(mut child) => {
+            child.set_args(argv);
+            child.set_cwd(cwd);
+            // Bind the child's stdio to the caller's PTY so output reaches the
+            // right terminal (e.g. /dev/pts/N) instead of the boot pts/0.
+            child.rebind_stdio_pty(term_pts);
+            let pid = crate::proc::register(name);
+            child.set_pid(pid);
+            // Interactive setup (mirrors exec_worker_task): give the child a
+            // cooked terminal + mark it foreground so VINTR (^C) targets it.
+            // Apps wanting raw (rtop, nano) flip it themselves and restore on
+            // exit; we restore the caller's termios + clear foreground after.
+            let saved_termios = crate::pty::termios_snapshot(term_pts);
+            crate::pty::force_cooked(term_pts);
+            crate::pty::set_foreground(term_pts, Some(pid));
+            let code = child.run().await;
+            crate::pty::set_foreground(term_pts, None);
+            crate::pty::set_termios(term_pts, saved_termios);
+            crate::proc::unregister(pid);
+            code
+        }
+    };
+    crate::binfo!("exec-ap", "wasmi ran_on=core{} code={}", cpu, code);
+    reply.complete(code);
+}
+
 /// Per-core wake flag. Index = owner core id. Set by `__pender`, cleared by that
 /// core's run loop before each poll. (Was a single global AtomicBool — single-core.)
 static WAKE_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] = {

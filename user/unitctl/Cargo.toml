@@ -1,0 +1,8 @@
+[package]
+name = "unitctl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "unitctl"
+path = "src/main.rs"

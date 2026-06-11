@@ -26,7 +26,7 @@ BIN_TOOLS  := shell ls cat echo \
               touch wc clear which \
               sort uniq cut tr tee \
               ifconfig nc date wget ping resolve \
-              service \
+              service unitctl \
               rtop \
               mkdisk mkboot install umount disks wifiscan wificonnect \
               gzip gunzip zcat

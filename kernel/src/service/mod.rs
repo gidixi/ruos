@@ -337,6 +337,29 @@ pub fn reset_restarts(name: &str) {
     if let Some(s) = r.iter_mut().find(|s| s.name == name) { s.restarts = 0; }
 }
 
+/// Snapshot dei timer enabled per lo scheduler: (idx, schedule, next_fire).
+pub fn timers_due_snapshot() -> Vec<(usize, schedule::Schedule, u64)> {
+    TIMERS.lock().iter().enumerate()
+        .filter(|(_, t)| t.enabled)
+        .map(|(i, t)| (i, t.schedule.clone(), t.next_fire))
+        .collect()
+}
+
+/// Registra lo scatto del timer `idx`: last_fire=now, next_fire ricalcolato
+/// (sempre futuro); BootPlus si disabilita (one-shot). Ritorna l'unit da
+/// avviare.
+pub fn timer_fired(idx: usize, epoch_now: u64, ticks_now: u64) -> Option<String> {
+    let mut g = TIMERS.lock();
+    let t = g.get_mut(idx)?;
+    t.last_fire = Some(match t.schedule {
+        schedule::Schedule::EveryTicks(_) | schedule::Schedule::BootPlus(_) => ticks_now,
+        _ => epoch_now,
+    });
+    t.next_fire = schedule::compute_next(&t.schedule, epoch_now, ticks_now);
+    if matches!(t.schedule, schedule::Schedule::BootPlus(_)) { t.enabled = false; }
+    Some(t.unit.clone())
+}
+
 /// Attesa di una richiesta dal dispatcher. Pattern `WaitForRequest`.
 pub struct WaitForServiceRequest;
 

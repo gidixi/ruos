@@ -252,6 +252,7 @@ pub fn run_core(cpu: u32) -> ! {
         spawner.spawn(ssh_pty_dispatcher_task()).unwrap();
         spawner.spawn(pty_watchdog_task()).unwrap();
         spawner.spawn(service_dispatcher_task()).unwrap();
+        spawner.spawn(unit_scheduler_task()).unwrap();
         crate::binfo!("user", "executor: core 0 tasks spawned");
     }
 
@@ -792,6 +793,32 @@ async fn service_dispatcher_task() {
         crate::proc::unregister(pid);
         mark_exited(&name, code);
         crate::binfo!("svc", "exit name={} code={}", name, code);
+    }
+}
+
+/// Scheduler dei timer unit: polling 1s (robusto a drift/cambi RTC), "fire
+/// if due, recompute to future" → niente doppio scatto, niente backfill.
+#[embassy_executor::task]
+async fn unit_scheduler_task() {
+    let _ = crate::proc::register_kernel("unit-sched");
+    loop {
+        delay::Delay::ticks(100).await; // ~1s @100Hz
+        let ticks = crate::timer::ticks();
+        let epoch = crate::rtc::to_unix_epoch(&crate::rtc::now());
+        for (idx, sched, next_fire) in crate::service::timers_due_snapshot() {
+            let due = match sched {
+                crate::service::schedule::Schedule::EveryTicks(_)
+                | crate::service::schedule::Schedule::BootPlus(_) => ticks >= next_fire,
+                _ => epoch >= next_fire,
+            };
+            if !due { continue; }
+            if let Some(unit) = crate::service::timer_fired(idx, epoch, ticks) {
+                crate::binfo!("svc", "timer fired -> start {}", unit);
+                if let Err(e) = crate::service::start(&unit) {
+                    crate::bwarn!("svc", "timer start {}: {}", unit, e);
+                }
+            }
+        }
     }
 }
 

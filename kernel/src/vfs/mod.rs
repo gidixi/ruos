@@ -153,37 +153,22 @@ pub async fn close(fd: Fd) -> Result<(), VfsError> {
 
 // Take-and-restore pattern: extract the FdEntry out of FDS, drop the
 // global lock, perform the I/O (which may suspend cooperatively under
-// Step 10.5 fibers), then restore the entry. Each VFS Fd is owned by
-// exactly one fiber at a time, so the gap between take and restore is
-// safe — no other code can observe the missing slot through normal
-// vfs API calls. A concurrent `close(fd)` while we're awaiting will
-// race: the slot will be None at restore time and we drop the file
-// silently (equivalent to closing during the I/O).
+// Step 10.5 fibers), then restore the entry. The slot stays RESERVED
+// (Slot::InFlight) for the whole op, so a concurrent `allocate()` can
+// never reuse the fd number while the I/O is pending — that reuse used
+// to cross-wire the old owner onto the new owner's file (a component
+// app opening its tty while the console shell sat in a blocking stdin
+// read stole the shell's fd; rtop-kill debug, 2026-06-11). A concurrent
+// `close(fd)` frees the slot; the restore then drops the entry
+// (close-during-I/O semantics, unchanged).
 async fn with_fd_take<F, T, FN>(fd: Fd, op: FN) -> Result<T, VfsError>
 where
     FN: FnOnce(crate::vfs::fd::FdEntry) -> F,
     F: core::future::Future<Output = (crate::vfs::fd::FdEntry, Result<T, VfsError>)>,
 {
-    let entry = {
-        let mut t = FDS.lock();
-        t.get_mut(fd as usize).and_then(|s| s.take()).ok_or(VfsError::BadFd)?
-    };
+    let entry = crate::vfs::fd::take(fd)?;
     let (entry, result) = op(entry).await;
-    {
-        let mut t = FDS.lock();
-        if let Some(s) = t.get_mut(fd as usize) {
-            if s.is_none() {
-                // Slot still ours — restore. (If a concurrent close()
-                // already nilled it, leaving s as None and dropping
-                // `entry` matches the close-during-I/O semantics.)
-                *s = Some(entry);
-            } else {
-                // Slot reused by an open() that happened during the
-                // await window. Drop our entry; the new owner stays.
-                drop(entry);
-            }
-        }
-    }
+    crate::vfs::fd::restore(fd, entry);
     result
 }
 

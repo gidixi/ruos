@@ -67,12 +67,7 @@ fn fd_to_pty(caller: &Caller<'_, RuntimeState>, fd: i32) -> Option<usize> {
         _ => return None,
     };
     // Peek into the global FDS table to find the FileImpl variant.
-    let t = crate::vfs::fd::FDS.lock();
-    let slot = t.get(vfs_fd as usize)?.as_ref()?;
-    match &slot.file {
-        crate::vfs::file::FileImpl::PtySlave(p) => Some(p.idx),
-        _ => None,
-    }
+    crate::vfs::fd::pts_index(vfs_fd)
 }
 
 /// ruos poll_stdin(buf_ptr, timeout_ticks) -> i32

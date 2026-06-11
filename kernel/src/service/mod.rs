@@ -338,6 +338,70 @@ pub fn reset_restarts(name: &str) {
     if let Some(s) = r.iter_mut().find(|s| s.name == name) { s.restarts = 0; }
 }
 
+/// Aggiorna enabled nel registry e posta la persistenza al dispatcher (le
+/// scritture VFS sono async; le host fn wasmi sono sync → queue).
+pub fn set_enabled(name: &str, on: bool) -> Result<(), ServiceError> {
+    let has_file = {
+        let mut r = UNITS.lock();
+        let entry = r.iter_mut().find(|s| s.name == name).ok_or(ServiceError::NotFound)?;
+        entry.enabled = on;
+        entry.file.is_some()
+    };
+    if has_file {
+        SERVICE_QUEUE.pending.lock().push_back(UnitReq::Persist(name.to_string()));
+        if let Some(w) = SERVICE_QUEUE.worker_waker.lock().take() { w.wake(); }
+    }
+    Ok(())
+}
+
+/// Riscrive il file sorgente dell'unit (chiamata dal dispatcher, async).
+pub async fn persist(name: &str) {
+    let (file, text) = {
+        let r = UNITS.lock();
+        let Some(u) = r.iter().find(|s| s.name == name) else { return; };
+        let Some(f) = u.file.clone() else { return; };
+        let text = if f.ends_with(".json") { unitfile::to_json(u) } else { unitfile::to_yaml(u) };
+        (f, text)
+    };
+    let flags = crate::vfs::OpenFlags::WRITE | crate::vfs::OpenFlags::CREATE | crate::vfs::OpenFlags::TRUNCATE;
+    match crate::vfs::open(&file, flags).await {
+        Ok(fd) => {
+            let bytes = text.as_bytes();
+            let mut off = 0;
+            while off < bytes.len() {
+                match crate::vfs::write(fd, &bytes[off..]).await {
+                    Ok(n) if n > 0 => off += n,
+                    _ => { crate::bwarn!("svc", "persist {}: short write", file); break; }
+                }
+            }
+            let _ = crate::vfs::close(fd).await;
+            crate::binfo!("svc", "persisted {}", file);
+        }
+        Err(_) => crate::bwarn!("svc", "persist {}: open failed", file),
+    }
+}
+
+/// Ri-parsa la dir: nuove unit aggiunte, le file-sourced non-Running
+/// vengono droppate e ricaricate (config fresca); le Running restano con
+/// la config vecchia fino al prossimo restart (warn). Timer ri-armati.
+pub async fn reload() {
+    {
+        let mut r = UNITS.lock();
+        r.retain(|u| u.file.is_none()
+            || matches!(u.status, UnitStatus::Running | UnitStatus::Restarting));
+        for u in r.iter() {
+            if u.file.is_some() {
+                crate::bwarn!("svc", "reload: '{}' running — config refresh at next restart", u.name);
+            }
+        }
+    }
+    TIMERS.lock().retain(|t| t.file.is_none());
+    // i duplicati con le Running superstiti vengono skippati con warn
+    load_from_disk().await;
+    let n = UNITS.lock().iter().filter(|u| u.file.is_some()).count();
+    crate::binfo!("svc", "reload done ({} file units)", n);
+}
+
 /// Snapshot dei timer enabled per lo scheduler: (idx, schedule, next_fire).
 pub fn timers_due_snapshot() -> Vec<(usize, schedule::Schedule, u64)> {
     TIMERS.lock().iter().enumerate()

@@ -87,3 +87,37 @@ pub fn build(doc: &UnitDoc, file: Option<&str>) -> Result<Parsed, String> {
         file: file.map(|s| s.to_string()),
     }))
 }
+
+fn kind_str(k: UnitKind) -> &'static str {
+    match k { UnitKind::Oneshot => "oneshot", UnitKind::Daemon => "daemon" }
+}
+fn restart_str(r: RestartPolicy) -> &'static str {
+    match r { RestartPolicy::No => "no", RestartPolicy::OnFailure => "on-failure", RestartPolicy::Always => "always" }
+}
+fn target_str(t: ActivateTarget) -> &'static str {
+    match t { ActivateTarget::Boot => "boot", ActivateTarget::PostBoot => "post-boot", ActivateTarget::Manual => "manual" }
+}
+
+/// Serializza una Unit nel formato YAML-subset (per la persistenza di
+/// enable/disable: riscrittura del file sorgente).
+pub fn to_yaml(u: &Unit) -> String {
+    let mut s = alloc::format!(
+        "name: {}\ntype: {}\nexec: {}\nrestart: {}\ntarget: {}\nenabled: {}\n",
+        u.name, kind_str(u.kind), u.path, restart_str(u.restart),
+        target_str(u.target), u.enabled);
+    if !u.after.is_empty()    { s += &alloc::format!("after: [{}]\n",    u.after.join(", ")); }
+    if !u.requires.is_empty() { s += &alloc::format!("requires: [{}]\n", u.requires.join(", ")); }
+    s
+}
+
+/// Serializza una Unit nel formato JSON-subset.
+pub fn to_json(u: &Unit) -> String {
+    let list = |l: &[String]| -> String {
+        let items: Vec<String> = l.iter().map(|x| alloc::format!("\"{}\"", x)).collect();
+        alloc::format!("[{}]", items.join(","))
+    };
+    alloc::format!(
+        "{{ \"name\":\"{}\", \"type\":\"{}\", \"exec\":\"{}\", \"restart\":\"{}\", \"target\":\"{}\", \"enabled\":{}, \"after\":{}, \"requires\":{} }}\n",
+        u.name, kind_str(u.kind), u.path, restart_str(u.restart),
+        target_str(u.target), u.enabled, list(&u.after), list(&u.requires))
+}

@@ -9,7 +9,27 @@ pub fn run() {
     check_unitfile();
     check_compute_next();
     check_topo();
+    check_serialize();
     crate::binfo!("svc-check", "init-units checks OK");
+}
+
+fn check_serialize() {
+    use super::unitfile::{build, to_yaml, to_json, Parsed};
+    let src = "name: sshd\ntype: daemon\nexec: /mnt/bin/sshd.wasm\nrestart: on-failure\ntarget: boot\nenabled: true\nafter: [net]\nrequires: [net]\n";
+    let Parsed::U(u) = build(&super::yaml::parse(src).unwrap(), None).unwrap() else { panic!() };
+    // roundtrip YAML: serialize → parse → build → campi uguali
+    let y = to_yaml(&u);
+    let Parsed::U(u2) = build(&super::yaml::parse(&y).unwrap(), None).unwrap() else { panic!() };
+    assert_eq!(u2.name, u.name);
+    assert_eq!(u2.enabled, u.enabled);
+    assert_eq!(u2.restart, u.restart);
+    assert_eq!(u2.after, u.after);
+    // roundtrip JSON
+    let j = to_json(&u);
+    let Parsed::U(u3) = build(&super::json::parse(&j).unwrap(), None).unwrap() else { panic!() };
+    assert_eq!(u3.name, u.name);
+    assert_eq!(u3.enabled, u.enabled);
+    crate::binfo!("svc-check", "serialize OK");
 }
 
 fn check_topo() {

@@ -744,11 +744,9 @@ async fn service_dispatcher_task() {
     let _ = crate::proc::register_kernel("svc-dispatch");
     loop {
         let name = match WaitForServiceRequest.await {
-            UnitReq::Start(n) => n,
-            other => {
-                crate::bwarn!("svc", "dispatcher: {:?} not yet implemented", other);
-                continue;
-            }
+            UnitReq::Start(n)   => n,
+            UnitReq::Persist(n) => { crate::service::persist(&n).await; continue; }
+            UnitReq::Reload     => { crate::service::reload().await;    continue; }
         };
         // Daemon o unit con restart policy → runner supervisionato (pool);
         // oneshot senza policy → exec inline qui sotto.

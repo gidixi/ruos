@@ -63,6 +63,36 @@ fn num(s: &str, max: u32) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Prossimo scatto FUTURO. Calendario: input/output = unix epoch (s).
+/// Monotoni: input/output = tick (EveryTicks→now_ticks+n; BootPlus→n, armato
+/// una volta sola al load). Pura: testabile nei boot-check. Day-of-week da
+/// epoch: 1970-01-01 = giovedì = 4.
+pub fn compute_next(s: &Schedule, epoch_now: u64, now_ticks: u64) -> u64 {
+    const HOUR: u64 = 3_600;
+    const DAY:  u64 = 86_400;
+    match *s {
+        Schedule::EveryTicks(n) => now_ticks + n,
+        Schedule::BootPlus(n)   => n,
+        Schedule::Hourly { minute } => {
+            let cand = epoch_now - epoch_now % HOUR + u64::from(minute) * 60;
+            if cand > epoch_now { cand } else { cand + HOUR }
+        }
+        Schedule::Daily { hour, minute } => {
+            let cand = epoch_now - epoch_now % DAY
+                     + u64::from(hour) * HOUR + u64::from(minute) * 60;
+            if cand > epoch_now { cand } else { cand + DAY }
+        }
+        Schedule::Weekly { dow, hour, minute } => {
+            let days = epoch_now / DAY;
+            let dow_now = ((days + 4) % 7) as u8;
+            let delta = u64::from((dow + 7 - dow_now) % 7);
+            let cand = (days + delta) * DAY
+                     + u64::from(hour) * HOUR + u64::from(minute) * 60;
+            if cand > epoch_now { cand } else { cand + 7 * DAY }
+        }
+    }
+}
+
 /// Backoff esponenziale capato: 1s,2s,4s,…,30s (in tick @100Hz).
 /// `restarts` = numero di restart già fatti (0-based al primo).
 pub fn backoff_ticks(restarts: u32) -> u64 {

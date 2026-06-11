@@ -7,7 +7,34 @@ pub fn run() {
     check_json();
     check_schedule();
     check_unitfile();
+    check_compute_next();
     crate::binfo!("svc-check", "init-units checks OK");
+}
+
+fn check_compute_next() {
+    use super::schedule::{compute_next, Schedule};
+    // 2026-06-08 14:30:00 UTC = 1780929000 (lunedì, dow=1) — verificato con
+    // `date -u -d @N`.
+    let now: u64 = 1_780_929_000;
+    assert_eq!(compute_next(&Schedule::Daily { hour: 3, minute: 0 }, now, 0),
+               1_780_974_000);              // 2026-06-09 03:00:00 (domani)
+    assert_eq!(compute_next(&Schedule::Hourly { minute: 0 }, now, 0),
+               1_780_930_800);              // 15:00:00
+    assert_eq!(compute_next(&Schedule::Hourly { minute: 45 }, now, 0),
+               1_780_929_900);              // 14:45:00 (stessa ora, futuro)
+    // weekly Tue 14:00 → domani: 2026-06-09 14:00:00
+    assert_eq!(compute_next(&Schedule::Weekly { dow: 2, hour: 14, minute: 0 }, now, 0),
+               1_781_013_600);
+    // weekly Mon 09:30 → oggi è lunedì ma orario passato → +7g: 2026-06-15 09:30:00
+    assert_eq!(compute_next(&Schedule::Weekly { dow: 1, hour: 9, minute: 30 }, now, 0),
+               1_781_515_800);
+    // rollover anno: 2026-12-31 23:59:00 → daily 00:00 = 2027-01-01 00:00:00
+    assert_eq!(compute_next(&Schedule::Daily { hour: 0, minute: 0 }, 1_798_761_540, 0),
+               1_798_761_600);
+    // monotoni: in tick
+    assert_eq!(compute_next(&Schedule::EveryTicks(500), now, 12_345), 12_845);
+    assert_eq!(compute_next(&Schedule::BootPlus(1_000), now, 12_345), 1_000);
+    crate::binfo!("svc-check", "compute_next OK");
 }
 
 fn check_unitfile() {

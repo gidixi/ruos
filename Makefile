@@ -3,6 +3,10 @@ KERNEL    := kernel/target/x86_64-unknown-none/release/kernel
 LIMINE    := third_party/limine
 ISO_ROOT  := build/iso_root
 ISO       := build/os.iso
+# ISO separata per i target di test: run-test/run-test-usb buildano e bootano
+# QUESTA (init = smoke.sh), così build/os.iso resta sempre quella pulita di
+# `make iso` (init minimale) e si può flashare senza la batteria di test.
+TEST_ISO  := build/os-test.iso
 DISK_IMG  := build/disk.img
 DISK_MB   := 64
 HELLO     := shell: init.sh complete
@@ -273,9 +277,9 @@ run: iso $(DISK_IMG)
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0
 
 run-test: $(DISK_IMG)
-	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh ISO=$(TEST_ISO)
 	@echo "--- serial (timeout 240s, NIC=$(NIC)) ---"
-	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(ISO) -serial stdio -display none -no-reboot -m 1024 \
+	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom $(TEST_ISO) -serial stdio -display none -no-reboot -m 1024 \
 		-device qemu-xhci -device usb-kbd -netdev user,id=net0 -device $(NIC),netdev=net0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
@@ -302,10 +306,10 @@ run-test: $(DISK_IMG)
 # Asserts the shell comes up and bin.bgz was unpacked successfully.
 .PHONY: run-test-usb
 run-test-usb:
-	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh
+	@$(MAKE) iso INIT_SCRIPT=user-bin/smoke.sh ISO=$(TEST_ISO)
 	@echo "--- usb-msc serial (timeout 240s) ---"
 	@timeout 240 qemu-system-x86_64 -machine q35 -cpu max -m 1024 -no-reboot -display none -serial stdio \
-		-drive if=none,id=stick,file=$(ISO),format=raw \
+		-drive if=none,id=stick,file=$(TEST_ISO),format=raw \
 		-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
 		-device usb-kbd,bus=xhci.0 \
 		-netdev user,id=net0 -device $(NIC),netdev=net0 \

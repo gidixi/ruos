@@ -253,6 +253,7 @@ pub fn run_core(cpu: u32) -> ! {
         spawner.spawn(pty_watchdog_task()).unwrap();
         spawner.spawn(service_dispatcher_task()).unwrap();
         spawner.spawn(unit_scheduler_task()).unwrap();
+        spawner.spawn(init_units_task()).unwrap();
         crate::binfo!("user", "executor: core 0 tasks spawned");
     }
 
@@ -794,6 +795,18 @@ async fn service_dispatcher_task() {
         mark_exited(&name, code);
         crate::binfo!("svc", "exit name={} code={}", name, code);
     }
+}
+
+/// Orchestrazione boot delle unit: carica i file, attiva il target Boot,
+/// poi PostBoot quando shell/compositor hanno avuto modo di partire.
+#[embassy_executor::task]
+async fn init_units_task() {
+    let _ = crate::proc::register_kernel("init-units");
+    crate::service::load_from_disk().await;
+    crate::service::activate_target(crate::service::ActivateTarget::Boot).await;
+    delay::Delay::ticks(300).await;   // ~3s: shell + compositor su
+    crate::service::activate_target(crate::service::ActivateTarget::PostBoot).await;
+    crate::binfo!("svc", "unit activation complete");
 }
 
 /// Scheduler dei timer unit: polling 1s (robusto a drift/cambi RTC), "fire

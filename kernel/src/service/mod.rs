@@ -383,6 +383,92 @@ impl core::future::Future for WaitForServiceRequest {
 /// del piano init-units (stub per far girare init_units_task prima).
 pub async fn load_from_disk() {}
 
+/// "Su" = daemon/builtin → Running; oneshot → Exited(0).
+pub fn is_up(name: &str) -> bool {
+    let r = UNITS.lock();
+    match r.iter().find(|s| s.name == name) {
+        Some(u) => match u.kind {
+            UnitKind::Daemon  => matches!(u.status, UnitStatus::Running),
+            UnitKind::Oneshot => matches!(u.status, UnitStatus::Exited(0)),
+        },
+        None => false,
+    }
+}
+
+fn is_failed(name: &str) -> bool {
+    UNITS.lock().iter().find(|s| s.name == name)
+        .map(|u| matches!(u.status, UnitStatus::Failed(_)))
+        .unwrap_or(false)
+}
+
+/// Attiva le unit enabled del target `t` + chiusura transitiva dei requires,
+/// in ordine topologico. Async: attende che le dep siano "su" (timeout 10s)
+/// prima di avviare le dipendenti; requires fallito → dipendente
+/// `Failed(dep)`. Vedi spec §6.
+pub async fn activate_target(t: ActivateTarget) {
+    // 1. set = enabled con target t + chiusura requires (snapshot, lock corto)
+    let nodes: Vec<(String, Vec<String>)> = {
+        let r = UNITS.lock();
+        let mut set: Vec<String> = r.iter()
+            .filter(|u| u.enabled && u.target == t)
+            .map(|u| u.name.clone()).collect();
+        let mut i = 0;
+        while i < set.len() {                       // chiusura transitiva requires
+            let reqs: Vec<String> = r.iter().find(|u| u.name == set[i])
+                .map(|u| u.requires.clone()).unwrap_or_default();
+            for q in reqs {
+                if !set.contains(&q) && r.iter().any(|u| u.name == q) { set.push(q); }
+            }
+            i += 1;
+        }
+        set.iter().map(|n| {
+            let u = r.iter().find(|u| u.name == *n).unwrap();
+            let mut deps = u.after.clone();
+            for q in &u.requires { if !deps.contains(q) { deps.push(q.clone()); } }
+            (n.clone(), deps)
+        }).collect()
+    };
+    if nodes.is_empty() { return; }
+
+    // 2. topo-sort; ciclo → Failed(cycle)
+    let (order, cyclic) = topo::topo_sort(&nodes);
+    for n in &cyclic {
+        crate::bwarn!("svc", "activate: dependency cycle at '{}'", n);
+        mark_failed(n, "cycle");
+    }
+
+    // 3. avvio in ordine; attesa "su" delle dep (cap 10s)
+    for name in order {
+        let deps = nodes.iter().find(|(n, _)| *n == name)
+            .map(|(_, d)| d.clone()).unwrap_or_default();
+        let mut dep_failed = false;
+        for d in &deps {
+            // dep fuori registry (typo) → warn e prosegui
+            if !UNITS.lock().iter().any(|u| u.name == *d) {
+                crate::bwarn!("svc", "activate {}: unknown dep '{}'", name, d);
+                continue;
+            }
+            let deadline = crate::timer::ticks() + 1_000;     // 10s
+            while !is_up(d) && !is_failed(d) && crate::timer::ticks() < deadline {
+                crate::executor::delay::Delay::ticks(10).await; // 100ms
+            }
+            if is_failed(d) { dep_failed = true; break; }
+            if !is_up(d) {
+                crate::bwarn!("svc", "activate {}: dep '{}' not up after 10s — proceeding", name, d);
+            }
+        }
+        if dep_failed {
+            crate::bwarn!("svc", "activate {}: required dep failed", name);
+            mark_failed(&name, "dep");
+            continue;
+        }
+        if is_up(&name) { continue; }                          // builtin già Running
+        if let Err(e) = start(&name) {
+            crate::bwarn!("svc", "activate {}: {}", name, e);
+        }
+    }
+}
+
 /// Seeding boot del registry. Chiamato da `boot::phases::userland::init`
 /// prima dello spawn SSH.
 pub fn init() {

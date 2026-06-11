@@ -278,6 +278,11 @@ pub fn run_tui_component(app_cwasm: &[u8], tui_cwasm: &[u8], once: bool, pts: Op
         }
     }
     let mut store = Store::new(engine, state);
+    // epoch_interruption è attiva engine-wide: senza deadline lo store trappa
+    // SUBITO (default 0). L'app TUI è interattiva (poll-key coopera già con
+    // kill/VINTR); la policy watchdog vera per questo runner è SP1
+    // (spec multi-tenant-hardening, punto 5) — qui solo no-deadline.
+    store.set_epoch_deadline(crate::wasm::wt::NO_DEADLINE_TICKS);
 
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("cld", options(nostack)); }

@@ -748,13 +748,25 @@ async fn service_dispatcher_task() {
                 continue;
             }
         };
-        let path = match path_of(&name) {
-            Some(p) => p,
-            None    => {
+        // Daemon o unit con restart policy → runner supervisionato (pool);
+        // oneshot senza policy → exec inline qui sotto.
+        let (kind, policy, path) = match crate::service::exec_info_of(&name) {
+            Some(t) => t,
+            None => {
                 crate::bwarn!("svc", "dispatcher: unknown name '{}'", name);
                 continue;
             }
         };
+        let supervised = matches!(kind, crate::service::UnitKind::Daemon)
+            || !matches!(policy, crate::service::RestartPolicy::No);
+        if supervised {
+            if spawn_on(0, unit_runner_task(name.clone())).is_err() {
+                crate::bwarn!("svc", "start {}: no free daemon slot (max {})",
+                    name, crate::service::MAX_DAEMONS);
+                mark_failed(&name, "noslot");
+            }
+            continue;
+        }
         let bytes = match crate::wasm::read_all(&path).await {
             Ok(b) => b,
             Err(_) => {
@@ -780,6 +792,66 @@ async fn service_dispatcher_task() {
         crate::proc::unregister(pid);
         mark_exited(&name, code);
         crate::binfo!("svc", "exit name={} code={}", name, code);
+    }
+}
+
+/// Runner di un'unità supervisionata: esegue il child, applica la restart
+/// policy con backoff esponenziale, esce su stop_requested o policy esaurita.
+/// I daemon non hanno PTY: stdout → console (pts 0). `.cwasm` gira su un
+/// compute core via `exec_cwasm_inner`; `.wasm` inline (wasmi) sul BSP.
+#[embassy_executor::task(pool_size = 8)] // = service::MAX_DAEMONS (l'attr vuole un letterale)
+async fn unit_runner_task(name: alloc::string::String) {
+    use crate::service::{self, RestartPolicy};
+    loop {
+        let Some((_kind, policy, path)) = service::exec_info_of(&name) else { return; };
+        let bytes = match crate::wasm::read_all(&path).await {
+            Ok(b) => b,
+            Err(_) => { service::mark_failed(&name, "read"); return; }
+        };
+        let pid = crate::proc::register(name.clone());
+        service::mark_running(&name, pid);
+        let started = crate::timer::ticks();
+        crate::binfo!("svc", "runner start name={} pid={} path={}", name, pid, path);
+
+        let code = if path.ends_with(".cwasm") {
+            crate::wasm::fiber::exec_cwasm_inner(
+                bytes, alloc::vec![name.as_bytes().to_vec()], 0).await
+        } else {
+            match crate::wasm::fiber::Fiber::new(&bytes) {
+                Ok(mut fb) => {
+                    fb.set_args(alloc::vec![name.as_bytes().to_vec()]);
+                    fb.set_pid(pid);
+                    fb.run().await
+                }
+                Err(_) => {
+                    service::mark_failed(&name, "instantiate");
+                    crate::proc::unregister(pid);
+                    return;
+                }
+            }
+        };
+        crate::proc::unregister(pid);
+        crate::binfo!("svc", "runner exit name={} code={}", name, code);
+
+        // Uptime > 60s → crash transitorio recuperato: reset del backoff.
+        if crate::timer::ticks().saturating_sub(started) > 6_000 {
+            service::reset_restarts(&name);
+        }
+        if service::take_stop_requested(&name) {
+            service::mark_exited(&name, code);
+            return;
+        }
+        let restart = matches!(policy, RestartPolicy::Always)
+            || (matches!(policy, RestartPolicy::OnFailure) && code != 0);
+        if !restart {
+            service::mark_exited(&name, code);
+            return;
+        }
+        service::mark_restarting(&name);
+        let n = service::bump_restarts(&name);
+        let wait = crate::service::schedule::backoff_ticks(n.saturating_sub(1));
+        crate::binfo!("svc", "restart name={} #{} in {} ticks", name, n, wait);
+        delay::Delay::ticks(wait).await;
     }
 }
 

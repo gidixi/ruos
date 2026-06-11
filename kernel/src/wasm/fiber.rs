@@ -53,7 +53,21 @@ pub async fn exec_cwasm_parallel(
         alloc::string::String::from(path.trim_start_matches('/')),
     );
 
-    let code = match crate::executor::pick_compute_core() {
+    let code = exec_cwasm_inner(bytes, argv, term_pts).await;
+
+    crate::proc::unregister(pid);
+    code
+}
+
+/// Esegue bytes `.cwasm` già letti, con pid già registrato dal chiamante
+/// (l'unit runner deve possedere il pid per `request_kill`). Stessa logica
+/// di [`exec_cwasm_parallel`] ma senza register/unregister.
+pub async fn exec_cwasm_inner(
+    bytes:    alloc::vec::Vec<u8>,
+    argv:     alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    term_pts: usize,
+) -> i32 {
+    match crate::executor::pick_compute_core() {
         Some(core) => {
             let reply = crate::executor::ExecReply::new();
             let boxed = bytes.into_boxed_slice();
@@ -82,10 +96,7 @@ pub async fn exec_cwasm_parallel(
             // 1-2 core system: no ComputeApp AP — run inline on the calling fiber.
             crate::wasm::wt::run_cwasm(&bytes, argv, Some(term_pts))
         }
-    };
-
-    crate::proc::unregister(pid);
-    code
+    }
 }
 
 /// Per-host-call fuel budget. A pure-compute loop with no host calls burns this

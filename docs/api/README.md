@@ -46,6 +46,14 @@ CHANGELOG 422 `memory_reservation`, CHANGELOG 455 `epoch_interruption`),
   `wt-precompile <app>.wasm <app>.cwasm`. Your `.wasm` sources stay valid —
   only the precompile output is config-bound.
 - Replace stale copies on `/mnt/apps` too: a new ISO does not touch the disk.
+- **THREADS feature bit (wasmtime fork, MT Fase 2 — CHANGELOG/486):** forward-only
+  incompatibility. `.cwasm` precompiled after changelog 486 (with `wasm_threads(true)`)
+  record the THREADS feature bit and are **rejected by pre-486 kernels** (engine
+  without the bit). Conversely, old `.cwasm` compiled without THREADS keep loading
+  on the new engine — the check is a subset check (`module features ⊆ engine
+  features`), so no re-AOT is needed when upgrading the kernel. If you downgrade
+  the kernel below 486, re-precompile any `.cwasm` produced by the new
+  `wt-precompile`.
 
 ## Conventions
 

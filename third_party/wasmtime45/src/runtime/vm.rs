@@ -77,6 +77,7 @@ mod vmcontext;
 // no_std il blocking di memory.atomic.wait*/notify va sugli hook extern "C"
 // wasmtime_futex_* del kernel (vedi memory/shared_memory.rs), quindi il modulo
 // resta solo per le build std.
+// (solo per minimizzare il diff: in questo fork nessuna build usa più parking_spot; una build std del fork richiederebbe comunque i simboli futex esterni)
 #[cfg(all(feature = "threads", feature = "std"))]
 mod parking_spot;
 

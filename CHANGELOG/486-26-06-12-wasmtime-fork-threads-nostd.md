@@ -66,6 +66,5 @@ e NON caricherebbero su un kernel vecchio. Verificato con `make run-test` →
 - kernel/src/wasm/wt/mod.rs
 - kernel/src/wasm/wt/platform.rs
 - tools/wt-precompile/Cargo.toml
-- tools/wt-precompile/Cargo.lock
 - tools/wt-precompile/src/main.rs
 - CHANGELOG/486-26-06-12-wasmtime-fork-threads-nostd.md

@@ -222,6 +222,10 @@ pub fn init() -> Result<(), BootError> {
         // notify risveglia via IPI (waiter/waker su due fiber dello stesso gruppo).
         let g3 = crate::wasm::wt::run_threads_gate3();
         crate::binfo!("wt", "THREADS-OK 3 = {}", if g3 { "ok" } else { "FAIL" });
+        // MT Fase 2 gate 2: thread-spawn reale — il main spawna un thread
+        // (fresh Instance, stessa SharedMemory) e ne vede la scrittura.
+        let g2 = crate::wasm::wt::run_threads_gate2();
+        crate::binfo!("wt", "THREADS-OK 2 = {}", if g2 { "ok" } else { "FAIL" });
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();

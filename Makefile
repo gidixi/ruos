@@ -128,13 +128,15 @@ WT_KDIR    := kernel/src/wasm/wt
 WT_KCWASMS := $(WT_KDIR)/hello.cwasm \
               $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm \
               $(WT_KDIR)/spin_reactor.cwasm $(WT_KDIR)/threads_gate1.cwasm \
-              $(WT_KDIR)/threads_gate3.cwasm
+              $(WT_KDIR)/threads_gate2.cwasm $(WT_KDIR)/threads_gate3.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/spin.cwasm: tools/wt-spin/spin.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/threads_gate1.cwasm: tools/wt-threads-gate/gate1.wat $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/threads_gate2.cwasm: tools/wt-threads-gate/gate2.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/threads_gate3.cwasm: tools/wt-threads-gate/gate3.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
@@ -487,6 +489,12 @@ run-pipe-test: iso ssh-key-on-disk
 .PHONY: run-smp-test
 run-smp-test: iso $(DISK_IMG)
 	bash tests/smp-test.sh
+
+# MT Fase 2 wasm-threads gates: builds its own boot-checks ISO and asserts
+# THREADS-OK 1/2/3 + THREADS-FIBER-OK on -smp 4 AND -smp 1 (BSP fallback).
+.PHONY: run-threads-test
+run-threads-test:
+	bash tests/threads-test.sh
 
 # rtop interactive test: runs rtop over SSH, asserts timer-driven auto-refresh
 # (multiple frames while idle) + clean 'q' quit (alt-screen restored).

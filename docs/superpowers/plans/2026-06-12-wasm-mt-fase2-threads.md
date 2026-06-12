@@ -668,7 +668,7 @@ Runner kernel (boot-checks): crea gruppo per gate3.cwasm, spawna fiber-waiter po
 - Modify: `kernel/src/wasm/wt/threads.rs` (`add_thread_spawn_to_linker`), `kernel/src/wasm/wt/wasi.rs` (registrazione condizionale)
 - Create: `tools/wt-threads-gate/gate2.wat` + regola/include/runner
 
-- [ ] **Step 1: Host fn thread-spawn**
+- [x] **Step 1: Host fn thread-spawn** (nota: anche `spawn_fiber_export` ora setta `state.threads` — il main del gate 2 chiama thread-spawn dal path di test)
 
 In `threads.rs`:
 ```rust
@@ -694,7 +694,7 @@ pub fn add_thread_spawn_to_linker(
 ```
 Spawn NON esegue inline: accoda il fiber (run-to-runnable, lo prende il primo core libero). Già wired in `exec_threaded` (Task 3).
 
-- [ ] **Step 2: Gate 2 guest**
+- [x] **Step 2: Gate 2 guest**
 
 `gate2.wat` — il main spawna un "thread" via l'import e attende che scriva una cella:
 ```wat
@@ -712,13 +712,14 @@ Spawn NON esegue inline: accoda il fiber (run-to-runnable, lo prende il primo co
 ```
 Runner: gruppo + fiber main su export `run` (riusa il path di test del Task 4), assert exit = 99 → `THREADS-OK 2 = ok`. Prova: spawn crea una nuova Instance sulla STESSA SharedMemory, il child scrive, il main lo vede.
 
-- [ ] **Step 3: Makefile + include + boot call + assert** (pattern solito). Tutti e tre i marker ora nel log: `THREADS-OK 1/2/3`.
+- [x] **Step 3: Makefile + include + boot call + assert** (pattern solito). Tutti e tre i marker ora nel log: `THREADS-OK 1/2/3`.
 
-- [ ] **Step 4: Aggiorna `tests/` — script gate**
+- [x] **Step 4: Aggiorna `tests/` — script gate**
 
 Create `tests/threads-test.sh` (clone della struttura di frame-smp-test.sh): builda con `CARGO_FEATURES=boot-checks`, boota `-smp 4 -m 2048`, grep-assert i 3 marker `THREADS-OK [123] = ok` + `THREADS-FIBER-OK`. FAIL se uno manca.
+(Fatto, in più: boota anche `-smp 1` come regressione deadlock del fallback BSP; target `make run-threads-test`. Verificato: TEST_PASS_THREADS + make run-test TEST_PASS.)
 
-- [ ] **Step 5: Commit** (`feat(wt): wasi thread-spawn — new instance per thread on the shared memory`).
+- [x] **Step 5: Commit** (`feat(wt): wasi thread-spawn — new instance per thread on the shared memory`).
 
 ---
 

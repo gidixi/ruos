@@ -123,6 +123,17 @@ pub fn run_threads_gate3() -> bool {
     threads::gate3_run(THREADS_GATE3_CWASM)
 }
 
+/// Gate 2 MT Fase 2 (`tools/wt-threads-gate/gate2.wat` precompilato):
+/// thread-spawn reale — fresh Instance sulla stessa SharedMemory.
+#[cfg(feature = "boot-checks")]
+static THREADS_GATE2_CWASM: &[u8] = include_bytes!("threads_gate2.cwasm");
+
+/// Gate 2 MT Fase 2 — vedi `threads::gate2_run` (main spawna un thread vero).
+#[cfg(feature = "boot-checks")]
+pub fn run_threads_gate2() -> bool {
+    threads::gate2_run(THREADS_GATE2_CWASM)
+}
+
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]

@@ -579,19 +579,32 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
 }
 
 /// Registra l'import wasi-threads: modulo `"wasi"`, field `"thread-spawn"`
-/// (TRATTINO), `(param i32) (result i32)`. Ogni modulo wasip1-threads importa
-/// il simbolo, quindi la definizione serve già ora per l'instantiate; lo spawn
-/// REALE (nuovo fiber su `wasi_thread_start`) arriva col Task 5 — finché non
-/// c'è, rifiuta con -1 (pthread_create fallisce pulito, EAGAIN guest-side).
+/// (TRATTINO), `(param i32) (result i32)`. Spawn = nuovo fiber accodato
+/// runnable (lo prende il primo core libero, NON esegue inline): fresh
+/// Instance dello stesso Module sulla STESSA SharedMemory, entry
+/// `wasi_thread_start(tid, start_arg)` (stack pointer + TLS del thread sono
+/// affare del guest, preparati da pthread_create nel blocco `start_arg`).
+/// Ritorna il tid > 0, o -1 su errore (pthread_create → EAGAIN guest-side).
 pub fn add_thread_spawn_to_linker(
     linker: &mut wasmtime::Linker<crate::wasm::wt::state::WtState>,
 ) -> wasmtime::Result<()> {
     linker.func_wrap("wasi", "thread-spawn",
-        |caller: wasmtime::Caller<'_, crate::wasm::wt::state::WtState>, _start_arg: i32| -> i32 {
-            if caller.data().threads.is_none() {
-                return -1; // modulo non threaded: import mai definito altrove
+        |caller: wasmtime::Caller<'_, crate::wasm::wt::state::WtState>, start_arg: i32| -> i32 {
+            let g = match caller.data().threads.clone() {
+                Some(g) => g,
+                None => return -1, // modulo non threaded: niente gruppo
+            };
+            if g.poisoned.load(Ordering::SeqCst) {
+                return -1; // gruppo morente: non rianimarlo
             }
-            -1 // Task 5: spawn_thread reale (nuovo fiber, wasi_thread_start)
+            let tid = g.next_tid.fetch_add(1, Ordering::SeqCst);
+            if tid >= (1 << 29) {
+                return -1; // range tid valido wasi-threads: [1, 2^29)
+            }
+            crate::binfo!("wt", "thread-spawn tid={} live={}", tid,
+                          g.live.load(Ordering::SeqCst) + 1);
+            spawn_fiber(g, tid, start_arg, None);
+            tid as i32
         })?;
     Ok(())
 }
@@ -668,6 +681,76 @@ pub fn gate3_run(cwasm: &[u8]) -> bool {
     code == Some(7)
 }
 
+/// Gate 2 MT Fase 2: il main (export `run`, su fiber) chiama l'import
+/// `wasi.thread-spawn`; il kernel crea un SECONDO fiber con una fresh
+/// Instance sulla STESSA SharedMemory che esegue `wasi_thread_start` (scrive
+/// 99 + notify); il main attende in atomic.wait e rilegge il valore.
+/// Ritorna true sse il main esce con 99.
+#[cfg(feature = "boot-checks")]
+pub fn gate2_run(cwasm: &[u8]) -> bool {
+    let engine = crate::wasm::wt::engine();
+    // SAFETY: cwasm prodotto da tools/wt-precompile per questa exact config.
+    let module = match unsafe { wasmtime::Module::deserialize(engine, cwasm) } {
+        Ok(m) => m,
+        Err(e) => { crate::kprintln!("ruos: gate2 deserialize: {:?}", e); return false; }
+    };
+    let mem_ty = match module.imports().find_map(|i| i.ty().memory().cloned()) {
+        Some(t) => t,
+        None => { crate::kprintln!("ruos: gate2: no memory import"); return false; }
+    };
+    let shared = match wasmtime::SharedMemory::new(engine, mem_ty) {
+        Ok(s) => s,
+        Err(e) => { crate::kprintln!("ruos: gate2 SharedMemory: {:?}", e); return false; }
+    };
+    let mut linker: wasmtime::Linker<crate::wasm::wt::state::WtState> =
+        wasmtime::Linker::new(engine);
+    if let Err(e) = add_thread_spawn_to_linker(&mut linker) {
+        crate::kprintln!("ruos: gate2 thread-spawn link: {}", e);
+        return false;
+    }
+    {
+        let throwaway =
+            wasmtime::Store::new(engine, crate::wasm::wt::state::WtState::new(Vec::new()));
+        if let Err(e) = linker.define(&throwaway, "env", "memory", shared.clone()) {
+            crate::kprintln!("ruos: gate2 define: {:?}", e);
+            return false;
+        }
+    }
+    let cpu = crate::cpu::cpu_id();
+    let group = Arc::new(ThreadGroup {
+        module,
+        linker: Arc::new(linker),
+        shared,
+        next_tid: AtomicU32::new(1),
+        live: AtomicU32::new(0),
+        poisoned: AtomicBool::new(false),
+        exit: IrqMutex::new(None),
+        waiter_core: AtomicU32::new(cpu),
+        base_args: Vec::new(),
+        env: Vec::new(),
+    });
+    // main = tid 0 sull'export `run`; il thread tid 1 lo crea thread-spawn.
+    spawn_fiber_export(group.clone(), 0, "run");
+    let deadline = crate::timer::ticks() + 500; // 5 s
+    while group.live.load(Ordering::SeqCst) != 0 {
+        if core_allowed(cpu) {
+            expire_timeouts();
+            while run_one(cpu) {}
+        }
+        if crate::timer::ticks() > deadline {
+            crate::kprintln!(
+                "ruos: gate2 timeout (live={})", group.live.load(Ordering::SeqCst));
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    let code = *group.exit.lock();
+    if code != Some(99) {
+        crate::kprintln!("ruos: gate2 main exit = {:?} (want Some(99))", code);
+    }
+    code == Some(99)
+}
+
 /// Variante test di `spawn_fiber`: chiama un export custom `() -> i32` invece
 /// di `_start`/`wasi_thread_start` (i guest dei gate non sono binari WASI).
 #[cfg(feature = "boot-checks")]
@@ -685,8 +768,10 @@ fn spawn_fiber_export(group: Arc<ThreadGroup>, tid: u32, export: &'static str) {
     let fiber = match wasmtime_internal_fiber::Fiber::new(stack, move |_: (), sus| -> i32 {
         publish_suspend(sus);
         let engine = crate::wasm::wt::engine();
-        let mut store =
-            wasmtime::Store::new(engine, crate::wasm::wt::state::WtState::new(Vec::new()));
+        let mut state = crate::wasm::wt::state::WtState::new(Vec::new());
+        // Il gruppo serve anche qui: il main del gate 2 chiama thread-spawn.
+        state.threads = Some(g.clone());
+        let mut store = wasmtime::Store::new(engine, state);
         store.set_epoch_deadline(crate::wasm::wt::NO_DEADLINE_TICKS);
         let inst = match g.linker.instantiate(&mut store, &g.module) {
             Ok(i) => i,

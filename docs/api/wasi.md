@@ -40,7 +40,7 @@ cooperative fiber (MT Fase 2).
 
 | Function | Meaning |
 |----------|---------|
-| `("wasi", "thread-spawn")(start_arg: i32) -> i32` | Spawn a new thread: the host re-instantiates the module against the same shared memory and calls its exported `wasi_thread_start(tid, start_arg)`. Returns the new `tid > 0`, or a negative errno. **Current status: stub — always returns `-1`** (spawn lands with MT Fase 2 Task 5; `pthread_create` fails cleanly until then). |
+| `("wasi", "thread-spawn")(start_arg: i32) -> i32` | Spawn a new thread: the host creates a fresh Instance of the module against the **same shared memory** and calls its exported `wasi_thread_start(tid, start_arg)` on a new cooperative fiber (first free ComputeApp core picks it up — not executed inline). Stack pointer + TLS of the new thread are guest-side, prepared by `pthread_create` in the `start_arg` block. Returns the new `tid` (range `[1, 2^29)`), or `-1` on error (group poisoned / tid range exhausted / non-threaded module) — surfaces as `EAGAIN` from `pthread_create`. |
 
 ## Clock  (`clock.rs`)
 

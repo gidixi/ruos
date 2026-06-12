@@ -30,6 +30,13 @@ You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 > get an **empty** environ (no `PWD` injection on this runtime); threaded
 > modules (see below) get `RAYON_NUM_THREADS=<ComputeApp cores>` injected by
 > the kernel at exec.
+>
+> `poll_oneoff` on Wasmtime: clock subscriptions only (what
+> `std::thread::sleep` / C `usleep`/`nanosleep` emit), first subscription
+> honored, non-clock → `28` EINVAL. On a wasm-thread **fiber** the sleep parks
+> the fiber (the core stays free); on the classic sync `.cwasm` path it
+> hlt-waits on the spot — a sleepy CLI tool on a 1-2 core system is better
+> shipped as `.wasm` (wasmi suspends cooperatively).
 
 ## wasi-threads  (Wasmtime only, `kernel/src/wasm/wt/threads.rs`)
 
@@ -37,6 +44,13 @@ Modules built for `wasm32-wasip1-threads` import their linear memory
 (`env::memory`, shared) and the spawn host fn below; the kernel detects the
 shared-memory import in `run_cwasm` and runs the module's `_start` on a
 cooperative fiber (MT Fase 2).
+
+Rust's `wasm32-wasip1-threads` target emits the memory import by default.
+**C/C++ via wasi-sdk does NOT**: link with
+`-Wl,--import-memory,--export-memory,--max-memory=<bytes>` (plus `-pthread`),
+otherwise the module *defines* its own shared memory and every thread's fresh
+Instance would get a private one — see `tools/hello-pthread/build-wasm.sh`
+for the working recipe.
 
 | Function | Meaning |
 |----------|---------|

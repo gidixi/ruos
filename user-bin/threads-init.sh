@@ -4,5 +4,6 @@
 # kill-group exit 134, la shell DEVE sopravvivere e stampare il marker finale.
 parsum
 mtstress
+hello-pthread
 mtstress trap
 echo THREADS_INIT_DONE

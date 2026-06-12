@@ -33,6 +33,8 @@ fn main() {
     for h in hs {
         h.join().unwrap();
     }
+    // poll_oneoff (clock subscription): il fiber si parcheggia, core libero.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     let v = *counter.lock().unwrap();
     assert_eq!(v, n_threads as u64 * m);
     println!("STRESS_MT_OK count={}", v);

@@ -283,6 +283,20 @@ fn park_current(key: usize, deadline: u64) -> bool {
     true
 }
 
+/// Sleep cooperativo per `poll_oneoff` (wasi.rs): parcheggia il fiber
+/// corrente fino a `deadline_ticks` — il riscatto è `expire_timeouts`, come
+/// per i timeout futex. La chiave di park è il fiber stesso (nessun notify
+/// arriverà mai su quell'indirizzo: è heap kernel, disgiunto dalla memoria
+/// guest delle chiavi futex). Ritorna false se non siamo su un fiber — il
+/// chiamante degrada all'attesa sincrona.
+pub fn sleep_current(deadline_ticks: u64) -> bool {
+    let me = CURRENT[crate::cpu::cpu_id() as usize].load(Ordering::SeqCst) as *mut ThreadFiber;
+    if me.is_null() {
+        return false;
+    }
+    park_current(me as usize, deadline_ticks)
+}
+
 /// Sveglia fino a `count` fiber parcheggiati su `key`; ritorna quanti ne ha
 /// effettivamente rimessi in RUNQ. Il resto del budget diventa credito per i
 /// parker in volo (vedi doc-comment in testa). Base dell'hook notify (Task 4).

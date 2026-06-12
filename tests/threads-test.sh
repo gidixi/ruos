@@ -82,10 +82,12 @@ timeout 240 qemu-system-x86_64 -machine q35 -cpu max -smp 6 -m 2048 \
   -device qemu-xhci >/dev/null 2>&1
 kill_qemu
 
-grep -aE "PARSUM_OK|STRESS_MT_OK|THREADS_INIT_DONE|thread-spawn" "$LOGR" \
+grep -aE "PARSUM_OK|STRESS_MT_OK|PTHREAD_C|THREADS_INIT_DONE|thread-spawn" "$LOGR" \
   | sed 's/^/[threads] run: /'
 grep -aqE "PARSUM_OK threads=[2-9]" "$LOGR" || { echo "(missing/serial PARSUM_OK)"; FAIL=1; }
 grep -aq "STRESS_MT_OK count=400000" "$LOGR" || { echo "(missing STRESS_MT_OK count=400000)"; FAIL=1; }
+# C/pthread (wasi-sdk) + poll_oneoff (usleep nel thread e nel main)
+grep -aq "PTHREAD_C_OK val=42 ret=123" "$LOGR" || { echo "(missing PTHREAD_C_OK)"; FAIL=1; }
 grep -aq "THREADS_INIT_DONE" "$LOGR" || { echo "(missing THREADS_INIT_DONE — shell died after trap?)"; FAIL=1; }
 grep -aq "UNREACHABLE" "$LOGR" && { echo "(UNREACHABLE printed — kill-group failed)"; FAIL=1; }
 grep -aqi "kernel panic" "$LOGR" && { echo "(kernel panic in run log)"; FAIL=1; }

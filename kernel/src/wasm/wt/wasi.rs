@@ -303,6 +303,58 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
     linker.func_wrap("wasi_snapshot_preview1", "sched_yield",
         |_caller: Caller<'_, T>| -> i32 { OK })?;
 
+    // poll_oneoff(in, out, nsubs, nevents) -> errno. Clock subscriptions only
+    // (sleep/timeout — what std::thread::sleep and C usleep/nanosleep emit),
+    // mirroring the wasmi shim (host/lifecycle.rs). Non-clock subs → EINVAL.
+    // Only the FIRST subscription is honored (std/libc sleep emit exactly one).
+    //
+    // Wait strategy: on a wasm-thread FIBER the sleep parks the fiber
+    // (threads::sleep_current → expire_timeouts redeems it) so the core stays
+    // free; on the classic sync .cwasm path it hlt-waits on the spot — that
+    // blocks this core like any long-running sync tool (on 1-2 core systems
+    // prefer the wasmi `.wasm` build of a sleepy CLI tool: wasmi suspends).
+    linker.func_wrap("wasi_snapshot_preview1", "poll_oneoff",
+        |mut caller: Caller<'_, T>, in_ptr: i32, out_ptr: i32, nsubs: i32, nevents: i32| -> i32 {
+            if nsubs < 1 { return EINVAL; }
+            // __wasi_subscription_t (48 bytes): userdata u64 @0, tag u16 @8
+            // (0 = CLOCK), clock_id u32 @16, timeout u64 @24 (ns),
+            // precision u64 @32, flags u16 @40 (bit0 = ABSTIME).
+            let sub = match mem::read(&mut caller, in_ptr as u32, 48) {
+                Some(s) => s, None => return EINVAL };
+            let sub_type = u16::from_le_bytes([sub[8], sub[9]]);
+            if sub_type != 0 { return EINVAL; } // solo clock (come wasmi)
+            let mut userdata = [0u8; 8];
+            userdata.copy_from_slice(&sub[0..8]);
+            let timeout_ns = u64::from_le_bytes(sub[24..32].try_into().unwrap());
+            let abstime = u16::from_le_bytes([sub[40], sub[41]]) & 1 != 0;
+
+            const TICK_NS: u64 = 10_000_000; // 100 Hz
+            let now = crate::timer::ticks();
+            let target = if abstime {
+                // ABSTIME su monotonic = ns dal boot (clock_time_get id != 0).
+                (timeout_ns / TICK_NS).max(now)
+            } else {
+                now.saturating_add((timeout_ns + TICK_NS - 1) / TICK_NS)
+            };
+            if target > now {
+                // Fiber (app threaded): park con deadline, il core resta libero.
+                if !crate::wasm::wt::threads::sleep_current(target) {
+                    // Path sync classico: hlt fino alla deadline (timer 100 Hz
+                    // risveglia ogni tick; IRQ abilitati nel contesto exec).
+                    while crate::timer::ticks() < target {
+                        x86_64::instructions::hlt();
+                    }
+                }
+            }
+            // Un evento clock (__wasi_event_t, 32 bytes): userdata della sub,
+            // error u16 = 0, type u8 = 0 (CLOCK), resto zero.
+            let mut event = [0u8; 32];
+            event[0..8].copy_from_slice(&userdata);
+            if !mem::write(&mut caller, out_ptr as u32, &event) { return EINVAL; }
+            if !mem::write_u32(&mut caller, nevents as u32, 1) { return EINVAL; }
+            OK
+        })?;
+
     Ok(())
 }
 

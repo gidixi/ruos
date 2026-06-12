@@ -100,7 +100,10 @@ wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <c
   componenti `rust-src` e `llvm-tools-preview` + target `wasm32-wasip1` (tool/UI),
   `wasm32-unknown-unknown` (finestre compositor) e `wasm32-wasip1-threads`
   (tool/app threaded MT Fase 2, es. `tools/parsum`); `xorriso`, `qemu-system-x86_64`,
-  `gcc`/`make` (per buildare il tool host `limine`).
+  `gcc`/`make` (per buildare il tool host `limine`); **wasi-sdk 24** in
+  `/opt/wasi-sdk` (clang per i tool C/C++ → wasm: `lua.wasm`,
+  `tools/hello-pthread` — artefatti `.wasm` vendored/committati, wasi-sdk NON
+  è dipendenza di `make iso`).
 - **Submodule:** `git submodule update --init --recursive` (serve `ruos-desktop`
   per buildare `gui.cwasm`). Su `/mnt/e` può servire
   `git config --global --add safe.directory '*'` (dubious-ownership).

@@ -133,6 +133,11 @@ build/mtstress.cwasm: tools/mtstress/src/main.rs tools/mtstress/Cargo.toml $(WT_
 	source $$HOME/.cargo/env && cd tools/mtstress && \
 		cargo build --release --target wasm32-wasip1-threads
 	$(WT_PRECOMPILE) tools/mtstress/target/wasm32-wasip1-threads/release/mtstress.wasm build/mtstress.cwasm
+# hello-pthread: C/pthread via wasi-sdk. Il .wasm è un VENDORED PREBUILT
+# committato (come lua.wasm) — rigenerarlo con tools/hello-pthread/build-wasm.sh.
+build/hello-pthread.cwasm: tools/hello-pthread/hello-pthread.wasm $(WT_PRECOMPILE)
+	@mkdir -p build
+	$(WT_PRECOMPILE) tools/hello-pthread/hello-pthread.wasm build/hello-pthread.cwasm
 
 # Boot-check AOT demos embedded in the kernel via include_bytes! (compiled ONLY
 # under the `boot-checks` feature). Regenerated into the source tree from their
@@ -287,7 +292,7 @@ build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml
 		-o build/rtop.component.wasm
 	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/parsum.cwasm build/mtstress.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/parsum.cwasm build/mtstress.cwasm build/hello-pthread.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -300,6 +305,7 @@ iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm b
 	cp build/wtecho.cwasm build/binstage/wtecho.cwasm
 	cp build/parsum.cwasm build/binstage/parsum.cwasm
 	cp build/mtstress.cwasm build/binstage/mtstress.cwasm
+	cp build/hello-pthread.cwasm build/binstage/hello-pthread.cwasm
 	cp build/about.cwasm build/binstage/about.cwasm
 	cp build/files.cwasm build/binstage/files.cwasm
 	cp build/terminal.cwasm build/binstage/terminal.cwasm

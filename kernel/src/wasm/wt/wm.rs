@@ -231,7 +231,7 @@ fn module_at_path(path: &str) -> Option<Module> {
 /// export (→ not a launcher app) or anything goes wrong. The manifest record is
 /// const data in the guest's data segment (no heap), so it is valid right after
 /// instantiation without running `_initialize`. The store is dropped on return.
-fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manifest> {
+fn extract_manifest(linker: &Linker<AppState>, module: &Module, name: &str) -> Option<Manifest> {
     let mut store = Store::new(
         engine(),
         AppState {
@@ -247,16 +247,34 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
             limits: wasmtime::StoreLimits::default(), // throwaway probe: unlimited
         },
     );
-    // Watchdog: a hostile/broken .cwasm must not hang the ~1 Hz catalog scan.
-    store.set_epoch_deadline(crate::wasm::wt::PROBE_DEADLINE_TICKS);
     // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("cld", options(nostack)); }
-    let inst = linker.instantiate(&mut store, module).ok()?;
+    // `instantiate` is HOST work (maps the AOT image + W^X mprotect); these wasip1
+    // window cdylibs have no wasm `start` section, so it runs NO guest code. For a
+    // large blob (e.g. the 77 MB rustls viewer) it can take >1 s of wall clock
+    // under TCG — which would burn the epoch budget if the watchdog were armed
+    // here, so the trivial `manifest()` call below would false-trap. Arm the
+    // deadline AFTER instantiate (it guards guest execution, not host setup).
+    let inst = match linker.instantiate(&mut store, module) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::bwarn!("wm", "probe '{}': instantiate failed: {:?}", name, e);
+            return None;
+        }
+    };
     // The `manifest` export is OPTIONAL — its absence is the normal "not a launcher
     // app" case, so a missing-export error here is not logged.
     let f = inst.get_typed_func::<(), i64>(&mut store, "manifest").ok()?;
-    let packed = f.call(&mut store, ()).ok()?;
+    // Watchdog: a hostile/broken `manifest()` must not hang the ~1 Hz catalog scan.
+    store.set_epoch_deadline(crate::wasm::wt::PROBE_DEADLINE_TICKS);
+    let packed = match f.call(&mut store, ()) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::bwarn!("wm", "probe '{}': manifest() trap: {:?}", name, e);
+            return None;
+        }
+    };
     let ptr = ((packed >> 32) & 0xffff_ffff) as u32;
     let len = (packed & 0xffff_ffff) as u32;
     if len == 0 || len > 4096 { return None; }
@@ -356,7 +374,7 @@ fn scan_apps() {
         if crate::wasm::wt::net::add_to_linker(&mut linker).is_err() { return; }
         for (stem, path, size) in need_probe {
             let m = module_at_path(&path)
-                .and_then(|module| extract_manifest(&linker, &module));
+                .and_then(|module| extract_manifest(&linker, &module, &stem));
             MANIFEST_CACHE.lock().insert(stem, ProbeEntry { path, size, manifest: m });
         }
     }

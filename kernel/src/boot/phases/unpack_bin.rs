@@ -53,21 +53,20 @@ fn unpack(bytes: &[u8]) {
                 }
                 match pack::decompress_member(gz) {
                     Ok(data) => {
-                        // La scrittura tmpfs copia `data` in un secondo Vec
-                        // contiguo mentre il primo è ancora vivo: ri-sonda.
-                        if !heap_has(data.len()) {
-                            fail += 1;
-                            crate::bwarn!("unpack_bin",
-                                "{}: skipped — no contiguous {} MiB of heap for tmpfs copy",
-                                name, data.len() >> 20);
-                            continue;
-                        }
+                        // MOVE the inflate buffer straight into tmpfs: the heap
+                        // holds the blob ONCE, not twice. A buffered write copied
+                        // `data` into a second contiguous Vec while the first was
+                        // still alive (2× peak) — fatal for a big app `.cwasm`
+                        // (~74 MiB viewer) that won't fit twice in the 384 MiB heap.
                         let path = format!("/bin/{}", name);
-                        if write_file(&path, &data).is_ok() {
-                            ok += 1;
-                        } else {
-                            fail += 1;
-                            crate::bwarn!("unpack_bin", "write {} failed", name);
+                        let n = data.len();
+                        match crate::vfs::write_file_owned(&path, data) {
+                            Ok(()) => ok += 1,
+                            Err(e) => {
+                                fail += 1;
+                                crate::bwarn!("unpack_bin",
+                                    "write {} ({} MiB) failed: {:?}", name, n >> 20, e);
+                            }
                         }
                     }
                     Err(e) => {

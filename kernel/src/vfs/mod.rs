@@ -151,6 +151,32 @@ pub async fn close(fd: Fd) -> Result<(), VfsError> {
     fd_close(fd)
 }
 
+/// Create `path` with `content`, MOVING the buffer in on tmpfs (no transient
+/// copy) — the heap holds the bytes once, not twice. For non-tmpfs mounts (e.g.
+/// FAT32 `/mnt`) it falls back to a normal buffered create+write. The parent
+/// directory must already exist. Used by boot `unpack_bin` for large blobs.
+pub fn write_file_owned(path: &str, content: Vec<u8>) -> Result<(), VfsError> {
+    let parts = path::split(path)?;
+    let (idx, sub) = resolve(&parts)?;
+    let mounts = MOUNTS.lock();
+    match &mounts[idx].1 {
+        crate::vfs::fs::FsImpl::Tmpfs(t) => {
+            let r = t.create_file_owned(&sub, content);
+            drop(mounts);
+            r
+        }
+        _ => {
+            drop(mounts);
+            block_on(async {
+                let fd = open(path, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::READ).await?;
+                write(fd, &content).await?;
+                close(fd).await?;
+                Ok(())
+            })
+        }
+    }
+}
+
 // Take-and-restore pattern: extract the FdEntry out of FDS, drop the
 // global lock, perform the I/O (which may suspend cooperatively under
 // Step 10.5 fibers), then restore the entry. The slot stays RESERVED

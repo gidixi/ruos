@@ -50,6 +50,21 @@ impl Tmpfs {
         Ok(())
     }
 
+    /// Create a regular file at `path`, MOVING `content` into the inode (no copy).
+    /// Sync; parent must exist; fails if the name is taken. Used by boot unpack to
+    /// avoid the transient 2× contiguous allocation that a buffered write incurs
+    /// (the inflate buffer becomes the file content directly) — critical for large
+    /// blobs (e.g. a ~74 MiB app `.cwasm`) that won't fit twice in the heap.
+    pub fn create_file_owned(&self, path: &[&str], content: Vec<u8>) -> Result<(), VfsError> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let mut p = parent.lock();
+        if !matches!(p.kind, TmpKind::Dir) { return Err(VfsError::NotDirectory); }
+        if p.children.contains_key(name) { return Err(VfsError::AlreadyExists); }
+        let inode = TmpInode { kind: TmpKind::Reg, children: BTreeMap::new(), content };
+        p.children.insert(name.to_string(), Arc::new(Mutex::new(inode)));
+        Ok(())
+    }
+
     /// Insert a pre-built inode (used to seed device files at boot).
     pub fn insert_inode(&self, path: &[&str], inode: TmpInode) -> Result<(), VfsError> {
         let (parent, name) = self.parent_and_name(path)?;

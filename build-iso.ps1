@@ -49,6 +49,14 @@
     asks interactively and defaults to NO. Pass -Netconsole to force it on
     non-interactively.
 
+.PARAMETER Fps
+    Shortcut for -Features wm-fps (on-screen compositor FPS/timing overlay,
+    bottom-right). When omitted, the script asks interactively and defaults to
+    YES (press Enter to enable). Pass -NoFps to skip it non-interactively.
+
+.PARAMETER NoFps
+    Force the wm-fps overlay OFF without the interactive prompt.
+
 .PARAMETER Clean
     Run `make clean` first for a fresh build (does NOT remove the cached Limine
     clone in third_party/).
@@ -69,6 +77,7 @@
     .\build-iso.ps1 -Distro Ubuntu
     .\build-iso.ps1 -UsbProbe
     .\build-iso.ps1 -Netconsole
+    .\build-iso.ps1 -NoFps
     .\build-iso.ps1 -BootChecks -Clean
     .\build-iso.ps1 -Features "usb-probe panic-halt"
 #>
@@ -79,6 +88,8 @@ param(
     [switch]$BootChecks,
     [switch]$UsbProbe,
     [switch]$Netconsole,
+    [switch]$Fps,
+    [switch]$NoFps,
     [switch]$Clean,
     [switch]$SyncSubmodule,
     [switch]$SkipDeps
@@ -102,6 +113,20 @@ if (-not $wantNetconsole -and (($featList -join ' ') -notmatch 'netconsole')) {
 }
 if ($wantNetconsole -and (($featList -join ' ') -notmatch 'netconsole')) {
     $featList += "netconsole"
+}
+
+# FPS overlay (on-screen compositor framerate/timing, feature wm-fps): opt-OUT.
+# Default = ON. -Fps forces it on, -NoFps forces it off; otherwise, unless
+# already named via -Features, ask interactively with YES as the default (just
+# press Enter to enable). Shows a green box bottom-right with present/s, loop
+# iters/s, and frame_all + present timing.
+$wantFps = [bool]$Fps
+if (-not $NoFps -and -not $wantFps -and (($featList -join ' ') -notmatch 'wm-fps')) {
+    $ans = Read-Host "Attivare overlay FPS on-screen del compositor (feature wm-fps)? [Y/n]"
+    if ($ans -notmatch '^(n|no)$') { $wantFps = $true }
+}
+if ($wantFps -and (($featList -join ' ') -notmatch 'wm-fps')) {
+    $featList += "wm-fps"
 }
 
 $FeatureStr = ($featList -join " ").Trim()
@@ -258,7 +283,11 @@ fi
 
 echo "==> [5/5] make iso"
 if [ -n "$FEATURES" ]; then
-  make iso CARGO_FEATURES="$FEATURES"
+  # The Makefile passes CARGO_FEATURES to `cargo --features` UNQUOTED, so a
+  # space-separated list splits into stray args ("unexpected argument"). cargo
+  # accepts a comma-separated single token — convert here so multiple features
+  # (e.g. wm-fps + netconsole) build correctly.
+  make iso CARGO_FEATURES="$(printf '%s' "$FEATURES" | tr ' ' ',')"
 else
   make iso
 fi

@@ -72,6 +72,11 @@ serial-composite = []
 # dispatch across the compute pool). Bisect baseline for the parallel compositor
 # (MT Fase 1); mirror of serial-composite for the frame() loop. Default = parallel.
 wm-serial-frames = []
+# Compositor framerate/timing telemetry: once per second the GUI loop logs
+# present/s (visible FPS), loop iters/s, and avg/max frame_all + present time in
+# µs (via TSC). Gated → zero overhead by default. Use to compare parallel vs
+# `wm-serial-frames` dispatch cost. Greppable marker tag "wmfps".
+wm-fps = []
 # When set, a kernel panic halts (cli; hlt loop) instead of rebooting.
 # Use for debugging: `cargo build --features panic-halt`.
 # Default (no flag): panic triggers a controlled reboot via power::reboot().

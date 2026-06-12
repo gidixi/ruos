@@ -113,18 +113,21 @@ fn module_for(cwasm: &'static [u8]) -> Option<Module> {
 /// `String`-keyed cache. `Module` is Arc-backed: a cached `clone` is cheap.
 static NAME_CACHE: Mutex<BTreeMap<String, Module>> = Mutex::new(BTreeMap::new());
 
-/// App directories searched (in priority order) for a `<name>.cwasm`: the
-/// ISO-baked `/bin` (Limine modules — core apps, available diskless) first, then
-/// the persistent FAT32 `/mnt/apps` DROP FOLDER (copy a `.cwasm` here at runtime —
-/// no rebuild — and it becomes spawnable + appears in the launcher). `/mnt/apps`
-/// is skipped when no disk is mounted.
-const APP_DIRS: &[&str] = &["/bin", "/mnt/apps"];
+/// App directories searched (in priority order) for a `<name>.cwasm`:
+///   1. `/bin`      — tmpfs, disponibile diskless (live ISO o ESP slim del SSD).
+///   2. `/mnt/bin`  — data partition SSD installato; contiene tutti i `.cwasm`
+///                    scompattati dal installer. Skipato se /mnt non montata.
+///   3. `/mnt/apps` — drop folder utente (copia un .cwasm qui a runtime).
+///
+/// L'ordine garantisce che un'app in `/bin` (sistema, sempre disponibile)
+/// vinca su una copia eventualmente diversa in `/mnt/bin` o `/mnt/apps`.
+const APP_DIRS: &[&str] = &["/bin", "/mnt/bin", "/mnt/apps"];
 
 /// Read `<dir>/<name>.cwasm` bytes, trying each [`APP_DIRS`] entry in order.
-/// `/bin` wins over `/mnt/apps` on a name clash (a system app can't be shadowed).
+/// `/bin` wins over `/mnt/bin`/`/mnt/apps` on a name clash.
 fn read_app_bytes(name: &str) -> Option<Vec<u8>> {
     for dir in APP_DIRS {
-        if *dir == "/mnt/apps" && !crate::vfs::is_mounted("/mnt") { continue; }
+        if dir.starts_with("/mnt") && !crate::vfs::is_mounted("/mnt") { continue; }
         let path = alloc::format!("{}/{}.cwasm", dir, name);
         if let Ok(b) = crate::vfs::block_on(crate::wasm::read_all(&path)) {
             return Some(b);
@@ -309,7 +312,7 @@ fn scan_apps() {
     // METADATA (tmpfs node / FAT32 dir entry) — no file content is read here.
     let mut present: Vec<(String, String, u64)> = Vec::new(); // (stem, path, size)
     for dir in APP_DIRS {
-        if *dir == "/mnt/apps" && !crate::vfs::is_mounted("/mnt") { continue; }
+        if dir.starts_with("/mnt") && !crate::vfs::is_mounted("/mnt") { continue; }
         let entries = match crate::vfs::block_on(crate::vfs::readdir(dir)) {
             Ok(e) => e,
             Err(_) => continue,
@@ -2429,6 +2432,26 @@ impl Compositor {
         let mut overlay_btn = false;
         let mut marker_done = false;
         let mut frame_marker_done = false;
+        // FPS/timing telemetry (feature wm-fps): accumulators over a ~1 s window.
+        #[cfg(feature = "wm-fps")]
+        let (mut fps_t0, mut n_present, mut n_iter, mut fa_sum, mut fa_max, mut pr_sum) =
+            (crate::timer::ticks(), 0u32, 0u32, 0u64, 0u64, 0u64);
+        // Last-computed display values (held between the 1 s reports) + the small
+        // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
+        // VBox/HW screen (the binfo log only reaches serial/netconsole).
+        #[cfg(feature = "wm-fps")]
+        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr) =
+            (0u64, 0u64, 0u64, 0u64);
+        #[cfg(feature = "wm-fps")]
+        let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
+                              crate::console::font::glyph_height() as u32);
+        // Two text rows; sized to the longer label line.
+        #[cfg(feature = "wm-fps")]
+        let (ov_cols, ov_pad, ov_gap) = (32u32, 4u32, 2u32);
+        #[cfg(feature = "wm-fps")]
+        let (ov_w, ov_h) = (ov_cols * ov_gw + ov_pad * 2, ov_gh * 2 + ov_gap + ov_pad * 2);
+        #[cfg(feature = "wm-fps")]
+        let mut ov_buf = alloc::vec![0u8; (ov_w * ov_h * 4) as usize];
         loop {
             // "Torna alla shell" (wm.exit_to_shell): la finestra di sfondo (la shell
             // SP-D) ha premuto il pulsante console. Esci dal loop → teardown sotto:
@@ -2614,7 +2637,14 @@ impl Compositor {
                 s.win.stay_awake_request = false;
             }
 
+            #[cfg(feature = "wm-fps")] { n_iter += 1; }
+            #[cfg(feature = "wm-fps")] let fa0 = crate::boot::clock::read_tsc();
             self.frame_all();
+            #[cfg(feature = "wm-fps")] {
+                let d = crate::boot::clock::read_tsc().wrapping_sub(fa0);
+                fa_sum = fa_sum.wrapping_add(d);
+                if d > fa_max { fa_max = d; }
+            }
 
             // SP-C: process deferred window→kernel requests raised during
             // `frame_all` (`wm.set_background`, `wm.spawn`). Deferred to HERE —
@@ -2750,7 +2780,12 @@ impl Compositor {
             const WARMUP_FRAMES: u32 = 90;
             let any_committed = self.wins.iter().any(|w| w.store.data().win.committed);
             if self.dirty || any_committed || self.frame_no < WARMUP_FRAMES {
+                #[cfg(feature = "wm-fps")] let pr0 = crate::boot::clock::read_tsc();
                 self.present();
+                #[cfg(feature = "wm-fps")] {
+                    pr_sum = pr_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(pr0));
+                    n_present += 1;
+                }
                 self.dirty = false;
             }
 
@@ -2786,6 +2821,62 @@ impl Compositor {
                 }
                 crate::binfo!("wm", "frame cores={} {:?}", cores.len(), cores);
                 frame_marker_done = true;
+            }
+
+            // FPS/timing report (feature wm-fps): once the ~1 s window elapses,
+            // log rates normalized by the actual elapsed ticks (the loop hlt's, so
+            // a window may span >1 s when idle) and avg/max durations in µs.
+            #[cfg(feature = "wm-fps")]
+            {
+                let now = crate::timer::ticks();
+                let elapsed = now.wrapping_sub(fps_t0); // 100 Hz ticks
+                if self.frame_no < WARMUP_FRAMES {
+                    // Discard the warm-up window: the first egui frames (parse +
+                    // font atlas) take ~1 s and would dominate the average as a
+                    // misleading startup spike. Keep the window anchored to now.
+                    fps_t0 = now;
+                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
+                } else if elapsed >= 100 {
+                    let tpm = crate::boot::clock::tsc_per_ms().max(1);
+                    let present_s = (n_present as u64) * 100 / elapsed;
+                    let iter_s = (n_iter as u64) * 100 / elapsed;
+                    let fa_avg_us = if n_iter > 0 { (fa_sum / n_iter as u64) * 1000 / tpm } else { 0 };
+                    let fa_max_us = fa_max * 1000 / tpm;
+                    let pr_avg_us = if n_present > 0 { (pr_sum / n_present as u64) * 1000 / tpm } else { 0 };
+                    crate::binfo!("wmfps",
+                        "present={}/s iters={}/s frame_all avg={}us max={}us present avg={}us jobs={}",
+                        present_s, iter_s, fa_avg_us, fa_max_us, pr_avg_us,
+                        FRAME_JOBS_LAST.load(Ordering::SeqCst));
+                    disp_p = present_s; disp_it = iter_s;
+                    disp_fa = fa_avg_us; disp_pr = pr_avg_us;
+                    let _ = fa_max_us; // logged above; not shown on the overlay (noisy under VM)
+                    fps_t0 = now;
+                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
+                }
+            }
+
+            // On-screen FPS overlay (feature wm-fps): a small opaque box drawn
+            // bottom-right directly to the framebuffer EVERY iter (so it survives a
+            // skipped present and stays visible while idle). Updated values come
+            // from the 1 s report above.
+            #[cfg(feature = "wm-fps")]
+            {
+                let g = crate::gfx::geom();
+                if g.width >= ov_w && g.height >= ov_h {
+                    decor::fill_rect(&mut ov_buf, ov_w, ov_h, 0, 0, ov_w, ov_h,
+                                     [0x10, 0x10, 0x10, 0xFF]);
+                    // Row 1: present rate (fps) + loop rate (Hz) — reliable counters.
+                    // Row 2: per-frame timing in ms (wall-clock; approx under a VM).
+                    let l1 = alloc::format!("display: {} fps  ({} Hz)", disp_p, disp_it);
+                    let l2 = alloc::format!("rendering: {} ms   blit: {} ms",
+                        disp_fa / 1000, disp_pr / 1000);
+                    let white = [0x80, 0xFF, 0x80, 0xFF];
+                    decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad,
+                                        ov_w - ov_pad, &l1, white);
+                    decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad + ov_gh + ov_gap,
+                                        ov_w - ov_pad, &l2, white);
+                    crate::gfx::blit(&ov_buf, g.width - ov_w - 2, g.height - ov_h - 2, ov_w, ov_h);
+                }
             }
 
             // Idle pacing: park the core until the next interrupt instead of busy-

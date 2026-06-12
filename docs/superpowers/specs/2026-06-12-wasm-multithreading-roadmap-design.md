@@ -31,7 +31,7 @@ Decisioni dal brainstorming:
 
 | Fase | Cosa | Beneficio | Stato |
 |---|---|---|---|
-| **1** | Compositor parallelo: `frame()` delle finestre sveglie su core diversi del compute pool + **audit rientranza host fn** | un'app lenta non blocca più il desktop; kernel pronto alla concorrenza guest | spec QUI sotto, implementabile |
+| **1** | Compositor parallelo: `frame()` delle finestre sveglie su core diversi del compute pool + **audit rientranza host fn** | un'app lenta non blocca più il desktop; kernel pronto alla concorrenza guest | ✅ IMPLEMENTATO (changelog 476): `frame_all` a 3 fasi + `dispatch_frames`, feature `wm-serial-frames`, marker `frame cores=`, audit + fix `proc::REGISTRY`→IrqMutex. Verificato QEMU `-smp 4` (`frame cores=2`). VBox + stress reactor pendenti. Piano: `2026-06-12-wasm-mt-fase1-compositor-parallelo.md`; audit: `2026-06-12-hostfn-reentrancy-audit.md` |
 | **2** | wasm-threads MVP: atomics + SharedMemory + `wasm32-wasip1-threads` + `wasi_thread_spawn` (thread = core dedicato, `atomic.wait` = park hlt/IPI) | `std::thread` e rayon funzionano nelle app | outline §Fase 2, da rispecificare a Fase 1 conclusa |
 | **3** | Oversubscription / scheduler preemptive | densità di thread > core | FUTURO, documentato, NON costruito |
 

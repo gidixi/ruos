@@ -68,6 +68,10 @@ usb-probe = []
 # Force the compositor to use a single band on the BSP (no SMP split). Used by
 # the SP4 visual-equivalence test to capture a serial reference screendump.
 serial-composite = []
+# Force window frame() execution to run serially on the GUI core (no SMP
+# dispatch across the compute pool). Bisect baseline for the parallel compositor
+# (MT Fase 1); mirror of serial-composite for the frame() loop. Default = parallel.
+wm-serial-frames = []
 # When set, a kernel panic halts (cli; hlt loop) instead of rebooting.
 # Use for debugging: `cargo build --features panic-halt`.
 # Default (no flag): panic triggers a controlled reboot via power::reboot().

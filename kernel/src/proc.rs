@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 #[derive(Clone)]
 pub struct ProcInfo {
@@ -26,7 +26,12 @@ pub struct ProcInfo {
     pub kernel: bool,
 }
 
-static REGISTRY: Mutex<BTreeMap<u32, ProcInfo>> = Mutex::new(BTreeMap::new());
+// IrqMutex (not bare spin::Mutex): `list()` clones the whole map under the lock
+// and is now reachable from a window `frame()` running on a compute-pool AP core
+// (parallel compositor, MT Fase 1) while another core charges `add_cpu_tsc` — an
+// interrupt-masked lock keeps the O(n) critical section deadlock-safe vs IRQs and
+// matches the rest of the hot kernel state (golden rule #2 of the reentrancy audit).
+static REGISTRY: IrqMutex<BTreeMap<u32, ProcInfo>> = IrqMutex::new(BTreeMap::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
 pub fn register(name: String) -> u32 {

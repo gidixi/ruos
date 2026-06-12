@@ -19,7 +19,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
-use wasmtime::{Caller, Instance, Linker, Module, Store};
+use wasmtime::{AsContextMut, Caller, Instance, Linker, Module, Store};
 use crate::gfx::GfxEvt;
 use crate::wasm::wt::engine;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -465,6 +465,66 @@ pub fn take_composite_core_mask() -> u32 {
     COMPOSITE_CORE_MASK.swap(0, Ordering::SeqCst)
 }
 
+/// Max window frame() jobs dispatched in parallel per frame. One per pool slot;
+/// capped at pool::MAX_JOBS (64). Mirror of MAX_BANDS for the frame() loop.
+const MAX_FRAME_JOBS: usize = 64;
+
+/// One window's frame() job descriptor. Carries a raw `*mut Window` (as usize)
+/// into the live `wins` Vec. The GUI core fills `[0, n)` with DISTINCT windows,
+/// submits, and BLOCKS on the join before touching `wins` again — so no two
+/// in-flight jobs alias the same Window, and the GUI core never reads/mutates
+/// `wins` during the flight (same invariant as BAND_ARENA).
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct FrameArg {
+    win: usize, // *mut Window into self.wins
+}
+
+/// SAFETY of the arena: same contract as BAND_ARENA. Only the GUI core writes it
+/// (between frames, never concurrently with in-flight jobs); each slot carries a
+/// distinct live `Window` pointer kept alive across the join by the GUI core.
+static mut FRAME_ARENA: [FrameArg; MAX_FRAME_JOBS] =
+    [FrameArg { win: 0 }; MAX_FRAME_JOBS];
+
+/// Distinct cores that ran a frame() job in the most recent frame (bitset by
+/// cpu_id). Reset at the top of `frame_all`; read by the boot-check marker to
+/// prove parallel frame() execution.
+static FRAME_CORE_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Number of parallel frame() jobs dispatched in the most recent frame (awake
+/// windows, capped at MAX_FRAME_JOBS). The boot-check marker only fires on a
+/// frame with ≥2 jobs, so `frame cores=K` reflects genuine in-frame parallelism
+/// (not cores accumulated by a lone window bouncing across frames).
+static FRAME_JOBS_LAST: AtomicU32 = AtomicU32::new(0);
+
+/// Read + clear the frame core mask (boot-check marker support).
+pub fn take_frame_core_mask() -> u32 {
+    FRAME_CORE_MASK.swap(0, Ordering::SeqCst)
+}
+
+/// Pool job: run ONE window's frame(). `input` is a byte view of one `FrameArg`
+/// in FRAME_ARENA. Returns 0 (unused).
+///
+/// SAFETY: the dispatcher guarantees (a) `input` is exactly size_of::<FrameArg>()
+/// bytes of a valid FrameArg, (b) `win` points at a live Window uniquely owned
+/// by THIS job for its lifetime (GUI core blocks on join before reusing it),
+/// (c) the epoch deadline is already armed on that Window's store, (d) no other
+/// core touches this Window concurrently.
+fn frame_one_job(input: &[u8]) -> u64 {
+    if input.len() < core::mem::size_of::<FrameArg>() {
+        return 0;
+    }
+    let arg: FrameArg = unsafe { core::ptr::read_unaligned(input.as_ptr() as *const FrameArg) };
+    // SAFETY: unique live Window for the flight (see fn contract).
+    let w: &mut Window = unsafe { &mut *(arg.win as *mut Window) };
+    Compositor::run_frame(w);
+    let cpu = crate::cpu::cpu_id();
+    if cpu < 32 {
+        FRAME_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst);
+    }
+    0
+}
+
 /// Pool job: composite one band. `input` is a byte view of one `BandArg` in the
 /// static arena (its bytes copied in by the dispatcher). Returns 0 (unused).
 ///
@@ -872,6 +932,26 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // source the desktop uses). egui needs it for `RawInput.time` + animations.
     linker.func_wrap("wm", "wall_seconds",
         |_caller: Caller<'_, T>| -> f64 { crate::wasm::wt::gfx::wall_secs() })?;
+    // wm.frame_deadline_set(ticks): widen THIS window's watchdog deadline for
+    // the rest of the current frame. The compositor arms the epoch deadline
+    // per-store right before `frame.call` (see frame_all); a guest doing heavy
+    // work inside one frame (e.g. the viewer running a page's JS bootstrap)
+    // calls this to push its own deadline out so it isn't WATCHDOG-killed,
+    // then `frame_deadline_reset()` when done. Per-store by construction
+    // (`caller` is the calling window's store) — touches no shared state, so it
+    // stays reentrancy-clean under the parallel compositor. `ticks` is epoch
+    // ticks (≈10 ms each, same unit as FRAME_DEADLINE_TICKS); next frame the
+    // compositor re-arms the normal deadline regardless.
+    linker.func_wrap("wm", "frame_deadline_set",
+        |mut caller: Caller<'_, T>, ticks: u32| {
+            caller.as_context_mut().set_epoch_deadline(ticks as u64);
+        })?;
+    // wm.frame_deadline_reset(): restore THIS window's deadline to the normal
+    // per-frame regime (FRAME_DEADLINE_TICKS). Pair with frame_deadline_set().
+    linker.func_wrap("wm", "frame_deadline_reset",
+        |mut caller: Caller<'_, T>| {
+            caller.as_context_mut().set_epoch_deadline(crate::wasm::wt::FRAME_DEADLINE_TICKS);
+        })?;
     // wm.poll_event(retptr): drain ONE event from THIS window's queue into the
     // guest's 20-byte return area. The calling app is identified by its own
     // Store (caller.data()), so it can only ever see its own window's events.
@@ -1712,8 +1792,126 @@ impl Compositor {
     /// `panic=abort`, or a guest `proc_exit` (which `wasi.rs` maps to a trap) —
     /// flags the window `close_requested`, so the reap pass drops it next loop
     /// instead of leaving a frozen, un-closeable window (its CSD [X] is gone).
+    /// Execute ONE window's frame(): get the typed func, call it, handle a crash.
+    /// No `&self`: callable from any core as a pool job (`frame_one_job`) OR
+    /// inline on the GUI core. PRECONDITION: the caller has already armed
+    /// `w.store`'s epoch deadline. The committed-size adoption + `framed_once`
+    /// are done by the caller AFTER the join (they read/mutate the store on the
+    /// GUI core, kept serial).
+    ///
+    /// CSD crash safety-net: a `frame()` that returns `Err` — a trap, a
+    /// `panic=abort`, or a guest `proc_exit` (which `wasi.rs` maps to a trap) —
+    /// flags the window `close_requested`, so the reap pass drops it next loop.
+    fn run_frame(w: &mut Window) {
+        let frame = match w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        match frame.call(&mut w.store, ()) {
+            Ok(()) => {}
+            Err(e) => {
+                // Anche un proc_exit volontario arriva qui come trap — il log
+                // distingue "app crashata" da "mai partita"; il marker WATCHDOG
+                // distingue il kill da deadline.
+                let causa = if matches!(e.downcast_ref::<wasmtime::Trap>(),
+                                        Some(wasmtime::Trap::Interrupt)) {
+                    crate::bwarn!("wm",
+                        "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed",
+                        w.id, w.title);
+                    crate::kevent::CRASH_WATCHDOG
+                } else {
+                    crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
+                    crate::kevent::CRASH_TRAP
+                };
+                crate::kevent::publish_named(crate::kevent::KIND_APP_CRASHED,
+                    crate::kevent::SEV_WARN, [w.id, causa, 0, 0], &w.title);
+                w.store.data_mut().win.close_requested = true;
+            }
+        }
+    }
+
+    /// Run the first `n` FRAME_ARENA jobs. With `wm-serial-frames` (or ≤1 CPU)
+    /// runs them inline on the GUI core; otherwise dispatches one pool job per
+    /// window across the compute pool and JOINS before returning. Mirror of
+    /// `dispatch_bands`. PRECONDITION: FRAME_ARENA[0..n] filled with DISTINCT
+    /// live Windows whose deadlines are already armed; the GUI core must not
+    /// touch `wins` until this returns.
+    fn dispatch_frames(n: usize) {
+        if n == 0 { return; }
+
+        #[cfg(feature = "wm-serial-frames")]
+        {
+            for k in 0..n {
+                // SAFETY: distinct live Window per slot (filled by frame_all).
+                let w = unsafe { &mut *((FRAME_ARENA[k].win) as *mut Window) };
+                Self::run_frame(w);
+                let cpu = crate::cpu::cpu_id();
+                if cpu < 32 { FRAME_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+            }
+        }
+
+        #[cfg(not(feature = "wm-serial-frames"))]
+        {
+            let mut ids: [usize; MAX_FRAME_JOBS] = [usize::MAX; MAX_FRAME_JOBS];
+            let mut n_submitted = 0usize;
+            for k in 0..n {
+                // A `&'static [u8]` view of arena slot k. FRAME_ARENA is a real
+                // `static`, so the slice is genuinely 'static; the GUI core blocks
+                // on the join below before reusing slot k next frame.
+                let bytes: &'static [u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        core::ptr::addr_of!(FRAME_ARENA[k]) as *const u8,
+                        core::mem::size_of::<FrameArg>(),
+                    )
+                };
+                match crate::smp::pool::submit(frame_one_job, bytes) {
+                    Some(id) => { ids[k] = id; n_submitted += 1; }
+                    None => { break; } // pool full: leftovers run inline below
+                }
+            }
+
+            // 1-CPU fallback: drain queued jobs inline so we never wait on cores
+            // that aren't there.
+            if crate::cpu::cpus_online() <= 1 {
+                while let Some(slot) = crate::smp::pool::take() {
+                    crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+                }
+            }
+
+            // Pool-full leftover: run the unsubmitted frames inline on the GUI core.
+            for k in n_submitted..n {
+                // SAFETY: distinct live Window per slot; not submitted to any AP,
+                // so running it here cannot race an in-flight job.
+                let w = unsafe { &mut *((FRAME_ARENA[k].win) as *mut Window) };
+                Self::run_frame(w);
+                let cpu = crate::cpu::cpu_id();
+                if cpu < 32 { FRAME_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+            }
+
+            // Join: block until every submitted frame job is DONE. Work-steal so
+            // the GUI core makes forward progress if APs are slow (same rationale
+            // as dispatch_bands; stealing a frame job just runs Wasmtime on the
+            // GUI core, which is where it ran before the parallel split).
+            for k in 0..n {
+                if ids[k] == usize::MAX { continue; }
+                loop {
+                    if crate::smp::pool::poll_done(ids[k]).is_some() { break; }
+                    if let Some(slot) = crate::smp::pool::take() {
+                        crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+                    } else {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+
     fn frame_all(&mut self) {
         let fno = self.frame_no;
+        FRAME_CORE_MASK.store(0, Ordering::SeqCst); // per-frame: il marker legge questo frame
+
+        // --- Fase A (core GUI): selezione + arming deadline → riempi l'arena. ---
+        let mut n = 0usize;
         for w in self.wins.iter_mut() {
             if !Self::compute_awake(w, fno) {
                 w.awake = false;
@@ -1721,39 +1919,36 @@ impl Compositor {
             }
             w.awake = true;
             w.last_active_frame = fno;
-            if let Ok(frame) = w.inst.get_typed_func::<(), ()>(&mut w.store, "frame") {
-                // Watchdog: riarma il deadline epoch PRIMA di ogni entry nel
-                // guest (è relativo all'epoch corrente). Primo frame più largo
-                // (parse/font-atlas/init pesanti); a regime un guest che sfora
-                // viene trappato e chiuso — il desktop non si congela mai.
-                let ticks = self.frame_deadline_override.unwrap_or(if w.framed_once {
-                    crate::wasm::wt::FRAME_DEADLINE_TICKS
-                } else {
-                    crate::wasm::wt::FIRST_FRAME_DEADLINE_TICKS
-                });
-                w.store.set_epoch_deadline(ticks);
-                match frame.call(&mut w.store, ()) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Anche un proc_exit volontario arriva qui come trap —
-                        // il log distingue "app crashata" da "mai partita";
-                        // il marker WATCHDOG distingue il kill da deadline.
-                        let causa = if matches!(e.downcast_ref::<wasmtime::Trap>(),
-                                                Some(wasmtime::Trap::Interrupt)) {
-                            crate::bwarn!("wm",
-                                "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed",
-                                w.id, w.title);
-                            crate::kevent::CRASH_WATCHDOG
-                        } else {
-                            crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
-                            crate::kevent::CRASH_TRAP
-                        };
-                        crate::kevent::publish_named(crate::kevent::KIND_APP_CRASHED,
-                            crate::kevent::SEV_WARN, [w.id, causa, 0, 0], &w.title);
-                        w.store.data_mut().win.close_requested = true;
-                    }
-                }
+            // Watchdog: riarma il deadline epoch PRIMA dell'entry nel guest (è
+            // relativo all'epoch corrente). Primo frame più largo (parse/font-atlas/
+            // init pesanti). Fatto sul core GUI perché serve `frame_deadline_override`.
+            let ticks = self.frame_deadline_override.unwrap_or(if w.framed_once {
+                crate::wasm::wt::FRAME_DEADLINE_TICKS
+            } else {
+                crate::wasm::wt::FIRST_FRAME_DEADLINE_TICKS
+            });
+            w.store.set_epoch_deadline(ticks);
+            if n < MAX_FRAME_JOBS {
+                // SAFETY: ogni slot riceve un elemento DISTINTO di `wins`; il core
+                // GUI non tocca `wins` finché dispatch_frames non ha joinato.
+                unsafe { FRAME_ARENA[n] = FrameArg { win: w as *mut Window as usize }; }
+                n += 1;
+            } else {
+                // Overflow (>64 finestre sveglie): esegui inline subito.
+                Self::run_frame(w);
+                let cpu = crate::cpu::cpu_id();
+                if cpu < 32 { FRAME_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
             }
+        }
+
+        FRAME_JOBS_LAST.store(n as u32, Ordering::SeqCst);
+
+        // --- Fase B: esegui le frame() in parallelo sul compute pool (o inline). ---
+        Self::dispatch_frames(n);
+
+        // --- Fase C (core GUI, dopo il join): adotta la committed size. ---
+        for w in self.wins.iter_mut() {
+            if !w.awake { continue; }
             // Considera la finestra "avviata" solo quando ha prodotto una surface:
             // un'app egui può richiedere più frame per il primo commit; finché non
             // disegna resta sveglia (framed_once=false ⇒ gira ogni frame).
@@ -1761,19 +1956,10 @@ impl Compositor {
                 w.framed_once = true;
             }
             // CSD: the window IS its committed surface, so the hit-rect size must
-            // track the committed `win_w × win_h` (apps pick their own size — the
-            // egui demo commits 480×320, not the 320×240 spawn placeholder). Without
-            // this, `window_at` / drag clamp use the stale placeholder size and a
-            // click on the app's [X] (past the placeholder right/bottom edge) is
-            // never routed. Keep the rect ORIGIN (x,y); only adopt the real w/h.
+            // track the committed `win_w × win_h`. Keep the rect ORIGIN (x,y); only
+            // adopt the real w/h on the FIRST committed surface (configure bootstrap).
             let (cw, ch) = { let s = w.store.data(); (s.win.win_w, s.win.win_h) };
             if cw != 0 && ch != 0 && !w.sized {
-                // Configure bootstrap: the FIRST committed surface establishes the
-                // window's size. Keep the rect ORIGIN (x,y); adopt the committed
-                // w/h, publish it as the configure target, and mark `sized` — from
-                // now the kernel owns the size (maximize/resize set rect + target;
-                // the app renders to `wm.window_size()`, so the committed size
-                // already matches rect.w/h and we must NOT re-adopt it).
                 let (rx, ry, _, _) = w.rect;
                 w.rect = (rx, ry, cw, ch);
                 let s = w.store.data_mut();
@@ -2242,6 +2428,7 @@ impl Compositor {
         let mut btn_l = false;
         let mut overlay_btn = false;
         let mut marker_done = false;
+        let mut frame_marker_done = false;
         loop {
             // "Torna alla shell" (wm.exit_to_shell): la finestra di sfondo (la shell
             // SP-D) ha premuto il pulsante console. Esci dal loop → teardown sotto:
@@ -2582,6 +2769,23 @@ impl Compositor {
                 let n_cores = cores.len();
                 crate::binfo!("wm", "composite cores={} {:?}", n_cores, cores);
                 marker_done = true;
+            }
+
+            // Companion marker for the PARALLEL frame() dispatch (MT Fase 1): on
+            // the first frame ≥30 that dispatched ≥2 jobs, report the distinct
+            // cores that ran frame() this frame (FRAME_CORE_MASK is reset per
+            // frame, so it reflects THIS frame's parallelism, not an accumulation).
+            // Greppable as "frame cores=N [..]" by tests/frame-smp-test.sh.
+            if !frame_marker_done && self.frame_no >= 30
+                && FRAME_JOBS_LAST.load(Ordering::SeqCst) >= 2
+            {
+                let mask = take_frame_core_mask();
+                let mut cores: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                for c in 0..32u32 {
+                    if mask & (1u32 << c) != 0 { cores.push(c); }
+                }
+                crate::binfo!("wm", "frame cores={} {:?}", cores.len(), cores);
+                frame_marker_done = true;
             }
 
             // Idle pacing: park the core until the next interrupt instead of busy-

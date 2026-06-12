@@ -253,7 +253,7 @@ Expected: `THREADS-OK 1 = ok`. Se FAIL → debug del fork (è il punto previsto 
 - Create: `kernel/src/wasm/wt/threads.rs`
 - Modify: `kernel/Cargo.toml` (dep fiber), `kernel/src/wasm/wt/mod.rs` (`pub mod threads;`), `kernel/src/executor/mod.rs` (seam), `kernel/src/boot/phases/interrupts.rs` (self-test)
 
-- [ ] **Step 1: Dep fiber**
+- [x] **Step 1: Dep fiber**
 
 `kernel/Cargo.toml`:
 ```toml
@@ -262,7 +262,7 @@ wasmtime-internal-fiber = { version = "=45.0.0", default-features = false }
 ```
 Verifica API reale: `wsl … cargo doc` o leggi `/root/.cargo/registry/src/…/wasmtime-internal-fiber-45.0.0/src/lib.rs` — attesi `FiberStack::new(size)`, `Fiber::new(stack, closure(Resume, &mut Suspend))`, `fiber.resume(val)`, `suspend.suspend(val)`. Adatta i nomi esatti.
 
-- [ ] **Step 2: Scheletro scheduler in `threads.rs`**
+- [x] **Step 2: Scheletro scheduler in `threads.rs`**
 
 ```rust
 //! MT Fase 2 — scheduler dei wasm-thread come fiber cooperativi M:N.
@@ -356,7 +356,7 @@ fn finish_fiber(f: Box<ThreadFiber>, code: i32) {
 ```
 NOTE per l'esecutore: `tls_raw_get/set` sono da esporre in `platform.rs` (2 righe: load/store di `TLS[cpu_id()]`). `wasmtime_internal_fiber::Fiber::resume` ritorna `Result<Return, Yield>` (Ok=finito, Err=sospeso) — verifica la firma reale e adatta. `finish_fiber`/`tid_pid` completati nel Task 6; per ora stub senza proc.
 
-- [ ] **Step 3: Seam in run_core**
+- [x] **Step 3: Seam in run_core**
 
 `kernel/src/executor/mod.rs`, nel loop di `run_core` dopo il drain del pool (riga ~342):
 ```rust
@@ -386,7 +386,7 @@ pub fn core_allowed(cpu: u32) -> bool {
 }
 ```
 
-- [ ] **Step 4: Self-test host-only (niente wasm): fiber suspend/resume cross-core**
+- [x] **Step 4: Self-test host-only (niente wasm): fiber suspend/resume cross-core**
 
 In `threads.rs`, gated boot-checks — crea un fiber che incrementa un contatore, si auto-sospende via una funzione `test_park()` (stesso meccanismo dell'hook futex ma su una chiave di test), viene risvegliato da `test_unpark()` chiamato dal BSP, e finisce. Assert: il fiber ha girato (contatore avanzato), il resume è avvenuto, e `ran_on` registra un core ≠ BSP con ≥3 core. Marker:
 ```rust
@@ -394,11 +394,12 @@ crate::binfo!("wt", "THREADS-FIBER-OK ran_on={} resumed={}", core, resumed);
 ```
 Chiamato da `interrupts.rs` dopo il gate 1. (Codice: copia il protocollo park di Task 4 Step 1 ridotto a una chiave statica di test — l'esecutore lo scrive qui e lo riusa al Task 4.)
 
-- [ ] **Step 5: Build + boot + marker**
+- [x] **Step 5: Build + boot + marker**
 
 Come Task 1 Step 5, grep `THREADS-FIBER-OK`. Expected: presente, `ran_on` ∈ core ComputeApp, niente panic. Anche `make run-test` resta verde.
+(Verificato 2026-06-12: `THREADS-FIBER-OK = ok ran_on=3 resumed_on=3` con -smp 4; `make run-test` TEST_PASS. NB: `make iso CARGO_FEATURES=boot-checks` richiede `make wt-cwasm` prima — i gate .cwasm non sono prerequisiti del target `iso`.)
 
-- [ ] **Step 6: Commit** (`feat(wt): fiber runtime for wasm threads — stack-switch + TLS swap + run_core seam`).
+- [x] **Step 6: Commit** (`feat(wt): fiber runtime for wasm threads — stack-switch + TLS swap + run_core seam`).
 
 ---
 

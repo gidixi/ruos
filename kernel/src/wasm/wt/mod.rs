@@ -15,6 +15,7 @@ pub mod term;
 pub mod compose;
 pub mod sys;
 pub mod net;
+pub mod threads;
 
 use crate::kprintln;
 use alloc::vec::Vec;

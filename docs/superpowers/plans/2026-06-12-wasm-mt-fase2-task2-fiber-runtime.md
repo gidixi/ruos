@@ -11,8 +11,8 @@
 |------|-------|-----------|
 | 0 — Vendor fork + build verde | ✅ Done | 486 |
 | 1 — Gate 1 (SharedMemory + atomics) | ✅ Done | 487 |
-| **2 — Fiber runtime + self-test** | ⬜ **NEXT** | — |
-| 3 — exec_threaded (main on fiber) | ⬜ Pending | — |
+| 2 — Fiber runtime + self-test | ✅ Done | 488 |
+| **3 — exec_threaded (main on fiber)** | ⬜ **NEXT** | — |
 | 4 — Futex hooks (atomic.wait/notify) + Gate 3 | ⬜ Pending | — |
 | 5 — thread-spawn + Gate 2 | ⬜ Pending | — |
 | 6 — parsum end-to-end (rayon) | ⬜ Pending | — |

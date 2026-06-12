@@ -210,6 +210,14 @@ pub fn init() -> Result<(), BootError> {
         // MT Fase 2 gate 1: SharedMemory + atomics nativi (fork wasmtime no_std).
         let g1 = crate::wasm::wt::run_threads_gate1();
         crate::binfo!("wt", "THREADS-OK 1 = {}", if g1 { "ok" } else { "FAIL" });
+        // MT Fase 2 fiber self-test: host-only fiber suspend/resume cross-core
+        // (con ≥3 core ran_on/resumed devono essere core ComputeApp, cioè ≥2).
+        let (fok, fran, fres) = crate::wasm::wt::threads::fiber_self_test();
+        crate::binfo!(
+            "wt",
+            "THREADS-FIBER-OK = {} ran_on={} resumed_on={}",
+            if fok { "ok" } else { "FAIL" }, fran, fres,
+        );
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();

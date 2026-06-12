@@ -342,6 +342,11 @@ pub fn run_core(cpu: u32) -> ! {
         while let Some(slot) = crate::smp::pool::take() {
             crate::smp::pool::run_slot(slot, cpu);
         }
+        // MT Fase 2: esegui i wasm-thread fiber runnable. Solo core ComputeApp
+        // (o il BSP sui sistemi 1-2 core, dove ComputeApp non esiste).
+        if crate::wasm::wt::threads::core_allowed(cpu) {
+            while crate::wasm::wt::threads::run_one(cpu) {}
+        }
         crate::sched::cpustat::add_busy(
             cpu as usize, crate::boot::clock::read_tsc().saturating_sub(poll_start));
 
@@ -352,7 +357,9 @@ pub fn run_core(cpu: u32) -> ! {
         interrupts::disable();
         let more = WAKE_PENDING[cpu as usize].load(Ordering::SeqCst)
             || crate::smp::inbox::is_pending(cpu)
-            || !crate::smp::pool::is_empty();
+            || !crate::smp::pool::is_empty()
+            || (crate::wasm::wt::threads::core_allowed(cpu)
+                && !crate::wasm::wt::threads::runnable_empty());
         if more {
             interrupts::enable();
             // Re-poll immediately; some waker fired during poll().

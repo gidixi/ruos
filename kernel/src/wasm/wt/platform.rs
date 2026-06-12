@@ -40,6 +40,18 @@ pub extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     TLS[crate::cpu::cpu_id() as usize].store(ptr, Ordering::SeqCst);
 }
 
+/// Raw per-core TLS load for the fiber scheduler's TLS swap (wt/threads.rs):
+/// a suspended fiber carries its wasmtime activation chain in its own stack,
+/// so the TLS pointer must travel with it across suspend/resume (and cores).
+pub fn tls_raw_get() -> *mut u8 {
+    TLS[crate::cpu::cpu_id() as usize].load(Ordering::SeqCst)
+}
+
+/// Raw per-core TLS store for the fiber scheduler's TLS swap (wt/threads.rs).
+pub fn tls_raw_set(ptr: *mut u8) {
+    TLS[crate::cpu::cpu_id() as usize].store(ptr, Ordering::SeqCst);
+}
+
 // ---------------------------------------------------------------------------
 // Custom sync primitives (`custom-sync-primitives` feature). no_std Wasmtime's
 // default locks PANIC on contention; with this feature it calls these shims so

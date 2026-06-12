@@ -37,14 +37,13 @@ della fase allineata a ciò che è stato costruito.
 
 - `make run-test`: TEST_PASS. `tests/threads-test.sh`: tutti i gate smp4+smp1
   + `PARSUM_OK threads=4` + `STRESS_MT_OK count=400000` + trap/kill-group ok.
-- **`tests/frame-smp-test.sh`: FAIL** — il marker `frame cores=` non viene
-  MAI emesso (né parallel né serial, `distinct_cores=0` in entrambe). Nessuna
-  modifica di questa fase tocca il dispatch frame() del wm; il test non è
-  wired nel Makefile e non risulta eseguito dai changelog ~476 in poi —
-  l'attribuzione (pre-esistente vs fase 2) è DA CHIARIRE con un run sul
-  commit pre-fase (6ff2dd8). Nel log: la finestra shell viene uccisa dal
-  watchdog epoch a T+9s e il gate compositor riporta "2 windows" ma
-  FRAME_JOBS non raggiunge mai ≥2 a frame ≥30.
+- **`tests/frame-smp-test.sh`: FAIL PRE-ESISTENTE** (attribuzione VERIFICATA:
+  identico esito — marker `frame cores=` mai emesso + `frame() WATCHDOG …
+  'shell': killed` a T+9s — anche al commit pre-fase 6ff2dd8, ribuildato e
+  bootato apposta). NON è una regressione della fase 2; il test non è wired
+  nel Makefile e non risulta eseguito dai changelog ~476 in poi. Da
+  investigare A PARTE: il watchdog epoch uccide la finestra shell sotto
+  compositor-init e FRAME_JOBS non raggiunge mai ≥2 a frame ≥30.
 - VBox (CPU-sensitive, OBBLIGATORIO da piano): verifica manuale utente
   ancora da fare — ISO boot-checks + threads-init, ≥4 vCPU.
 

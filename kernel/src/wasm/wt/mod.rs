@@ -276,6 +276,16 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
         Ok(m) => m,
         Err(e) => { kprintln!("ruos: wt deserialize err: {:?}", e); return 126; }
     };
+    // MT Fase 2: un modulo wasm32-wasip1-threads importa la memoria condivisa
+    // (env::memory shared) → va sul runtime threaded (main su fiber), altrimenti
+    // un atomic.wait nel main non avrebbe un fiber da sospendere.
+    let wants_shared = module.imports().any(|i| {
+        i.module() == "env" && i.name() == "memory"
+            && i.ty().memory().map_or(false, |m| m.is_shared())
+    });
+    if wants_shared {
+        return threads::exec_threaded(&module, args, pts);
+    }
     let mut state = WtState::new(args);
     // Bind stdout/stderr to the caller's PTY slave, if any.
     if let Some(n) = pts {

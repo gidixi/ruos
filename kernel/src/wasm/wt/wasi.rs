@@ -252,14 +252,31 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
             }
             OK
         })?;
+    // environ: same layout contract as args_* above, sourced from WtState.env
+    // ("K=V" entries). Empty for classic tools (count 0, as the old stubs);
+    // threaded modules see RAYON_NUM_THREADS injected by threads::exec_threaded.
     linker.func_wrap("wasi_snapshot_preview1", "environ_sizes_get",
         |mut caller: Caller<'_, T>, c: i32, s: i32| -> i32 {
-            if !mem::write_u32(&mut caller, c as u32, 0) { return EINVAL; }
-            if !mem::write_u32(&mut caller, s as u32, 0) { return EINVAL; }
+            let n = caller.data().wasi_ref().env.len() as u32;
+            let sz: u32 = caller.data().wasi_ref().env.iter().map(|e| e.len() as u32 + 1).sum();
+            if !mem::write_u32(&mut caller, c as u32, n) { return EINVAL; }
+            if !mem::write_u32(&mut caller, s as u32, sz) { return EINVAL; }
             OK
         })?;
     linker.func_wrap("wasi_snapshot_preview1", "environ_get",
-        |_caller: Caller<'_, T>, _e: i32, _b: i32| -> i32 { OK })?;
+        |mut caller: Caller<'_, T>, environ: i32, buf: i32| -> i32 {
+            let env = caller.data().wasi_ref().env.clone();
+            let mut cursor = buf as u32;
+            for (i, entry) in env.iter().enumerate() {
+                let slot = environ as u32 + (i as u32) * 4;
+                if !mem::write_u32(&mut caller, slot, cursor) { return EINVAL; }
+                let mut owned = entry.clone();
+                owned.push(0);
+                if !mem::write(&mut caller, cursor, &owned) { return EINVAL; }
+                cursor += owned.len() as u32;
+            }
+            OK
+        })?;
 
     // clock_time_get(id, precision, time_out) -> errno.
     // id 0 (REALTIME): unix-epoch ns, anchored to the RTC once at first use —

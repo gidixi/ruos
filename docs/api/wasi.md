@@ -6,7 +6,7 @@ Runtime: **wasmi**. Sources: `kernel/src/wasm/host/{lifecycle,clock,random,fd,pa
 You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 `std::time`, `println!`) does. Listed for completeness.
 
-**Last reviewed:** 2026-06-11.
+**Last reviewed:** 2026-06-12.
 
 ---
 
@@ -24,6 +24,23 @@ You normally don't call these directly — Rust `std` (`std::fs`, `std::env`,
 
 > `environ_get`/`PWD` + the `ruos_rt::init()` shim are how a tool's relative paths
 > resolve against the shell's cwd. See [path resolution](#path-resolution).
+>
+> **Window/CLI apps on Wasmtime** (`kernel/src/wasm/wt/wasi.rs` shim):
+> `environ_*` reads `WtState.env` (`KEY=VALUE` entries). Classic `.cwasm` tools
+> get an **empty** environ (no `PWD` injection on this runtime); threaded
+> modules (see below) get `RAYON_NUM_THREADS=<ComputeApp cores>` injected by
+> the kernel at exec.
+
+## wasi-threads  (Wasmtime only, `kernel/src/wasm/wt/threads.rs`)
+
+Modules built for `wasm32-wasip1-threads` import their linear memory
+(`env::memory`, shared) and the spawn host fn below; the kernel detects the
+shared-memory import in `run_cwasm` and runs the module's `_start` on a
+cooperative fiber (MT Fase 2).
+
+| Function | Meaning |
+|----------|---------|
+| `("wasi", "thread-spawn")(start_arg: i32) -> i32` | Spawn a new thread: the host re-instantiates the module against the same shared memory and calls its exported `wasi_thread_start(tid, start_arg)`. Returns the new `tid > 0`, or a negative errno. **Current status: stub — always returns `-1`** (spawn lands with MT Fase 2 Task 5; `pthread_create` fails cleanly until then). |
 
 ## Clock  (`clock.rs`)
 

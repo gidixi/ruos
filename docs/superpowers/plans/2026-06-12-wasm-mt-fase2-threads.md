@@ -408,7 +408,7 @@ Come Task 1 Step 5, grep `THREADS-FIBER-OK`. Expected: presente, `ran_on` ∈ co
 **Files:**
 - Modify: `kernel/src/wasm/wt/threads.rs` (`exec_threaded`), `kernel/src/wasm/wt/mod.rs` (route), `kernel/src/wasm/wt/state.rs` (env + threads handle), `kernel/src/wasm/wt/wasi.rs` (environ reali)
 
-- [ ] **Step 1: WtState esteso**
+- [x] **Step 1: WtState esteso**
 
 `state.rs`:
 ```rust
@@ -423,11 +423,11 @@ pub struct WtState {
 ```
 `WtState::new` inizializza `env: Vec::new(), threads: None`. Sistemare i costruttori esistenti (compile-driven).
 
-- [ ] **Step 2: environ reali in wasi.rs**
+- [x] **Step 2: environ reali in wasi.rs**
 
 Sostituisci gli stub (wasi.rs:255-262) col pattern esatto di `args_sizes_get`/`args_get` (wasi.rs:233-254) ma su `caller.data().wasi().env` (campo `env`): `environ_sizes_get` scrive count e bytes totali (NUL inclusi), `environ_get` scrive i puntatori + le stringhe NUL-terminate. Copia la struttura del codice args adattando il campo.
 
-- [ ] **Step 3: route in run_cwasm**
+- [x] **Step 3: route in run_cwasm** (getter reale: `MemoryType::is_shared()`, non `.shared()`)
 
 `wt/mod.rs`, in `run_cwasm` subito dopo il deserialize (riga ~226):
 ```rust
@@ -443,7 +443,7 @@ if wants_shared {
 }
 ```
 
-- [ ] **Step 4: exec_threaded**
+- [x] **Step 4: exec_threaded** (deviazioni: il wait-loop DRENA i fiber dal proprio core — con un solo core ComputeApp il main non girerebbe mai; `ThreadGroup.waiter_core` nuovo campo e `finish_fiber` sveglia quello; `env::memory` definita una volta con store usa-e-getta, funziona perché SharedMemory è engine-scoped; thread-spawn registrato come STUB -1 fino al Task 5)
 
 In `threads.rs`:
 ```rust
@@ -544,9 +544,9 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
 ```
 NOTE esecutore: (1) `instantiate_in_group` = helper che definisce `env::memory = g.shared.clone()` nel linker/per-store e poi `linker.instantiate(&mut store, &g.module)` — la firma esatta di `Linker::define` per SharedMemory in wasmtime 45 va verificata sul fork (se richiede `&Store`, definiscila qui per-store; un define ripetuto sullo stesso linker fallisce → in quel caso usa `linker.define` una sola volta in exec_threaded con una store usa-e-getta, o `Linker::allow_shadowing(true)`). (2) `publish_suspend` salva `suspend as *mut _ as usize` nel `ThreadFiber.suspend_ptr` corrente — il fiber NON ha accesso diretto alla sua Box; usa `CURRENT[cpu_id()]` che `run_one` ha appena settato. (3) il busy-wait di exec_threaded sull'AP: accettabile v1 (l'AP è dedicato all'app, identico a run_cwasm sync); annotare.
 
-- [ ] **Step 5: Build verde + run-test verde** (niente ancora chiama thread-spawn: i moduli wasip1 classici non passano dalla route).
+- [x] **Step 5: Build verde + run-test verde** (niente ancora chiama thread-spawn: i moduli wasip1 classici non passano dalla route). (Verificato: boot-checks ISO con THREADS-OK 1 + THREADS-FIBER-OK ancora ok; `make run-test` TEST_PASS.)
 
-- [ ] **Step 6: Commit** (`feat(wt): exec_threaded — threaded modules run their main on a fiber`).
+- [x] **Step 6: Commit** (`feat(wt): exec_threaded — threaded modules run their main on a fiber`).
 
 ---
 

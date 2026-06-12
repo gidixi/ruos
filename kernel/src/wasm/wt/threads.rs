@@ -22,7 +22,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::sync::IrqMutex;
 
 /// Stack nativo di ogni fiber: frame cranelift + host call (max_wasm_stack=512K).
-#[allow(dead_code)]
 pub const FIBER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const WAITQ_SHARDS: usize = 16;
 
@@ -59,19 +58,26 @@ struct ThreadFiber {
 unsafe impl Send for ThreadFiber {}
 
 /// Stato condiviso di UNA app threaded (1 Module + 1 SharedMemory + N thread).
-/// Creato da `exec_threaded` (Task 3); i campi servono a `spawn_fiber` e al
-/// futuro `thread-spawn` (Task 5).
-#[allow(dead_code)]
+/// Creato da `exec_threaded`; usato da `spawn_fiber` e dal `thread-spawn`
+/// host fn (spawn reale nel Task 5).
 pub struct ThreadGroup {
     pub module: wasmtime::Module,
     pub linker: Arc<wasmtime::Linker<crate::wasm::wt::state::WtState>>,
+    /// La linear memory condivisa del gruppo, già definita come `env::memory`
+    /// nel linker (engine-scoped: vale per ogni Store/instantiate del gruppo).
+    /// Tenuta qui anche solo per ancorarne la vita a quella del gruppo.
+    #[allow(dead_code)]
     pub shared: wasmtime::SharedMemory,
+    #[allow(dead_code)] // allocatore tid per thread-spawn (Task 5)
     pub next_tid: AtomicU32,
     pub live: AtomicU32,
     /// Trap in un thread → muore tutto il gruppo (kill-group, Task 7).
     pub poisoned: AtomicBool,
     /// Exit code del main (tid 0).
     pub exit: IrqMutex<Option<i32>>,
+    /// Core (dense id) che attende la fine del gruppo dentro `exec_threaded`,
+    /// da svegliare quando `live` arriva a 0.
+    pub waiter_core: AtomicU32,
     pub base_args: Vec<Vec<u8>>,
     /// Environ "K=V" del gruppo (RAYON_NUM_THREADS iniettato da exec_threaded).
     pub env: Vec<Vec<u8>>,
@@ -125,7 +131,6 @@ pub fn core_allowed(cpu: u32) -> bool {
 
 /// Accoda un fiber runnable e sveglia i core dormienti (stesso pattern di
 /// `pool::submit`: broadcast VEC_WAKE, i core non-allowed lo ignorano).
-#[allow(dead_code)] // producer: self-test ora, spawn_fiber dal Task 3
 fn enqueue_runnable(f: Box<ThreadFiber>) {
     RUNQ.lock().push_back(f);
     crate::apic::lapic::send_ipi_all_but_self(crate::idt::VEC_WAKE);
@@ -190,9 +195,9 @@ fn finish_fiber(f: Box<ThreadFiber>, code: i32) {
             *g.exit.lock() = Some(code);
         }
         if g.live.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Ultimo thread del gruppo: exec_threaded (BSP/AP, Task 3) se ne
-            // accorge dal live==0 — sveglialo.
-            crate::executor::wake_core(0);
+            // Ultimo thread del gruppo: sveglia il core che attende in
+            // exec_threaded (se ne accorge dal live==0).
+            crate::executor::wake_core(g.waiter_core.load(Ordering::SeqCst));
         }
     }
     // (Task 6: unregister da proc/ps.)
@@ -201,7 +206,6 @@ fn finish_fiber(f: Box<ThreadFiber>, code: i32) {
 /// Pubblica l'handle Suspend del fiber corrente (chiamata come PRIMA cosa dal
 /// corpo di ogni fiber). Il fiber non ha accesso diretto alla propria Box:
 /// passa da CURRENT, che run_one ha appena settato su questo core.
-#[allow(dead_code)] // chiamato dai corpi fiber: self-test ora, spawn_fiber dal Task 3
 fn publish_suspend(sus: &mut FiberSuspend) {
     let me = CURRENT[crate::cpu::cpu_id() as usize].load(Ordering::SeqCst) as *mut ThreadFiber;
     debug_assert!(!me.is_null(), "publish_suspend outside run_one");
@@ -273,6 +277,214 @@ pub fn wake_key(key: usize, count: u32) -> u32 {
         crate::apic::lapic::send_ipi_all_but_self(crate::idt::VEC_WAKE);
     }
     woken
+}
+
+// ---------------------------------------------------------------------------
+// exec_threaded — esecuzione di un modulo wasm32-wasip1-threads (Task 3).
+// ---------------------------------------------------------------------------
+
+/// Esegue un modulo threaded: gruppo + SharedMemory + linker condiviso, main
+/// (`_start`) su fiber tid=0, attesa cooperativa della fine del gruppo.
+/// Chiamato SINCRONO da `run_cwasm` (su un AP via run_app_on_core, o inline
+/// sul BSP nei sistemi 1-2 core), come ogni altro exec `.cwasm`.
+pub fn exec_threaded(
+    module: &wasmtime::Module,
+    args: Vec<Vec<u8>>,
+    pts: Option<usize>,
+) -> i32 {
+    let engine = crate::wasm::wt::engine();
+    let mem_ty = match module.imports().find_map(|i| {
+        if i.module() == "env" && i.name() == "memory" { i.ty().memory().cloned() } else { None }
+    }) {
+        Some(t) => t,
+        None => return 126, // il chiamante ha già verificato l'import shared
+    };
+    let shared = match wasmtime::SharedMemory::new(engine, mem_ty) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::kprintln!("ruos: wt exec_threaded SharedMemory: {:?}", e);
+            return 126;
+        }
+    };
+    // Linker condiviso del gruppo: stessa superficie di run_cwasm + thread-spawn.
+    let mut linker: wasmtime::Linker<crate::wasm::wt::state::WtState> =
+        wasmtime::Linker::new(engine);
+    if let Err(e) = crate::wasm::wt::wasi::add_to_linker(&mut linker) {
+        crate::kprintln!("ruos: wt exec_threaded wasi link: {}", e);
+        return 126;
+    }
+    if let Err(e) = crate::wasm::wt::gfx::add_to_linker(&mut linker) {
+        crate::kprintln!("ruos: wt exec_threaded gfx link: {}", e);
+        return 126;
+    }
+    if let Err(e) = crate::wasm::wt::gui::add_to_linker(&mut linker) {
+        crate::kprintln!("ruos: wt exec_threaded gui link: {}", e);
+        return 126;
+    }
+    if let Err(e) = add_thread_spawn_to_linker(&mut linker) {
+        crate::kprintln!("ruos: wt exec_threaded thread-spawn link: {}", e);
+        return 126;
+    }
+    // env::memory definita UNA volta: SharedMemory è engine-scoped, quindi il
+    // define vale per ogni Store/instantiate del gruppo (la store qui serve
+    // solo da contesto per la firma di Linker::define).
+    {
+        let throwaway = wasmtime::Store::new(engine, crate::wasm::wt::state::WtState::new(Vec::new()));
+        if let Err(e) = linker.define(&throwaway, "env", "memory", shared.clone()) {
+            crate::kprintln!("ruos: wt exec_threaded define memory: {:?}", e);
+            return 126;
+        }
+    }
+    // rayon non può scoprire i core (available_parallelism = Unsupported su
+    // wasi): inietta il parallelismo reale = numero di core ComputeApp.
+    let total = 1 + crate::cpu::cpus_online();
+    let ncomp = total.saturating_sub(2).max(1);
+    let mut env: Vec<Vec<u8>> = Vec::new();
+    env.push(alloc::format!("RAYON_NUM_THREADS={}", ncomp).into_bytes());
+    let cpu = crate::cpu::cpu_id();
+    let group = Arc::new(ThreadGroup {
+        module: module.clone(),
+        linker: Arc::new(linker),
+        shared,
+        next_tid: AtomicU32::new(1),
+        live: AtomicU32::new(0),
+        poisoned: AtomicBool::new(false),
+        exit: IrqMutex::new(None),
+        waiter_core: AtomicU32::new(cpu),
+        base_args: args,
+        env,
+    });
+    // main = tid 0
+    spawn_fiber(group.clone(), 0, 0, pts);
+    // Attesa cooperativa della fine del gruppo, DRENANDO i fiber da questo
+    // stesso core: exec_threaded occupa sync il suo core ComputeApp (o il BSP
+    // inline su 1-2 core) — se non drenasse, su un sistema con UN solo core
+    // abilitato il main fiber non girerebbe mai (deadlock). Gli altri core
+    // ComputeApp rubano comunque dalla RUNQ globale dentro run_core.
+    loop {
+        if group.live.load(Ordering::SeqCst) == 0 {
+            let code = *group.exit.lock();
+            return code.unwrap_or(if group.poisoned.load(Ordering::SeqCst) { 134 } else { 0 });
+        }
+        if core_allowed(cpu) {
+            while run_one(cpu) {}
+            if group.live.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+        }
+        // Tutti i fiber parcheggiati/altrove: dormi fino a timer (100 Hz) o
+        // IPI wake (enqueue_runnable / wake_key / finish_fiber → waiter_core).
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Crea il fiber di UN thread (main tid=0 o spawned tid>0) e lo accoda
+/// runnable. Il corpo del fiber costruisce Store+WtState, istanzia il modulo
+/// del gruppo contro la SharedMemory condivisa e chiama `_start` (main) o
+/// `wasi_thread_start(tid, start_arg)` (thread, Task 5).
+fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<usize>) {
+    group.live.fetch_add(1, Ordering::SeqCst);
+    let stack = match wasmtime_internal_fiber::FiberStack::new(FIBER_STACK_SIZE, false) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::kprintln!("ruos: wt spawn_fiber stack: {:?}", e);
+            group.poisoned.store(true, Ordering::SeqCst);
+            group.live.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    };
+    let g = group.clone();
+    let fiber = match wasmtime_internal_fiber::Fiber::new(stack, move |_: (), sus| -> i32 {
+        publish_suspend(sus);
+        let engine = crate::wasm::wt::engine();
+        let mut state = crate::wasm::wt::state::WtState::new(g.base_args.clone());
+        state.env = g.env.clone();
+        state.threads = Some(g.clone());
+        // Solo il main eredita il PTY del chiamante (stesso wiring di run_cwasm).
+        if tid == 0 {
+            if let Some(n) = pts {
+                let path = alloc::format!("/dev/pts/{}", n);
+                if let Ok(fd) = crate::vfs::block_on(
+                    crate::vfs::open(&path, crate::vfs::OpenFlags::WRITE)) {
+                    state.stdout_pty = Some(fd);
+                }
+            }
+        }
+        let mut store = wasmtime::Store::new(engine, state);
+        // Niente deadline assoluta: un thread può restare parcheggiato a lungo
+        // e una deadline trapperebbe al resume (deviazione documentata dalla
+        // spec §7 — la protezione del desktop resta strutturale: un runaway
+        // occupa UN core ComputeApp, la GUI sul core 1 non è toccata).
+        store.set_epoch_deadline(crate::wasm::wt::NO_DEADLINE_TICKS);
+        let inst = match g.linker.instantiate(&mut store, &g.module) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::kprintln!("ruos: wt thread tid={} instantiate: {:?}", tid, e);
+                g.poisoned.store(true, Ordering::SeqCst);
+                return 126;
+            }
+        };
+        // DF=0 prima di entrare nel guest (convenzione di ogni call site wt).
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cld", options(nostack)); }
+        let r = if tid == 0 {
+            inst.get_typed_func::<(), ()>(&mut store, "_start")
+                .and_then(|f| f.call(&mut store, ()))
+        } else {
+            inst.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
+                .and_then(|f| f.call(&mut store, (tid as i32, start_arg)))
+        };
+        let code = match r {
+            Ok(()) => store.data().exit.unwrap_or(0),
+            Err(e) => match store.data().exit {
+                Some(c) => c, // proc_exit trappa per srotolare: non è un errore
+                None => {
+                    crate::bwarn!("wt", "thread tid={} trap: {:?} — group poisoned", tid, e);
+                    g.poisoned.store(true, Ordering::SeqCst);
+                    134
+                }
+            },
+        };
+        if let Some(fd) = store.data().stdout_pty {
+            let _ = crate::vfs::block_on(crate::vfs::close(fd));
+        }
+        code
+    }) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::kprintln!("ruos: wt spawn_fiber Fiber::new: {:?}", e);
+            group.poisoned.store(true, Ordering::SeqCst);
+            group.live.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    };
+    enqueue_runnable(Box::new(ThreadFiber {
+        fiber,
+        saved_tls: core::ptr::null_mut(),
+        suspend_ptr: AtomicUsize::new(0),
+        group: Some(group),
+        tid,
+        park_key: 0,
+        park_deadline: 0,
+    }));
+}
+
+/// Registra l'import wasi-threads: modulo `"wasi"`, field `"thread-spawn"`
+/// (TRATTINO), `(param i32) (result i32)`. Ogni modulo wasip1-threads importa
+/// il simbolo, quindi la definizione serve già ora per l'instantiate; lo spawn
+/// REALE (nuovo fiber su `wasi_thread_start`) arriva col Task 5 — finché non
+/// c'è, rifiuta con -1 (pthread_create fallisce pulito, EAGAIN guest-side).
+pub fn add_thread_spawn_to_linker(
+    linker: &mut wasmtime::Linker<crate::wasm::wt::state::WtState>,
+) -> wasmtime::Result<()> {
+    linker.func_wrap("wasi", "thread-spawn",
+        |caller: wasmtime::Caller<'_, crate::wasm::wt::state::WtState>, _start_arg: i32| -> i32 {
+            if caller.data().threads.is_none() {
+                return -1; // modulo non threaded: import mai definito altrove
+            }
+            -1 // Task 5: spawn_thread reale (nuovo fiber, wasi_thread_start)
+        })?;
+    Ok(())
 }
 
 /// Boot-check MT Fase 2: fiber host-only (niente wasm) con suspend/resume

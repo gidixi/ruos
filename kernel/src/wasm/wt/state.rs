@@ -13,6 +13,9 @@ pub enum WtFd {
 
 pub struct WtState {
     pub args: Vec<Vec<u8>>,
+    /// Environ "K=V" (bytes, no NUL). Empty for classic tools; threaded modules
+    /// get RAYON_NUM_THREADS injected by `threads::exec_threaded`.
+    pub env: Vec<Vec<u8>>,
     pub exit: Option<i32>,
     /// fd table. 0/1/2 = Console; 3 = virtual preopen "/" (handled in the WASI
     /// fns, kept as Closed here); 4.. = files opened via path_open.
@@ -20,15 +23,20 @@ pub struct WtState {
     /// If set, stdout/stderr (fd 1/2) are written to this PTY slave VFS fd
     /// (so output reaches the bound terminal/SSH channel). None → CONSOLE.
     pub stdout_pty: Option<crate::vfs::Fd>,
+    /// Thread group of the owning threaded app (MT Fase 2); None for classic
+    /// single-threaded modules. Read by the "wasi" `thread-spawn` host fn.
+    pub threads: Option<alloc::sync::Arc<crate::wasm::wt::threads::ThreadGroup>>,
 }
 
 impl WtState {
     pub fn new(args: Vec<Vec<u8>>) -> Self {
         Self {
             args,
+            env: Vec::new(),
             exit: None,
             fds: alloc::vec![WtFd::Console, WtFd::Console, WtFd::Console, WtFd::Closed],
             stdout_pty: None,
+            threads: None,
         }
     }
 

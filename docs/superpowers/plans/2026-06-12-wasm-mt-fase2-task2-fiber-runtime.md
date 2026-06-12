@@ -13,8 +13,8 @@
 | 1 — Gate 1 (SharedMemory + atomics) | ✅ Done | 487 |
 | 2 — Fiber runtime + self-test | ✅ Done | 488 |
 | 3 — exec_threaded (main on fiber) | ✅ Done | 489 |
-| **4 — Futex hooks (atomic.wait/notify) + Gate 3** | ⬜ **NEXT** | — |
-| 5 — thread-spawn + Gate 2 | ⬜ Pending | — |
+| 4 — Futex hooks (atomic.wait/notify) + Gate 3 | ✅ Done | 490 |
+| **5 — thread-spawn + Gate 2** | ⬜ **NEXT** | — |
 | 6 — parsum end-to-end (rayon) | ⬜ Pending | — |
 | 7 — Stress + kill-group + docs | ⬜ Pending | — |
 

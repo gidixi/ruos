@@ -112,6 +112,17 @@ pub fn run_threads_gate1() -> bool {
     }
 }
 
+/// Gate 3 MT Fase 2 (`tools/wt-threads-gate/gate3.wat` precompilato): atomic.wait
+/// sospende il fiber (il core resta libero), notify risveglia via IPI.
+#[cfg(feature = "boot-checks")]
+static THREADS_GATE3_CWASM: &[u8] = include_bytes!("threads_gate3.cwasm");
+
+/// Gate 3 MT Fase 2 — vedi `threads::gate3_run` (waiter/waker su due fiber).
+#[cfg(feature = "boot-checks")]
+pub fn run_threads_gate3() -> bool {
+    threads::gate3_run(THREADS_GATE3_CWASM)
+}
+
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]

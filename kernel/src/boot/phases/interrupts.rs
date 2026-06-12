@@ -218,6 +218,10 @@ pub fn init() -> Result<(), BootError> {
             "THREADS-FIBER-OK = {} ran_on={} resumed_on={}",
             if fok { "ok" } else { "FAIL" }, fran, fres,
         );
+        // MT Fase 2 gate 3: atomic.wait sospende il fiber (non il core),
+        // notify risveglia via IPI (waiter/waker su due fiber dello stesso gruppo).
+        let g3 = crate::wasm::wt::run_threads_gate3();
+        crate::binfo!("wt", "THREADS-OK 3 = {}", if g3 { "ok" } else { "FAIL" });
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();

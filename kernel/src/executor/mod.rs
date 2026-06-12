@@ -345,6 +345,7 @@ pub fn run_core(cpu: u32) -> ! {
         // MT Fase 2: esegui i wasm-thread fiber runnable. Solo core ComputeApp
         // (o il BSP sui sistemi 1-2 core, dove ComputeApp non esiste).
         if crate::wasm::wt::threads::core_allowed(cpu) {
+            crate::wasm::wt::threads::expire_timeouts();
             while crate::wasm::wt::threads::run_one(cpu) {}
         }
         crate::sched::cpustat::add_busy(

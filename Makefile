@@ -127,13 +127,16 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 WT_KDIR    := kernel/src/wasm/wt
 WT_KCWASMS := $(WT_KDIR)/hello.cwasm \
               $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm \
-              $(WT_KDIR)/spin_reactor.cwasm $(WT_KDIR)/threads_gate1.cwasm
+              $(WT_KDIR)/spin_reactor.cwasm $(WT_KDIR)/threads_gate1.cwasm \
+              $(WT_KDIR)/threads_gate3.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/spin.cwasm: tools/wt-spin/spin.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/threads_gate1.cwasm: tools/wt-threads-gate/gate1.wat $(WT_PRECOMPILE)
+	$(WT_PRECOMPILE) $< $@
+$(WT_KDIR)/threads_gate3.cwasm: tools/wt-threads-gate/gate3.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/echo.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@

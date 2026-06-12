@@ -556,7 +556,7 @@ NOTE esecutore: (1) `instantiate_in_group` = helper che definisce `env::memory =
 - Modify: `kernel/src/wasm/wt/threads.rs` (hook + park/unpark), `kernel/src/boot/phases/interrupts.rs`
 - Create: `tools/wt-threads-gate/gate3.wat` + regola Makefile + include/runner (pattern Task 1)
 
-- [ ] **Step 1: Protocollo futex in threads.rs**
+- [x] **Step 1: Protocollo futex in threads.rs** (deviazione: pre-filtro di expire_timeouts = contatore `TIMED_WAITERS` invece di `EARLIEST_DEADLINE` — l'atomic min aveva una race insert-vs-rescan con deadline perse; il ricontrollo del valore avviene sotto il lock shard PRIMA del park, la finestra in-volo resta coperta dai crediti del Task 2)
 
 ```rust
 /// Spin adattivo prima del park: la critical section media è più corta del park.
@@ -636,7 +636,7 @@ NOTE esecutore (importanti):
 2. Race window: tra il drop del lock shard e l'effettivo park in run_one, un notify può NON trovare il fiber nello shard (è ancora "in volo"). Fix: il registro in WAITQ avviene PRIMA del suspend → sposta l'inserimento nello shard DENTRO `park_current` (sotto il lock) usando un placeholder; ma la Box è posseduta da run_one… **Soluzione canonica**: `park_current` setta `park_key/deadline` e sospende; `run_one` inserisce in WAITQ; `wasmtime_futex_notify` che non trova la chiave nello shard setta un flag `pending_wake` in una mappa shard `(key→contatore)`: `run_one`, PRIMA di inserire in WAITQ, controlla/consuma `pending_wake` per la sua chiave e in caso re-enqueue subito. Implementa questo contatore nello stesso shard (campo `Vec<(usize, u32)>` o piccola mappa). Documenta l'invariante nel codice.
 3. `FiberSuspend` = alias del tipo Suspend reale del crate. Timeout: i waiter scaduti vanno riscattati — aggiungi `pub fn expire_timeouts()` che scorre gli shard con `ticks() >= deadline` e re-enqueue (chiamata da run_core ogni giro, costo ~0 con `EARLIEST_DEADLINE: AtomicU64` come pre-filtro). Scrivila.
 
-- [ ] **Step 2: Gate 3 guest**
+- [x] **Step 2: Gate 3 guest**
 
 `tools/wt-threads-gate/gate3.wat` — DUE "thread" senza spawn ancora: il main fa `atomic.notify` dopo un ciclo; il gate runner host crea il gruppo e spawna A MANO due fiber sullo stesso modulo (riusa `spawn_fiber` con due export diversi `waiter`/`waker`):
 ```wat
@@ -654,11 +654,11 @@ NOTE esecutore (importanti):
 ```
 Runner kernel (boot-checks): crea gruppo per gate3.cwasm, spawna fiber-waiter poi fiber-waker (export custom — generalizza `spawn_fiber` con un parametro export/firma per il path di test), attendi `live==0`, assert: waiter exit = 7. Marker `THREADS-OK 3 = ok`. **Questo prova: wait sospende il fiber (il waiter NON blocca il core: il waker gira), notify risveglia via IPI.**
 
-- [ ] **Step 3: Makefile + include + boot call** (pattern identico Task 1 Step 2-4, file `threads_gate3.cwasm`).
+- [x] **Step 3: Makefile + include + boot call** (pattern identico Task 1 Step 2-4, file `threads_gate3.cwasm`).
 
-- [ ] **Step 4: Boot + assert** `THREADS-OK 3 = ok` con `-smp 4 -m 2048`; anche con `-smp 2` (fallback BSP) non deve deadlockare.
+- [x] **Step 4: Boot + assert** `THREADS-OK 3 = ok` con `-smp 4 -m 2048`; anche con `-smp 2` (fallback BSP) non deve deadlockare. (Verificato: ok su -smp 4, -smp 2 E -smp 1; `make run-test` TEST_PASS.)
 
-- [ ] **Step 5: Commit** (`feat(wt): futex hooks — atomic.wait suspends the fiber, notify wakes via IPI`).
+- [x] **Step 5: Commit** (`feat(wt): futex hooks — atomic.wait suspends the fiber, notify wakes via IPI`).
 
 ---
 

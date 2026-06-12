@@ -136,41 +136,9 @@ pub extern "C" fn wasmtime_sync_rwlock_free(_lock: *mut usize) {
     // Inline state — nothing to free.
 }
 
-// ---------------------------------------------------------------------------
-// Futex hooks (`threads` feature of the vendored wasmtime fork,
-// third_party/wasmtime45). Back `memory.atomic.wait32/wait64/notify` on shared
-// memories. Wait contract (wasm threads semantics): 0 = woken, 1 = not-equal,
-// 2 = timed-out; `timeout_ns < 0` = infinite. notify returns the number of
-// woken waiters.
-//
-// Stub MT Fase 2 Task 0 — replaced by wt/threads.rs in Task 4: wait never
-// blocks (returns 1 = not-equal immediately — NOT spec-accurate when the value
-// matches, but no fiber scheduler exists yet so nothing can park), notify
-// wakes nobody (no waiter can exist if nobody ever blocks).
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn wasmtime_futex_wait32(
-    _addr: *const u32,
-    _expected: u32,
-    _timeout_ns: i64,
-) -> u32 {
-    1 // not-equal: never blocks (stub)
-}
-
-#[no_mangle]
-pub extern "C" fn wasmtime_futex_wait64(
-    _addr: *const u64,
-    _expected: u64,
-    _timeout_ns: i64,
-) -> u32 {
-    1 // not-equal: never blocks (stub)
-}
-
-#[no_mangle]
-pub extern "C" fn wasmtime_futex_notify(_addr: *const u8, _count: u32) -> u32 {
-    0 // no waiters woken (stub)
-}
+// Futex hooks (`threads` feature of the vendored wasmtime fork): implemented
+// in wt/threads.rs (`wasmtime_futex_wait32/wait64/notify`) on the fiber
+// scheduler's park/wake protocol — MT Fase 2 Task 4.
 
 // ---------------------------------------------------------------------------
 // Virtual memory — backed by the frame allocator + paging.

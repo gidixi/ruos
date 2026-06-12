@@ -26,9 +26,6 @@ pub const FIBER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const WAITQ_SHARDS: usize = 16;
 
 /// Tipo Suspend concreto dei nostri fiber: Resume=(), Yield=(), Return=exit code.
-/// (dead_code: fuori da boot-checks il protocollo park è usato solo dal
-/// self-test finché il Task 4 non aggancia gli hook futex.)
-#[allow(dead_code)]
 type FiberSuspend = wasmtime_internal_fiber::Suspend<(), (), i32>;
 
 /// Un fiber-thread registrato. Lo stato di esecuzione (Store, Instance,
@@ -39,7 +36,6 @@ struct ThreadFiber {
     saved_tls: *mut u8,
     /// `&mut Suspend` pubblicato dal corpo del fiber al primo run
     /// (`publish_suspend`) — serve a `park_current` per sospendere.
-    #[allow(dead_code)] // letto solo dal protocollo park (self-test → Task 4)
     suspend_ptr: AtomicUsize,
     /// Gruppo dell'app threaded; `None` per i fiber host-only (self-test).
     group: Option<Arc<ThreadGroup>>,
@@ -181,6 +177,9 @@ pub fn run_one(cpu: u32) -> bool {
                     RUNQ.lock().push_back(f);
                 } else {
                     s.waiters.push((key, deadline, f));
+                    if deadline != u64::MAX {
+                        TIMED_WAITERS.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
         }
@@ -219,12 +218,11 @@ fn publish_suspend(sus: &mut FiberSuspend) {
 /// Parcheggia il fiber corrente sulla chiave `key` e sospende. Ritorna dopo un
 /// wake (`wake_key`). Riusato dall'hook futex (Task 4) con le sue deadline;
 /// `deadline` in tick (u64::MAX = infinito), riscatto timeout nel Task 4.
-#[allow(dead_code)] // usato dal self-test; gli hook futex lo agganciano nel Task 4
-fn park_current(key: usize, deadline: u64) {
+fn park_current(key: usize, deadline: u64) -> bool {
     let me = CURRENT[crate::cpu::cpu_id() as usize].load(Ordering::SeqCst) as *mut ThreadFiber;
     if me.is_null() {
         // Contesto non-fiber: niente da parcheggiare (il chiamante degrada a spin).
-        return;
+        return false;
     }
     // SAFETY: come publish_suspend — Box viva, posseduta da run_one, un solo
     // core la tocca. Il suspend rientra in run_one che la sposta in WAITQ.
@@ -235,13 +233,13 @@ fn park_current(key: usize, deadline: u64) {
         debug_assert!(!sus.is_null(), "park_current before publish_suspend");
         (*sus).suspend(());
     }
+    true
 }
 
 /// Sveglia fino a `count` fiber parcheggiati su `key`; ritorna quanti ne ha
 /// effettivamente rimessi in RUNQ. Il resto del budget diventa credito per i
 /// parker in volo (vedi doc-comment in testa). Base dell'hook notify (Task 4).
-#[allow(dead_code)] // chiamato dal self-test; hook notify nel Task 4
-pub fn wake_key(key: usize, count: u32) -> u32 {
+fn wake_key(key: usize, count: u32) -> u32 {
     let mut woken = 0u32;
     let mut to_run: Vec<Box<ThreadFiber>> = Vec::new();
     {
@@ -249,7 +247,10 @@ pub fn wake_key(key: usize, count: u32) -> u32 {
         let mut i = 0;
         while i < s.waiters.len() && woken < count {
             if s.waiters[i].0 == key {
-                let (_, _, f) = s.waiters.swap_remove(i);
+                let (_, d, f) = s.waiters.swap_remove(i);
+                if d != u64::MAX {
+                    TIMED_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                }
                 to_run.push(f);
                 woken += 1;
             } else {
@@ -277,6 +278,111 @@ pub fn wake_key(key: usize, count: u32) -> u32 {
         crate::apic::lapic::send_ipi_all_but_self(crate::idt::VEC_WAKE);
     }
     woken
+}
+
+// ---------------------------------------------------------------------------
+// Hook futex (Task 4) — chiamati dal fork wasmtime (third_party/wasmtime45,
+// shared_memory.rs) come back-end di memory.atomic.{wait32,wait64,notify}.
+// `addr` è un puntatore HOST già validato dal runtime (in-bounds, allineato).
+// Contratto wait: 0 = woken, 1 = not-equal, 2 = timed-out; timeout_ns < 0 =
+// infinito. notify ritorna il numero di waiter risvegliati.
+// ---------------------------------------------------------------------------
+
+/// Spin adattivo prima del park: le critical section medie (mutex guest) sono
+/// più corte di un ciclo suspend → IPI → resume.
+const SPIN_ITERS: u32 = 200;
+
+/// Waiter parcheggiati CON timeout. Pre-filtro O(1) di `expire_timeouts`:
+/// senza waiter a tempo (caso comune: wait infiniti) il riscatto non scansiona
+/// nulla. Mantenuto SOLO ai siti insert/remove sotto il lock dello shard.
+static TIMED_WAITERS: AtomicU32 = AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn wasmtime_futex_wait32(addr: *const u32, expected: u32, timeout_ns: i64) -> u32 {
+    // SAFETY: addr validato dal chiamante (vedi header); load 4-allineato.
+    futex_wait(addr as usize, timeout_ns,
+        move || unsafe { core::ptr::read_volatile(addr) } != expected)
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_futex_wait64(addr: *const u64, expected: u64, timeout_ns: i64) -> u32 {
+    // SAFETY: come wait32; load 8-allineato.
+    futex_wait(addr as usize, timeout_ns,
+        move || unsafe { core::ptr::read_volatile(addr) } != expected)
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_futex_notify(addr: *const u8, count: u32) -> u32 {
+    wake_key(addr as usize, count)
+}
+
+fn futex_wait(key: usize, timeout_ns: i64, not_equal: impl Fn() -> bool) -> u32 {
+    // Fast path: spin con PAUSE ricontrollando il valore.
+    for _ in 0..SPIN_ITERS {
+        if not_equal() {
+            return 1;
+        }
+        core::hint::spin_loop();
+    }
+    // ns → tick 100 Hz, arrotondando in SU: un timeout > 0 attende ≥ 1 tick.
+    let deadline = if timeout_ns < 0 {
+        u64::MAX
+    } else {
+        crate::timer::ticks() + ((timeout_ns as u64) / 10_000_000).max(1)
+    };
+    {
+        // Ricontrollo sotto il lock dello shard: serializza col percorso
+        // notify (wake_key prende lo stesso lock). La finestra residua —
+        // notify tra questo unlock e l'inserimento in WAITQ da parte di
+        // run_one — è coperta dai crediti (vedi doc-comment in testa al file).
+        let _s = shard(key).0.lock();
+        if not_equal() {
+            return 1;
+        }
+    }
+    if !park_current(key, deadline) {
+        // Contesto non-fiber: NON deve succedere (i moduli threaded girano
+        // sempre su fiber), ma non deve nemmeno bloccare il kernel.
+        crate::bwarn!("wt", "futex wait outside a fiber: degraded to spin");
+        while !not_equal() {
+            core::hint::spin_loop();
+        }
+        return 1;
+    }
+    // Risvegliato: da notify (0) o da expire_timeouts a deadline scaduta (2).
+    if deadline != u64::MAX && crate::timer::ticks() >= deadline { 2 } else { 0 }
+}
+
+/// Riscatta i waiter futex col timeout scaduto: re-enqueue in RUNQ (il loro
+/// `futex_wait` ritorna 2 = timed-out). Chiamato da `run_core` e dal wait-loop
+/// di `exec_threaded` a ogni giro — costo ~0 senza waiter a tempo.
+pub fn expire_timeouts() {
+    if TIMED_WAITERS.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let now = crate::timer::ticks();
+    let mut expired: Vec<Box<ThreadFiber>> = Vec::new();
+    for sh in WAITQ.iter() {
+        let mut s = sh.0.lock();
+        let mut i = 0;
+        while i < s.waiters.len() {
+            if s.waiters[i].1 <= now {
+                let (_, _, f) = s.waiters.swap_remove(i);
+                TIMED_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                expired.push(f);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if !expired.is_empty() {
+        let mut q = RUNQ.lock();
+        for f in expired {
+            q.push_back(f);
+        }
+        drop(q);
+        crate::apic::lapic::send_ipi_all_but_self(crate::idt::VEC_WAKE);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +473,9 @@ pub fn exec_threaded(
             return code.unwrap_or(if group.poisoned.load(Ordering::SeqCst) { 134 } else { 0 });
         }
         if core_allowed(cpu) {
+            // Anche il riscatto timeout: su 1-2 core (BSP inline) nessun
+            // run_core gira mentre questo loop blocca il core.
+            expire_timeouts();
             while run_one(cpu) {}
             if group.live.load(Ordering::SeqCst) == 0 {
                 continue;
@@ -485,6 +594,136 @@ pub fn add_thread_spawn_to_linker(
             -1 // Task 5: spawn_thread reale (nuovo fiber, wasi_thread_start)
         })?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gate 3 (boot-checks): atomic.wait sospende il FIBER, notify risveglia (IPI).
+// ---------------------------------------------------------------------------
+
+/// Gate 3 MT Fase 2: due fiber sullo stesso modulo + SharedMemory — `waiter`
+/// fa `memory.atomic.wait32` (sospende il SUO fiber: il core resta libero e
+/// può eseguire il waker), `waker` scrive il payload e fa notify (IPI).
+/// Ritorna true sse il waiter esce con 7 (il payload letto DOPO il wake).
+#[cfg(feature = "boot-checks")]
+pub fn gate3_run(cwasm: &[u8]) -> bool {
+    let engine = crate::wasm::wt::engine();
+    // SAFETY: cwasm prodotto da tools/wt-precompile per questa exact config.
+    let module = match unsafe { wasmtime::Module::deserialize(engine, cwasm) } {
+        Ok(m) => m,
+        Err(e) => { crate::kprintln!("ruos: gate3 deserialize: {:?}", e); return false; }
+    };
+    let mem_ty = match module.imports().find_map(|i| i.ty().memory().cloned()) {
+        Some(t) => t,
+        None => { crate::kprintln!("ruos: gate3: no memory import"); return false; }
+    };
+    let shared = match wasmtime::SharedMemory::new(engine, mem_ty) {
+        Ok(s) => s,
+        Err(e) => { crate::kprintln!("ruos: gate3 SharedMemory: {:?}", e); return false; }
+    };
+    let mut linker: wasmtime::Linker<crate::wasm::wt::state::WtState> =
+        wasmtime::Linker::new(engine);
+    {
+        let throwaway =
+            wasmtime::Store::new(engine, crate::wasm::wt::state::WtState::new(Vec::new()));
+        if let Err(e) = linker.define(&throwaway, "env", "memory", shared.clone()) {
+            crate::kprintln!("ruos: gate3 define: {:?}", e);
+            return false;
+        }
+    }
+    let cpu = crate::cpu::cpu_id();
+    let group = Arc::new(ThreadGroup {
+        module,
+        linker: Arc::new(linker),
+        shared,
+        next_tid: AtomicU32::new(1),
+        live: AtomicU32::new(0),
+        poisoned: AtomicBool::new(false),
+        exit: IrqMutex::new(None),
+        waiter_core: AtomicU32::new(cpu),
+        base_args: Vec::new(),
+        env: Vec::new(),
+    });
+    // waiter = tid 0: il suo valore di ritorno finisce in group.exit.
+    spawn_fiber_export(group.clone(), 0, "waiter");
+    spawn_fiber_export(group.clone(), 1, "waker");
+    // Come fiber_self_test: con ≥3 core drenano gli AP; senza ComputeApp è il
+    // BSP (questa fase di boot) a dover drenare da sé.
+    let deadline = crate::timer::ticks() + 500; // 5 s
+    while group.live.load(Ordering::SeqCst) != 0 {
+        if core_allowed(cpu) {
+            expire_timeouts();
+            while run_one(cpu) {}
+        }
+        if crate::timer::ticks() > deadline {
+            crate::kprintln!(
+                "ruos: gate3 timeout (live={})", group.live.load(Ordering::SeqCst));
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    let code = *group.exit.lock();
+    if code != Some(7) {
+        crate::kprintln!("ruos: gate3 waiter exit = {:?} (want Some(7))", code);
+    }
+    code == Some(7)
+}
+
+/// Variante test di `spawn_fiber`: chiama un export custom `() -> i32` invece
+/// di `_start`/`wasi_thread_start` (i guest dei gate non sono binari WASI).
+#[cfg(feature = "boot-checks")]
+fn spawn_fiber_export(group: Arc<ThreadGroup>, tid: u32, export: &'static str) {
+    group.live.fetch_add(1, Ordering::SeqCst);
+    let stack = match wasmtime_internal_fiber::FiberStack::new(FIBER_STACK_SIZE, false) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::kprintln!("ruos: gate3 stack: {:?}", e);
+            group.live.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    };
+    let g = group.clone();
+    let fiber = match wasmtime_internal_fiber::Fiber::new(stack, move |_: (), sus| -> i32 {
+        publish_suspend(sus);
+        let engine = crate::wasm::wt::engine();
+        let mut store =
+            wasmtime::Store::new(engine, crate::wasm::wt::state::WtState::new(Vec::new()));
+        store.set_epoch_deadline(crate::wasm::wt::NO_DEADLINE_TICKS);
+        let inst = match g.linker.instantiate(&mut store, &g.module) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::kprintln!("ruos: gate3 instantiate {}: {:?}", export, e);
+                return -1;
+            }
+        };
+        // DF=0 prima di entrare nel guest (convenzione di ogni call site wt).
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cld", options(nostack)); }
+        match inst.get_typed_func::<(), i32>(&mut store, export)
+            .and_then(|f| f.call(&mut store, ()))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                crate::kprintln!("ruos: gate3 {} trap: {:?}", export, e);
+                -1
+            }
+        }
+    }) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::kprintln!("ruos: gate3 Fiber::new: {:?}", e);
+            group.live.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    };
+    enqueue_runnable(Box::new(ThreadFiber {
+        fiber,
+        saved_tls: core::ptr::null_mut(),
+        suspend_ptr: AtomicUsize::new(0),
+        group: Some(group),
+        tid,
+        park_key: 0,
+        park_deadline: 0,
+    }));
 }
 
 /// Boot-check MT Fase 2: fiber host-only (niente wasm) con suspend/resume

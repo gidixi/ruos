@@ -13,6 +13,15 @@
 # Generated wasm artifacts (rebuilt by `make` from sources in user/ and tools/)
 user-bin/*.wasm
 kernel/src/wasm/wt/*.cwasm
+# Exception: lua.wasm is third-party C (no in-repo source), built once with
+# wasi-sdk via third_party/lua/build-wasm.sh and committed as a vendored prebuilt.
+!user-bin/lua.wasm
+
+# third_party/lua: keep only the build script + README; ignore the downloaded
+# Lua source tree / tarball (re-fetched by build-wasm.sh).
+/third_party/lua/*
+!/third_party/lua/build-wasm.sh
+!/third_party/lua/README.md
 
 # Editor / IDE
 .vscode/

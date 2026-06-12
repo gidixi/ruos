@@ -18,11 +18,17 @@ use talc::{ErrOnOom, Span, Talc, Talck};
 /// raster buffers — ~60 MiB live per window. SP-C's `wm.spawn` instantiates each
 /// window as a separate live instance, so the heap must hold compositor + shell +
 /// N windows at once; 256 MiB OOM'd the 3rd app window (`failed to allocate
-/// 0x3000000 bytes` = the 48 MiB linear-memory minimum). 384 MiB fits ~2 more.
+/// 0x3000000 bytes` = the 48 MiB linear-memory minimum). 384 MiB fit ~2 more.
+/// Bumped to 768 MiB for the JS-enabled viewer: embedding QuickJS grew
+/// `viewer.cwasm` to ~83 MiB, and `read_all` allocates the whole `.cwasm` in
+/// one contiguous Vec to deserialize it — on top of shell+notify already live
+/// (their 48 MiB linear memories + AOT images), 384 MiB OOM'd that 83 MiB read
+/// (`memory allocation of 83250488 bytes failed`).
 /// REQUIRES the QEMU run-config to give ≥ this much RAM in one USABLE region:
-/// the Makefile `-m 1024` (was 512) guarantees a contiguous region ≥ HEAP_SIZE.
-/// (Was 16 MiB — OOM'd the GUI; 128 MiB — OOM'd the 2nd window; 256 MiB — the 3rd.)
-pub const HEAP_SIZE: usize = 384 * 1024 * 1024;
+/// the Makefile `-m 2048` (was 1024) guarantees a contiguous region ≥ HEAP_SIZE.
+/// (Was 16 MiB — OOM'd the GUI; 128 MiB — 2nd window; 256 MiB — 3rd; 384 MiB —
+/// the JS-enabled viewer's 83 MiB cwasm read.)
+pub const HEAP_SIZE: usize = 768 * 1024 * 1024;
 
 // SMP baseline (migrazione shared-nothing, spec 2026-06-05): questo è un VERO
 // spinlock SMP (spin 0.9.8, CAS cross-core), non uno stub single-core. È preso su

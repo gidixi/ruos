@@ -15,9 +15,21 @@ pub fn init() -> Result<(), BootError> {
     match crate::modules::archive("bin.bgz") {
         Some(bytes) => unpack(bytes),
         None => {
-            crate::bwarn!("unpack_bin", "bin.bgz module missing → rescue fallback");
-            rescue_fallback();
-            // rescue_fallback() panica o popola /bin; poi cadiamo su Ok(())
+            // Nessun bin.bgz. Due casi:
+            //  - ISO live → l'archivio dovrebbe esserci: assenza = rescue fallback.
+            //  - SSD installato → la slim limine.conf NON carica bin.bgz di proposito:
+            //    i tool stanno sulla data partition, montata a /mnt/bin dalla fase
+            //    storage (che gira DOPO questa). Qui /bin ha solo shell.wasm (modulo
+            //    ESP); NON è un errore → WARN morbido, niente panic.
+            // Distinguo col set rescue: presente solo sull'ISO live. Se manca anche
+            // quello, siamo su SSD → continua; init userà /mnt/bin.
+            if crate::modules::rescue_all().is_empty() {
+                crate::bwarn!("unpack_bin",
+                    "no bin.bgz and no /rescue/ — installed SSD boot, tools come from /mnt/bin");
+            } else {
+                crate::bwarn!("unpack_bin", "bin.bgz module missing → rescue fallback");
+                rescue_fallback();
+            }
         }
     }
     Ok(())

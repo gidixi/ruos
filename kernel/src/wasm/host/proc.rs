@@ -7,6 +7,10 @@ use core::fmt::Write;
 use crate::wasm::state::RuntimeState;
 use crate::wasm::suspend::SuspendReason;
 
+/// Sessione di installazione attiva (al più una per volta).
+static INSTALL_SESSION: spin::Mutex<Option<crate::disk::InstallSession>> =
+    spin::Mutex::new(None);
+
 pub fn ruos_exec(
     caller: Caller<'_, RuntimeState>,
     path_ptr: i32,
@@ -965,6 +969,81 @@ fn ruos_install(_c: Caller<'_, RuntimeState>, esp_mib: i32, target: i32) -> Resu
     Ok(0)
 }
 
+/// ruos_install_open(target, esp_mib) → total_files  |  error code.
+///
+/// Apre una nuova sessione di installazione stepped: esegue il guard `/mnt`,
+/// acquisisce la porta AHCI, crea GPT+FAT sul disco target e precalcola il
+/// numero totale di file da copiare. Ritorna `total_files` (> 0) oppure:
+///   -3  /mnt montata (guard — bisogna bootare da installer medium)
+///   -4  sessione già aperta (precedente `install_open` non completata)
+///   -11 nessun disco SATA all'indice `target`
+///   -1  porta AHCI non disponibile
+///   -2  errore GPT/format (disco troppo piccolo o I/O failure)
+fn ruos_install_open(
+    _c: Caller<'_, RuntimeState>,
+    target: i32,
+    esp_mib: i32,
+) -> Result<i32, Error> {
+    if crate::vfs::is_mounted("/mnt") {
+        crate::bwarn!("install", "refusing: /mnt is mounted — boot the installer medium");
+        return Ok(-3);
+    }
+    if INSTALL_SESSION.lock().is_some() {
+        return Ok(-4); // sessione già aperta
+    }
+    let ports = crate::ahci::sata_ports();
+    let idx = target as usize;
+    if !ports.contains(&idx) { return Ok(-11); }
+    let esp = if esp_mib <= 0 { 64u32 } else if esp_mib > 4096 { 4096 } else { esp_mib as u32 };
+    match crate::disk::session_open(idx, esp) {
+        Ok(session) => {
+            let total = session.total as i32;
+            *INSTALL_SESSION.lock() = Some(session);
+            Ok(total)
+        }
+        Err(crate::disk::DiskError::TooSmall) => Ok(-11),
+        Err(crate::disk::DiskError::Io)       => Ok(-2),
+    }
+}
+
+/// ruos_install_step(name_buf, name_cap) → done_count  |  error code.
+///
+/// Copia il prossimo file della sessione aperta con `install_open`. Scrive il
+/// nome del file appena copiato in `name_buf` (C-string, max `name_cap` byte
+/// incluso il terminatore NUL). Ritorna:
+///   1..=total  file copiati finora (quando == total → install completa, sessione chiusa)
+///   -5         nessuna sessione aperta
+///   -2         errore di copia (sessione chiusa automaticamente)
+fn ruos_install_step(
+    mut caller: Caller<'_, RuntimeState>,
+    name_buf: i32,
+    name_cap: i32,
+) -> Result<i32, Error> {
+    let mut guard = INSTALL_SESSION.lock();
+    let session = match guard.as_mut() { Some(s) => s, None => return Ok(-5) };
+    match crate::disk::session_step(session) {
+        Ok((done, name)) => {
+            // Scrivi il nome del file nel buffer WASM del caller.
+            if name_cap > 1 {
+                let bytes = name.as_bytes();
+                let n = bytes.len().min(name_cap as usize - 1);
+                let mut buf = alloc::vec![0u8; n + 1]; // +1 NUL
+                buf[..n].copy_from_slice(&bytes[..n]);
+                let _ = crate::wasm::host::mem::guest_write(&mut caller, name_buf, &buf);
+            }
+            let total = session.total;
+            if done == total {
+                *guard = None; // sessione completata — rilascia porta
+            }
+            Ok(done as i32)
+        }
+        Err(_) => {
+            *guard = None; // errore — rilascia porta
+            Ok(-2)
+        }
+    }
+}
+
 /// ruos_net_dhcp_renew() → errno. Restart DHCP client (if currently static).
 pub fn ruos_net_dhcp_renew(_caller: Caller<'_, RuntimeState>) -> Result<i32, Error> {
     use smoltcp::socket::dhcpv4;
@@ -1002,6 +1081,8 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "mkdisk", ruos_mkdisk)?
         .func_wrap("ruos", "mkboot", ruos_mkboot)?
         .func_wrap("ruos", "install", ruos_install)?
+        .func_wrap("ruos", "install_open", ruos_install_open)?
+        .func_wrap("ruos", "install_step", ruos_install_step)?
         .func_wrap("ruos", "exec_pipeline", ruos_exec_pipeline)?;
     Ok(())
 }

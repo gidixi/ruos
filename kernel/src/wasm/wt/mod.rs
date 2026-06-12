@@ -60,6 +60,57 @@ pub fn run_spin_demo() -> i32 {
     run_cwasm(SPIN_CWASM, alloc::vec::Vec::new(), None)
 }
 
+/// Gate 1 MT Fase 2 (tools/wt-threads-gate/gate1.wat precompilato): modulo CORE
+/// con memoria SHARED importata che fa RMW atomici e rilegge il valore.
+#[cfg(feature = "boot-checks")]
+static THREADS_GATE1_CWASM: &[u8] = include_bytes!("threads_gate1.cwasm");
+
+/// Gate 1 MT Fase 2: SharedMemory + atomics nativi nell'engine no_std (fork
+/// third_party/wasmtime45, feature `threads`). Crea la SharedMemory host-side
+/// dal MemoryType importato dal guest, la definisce nel linker come
+/// `env.memory`, esegue due `i32.atomic.rmw.add` (lock-prefixed su x86 via
+/// AOT) + un `i32.atomic.load`. true sse run() == 42. Niente atomic.wait:
+/// gli stub futex temporanei di platform.rs non vengono toccati.
+#[cfg(feature = "boot-checks")]
+pub fn run_threads_gate1() -> bool {
+    let engine = engine();
+    // SAFETY: cwasm prodotto da tools/wt-precompile per questa exact config.
+    let module = match unsafe { wasmtime::Module::deserialize(engine, THREADS_GATE1_CWASM) } {
+        Ok(m) => m,
+        Err(e) => { kprintln!("ruos: gate1 deserialize: {:?}", e); return false; }
+    };
+    let mem_ty = match module.imports().find_map(|i| i.ty().memory().cloned()) {
+        Some(t) => t,
+        None => { kprintln!("ruos: gate1: no memory import"); return false; }
+    };
+    let shared = match wasmtime::SharedMemory::new(engine, mem_ty) {
+        Ok(s) => s,
+        Err(e) => { kprintln!("ruos: gate1 SharedMemory: {:?}", e); return false; }
+    };
+    let mut store = wasmtime::Store::new(engine, ());
+    store.set_epoch_deadline(NO_DEADLINE_TICKS); // boot-check, not watched
+    let mut linker: wasmtime::Linker<()> = wasmtime::Linker::new(engine);
+    if let Err(e) = linker.define(&store, "env", "memory", shared.clone()) {
+        kprintln!("ruos: gate1 define: {:?}", e);
+        return false;
+    }
+    let inst = match linker.instantiate(&mut store, &module) {
+        Ok(i) => i,
+        Err(e) => { kprintln!("ruos: gate1 instantiate: {:?}", e); return false; }
+    };
+    let run = match inst.get_typed_func::<(), i32>(&mut store, "run") {
+        Ok(f) => f,
+        Err(e) => { kprintln!("ruos: gate1 no run export: {}", e); return false; }
+    };
+    // DF=0 prima di entrare nel guest (convenzione di ogni call site wt).
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cld", options(nostack)); }
+    match run.call(&mut store, ()) {
+        Ok(42) => true,
+        other => { kprintln!("ruos: gate1 run = {:?} (want Ok(42))", other); false }
+    }
+}
+
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]
@@ -297,6 +348,10 @@ fn engine_config() -> wasmtime::Config {
     // e spec 2026-06-11-wt-epoch-interruption-design).
     config.epoch_interruption(true);
     config.wasm_threads(true); // feature bit nel .cwasm (check di SOTTOINSIEME a deserialize: .cwasm vecchi senza THREADS restano caricabili; spegnerlo qui rifiuta i .cwasm nuovi — vedi CHANGELOG/486)
+    // Gate runtime-only (NON hashato nel .cwasm) per la CREAZIONE di
+    // SharedMemory host-side: senza, `SharedMemory::new` fallisce con
+    // "shared memory support is disabled for this engine" (gate 1 MT Fase 2).
+    config.shared_memory(true);
     // memory_reservation > 0 forza il path MmapMemory (wasmtime memory.rs:
     // signals||guard||reservation||cow): la linear memory passa da
     // wasmtime_mmap_new → demand paging → FRAME allocator (RAM−heap), non più

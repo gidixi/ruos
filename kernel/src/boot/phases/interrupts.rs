@@ -207,6 +207,9 @@ pub fn init() -> Result<(), BootError> {
         // Component Model bring-up: prove the no_std AOT component path runs.
         let cc = crate::wasm::wt::run_bringup_demo();
         crate::binfo!("wt", "component bringup run={}", cc);
+        // MT Fase 2 gate 1: SharedMemory + atomics nativi (fork wasmtime no_std).
+        let g1 = crate::wasm::wt::run_threads_gate1();
+        crate::binfo!("wt", "THREADS-OK 1 = {}", if g1 { "ok" } else { "FAIL" });
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();

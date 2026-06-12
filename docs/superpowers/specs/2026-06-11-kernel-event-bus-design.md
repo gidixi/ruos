@@ -1,7 +1,8 @@
 # Kernel event bus + notifiche compositor (v1) — Design
 
 **Data:** 2026-06-11
-**Stato:** approvato (brainstorming), da pianificare — NON ancora implementato
+**Stato:** implementato (v1) — vedi CHANGELOG/471-26-06-11-kernel-event-bus.md
+e il piano docs/superpowers/plans/2026-06-11-kernel-event-bus.md
 
 ## Obiettivo
 
@@ -84,6 +85,7 @@ Categorie nel byte alto del `kind`: `0x00` meta-bus, `0x01` power,
 | Kind | Valore | Sev | Payload | Pubblicato da |
 |---|---|---|---|---|
 | `SUBSCRIBER_OVERFLOW` | 0x0001 | INFO | `[lost_lo, lost_hi, 0, 0]` | sintetizzato dal lettore (mai nel ring) |
+| `TEST` | 0x0002 | INFO/WARN | `[marker, 0, 0, 0]` + nome | self-test boot-checks + `ruos.kev_test` (debug) |
 | `SHUTDOWN_PENDING` | 0x0101 | CRIT | `[countdown_sec, reason, 0, 0]` | `power.rs` su `request_poweroff` |
 | `REBOOT_PENDING` | 0x0102 | CRIT | `[countdown_sec, reason, 0, 0]` | `power.rs` su `request_reboot` |
 | `POWER_CANCELLED` | 0x0103 | INFO | `[0; 4]` | `power.rs` su `cancel()` |

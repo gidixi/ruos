@@ -8,7 +8,8 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-11 (22 functions; `reboot()` + `exit_to_shell()` added).
+**Last reviewed:** 2026-06-11 (24 functions; added `set_overlay()`,
+`power_pending()`, `power_cancel()`; `poweroff()`/`reboot()` are now deferred + cancellable).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -130,10 +131,25 @@ Monotonic seconds since boot. Use for `egui::RawInput.time` / animations (NOT a
 wall clock).
 
 ### `poweroff()`
-Power off the machine. Never returns.
+Request a deferred poweroff: returns immediately; the kernel powers off after
+10 s unless cancelled (the compositor shows a countdown modal with a Cancel
+button / Esc). Calling it again while a request is pending is a no-op.
 
 ### `reboot()`
-Restart the machine. Never returns. Twin of `poweroff()` (the shell's reboot button).
+Twin of `poweroff()` for restart: deferred 10 s, cancellable from the modal
+(the shell's reboot button).
+
+### `power_pending() -> i64`
+`0` = no deferred request; else `(kind << 32) | ticks_remaining` (kind `1` =
+poweroff, `2` = reboot; 100 ticks = 1 s). Source of truth for the countdown.
+
+### `power_cancel()`
+Cancel the pending deferred poweroff/reboot (no-op when none).
+
+### `set_overlay()`
+Flag THIS window as the notifications overlay: full-screen, composited ABOVE
+all windows with per-pixel alpha, receives input only on pixels with
+alpha ≥ 32 (plus ALL input while a power request is pending). One overlay max.
 
 ### `exit_to_shell()`
 Tear the compositor down and hand the framebuffer back to the text console (the

@@ -66,7 +66,7 @@ di import:
 | `sys` | Wasmtime | 4 | Telemetria: cpustat, proc_stat, meminfo |
 | `term` | Wasmtime | 5 | Terminal bridge: open/read/write/resize/close |
 | `ruos_gfx` | Wasmtime | 6 | Raw framebuffer: blit, poll, gfx_info |
-| `ruos:gui/*` (WIT) | Wasmtime | varies | Typed component model bridge |
+| `ruos:gui/*`, `ruos:tui/*` (WIT) | Wasmtime | varies | Typed component model bridge (inclusi TUI component linking) |
 
 Documentazione dettagliata in [`docs/api/`](../../api/README.md).
 
@@ -81,13 +81,12 @@ fiber **sospende** con un `SuspendReason`. L'executor async esegue altro lavoro
 risposta TCP), la fiber **riprende** esattamente dove si era fermata. Dal punto
 di vista del guest, il call ha semplicemente bloccato.
 
-### Fuel metering
+### Fuel metering e Epoch Watchdog
 
-Ogni slice di esecuzione ha un budget di **2.000.000.000 istruzioni**
-(`FUEL_PER_SLICE`). Un loop CPU-bound senza host call esaurisce il fuel ed è
-**killed** (exit 137, log `wasm: task killed (fuel exhausted)`). I task I/O-bound
-ricaricano il fuel ad ogni host call e girano indefinitamente. Questo limita un
-guest in loop senza preemption.
+Per evitare che task malfunzionanti (o in loop infinito) monopolizzino la CPU:
+
+- **wasmi (fuel metering)**: Ogni slice di esecuzione ha un budget di **2.000.000.000 istruzioni** (`FUEL_PER_SLICE`). Un loop CPU-bound senza host call esaurisce il fuel ed è **killed** (exit 137). I task I/O-bound ricaricano il fuel ad ogni host call e girano indefinitamente.
+- **Wasmtime (epoch-based scheduling)**: Il motore Wasmtime utilizza l'opzione `epoch_interruption(true)`. Il timer IRQ a 100 Hz incrementa globalmente un epoch clock. I task Wasmtime specificano una `deadline` e se questa scade durante l'esecuzione pura su CPU, il task è trappato come se fosse andato in timeout (watchdog timeout) o sospeso per far girare altri task.
 
 ### Resource limits
 
@@ -101,10 +100,14 @@ dichiarata** del task: nessun `../` oltre `/`. La sandbox è path-based.
 
 ### Guest memory accessor
 
-**Tutti** gli accessi alla linear memory del guest passano per
-`wasm/host/mem.rs::check_bounds` — un unico punto auditato e fuzz-tested (casi
-avversariali: ptr negativo, len overflow, boundary). Nessun host fn legge/scrive
-raw nella guest memory.
+- **wasmi**: **Tutti** gli accessi alla linear memory del guest passano per
+  `wasm/host/mem.rs::check_bounds` — un unico punto auditato e fuzz-tested (casi
+  avversariali: ptr negativo, len overflow, boundary). Nessun host fn legge/scrive
+  raw nella guest memory bypassando questo check.
+- **Wasmtime**: I moduli AOT beneficiano di memory isolation tramite demand paging, 
+  riservando uno spazio VA configurato (`memory_reservation`, `memory_guard_size`).
+  La memoria in eccesso usa guard pages configurate dal runtime, mitigando 
+  l'overflow e gestendo la sicurezza a livello architetturale ed AOT.
 
 ## Router della shell
 
@@ -121,10 +124,11 @@ stadi concorrenti collegati da pipe in-RAM (`kernel/src/pipe/`).
   è inutilizzabile → Wasmtime AOT.
 - **Wasmtime è no_std, runtime-only**: non include Cranelift, non può compilare a
   runtime. I `.cwasm` devono essere precompilati sull'host.
-- **Fuel non è preemption**: un guest che non fa host call e non esaurisce il fuel
-  in un tick monopolizza la CPU per quel tick (10 ms a 100 Hz).
-- **Single-address-space**: la sandbox è il runtime WASM, non la MMU. Un bug nel
-  runtime stesso (o nell'`unsafe` del kernel) è fatale per tutto il sistema.
+- **Fuel non è preemption**: in `wasmi`, un guest che non fa host call e non esaurisce il fuel
+  in un tick monopolizza la CPU per quel tick (10 ms a 100 Hz). In `Wasmtime`, questo è mitigato
+  dall'epoch watchdog.
+- **Single-address-space**: la sandbox è il runtime WASM, non la MMU o le page table per processo. 
+  Un bug nel runtime stesso (o nell'`unsafe` del kernel) è fatale per tutto il sistema.
 
 ## Insidie / note
 

@@ -8,7 +8,8 @@ Guest declarations: `ruos-desktop/crates/ruos-window/src/lib.rs` (`mod sys`).
 Blob fields are little-endian. Return: `0` OK, `8` ERANGE (buffer too small),
 `21` EFAULT. Same layouts as the wasmi `ruos` module that `rtop` uses.
 
-**Last reviewed:** 2026-06-09 (4 functions).
+**Last reviewed:** 2026-06-11 (5 functions; `events_poll` added — kernel event
+bus reader for compositor windows, registered in `wm.rs`).
 
 ```rust
 #[link(wasm_import_module = "sys")]
@@ -60,3 +61,11 @@ u64 frames_used
 
 ### `uptime() -> i64`
 Centiseconds since boot (100 Hz tick).
+
+### `events_poll(buf_ptr) -> i32`
+One kernel-event-bus record per call, from THIS window's private cursor.
+Returns `1` (64-byte LE record written: seq u64 | kind u16 | severity u8 | pad[1]
+@11 | ts_ticks u32 | payload 4×u32 | name 32B NUL-padded) or `0` (nothing new).
+On reader overflow a synthetic `SUBSCRIBER_OVERFLOW` (kind 0x0001, payload =
+lost lo/hi) is delivered first. Kinds/payloads: see
+`docs/superpowers/specs/2026-06-11-kernel-event-bus-design.md` §2.

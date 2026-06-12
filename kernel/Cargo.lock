@@ -800,6 +800,7 @@ dependencies = [
  "embassy-executor",
  "getrandom",
  "gzip-core",
+ "heapless",
  "hmac",
  "limine",
  "log",

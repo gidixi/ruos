@@ -10,7 +10,8 @@ The SDK pulls these into `vendor/ruos-desktop`. UI widgets are plain
 [`egui` 0.31](https://docs.rs/egui/0.31) — its docs apply verbatim inside the
 `frame_once` closure.
 
-**Last reviewed:** 2026-06-09.
+**Last reviewed:** 2026-06-11 (added the notifications-overlay API: `set_overlay()`,
+`power_pending()`/`power_cancel()`, `events_poll()`, `WindowState::new_overlay()`).
 
 ---
 
@@ -118,17 +119,27 @@ the file name. Width/height are the app's default window size.
 | `start_move()` | Begin interactive drag (the title bar already calls this). |
 | `set_background()` | Flag THIS window as the desktop background (use `frame_once_bare`). |
 | `stay_awake()` | Request a repaint next frame (call every frame for animation). |
-| `poweroff()` | Power off the machine. |
+| `poweroff()` | Request deferred poweroff (10 s, cancellable from the compositor modal). |
 | `app_id() -> u32` | THIS window's id. |
 | `surface_size() -> (u32, u32)` | Full screen size; `(0,0)` before the framebuffer is up. |
 | `window_size() -> (u32, u32)` | THIS window's kernel size; `(0,0)` until established. |
 | `wall_seconds() -> f64` | Monotonic seconds since boot (for clocks/animation). |
 | `window_list() -> Vec<TaskbarWindow>` | Non-bg windows (id, minimized, focused, title) — for a taskbar. |
 | `app_list() -> Vec<AppCatalogEntry>` | Launchable apps (id, title) found by the manifest scan — for a launcher. |
+| `set_overlay()` | Flag THIS window as the notifications overlay (full-screen, z-top, per-pixel alpha input). |
+| `power_pending() -> Option<(PowerKind, u32)>` | Pending deferred power request (kind, ticks left). |
+| `power_cancel()` | Cancel the pending deferred poweroff/reboot. |
+| `events_poll() -> Option<KEventRec>` | One kernel-event-bus record per call (notify overlay). |
+| `WindowState::new_overlay()` | WindowState with a TRANSPARENT canvas (overlay apps). |
 
 ```rust
 pub struct TaskbarWindow { pub id: u32, pub minimized: bool, pub focused: bool, pub title: String }
 pub struct AppCatalogEntry { pub id: String, pub title: String }
+pub enum PowerKind { Poweroff, Reboot }
+pub struct KEventRec {
+    pub seq: u64, pub kind: u16, pub severity: u8, pub ts_ticks: u32,
+    pub payload: [u32; 4], pub name: String,
+}
 ```
 
 ---

@@ -36,8 +36,9 @@ const LAUNCHER_BTN_W: u32 = 96;
 /// Max simultaneously-live windows. Each live window holds a wasm instance (its
 /// own linear memory) + a surface buffer; this bounds the heap budget. (Reactor
 /// surface ≈ 0.3 MB; a full-window app ≈ 4 MB. 8 windows ≈ a few MB of surfaces
-/// + N linear memories — comfortably within the kernel heap.)
-const MAX_WINDOWS: usize = 8;
+/// + N linear memories — comfortably within the kernel heap.) +1: la finestra
+/// overlay `notify` occupa stabilmente uno slot, il budget utente resta ~8.
+const MAX_WINDOWS: usize = 9;
 
 // --- App registry + shared Module cache (SP5) -----------------------------
 
@@ -238,7 +239,8 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module) -> Option<Manife
             win: WmState { id: 0, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                            events: VecDeque::new(), close_requested: false,
                            move_requested: false, spawn_request: VecDeque::new(),
-                           bg_request: false, committed: false,
+                           bg_request: false, overlay_request: false,
+                           kev_cursor: crate::kevent::current_seq(), committed: false,
                            minimize_request: false, maximize_request: false,
                            activate_request: VecDeque::new(), target_w: 0, target_h: 0,
                            stay_awake_request: false, wake_pty: -1 },
@@ -433,7 +435,7 @@ static mut BAND_ARENA: [BandArg; MAX_BANDS] = [BandArg {
 /// jobs read the same list (painter order). The BSP fills `[0, n)` then submits;
 /// the footprint backing buffers are kept alive on the BSP across the join.
 static mut WIN_ARENA: [WinDesc; MAX_WINS] = [WinDesc {
-    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0, shadow: false,
+    px: core::ptr::null(), px_len: 0, x: 0, y: 0, w: 0, h: 0, shadow: false, blend: false,
 }; MAX_WINS];
 
 /// Distinct cores that ran a composite job in the most recent frame (bitset by
@@ -669,6 +671,22 @@ pub mod decor {
             pen += gw;
         }
     }
+
+    /// Come `draw_text` ma SENZA centratura verticale dentro `buf_h`: il pen
+    /// parte esattamente da (x, y) buffer-local. Serve agli overlay del
+    /// compositor (toast/modale), disegnati nel back-buffer full-screen (dove
+    /// la centratura su `buf_h` piazzerebbe il testo a metà schermo).
+    pub fn draw_text_at(buf: &mut [u8], buf_w: u32, buf_h: u32,
+                        x: u32, y: u32, max_x: u32, text: &str, c: [u8; 4]) {
+        let gw = crate::console::font::glyph_width() as u32;
+        let mut pen = x;
+        for ch in text.chars() {
+            if pen + gw > max_x { break; }
+            let r = crate::console::font::raster_for_weight(ch, false);
+            blend_glyph(buf, buf_w, buf_h, pen as i32, y as i32, r.raster(), c);
+            pen += gw;
+        }
+    }
 }
 
 /// Per-instance store data: window id, last committed surface, and this window's
@@ -697,6 +715,11 @@ pub struct WmState {
     /// as the full-screen, z-bottom background (`Window.bg`) AFTER `frame_all`,
     /// then clears it.
     pub bg_request: bool,
+    /// Set dal guest via `wm.set_overlay()`; il run loop pinna QUESTA finestra
+    /// come overlay notifiche (full-screen, z-TOP, alpha-blend) e poi lo azzera.
+    pub overlay_request: bool,
+    /// Cursore di lettura per-finestra sul kevent bus (`sys.events_poll`).
+    pub kev_cursor: u64,
     /// Damage flag: set by `wm.commit` (the guest drew a new surface this frame),
     /// cleared by the run loop before each `frame_all`. The compositor presents a
     /// frame only when SOME window committed (or geometry changed) — an idle app
@@ -822,6 +845,11 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // run loop (which sets `Window.bg`), like spawn/close/move.
     linker.func_wrap("wm", "set_background",
         |mut caller: Caller<'_, T>| { caller.data_mut().win().bg_request = true; })?;
+    // wm.set_overlay(): flag THIS window as the notifications overlay
+    // (full-screen, z-TOP, alpha-blended, input only on opaque pixels).
+    // Deferred to the run loop, mirror of set_background. One overlay max.
+    linker.func_wrap("wm", "set_overlay",
+        |mut caller: Caller<'_, T>| { caller.data_mut().win().overlay_request = true; })?;
     // wm.wall_seconds() -> f64: MONOTONIC seconds since boot (the same latched
     // source the desktop uses). egui needs it for `RawInput.time` + animations.
     linker.func_wrap("wm", "wall_seconds",
@@ -845,18 +873,87 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             // else: discriminant stays 0 (none); payload zeroed.
             crate::wasm::wt::mem::write(&mut caller, retptr as u32, &buf);
         })?;
-    // wm.poweroff(): the calling window (the shell's power button) asks the
-    // kernel to power off the machine. Same primitive `ruos:gui/power.poweroff`
-    // uses (`gui.rs`). Never returns; the `-> ()` annotation pins the closure's
-    // Wasm return type so never-type fallback stays `()` (matches `gui.rs`).
+    // sys.events_poll(buf_ptr) -> i32: un evento del kernel event bus per
+    // chiamata, dal cursore di QUESTA finestra. 1 = record scritto (64 byte LE:
+    // seq u64 | kind u16 | sev u8 | pad[1] | ts u32 @12 | payload 4xu32 | nome 32B
+    // NUL-pad), 0 = niente di nuovo. Gap (eventi sovrascritti) → PRIMA un
+    // record sintetico SUBSCRIBER_OVERFLOW{lost}, poi i reali alle chiamate
+    // successive. Registrata qui (non in sys.rs) perché serve lo stato finestra.
+    linker.func_wrap("sys", "events_poll",
+        |mut caller: Caller<'_, T>, buf_ptr: i32| -> i32 {
+            let cur = caller.data_mut().win().kev_cursor;
+            let mut tmp = [crate::kevent::KEvent::ZERO; 1];
+            let (n, lost) = crate::kevent::read_since(cur, &mut tmp);
+            let mut rec = [0u8; 64];
+            if lost > 0 {
+                // Salta i persi: il prossimo poll parte dal primo disponibile.
+                caller.data_mut().win().kev_cursor = cur + lost;
+                rec[8..10].copy_from_slice(&crate::kevent::KIND_SUBSCRIBER_OVERFLOW.to_le_bytes());
+                rec[10] = crate::kevent::SEV_INFO;
+                rec[12..16].copy_from_slice(&(crate::timer::ticks() as u32).to_le_bytes());
+                rec[16..20].copy_from_slice(&(lost as u32).to_le_bytes());
+                rec[20..24].copy_from_slice(&((lost >> 32) as u32).to_le_bytes());
+                if !crate::wasm::wt::mem::write(&mut caller, buf_ptr as u32, &rec) {
+                    caller.data_mut().win().kev_cursor = cur; // rollback: non consegnato
+                    return 0;
+                }
+                return 1;
+            }
+            if n == 0 { return 0; }
+            let ev = tmp[0];
+            caller.data_mut().win().kev_cursor = ev.seq;
+            rec[0..8].copy_from_slice(&ev.seq.to_le_bytes());
+            rec[8..10].copy_from_slice(&ev.kind.to_le_bytes());
+            rec[10] = ev.severity;
+            rec[12..16].copy_from_slice(&ev.ts_ticks.to_le_bytes());
+            for (i, p) in ev.payload.iter().enumerate() {
+                rec[16 + i * 4..20 + i * 4].copy_from_slice(&p.to_le_bytes());
+            }
+            if let Some(name) = crate::kevent::name_of(ev.seq) {
+                let b = name.as_bytes();
+                let l = b.len().min(32);
+                rec[32..32 + l].copy_from_slice(&b[..l]);
+            }
+            if !crate::wasm::wt::mem::write(&mut caller, buf_ptr as u32, &rec) {
+                caller.data_mut().win().kev_cursor = cur; // rollback: non consegnato
+                return 0;
+            }
+            1
+        })?;
+    // wm.power_pending() -> i64: 0 = nessuna richiesta differita; altrimenti
+    // (kind << 32) | tick_rimanenti, kind 1 = poweroff, 2 = reboot. Fonte di
+    // verità del countdown del modale (l'app NON conta da sola).
+    linker.func_wrap("wm", "power_pending",
+        |_caller: Caller<'_, T>| -> i64 {
+            match crate::power::pending() {
+                None => 0,
+                Some((kind, ticks)) => {
+                    let k: i64 = match kind {
+                        crate::power::PendingKind::Poweroff => 1,
+                        crate::power::PendingKind::Reboot => 2,
+                    };
+                    (k << 32) | (ticks as u32 as i64)
+                }
+            }
+        })?;
+    // wm.power_cancel(): annulla la richiesta power differita (no-op se assente).
+    linker.func_wrap("wm", "power_cancel",
+        |_caller: Caller<'_, T>| { crate::power::cancel(); })?;
+    // wm.poweroff(): the calling window (the shell's power button) asks for a
+    // DEFERRED, CANCELLABLE poweroff: publishes SHUTDOWN_PENDING on the kevent
+    // bus (the compositor shows the countdown modal) and RETURNS to the guest.
+    // Enforcement = power_enforce_task (fires even if the GUI dies). The old
+    // immediate never-return primitive stays in `crate::power::poweroff()`
+    // (still used by `ruos:gui/power` and the console `ruos.poweroff`).
     linker.func_wrap("wm", "poweroff",
-        |_caller: Caller<'_, T>| -> () { crate::power::poweroff() })?;
-    // wm.reboot(): the calling window (the shell's reboot button) asks the kernel
-    // to restart the machine. Twin of `wm.poweroff`; same primitive `ruos:gui/power.
-    // reboot` uses (`gui.rs`). Never returns; the `-> ()` annotation pins the
-    // closure's Wasm return type so never-type fallback stays `()`.
+        |_caller: Caller<'_, T>| {
+            crate::power::request_poweroff(crate::power::DEFAULT_COUNTDOWN_SEC);
+        })?;
+    // wm.reboot(): twin of wm.poweroff — deferred, cancellable REBOOT_PENDING.
     linker.func_wrap("wm", "reboot",
-        |_caller: Caller<'_, T>| -> () { crate::power::reboot() })?;
+        |_caller: Caller<'_, T>| {
+            crate::power::request_reboot(crate::power::DEFAULT_COUNTDOWN_SEC);
+        })?;
     // wm.exit_to_shell(): the calling window (the shell's "back to console" button)
     // asks the compositor to tear down and hand the framebuffer back to the text
     // console. Sets a flag the run loop reads next iteration (it can't tear down
@@ -1019,6 +1116,10 @@ pub struct Window {
     /// forced to the full framebuffer, undecorated, never raised/focused/moved/
     /// closed; it only receives input where no non-`bg` window covers the point.
     pub bg: bool,
+    /// Overlay notifiche: compositata per ULTIMA (z-top, sopra tutte), forzata
+    /// full-screen, alpha-blend, esclusa da hit-test normale/taskbar/focus.
+    /// Speculare a `bg`. Al reap si torna al fallback decor kernel (spec v2).
+    pub overlay: bool,
     /// SP6 window controls: minimized windows are kept in `wins` but skipped by the
     /// composite + input hit-test (the taskbar restores them via `wm.activate`).
     pub minimized: bool,
@@ -1063,6 +1164,12 @@ pub struct Compositor {
     /// dilata i tempi 10-30× — col deadline standard sarebbero falsi WATCHDOG).
     /// `None` = deadline normali (produzione).
     frame_deadline_override: Option<u64>,
+    /// Cursore di lettura sul kevent bus (seq dell'ultimo evento consumato).
+    kev_cursor: u64,
+    /// Toast attivi: i primi TOAST_MAX_VISIBLE sono a schermo, il resto in coda.
+    toasts: alloc::collections::VecDeque<Toast>,
+    /// Modale shutdown/reboot attivo (Some = input routato SOLO al modale).
+    modal: Option<PowerModal>,
 }
 
 /// Reactor surface size (matches `tools/wt-reactor` W/H). Windows are fixed at
@@ -1077,6 +1184,28 @@ const WORKAREA_TOP: u32 = 32;
 
 /// Desktop background (RGBA8888 [r,g,b,a]) shown where no window covers.
 const DESKTOP_BG: [u8; 4] = [0x10, 0x18, 0x20, 0xFF];
+
+/// Overlay notifiche (spec kernel-event-bus v1, sezione 4).
+const TOAST_W: u32 = 260;
+const TOAST_H: u32 = 36;
+const TOAST_PAD: u32 = 8;
+const TOAST_LIFE_TICKS: u64 = 500; // ~5 s @ 100 Hz
+const TOAST_MAX_VISIBLE: usize = 3;
+
+/// Una notifica toast (alloc lecita: contesto compositor, non IRQ).
+pub struct Toast {
+    pub text: alloc::string::String,
+    pub sev: u8,
+    /// None finché il toast non entra fra i TOAST_MAX_VISIBLE (coda FIFO);
+    /// la vita (TOAST_LIFE_TICKS) parte da quando diventa visibile.
+    pub born_tick: Option<u64>,
+}
+
+/// Modale CRIT shutdown/reboot. La fonte di verità del countdown è
+/// `power::pending()` — qui solo lo stato di ridisegno (ultimo secondo visto).
+pub struct PowerModal {
+    pub last_secs: u64,
+}
 
 impl Compositor {
     /// Build the `wm` + WASI linker and boot the compositor into ONE initial
@@ -1114,6 +1243,11 @@ impl Compositor {
             dirty: true,
             frame_no: 0,
             frame_deadline_override: None,
+            // Parte dal seq corrente: NON ripresenta il backlog di boot
+            // (es. gli eventi del self-test boot-checks) come toast.
+            kev_cursor: crate::kevent::current_seq(),
+            toasts: alloc::collections::VecDeque::new(),
+            modal: None,
         };
 
         // Initial window = the userspace desktop SHELL. Prefer the VFS
@@ -1131,6 +1265,11 @@ impl Compositor {
         match initial {
             Some(m) => { let _ = c.spawn_named(name, m); }
             None => { crate::bwarn!("wm", "no initial window: shell + egui-demo modules unavailable"); }
+        }
+        // App overlay notifiche (egui): opzionale — se /bin/notify.cwasm manca
+        // si resta sul fallback decor kernel (spec notifiche-egui-overlay §6).
+        if let Some(m) = module_by_name("notify") {
+            let _ = c.spawn_named("notify", m);
         }
         c
     }
@@ -1159,6 +1298,9 @@ impl Compositor {
             dirty: true,
             frame_no: 0,
             frame_deadline_override: None,
+            kev_cursor: crate::kevent::current_seq(),
+            toasts: alloc::collections::VecDeque::new(),
+            modal: None,
         }
     }
 
@@ -1179,7 +1321,7 @@ impl Compositor {
     /// non-`bg` window falls through to the `bg` window via `bg_index`).
     pub fn window_at(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.wins.len()).rev() {
-            if self.wins[i].bg || self.wins[i].minimized { continue; }
+            if self.wins[i].bg || self.wins[i].overlay || self.wins[i].minimized { continue; }
             let (rx, ry, rw, rh) = self.wins[i].rect;
             let (rx, ry) = (rx as i32, ry as i32);
             if px >= rx && px < rx + rw as i32 && py >= ry && py < ry + rh as i32 {
@@ -1194,6 +1336,11 @@ impl Compositor {
     /// so the bg app (SP-D's shell panel/launcher) still gets clicks.
     fn bg_index(&self) -> Option<usize> {
         self.wins.iter().position(|w| w.bg)
+    }
+
+    /// Indice della finestra overlay notifiche (None = fallback decor kernel).
+    fn overlay_index(&self) -> Option<usize> {
+        self.wins.iter().position(|w| w.overlay)
     }
 
     /// The ONE focus impl: clear the old focused flag, set the new one, update
@@ -1294,6 +1441,12 @@ impl Compositor {
     /// `wm.activate`). No-op for an unknown id.
     fn activate(&mut self, id: u32) {
         if let Some(i) = self.index_of(id) {
+            // L'overlay non si raisa/focalizza mai (spec notifiche): z-top fissa,
+            // input solo via grab/hit-test per-pixel nel run loop.
+            if self.wins[i].overlay {
+                crate::bwarn!("wm", "activate: win_id={} è overlay, ignorato", id);
+                return;
+            }
             self.wins[i].minimized = false;
             let top = self.raise(i);
             self.set_focus(top);
@@ -1306,7 +1459,7 @@ impl Compositor {
     /// Used after minimizing the focused window so focus never sticks on a hidden one.
     fn focus_topmost_visible(&mut self) {
         for i in (0..self.wins.len()).rev() {
-            if !self.wins[i].bg && !self.wins[i].minimized {
+            if !self.wins[i].bg && !self.wins[i].overlay && !self.wins[i].minimized {
                 self.set_focus(i);
                 return;
             }
@@ -1338,6 +1491,12 @@ impl Compositor {
         self.focused = self.focused.min(self.wins.len() - 1);
         for (j, w) in self.wins.iter_mut().enumerate() {
             w.focused = j == self.focused;
+        }
+        // Lo slittamento può far atterrare il focus su bg/overlay (che non devono
+        // mai averlo): in quel caso ripiega sulla topmost visibile legittima.
+        if self.wins[self.focused].overlay || self.wins[self.focused].bg {
+            self.wins[self.focused].focused = false;
+            self.focus_topmost_visible();
         }
     }
 
@@ -1374,7 +1533,8 @@ impl Compositor {
                 win: WmState { id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
                                events: VecDeque::new(), close_requested: false,
                                move_requested: false, spawn_request: VecDeque::new(),
-                               bg_request: false, committed: false,
+                               bg_request: false, overlay_request: false,
+                               kev_cursor: crate::kevent::current_seq(), committed: false,
                                minimize_request: false, maximize_request: false,
                                activate_request: VecDeque::new(), target_w: 0, target_h: 0,
                                stay_awake_request: false, wake_pty: -1 },
@@ -1395,6 +1555,9 @@ impl Compositor {
             Err(e) => {
                 self.free_ids.push(id);
                 crate::bwarn!("wm", "spawn: instantiate failed: {:?}", e);
+                crate::kevent::publish_named(crate::kevent::KIND_APP_CRASHED,
+                    crate::kevent::SEV_WARN,
+                    [id, crate::kevent::CRASH_SPAWN_FAILED, 0, 0], name);
                 return None;
             }
         };
@@ -1402,6 +1565,9 @@ impl Compositor {
         if !run_initialize(&mut store, &inst) {
             self.free_ids.push(id);
             crate::bwarn!("wm", "spawn '{}': _initialize failed — aborted", name);
+            crate::kevent::publish_named(crate::kevent::KIND_APP_CRASHED,
+                crate::kevent::SEV_WARN,
+                [id, crate::kevent::CRASH_SPAWN_FAILED, 0, 0], name);
             return None;
         }
         // Cascade placement (TUPLE rect): offset each new window so it doesn't
@@ -1423,6 +1589,7 @@ impl Compositor {
             alive: true,
             pid,
             bg: false,
+            overlay: false,
             minimized: false,
             maximized: false,
             saved_rect: None,
@@ -1553,14 +1720,18 @@ impl Compositor {
                         // Anche un proc_exit volontario arriva qui come trap —
                         // il log distingue "app crashata" da "mai partita";
                         // il marker WATCHDOG distingue il kill da deadline.
-                        if matches!(e.downcast_ref::<wasmtime::Trap>(),
-                                    Some(wasmtime::Trap::Interrupt)) {
+                        let causa = if matches!(e.downcast_ref::<wasmtime::Trap>(),
+                                                Some(wasmtime::Trap::Interrupt)) {
                             crate::bwarn!("wm",
                                 "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed",
                                 w.id, w.title);
+                            crate::kevent::CRASH_WATCHDOG
                         } else {
                             crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
-                        }
+                            crate::kevent::CRASH_TRAP
+                        };
+                        crate::kevent::publish_named(crate::kevent::KIND_APP_CRASHED,
+                            crate::kevent::SEV_WARN, [w.id, causa, 0, 0], &w.title);
                         w.store.data_mut().win.close_requested = true;
                     }
                 }
@@ -1621,6 +1792,11 @@ impl Compositor {
         if let Some(bi) = bg_idx {
             self.wins[bi].rect = (0, 0, sw, sh);
         }
+        // L'overlay notifiche è full-screen come la bg, ma in cima.
+        let ov_idx = self.overlay_index();
+        if let Some(oi) = ov_idx {
+            self.wins[oi].rect = (0, 0, sw, sh);
+        }
 
         // 1) BSP: build footprint descriptors bottom->top (z = `wins` Vec order),
         //    but with the `bg` window FIRST (z-bottom, forced to origin (0,0)).
@@ -1630,29 +1806,40 @@ impl Compositor {
         //    pointers stay valid for the whole parallel composite.
         // Each desc carries a `shadow` flag: the bg window casts none (it's the
         // full-screen backdrop), every normal window does.
-        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32, bool)> =
+        let mut descs: alloc::vec::Vec<(*const u8, usize, u32, u32, u32, u32, bool, bool)> =
             alloc::vec::Vec::new();
         if let Some(bi) = bg_idx {
             // Force the bg surface's footprint origin to (0,0) (full-screen bottom).
             if let Some((px, len, _, _, fw, fh)) = self.compose_window(bi) {
-                descs.push((px, len, 0, 0, fw, fh, false));
+                descs.push((px, len, 0, 0, fw, fh, false, false));
             }
         }
         for i in 0..self.wins.len() {
             if bg_idx == Some(i) { continue; } // bg already composited first
+            if ov_idx == Some(i) { continue; } // overlay composited LAST (below)
             if self.wins[i].minimized { continue; } // hidden → not composited
             if let Some((px, len, x, y, w, h)) = self.compose_window(i) {
-                descs.push((px, len, x, y, w, h, true));
+                descs.push((px, len, x, y, w, h, true, false));
+            }
+        }
+        // Overlay notifiche: compositata per ULTIMA (sopra tutte), alpha-blend,
+        // niente ombra, origine forzata (0,0).
+        if let Some(oi) = ov_idx {
+            if !self.wins[oi].minimized {
+                if let Some((px, len, _, _, fw, fh)) = self.compose_window(oi) {
+                    descs.push((px, len, 0, 0, fw, fh, false, true));
+                }
             }
         }
         let n = core::cmp::min(descs.len(), MAX_WINS);
         // SAFETY: BSP-only write of WIN_ARENA between joined frames (the previous
         // frame's jobs were joined inside dispatch_bands before we returned, so
         // no job is in flight while we mutate the arena here).
-        for (i, (px, len, fx, fy, fw, fh, sh)) in descs.iter().enumerate().take(n) {
+        for (i, (px, len, fx, fy, fw, fh, sh, bl)) in descs.iter().enumerate().take(n) {
             unsafe {
                 WIN_ARENA[i] = WinDesc {
-                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh, shadow: *sh,
+                    px: *px, px_len: *len, x: *fx, y: *fy, w: *fw, h: *fh,
+                    shadow: *sh, blend: *bl,
                 };
             }
         }
@@ -1664,6 +1851,9 @@ impl Compositor {
         let bg = u32::from_le_bytes(DESKTOP_BG);
         let back_ptr = self.backbuf.as_mut_ptr() as usize;
         dispatch_bands(back_ptr, stride, sw, sh, bg, n);
+        // Overlay notifiche (toast + modale): sopra le finestre composite,
+        // sotto il cursore software (che è ricomposto dal blit).
+        self.draw_overlays(sw, sh);
         crate::gfx::blit(&self.backbuf[..needed], 0, 0, sw, sh);
     }
 
@@ -1724,6 +1914,286 @@ impl Compositor {
         }
     }
 
+    /// Drena il kevent bus (nuovo step del run loop, dopo la fase input):
+    /// `read_since(cursor)` → smista per severity (toast INFO/WARN, modale CRIT).
+    fn drain_kevents(&mut self) {
+        // Overlay viva: gli eventi li legge LEI (sys.events_poll, suo cursore).
+        // Qui solo: avanza il cursore kernel e sveglia l'overlay dormiente.
+        if let Some(oi) = self.overlay_index() {
+            let cur = crate::kevent::current_seq();
+            if cur != self.kev_cursor {
+                self.kev_cursor = cur;
+                self.wins[oi].last_active_frame = self.frame_no;
+            }
+            return;
+        }
+        let mut buf = [crate::kevent::KEvent::ZERO; 16];
+        loop {
+            let (n, lost) = crate::kevent::read_since(self.kev_cursor, &mut buf);
+            if lost > 0 {
+                // Gap: il ring ha sovrascritto eventi mai letti →
+                // SUBSCRIBER_OVERFLOW sintetizzato localmente (mai nel ring).
+                self.push_toast(
+                    alloc::format!("bus eventi: persi {} eventi", lost),
+                    crate::kevent::SEV_INFO);
+            }
+            if n == 0 {
+                break;
+            }
+            self.kev_cursor = buf[n - 1].seq;
+            for i in 0..n {
+                let ev = buf[i];
+                self.handle_kevent(&ev);
+            }
+            if n < buf.len() {
+                break;
+            }
+        }
+    }
+
+    fn handle_kevent(&mut self, ev: &crate::kevent::KEvent) {
+        use crate::kevent as kev;
+        match ev.kind {
+            kev::KIND_SHUTDOWN_PENDING | kev::KIND_REBOOT_PENDING => {
+                self.modal = Some(PowerModal { last_secs: 0 });
+                self.dirty = true;
+            }
+            kev::KIND_POWER_CANCELLED => {
+                if self.modal.take().is_some() {
+                    self.dirty = true;
+                }
+            }
+            kev::KIND_APP_CRASHED => {
+                let name = kev::name_of(ev.seq);
+                let causa = match ev.payload[1] {
+                    kev::CRASH_WATCHDOG => "watchdog",
+                    kev::CRASH_SPAWN_FAILED => "avvio fallito",
+                    _ => "crash",
+                };
+                let text = match &name {
+                    Some(n) => alloc::format!("app '{}' terminata ({})", n.as_str(), causa),
+                    None => alloc::format!("app win_id={} terminata ({})", ev.payload[0], causa),
+                };
+                self.push_toast(text, ev.severity);
+            }
+            kev::KIND_APP_FUEL_EXHAUSTED => {
+                let name = kev::name_of(ev.seq);
+                let text = match &name {
+                    Some(n) => alloc::format!("'{}' fermata: fuel esaurito", n.as_str()),
+                    None => alloc::format!("pid {}: fuel esaurito", ev.payload[0]),
+                };
+                self.push_toast(text, ev.severity);
+            }
+            kev::KIND_MEM_LOW => {
+                self.push_toast(
+                    alloc::format!("memoria quasi esaurita: {}/{} frame liberi",
+                                   ev.payload[0], ev.payload[1]),
+                    ev.severity);
+            }
+            kev::KIND_TEST => {
+                let name = kev::name_of(ev.seq);
+                self.push_toast(
+                    alloc::format!("evento di test ({})", name.as_deref().unwrap_or("?")),
+                    ev.severity);
+            }
+            _ => {
+                // Kind sconosciuto (catalogo futuro): toast generico, mai drop silente.
+                self.push_toast(
+                    alloc::format!("kevent kind={:#06x}", ev.kind),
+                    ev.severity);
+            }
+        }
+    }
+
+    fn push_toast(&mut self, text: alloc::string::String, sev: u8) {
+        // Flood guard (es. `kev-test` in loop): la coda non cresce oltre 32 —
+        // si scarta il più vecchio, mai allocazione illimitata sul kernel heap.
+        if self.toasts.len() >= 32 {
+            self.toasts.pop_front();
+        }
+        self.toasts.push_back(Toast { text, sev, born_tick: None });
+        self.dirty = true;
+    }
+
+    /// Promozione FIFO + scadenza (~5 s da quando un toast diventa visibile).
+    fn tick_toasts(&mut self) {
+        let now = crate::timer::ticks();
+        let mut promoted = false;
+        for t in self.toasts.iter_mut().take(TOAST_MAX_VISIBLE) {
+            if t.born_tick.is_none() {
+                t.born_tick = Some(now);
+                promoted = true;
+            }
+        }
+        if promoted {
+            self.dirty = true;
+        }
+        let before = self.toasts.len();
+        self.toasts.retain(|t| match t.born_tick {
+            Some(b) => now.saturating_sub(b) < TOAST_LIFE_TICKS,
+            None => true,
+        });
+        if self.toasts.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// Sincronizza il modale con `power::pending()` (fonte di verità) e
+    /// ridisegna a ogni cambio di secondo del countdown.
+    fn tick_modal(&mut self) {
+        // Overlay viva: il modale lo disegna lei — chiudi quello decor se aperto.
+        if self.overlay_index().is_some() {
+            if self.modal.take().is_some() { self.dirty = true; }
+            return;
+        }
+        // Fallback: se c'è un pending e il modale decor non è aperto, aprilo
+        // (copre anche il caso "overlay morta con countdown in corso").
+        if self.modal.is_none() {
+            if crate::power::pending().is_some() {
+                self.modal = Some(PowerModal { last_secs: 0 });
+                self.dirty = true;
+            }
+            return;
+        }
+        match crate::power::pending() {
+            None => {
+                // Annullato altrove (kev-test cancel) o già spento: chiudi.
+                self.modal = None;
+                self.dirty = true;
+            }
+            Some((_, remaining)) => {
+                let secs = remaining / 100 + 1;
+                if self.modal.as_ref().map(|m| m.last_secs) != Some(secs) {
+                    if let Some(m) = self.modal.as_mut() {
+                        m.last_secs = secs;
+                    }
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Geometria modale: rect centrato + bottone Annulla. Calcolata on-the-fly
+    /// (stessa fn per draw e hit-test, mai disallineate).
+    fn modal_rects(sw: u32, sh: u32) -> ((u32, u32, u32, u32), (u32, u32, u32, u32)) {
+        const MW: u32 = 360;
+        const MH: u32 = 120;
+        let mx = sw.saturating_sub(MW) / 2;
+        let my = sh.saturating_sub(MH) / 2;
+        const BW: u32 = 100;
+        const BH: u32 = 28;
+        let bx = mx + (MW - BW) / 2;
+        let by = my + MH - BH - 12;
+        ((mx, my, MW, MH), (bx, by, BW, BH))
+    }
+
+    /// Hit-test dei toast visibili (stessa geometria di `draw_overlays`).
+    fn toast_at(&self, px: i32, py: i32) -> Option<usize> {
+        let g = crate::gfx::geom();
+        if g.width == 0 {
+            return None;
+        }
+        let x = g.width.saturating_sub(TOAST_W + TOAST_PAD) as i32;
+        let mut y = (WORKAREA_TOP + TOAST_PAD) as i32;
+        for i in 0..self.toasts.len().min(TOAST_MAX_VISIBLE) {
+            if px >= x && px < x + TOAST_W as i32 && py >= y && py < y + TOAST_H as i32 {
+                return Some(i);
+            }
+            y += (TOAST_H + TOAST_PAD) as i32;
+        }
+        None
+    }
+
+    /// Hit-test per-pixel sull'overlay: true se (px,py) cade su un pixel della
+    /// surface committata con alpha >= 32 (spec: soglia anti-ombra). La surface
+    /// è full-screen, quindi coordinate schermo = coordinate surface.
+    fn overlay_hit(&self, oi: usize, px: i32, py: i32) -> bool {
+        if px < 0 || py < 0 { return false; }
+        let s = self.wins[oi].store.data();
+        let (w, h) = (s.win.win_w as i32, s.win.win_h as i32);
+        if w == 0 || h == 0 || px >= w || py >= h { return false; }
+        let o = (py as usize * w as usize + px as usize) * 4 + 3;
+        s.win.pixels.get(o).map_or(false, |&a| a >= 32)
+    }
+
+    /// Input mentre il modale è attivo: TUTTO routato qui, niente alle finestre.
+    /// Esc (scancode set-1 0x01) o click su Annulla → `power::cancel()`; il
+    /// modale si chiude via POWER_CANCELLED / `pending() == None` (tick_modal).
+    fn modal_input(&mut self, ev: &crate::gfx::GfxEvt, cx: i32, cy: i32) {
+        match ev.kind {
+            0 => {
+                // key: p0 = scancode PS/2 set-1, p1 = pressed.
+                if ev.p0 == 0x01 && ev.p1 != 0 {
+                    crate::power::cancel();
+                }
+            }
+            2 => {
+                // left press dentro il bottone Annulla.
+                if ev.p0 == 0 && ev.p1 != 0 {
+                    let g = crate::gfx::geom();
+                    let (_, (bx, by, bw, bh)) = Self::modal_rects(g.width, g.height);
+                    if cx >= bx as i32 && cx < (bx + bw) as i32
+                        && cy >= by as i32 && cy < (by + bh) as i32 {
+                        crate::power::cancel();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Disegna toast + modale nel back-buffer, DOPO il composite delle finestre
+    /// e PRIMA del blit (il cursore software è ricomposto dal blit → resta sopra).
+    fn draw_overlays(&mut self, sw: u32, sh: u32) {
+        // Overlay egui viva → niente decor (toast/modale li disegna lei).
+        if self.overlay_index().is_some() { return; }
+        let gh = crate::console::font::glyph_height() as u32;
+        // -- toast: stack in alto a destra, bordo per severity --
+        {
+            let buf = &mut self.backbuf[..];
+            let x = sw.saturating_sub(TOAST_W + TOAST_PAD);
+            let mut y = WORKAREA_TOP + TOAST_PAD;
+            for t in self.toasts.iter().take(TOAST_MAX_VISIBLE) {
+                let border = if t.sev >= crate::kevent::SEV_WARN {
+                    [0xE0, 0xA0, 0x20, 0xFF] // ambra (WARN+)
+                } else {
+                    [0x80, 0x80, 0x80, 0xFF] // grigio (INFO)
+                };
+                decor::fill_rect(buf, sw, sh, x, y, TOAST_W, TOAST_H, border);
+                decor::fill_rect(buf, sw, sh, x + 2, y + 2, TOAST_W - 4, TOAST_H - 4,
+                                 [0x20, 0x28, 0x30, 0xFF]);
+                decor::draw_text_at(buf, sw, sh,
+                    x + 8, y + TOAST_H.saturating_sub(gh) / 2, x + TOAST_W - 8,
+                    &t.text, [0xF0, 0xF0, 0xF0, 0xFF]);
+                y += TOAST_H + TOAST_PAD;
+            }
+        }
+        // -- modale CRIT (countdown letto da power::pending(), non dall'evento) --
+        if self.modal.is_some() {
+            if let Some((kind, remaining)) = crate::power::pending() {
+                let buf = &mut self.backbuf[..];
+                let ((mx, my, mw, mh), (bx, by, bw, bh)) = Self::modal_rects(sw, sh);
+                let secs = remaining / 100 + 1;
+                decor::fill_rect(buf, sw, sh, mx, my, mw, mh, [0xC0, 0x30, 0x30, 0xFF]);
+                decor::fill_rect(buf, sw, sh, mx + 2, my + 2, mw - 4, mh - 4,
+                                 [0x18, 0x20, 0x28, 0xFF]);
+                let title = match kind {
+                    crate::power::PendingKind::Poweroff => "Spegnimento",
+                    crate::power::PendingKind::Reboot => "Riavvio",
+                };
+                decor::draw_text_at(buf, sw, sh, mx + 16, my + 14, mx + mw - 16,
+                                    title, [0xFF, 0xFF, 0xFF, 0xFF]);
+                let line = alloc::format!("tra {} s  (Esc per annullare)", secs);
+                decor::draw_text_at(buf, sw, sh, mx + 16, my + 14 + gh + 8, mx + mw - 16,
+                                    &line, [0xE0, 0xE0, 0xE0, 0xFF]);
+                decor::fill_rect(buf, sw, sh, bx, by, bw, bh, [0x40, 0x50, 0x60, 0xFF]);
+                decor::draw_text_at(buf, sw, sh,
+                    bx + 18, by + bh.saturating_sub(gh) / 2, bx + bw,
+                    "Annulla", [0xFF, 0xFF, 0xFF, 0xFF]);
+            }
+        }
+    }
+
     /// The per-frame window-manager loop. Owns the CPU; never returns.
     ///
     /// Each loop:
@@ -1752,6 +2222,7 @@ impl Compositor {
         unsafe { core::arch::asm!("cld", options(nostack)); }
 
         let mut btn_l = false;
+        let mut overlay_btn = false;
         let mut marker_done = false;
         loop {
             // "Torna alla shell" (wm.exit_to_shell): la finestra di sfondo (la shell
@@ -1778,6 +2249,70 @@ impl Compositor {
             crate::gfx::fold_mouse();
             while let Some(ev) = crate::gfx::pop() {
                 let (cx, cy) = crate::gfx::mouse_pos();
+                // Overlay notifiche viva: (a) modal grab — power pending ⇒ TUTTO
+                // l'input all'overlay; (b) altrimenti hit-test per-pixel: solo i
+                // pixel "dipinti" (alpha >= 32) catturano il mouse, il resto passa
+                // alle finestre sotto. overlay_btn traccia la press consumata
+                // dall'overlay così la release torna allo stesso owner (e una
+                // release di un drag iniziato su una finestra NON viene rubata).
+                if let Some(oi) = self.overlay_index() {
+                    let grab = crate::power::pending().is_some();
+                    let route = match ev.kind {
+                        0 => grab,
+                        1 => grab || overlay_btn || (!btn_l && self.overlay_hit(oi, cx, cy)),
+                        2 if ev.p0 == 0 => {
+                            let pressed = ev.p1 != 0;
+                            if pressed { grab || (!btn_l && self.overlay_hit(oi, cx, cy)) }
+                            else { grab || overlay_btn }
+                        }
+                        5 => grab || self.overlay_hit(oi, cx, cy),
+                        _ => false,
+                    };
+                    if route {
+                        match ev.kind {
+                            0 => {
+                                self.wins[oi].store.data_mut().win.events.push_back(ev);
+                            }
+                            1 => self.forward_mouse_move(oi, cx, cy),
+                            2 => {
+                                let pressed = ev.p1 != 0;
+                                overlay_btn = pressed;
+                                if !pressed {
+                                    // Il modal grab può rubare la release di un drag
+                                    // iniziato su una finestra normale: senza questo
+                                    // reset il drag riprenderebbe a bottone alzato
+                                    // dopo l'Annulla (btn_l/drag restano armati).
+                                    btn_l = false;
+                                    self.drag = None;
+                                }
+                                self.forward_left_button(oi, cx, cy, pressed);
+                            }
+                            5 => {
+                                self.forward_mouse_move(oi, cx, cy);
+                                self.wins[oi].store.data_mut().win.events.push_back(ev);
+                            }
+                            _ => {}
+                        }
+                        self.wins[oi].last_active_frame = self.frame_no;
+                        continue;
+                    }
+                }
+                // Modale attivo: input mouse/tastiera routato SOLO al modale,
+                // niente alle finestre (Esc / click su Annulla → power::cancel()).
+                if self.modal.is_some() {
+                    self.modal_input(&ev, cx, cy);
+                    continue;
+                }
+                // Click su un toast = dismiss immediato. Hit-test PRIMA di
+                // quello finestre. La press è consumata (btn_l resta false →
+                // la release sotto non viene inoltrata a nessuna finestra).
+                if ev.kind == 2 && ev.p0 == 0 && ev.p1 != 0 && self.overlay_index().is_none() {
+                    if let Some(i) = self.toast_at(cx, cy) {
+                        self.toasts.remove(i);
+                        self.dirty = true;
+                        continue;
+                    }
+                }
                 match ev.kind {
                     1 => { // mousemove
                         if let Some(d) = self.drag {
@@ -1859,6 +2394,12 @@ impl Compositor {
                 }
             }
 
+            // Notifiche kernel (spec kernel-event-bus): drena il bus, promuovi/
+            // scadi i toast, sincronizza il modale col PENDING di power.
+            self.drain_kevents();
+            self.tick_toasts();
+            self.tick_modal();
+
             // Clear per-window damage flags; `wm.commit` re-sets `committed` for any
             // window that draws a new surface during this `frame_all`. Also azzera
             // l'override dinamico `stay_awake_request` (dura un solo frame).
@@ -1882,6 +2423,28 @@ impl Compositor {
                     self.wins[i].bg = true;
                     self.dirty = true; // bg pin changes the composite → present
                     crate::binfo!("wm", "bg window win_id={}", self.wins[i].id);
+                }
+            }
+            // 1b) Overlay requests: pin the requesting window as the notifications
+            //     overlay (one max — extra requests are ignored with a warning).
+            for i in 0..self.wins.len() {
+                if self.wins[i].store.data().win.overlay_request {
+                    self.wins[i].store.data_mut().win.overlay_request = false;
+                    if self.overlay_index().is_some() {
+                        crate::bwarn!("wm", "set_overlay: overlay already present, ignored win_id={}",
+                                      self.wins[i].id);
+                    } else {
+                        self.wins[i].overlay = true;
+                        self.dirty = true;
+                        crate::binfo!("wm", "overlay window win_id={}", self.wins[i].id);
+                        // L'overlay non deve MAI restare focused (spawn_named l'ha
+                        // focussata alla creazione): sposta il focus sulla topmost
+                        // visibile (focus_topmost_visible salta bg e overlay).
+                        if self.focused == i {
+                            self.wins[i].focused = false;
+                            self.focus_topmost_visible();
+                        }
+                    }
                 }
             }
             // 2) Spawn requests: drain each window's name FIRST (collect into a
@@ -1959,7 +2522,7 @@ impl Compositor {
                 let mut snap = WINDOW_SNAPSHOT.lock();
                 snap.clear();
                 for (i, w) in self.wins.iter().enumerate() {
-                    if w.bg { continue; }
+                    if w.bg || w.overlay { continue; }
                     let mut flags = 0u32;
                     if w.minimized { flags |= 1; }
                     if i == self.focused { flags |= 2; }

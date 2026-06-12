@@ -191,6 +191,10 @@ build/notepad.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/app
 	@mkdir -p build
 	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p notepad-app --target wasm32-wasip1 --release
 	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/notepad_app.wasm build/notepad.cwasm
+build/notify.cwasm: $(WT_PRECOMPILE) $(APP_SRCS) $(wildcard $(RUOS_DESKTOP)/apps/notify-app/src/*.rs $(RUOS_DESKTOP)/apps/notify-app/Cargo.toml)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd $(RUOS_DESKTOP) && cargo build -p notify-app --target wasm32-wasip1 --release
+	$(WT_PRECOMPILE) $(RUOS_DESKTOP)/target/wasm32-wasip1/release/notify_app.wasm build/notify.cwasm
 
 # Bring-up component (Step-0 gate): guest -> component -> AOT cwasm embedded in kernel.
 kernel/src/wasm/wt/bringup.cwasm: wit/ruos-bringup.wit tools/wt-bringup/src/lib.rs tools/wt-bringup/Cargo.toml $(WT_PRECOMPILE)
@@ -251,7 +255,7 @@ build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml
 		-o build/rtop.component.wasm
 	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -267,6 +271,7 @@ iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm b
 	cp build/terminal.cwasm build/binstage/terminal.cwasm
 	cp build/system.cwasm build/binstage/system.cwasm
 	cp build/notepad.cwasm build/binstage/notepad.cwasm
+	cp build/notify.cwasm build/binstage/notify.cwasm
 	cp kernel/src/wasm/wt/reactor.cwasm build/binstage/compositor.cwasm
 	cp kernel/src/wasm/wt/egui_demo.cwasm build/binstage/egui-demo.cwasm
 	cp kernel/src/wasm/wt/shell.cwasm build/binstage/shell.cwasm

@@ -8,6 +8,7 @@ extern crate alloc;
 mod serial;
 mod kprint;
 mod klog;
+mod kevent;
 mod proc;
 mod power;
 mod memory;
@@ -114,6 +115,16 @@ fn panic(info: &PanicInfo) -> ! {
     // trying to acquire locks we may already hold.
     x86_64::instructions::interrupts::disable();
 
+    // Guard anti-rientranza: un panic DENTRO questo handler (es. nel
+    // rendering del panic screen) ricorrerebbe all'infinito. Al secondo
+    // ingresso (stesso core o un altro) si halta e basta: il primo panic
+    // sta già mostrando/loggando il suo report.
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static PANICKING: AtomicBool = AtomicBool::new(false);
+    if PANICKING.swap(true, Ordering::SeqCst) {
+        loop { x86_64::instructions::hlt(); }
+    }
+
     use core::fmt::Write as _;
 
     // Format the message once into a fixed stack buffer, then fan it out to
@@ -150,6 +161,14 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
 
+    // Panic screen: full-screen tecnico direttamente sul framebuffer (GUI o
+    // console mode — stiamo morendo, si scrive sopra tutto). Best-effort.
+    #[cfg(feature = "panic-halt")]
+    let footer = "halted (panic-halt)";
+    #[cfg(not(feature = "panic-halt"))]
+    let footer = "reboot in 30 s";
+    crate::gfx::panic_screen(core::str::from_utf8(msg).unwrap_or("KERNEL PANIC"), footer);
+
     // Feature-gated exit strategy:
     //   default (no `panic-halt`): controlled reset so the box recovers
     //     automatically instead of bricking until a power-cycle.
@@ -160,6 +179,16 @@ fn panic(info: &PanicInfo) -> ! {
 
     #[cfg(not(feature = "panic-halt"))]
     {
+        // 30 s di schermo (busy-wait TSC: niente timer, IRQ off) poi reset
+        // controllato — la macchina si riprende da sola, ma l'utente fa in
+        // tempo a fotografare il panic screen.
+        let tpm = crate::boot::clock::tsc_per_ms();
+        if tpm > 0 {
+            let end = crate::boot::clock::read_tsc().saturating_add(tpm.saturating_mul(30_000));
+            while crate::boot::clock::read_tsc() < end {
+                core::hint::spin_loop();
+            }
+        }
         crate::power::reboot();
         // reboot() is `-> !` and never returns; the loop below is unreachable
         // but satisfies the compiler's `-> !` type-check.

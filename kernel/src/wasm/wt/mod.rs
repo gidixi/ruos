@@ -162,11 +162,11 @@ pub fn run_cat_demo() -> i32 {
 // `set_epoch_deadline` traps IMMEDIATELY (default deadline 0). Every
 // `Store::new` site must arm one of these:
 
-/// Steady-state `frame()` budget (~300 ms): generous enough for a legitimate
+/// Steady-state `frame()` budget (~1 s): generous enough for a legitimate
 /// heavy relayout (GATE: 6400 nodes = 28 ms native; 50k ≈ 220 ms), still
-/// converts a runaway guest into a ~0.3 s blip. NB: QEMU TCG inflates guest
+/// converts a runaway guest into a ~1 s blip. NB: QEMU TCG inflates guest
 /// time 10-30× — values are tuned to avoid false kills there too.
-pub const FRAME_DEADLINE_TICKS: u64 = 30;
+pub const FRAME_DEADLINE_TICKS: u64 = 300;
 /// First `frame()` of a window (~3 s): parse/style/layout + font atlas + egui
 /// init all land here (viewer ≈ 30-60 ms native, seconds under QEMU TCG).
 pub const FIRST_FRAME_DEADLINE_TICKS: u64 = 300;

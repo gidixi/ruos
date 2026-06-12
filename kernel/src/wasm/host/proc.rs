@@ -563,6 +563,29 @@ pub fn ruos_reboot(_caller: Caller<'_, RuntimeState>) -> Result<(), Error> {
     crate::power::reboot();
 }
 
+/// ruos_kev_test(mode) → 0 ok, -1 modo sconosciuto. DEBUG del kevent bus
+/// (builtin shell `kev-test`): 0 = pubblica un evento WARN di prova (toast),
+/// 1 = request_poweroff differito, 2 = request_reboot differito, 3 = cancel,
+/// 4 = panic del kernel di proposito (debug del panic screen).
+/// Innocuo (equivale a poteri che `ruos_poweroff` già concede); rimovibile.
+pub fn ruos_kev_test(_caller: Caller<'_, RuntimeState>, mode: i32) -> Result<i32, Error> {
+    match mode {
+        0 => {
+            crate::kevent::publish_named(crate::kevent::KIND_TEST,
+                crate::kevent::SEV_WARN, [42, 0, 0, 0], "kev-test");
+            Ok(0)
+        }
+        1 => { crate::power::request_poweroff(crate::power::DEFAULT_COUNTDOWN_SEC); Ok(0) }
+        2 => { crate::power::request_reboot(crate::power::DEFAULT_COUNTDOWN_SEC); Ok(0) }
+        3 => { crate::power::cancel(); Ok(0) }
+        4 => {
+            // Debug del PANIC SCREEN: panica il kernel di proposito.
+            panic!("kev-test: requested panic");
+        }
+        _ => Ok(-1),
+    }
+}
+
 /// ruos_net_set_static(ip0..3: i32, prefix: i32, gw0..3: i32, gw_present: i32)
 ///   → errno. Sets the active Ethernet interface to a static address +
 ///   default route. `gw_present=0` skips the gateway. Replaces any DHCP-bound
@@ -963,6 +986,7 @@ pub fn link(linker: &mut Linker<RuntimeState>) -> Result<(), Error> {
         .func_wrap("ruos", "umount", ruos_umount)?
         .func_wrap("ruos", "poweroff", ruos_poweroff)?
         .func_wrap("ruos", "reboot", ruos_reboot)?
+        .func_wrap("ruos", "kev_test", ruos_kev_test)?
         .func_wrap("ruos", "pci_list", ruos_pci_list)?
         .func_wrap("ruos", "usb_list", ruos_usb_list)?
         .func_wrap("ruos", "sata_list", ruos_sata_list)?

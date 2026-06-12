@@ -33,5 +33,11 @@ pub fn init() -> Result<(), BootError> {
     #[cfg(feature = "boot-checks")]
     crate::console::engine_test::run();
 
+    // Self-test del kernel event bus (ring + cursori + rilevamento gap). Gira
+    // PRIMA che il compositor parta: il suo cursore parte da current_seq(),
+    // quindi questi eventi di prova non diventano mai toast.
+    #[cfg(feature = "boot-checks")]
+    crate::kevent::self_test();
+
     Ok(())
 }

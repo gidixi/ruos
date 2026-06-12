@@ -14,6 +14,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use limine::memmap::MEMMAP_USABLE;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size4KiB};
@@ -197,8 +198,45 @@ pub fn init() -> Result<FrameCounts, FrameInitError> {
     Ok(counts)
 }
 
+/// MEM_LOW (kevent bus): soglia frame liberi < 10% del totale, con isteresi —
+/// dopo il publish si ri-arma solo quando i liberi risalgono sopra il 15%.
+/// Un evento per attraversamento, niente spam.
+static MEM_LOW_ARMED: AtomicBool = AtomicBool::new(true);
+
+fn mem_low_check(c: FrameCounts) {
+    let (free, total) = (c.free, c.total);
+    if total == 0 {
+        return;
+    }
+    if MEM_LOW_ARMED.load(Ordering::Relaxed) {
+        if free * 10 < total {
+            MEM_LOW_ARMED.store(false, Ordering::Relaxed);
+            crate::kevent::publish(crate::kevent::KIND_MEM_LOW,
+                crate::kevent::SEV_WARN, [free as u32, total as u32, 0, 0]);
+        }
+    } else if free * 100 > total * 15 {
+        MEM_LOW_ARMED.store(true, Ordering::Relaxed);
+    }
+}
+
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    FRAMES.lock().as_mut().and_then(|f| f.allocate_frame())
+    // Il check MEM_LOW gira FUORI dal lock FRAMES (publish prende il suo
+    // IrqMutex; mai annidarlo dentro il lock dell'allocatore).
+    let (r, counts) = {
+        let mut g = FRAMES.lock();
+        match g.as_mut() {
+            Some(f) => {
+                let r = f.allocate_frame();
+                let c = f.counts();
+                (r, Some(c))
+            }
+            None => (None, None),
+        }
+    };
+    if let Some(c) = counts {
+        mem_low_check(c);
+    }
+    r
 }
 
 pub fn free_frame(frame: PhysFrame<Size4KiB>) {
@@ -208,7 +246,21 @@ pub fn free_frame(frame: PhysFrame<Size4KiB>) {
 }
 
 pub fn allocate_contiguous(n: u64) -> Option<PhysFrame<Size4KiB>> {
-    FRAMES.lock().as_mut().and_then(|f| f.allocate_contiguous(n))
+    let (r, counts) = {
+        let mut g = FRAMES.lock();
+        match g.as_mut() {
+            Some(f) => {
+                let r = f.allocate_contiguous(n);
+                let c = f.counts();
+                (r, Some(c))
+            }
+            None => (None, None),
+        }
+    };
+    if let Some(c) = counts {
+        mem_low_check(c);
+    }
+    r
 }
 
 pub fn free_contiguous(first: PhysFrame<Size4KiB>, n: u64) {

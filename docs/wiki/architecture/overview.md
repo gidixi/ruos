@@ -6,8 +6,8 @@
 
 ruOS è un OS x86-64 in Rust `no_std`, bootato da **Limine**, in cui **tutto lo
 userland è WebAssembly**: le app sono moduli `.wasm`/`.cwasm` e il runtime WASM è
-la sandbox (niente ring 3, niente ELF Linux, niente thread preemptivi —
-concorrenza async cooperativa).
+la sandbox (niente ring 3, niente ELF Linux, niente thread preemptivi veri e propri,
+ma concorrenza async cooperativa con *epoch-based watchdog* per interrompere i guest).
 
 ## Tesi in un paragrafo
 
@@ -15,19 +15,19 @@ Single-address-space, ring 0. Niente separazione di privilegio CPU, niente
 `SYSCALL`/`SYSRET`, niente page table per-processo. La **sandbox è il runtime
 WASM** e la **concorrenza è cooperativa async** (timer IRQ 100 Hz come wake
 source). Due runtime: **wasmi** (interprete, tool `.wasm` CLI) e **Wasmtime AOT**
-(`no_std`, `.cwasm` precompilati per GUI e Component Model). Un **desktop egui**
+(`no_std`, `.cwasm` precompilati per GUI e Component Model, con epoch scheduling). Un **desktop egui**
 con **compositor kernel-side** fa girare le app finestra come moduli WASM separati.
 
 ## Layer cake
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Userland  .wasm (~59): shell, coreutils, nano, rtop, gzip…  │
-│           GUI: egui desktop + window apps (.cwasm)           │  ring 0,
+│ Userland  .wasm (~58): shell, coreutils, nano, gzip…        │
+│           GUI/TUI: egui desktop, rtop, window apps (.cwasm) │  ring 0,
 ├──────────────────────────────────────────────────────────────┤  sandboxed
 │ Host ABI   wasi_snapshot_preview1 (25) + ruos (33)           │  by WASM
-│            wm (20) + sys (4) + term (5) + ruos_gfx (6)      │  runtime
-│            WIT components (ruos:gui/*, ruos:bringup/*)       │
+│            wm (20) + sys (4) + term (5) + ruos_gfx (6)       │  runtime
+│            WIT components (ruos:gui/*, ruos:tui/*, etc.)     │
 ├──────────────────────────────────────────────────────────────┤
 │ WASM runtimes   wasmi (interp) + Wasmtime AOT (no_std)       │
 │                 fibers · fuel metering · resource limits     │
@@ -80,8 +80,10 @@ Il modello è **cooperative async su un core, con compute offload SMP**:
 - **BSP**: executor `embassy`, tutti i task, tutto l'I/O.
 - **AP**: pool di job puri CPU (compositing parallelo, benchmark). Niente I/O,
   niente lock, niente VFS.
-- **Nessun preemptive scheduler**: il timer IRQ a 100 Hz sveglia i task sleeping,
-  ma non interrompe un task in esecuzione.
+- **Scheduling misto**: la concorrenza è cooperativa (timer IRQ a 100 Hz sveglia
+  i task sleeping), ma per i task `Wasmtime` è attivo l'**epoch-based scheduling**.
+  Agisce da *watchdog*: se un task è bloccato in un loop CPU-bound, l'epoch scatta
+  e il task viene "trappato" (killed) o interrotto per rilasciare la CPU all'executor.
 
 Dettagli: [SMP / executor](../components/smp-executor.md).
 

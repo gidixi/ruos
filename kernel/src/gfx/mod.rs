@@ -23,6 +23,12 @@ static GFX_W:     AtomicU32 = AtomicU32::new(0);
 static GFX_H:     AtomicU32 = AtomicU32::new(0);
 static GFX_FMT:   AtomicU32 = AtomicU32::new(0); // 0 = RGB, 1 = BGR
 
+/// PANIC FREEZE: set dal panic handler prima di disegnare il panic screen.
+/// Da quel momento blit/cursore diventano no-op — il core GUI (se il panic è
+/// avvenuto su un ALTRO core) non può ridipingere sopra lo schermo di panico
+/// durante l'attesa pre-reboot.
+static PANIC_FREEZE: AtomicBool = AtomicBool::new(false);
+
 // RAM shadow of the last presented frame, in GUEST format (RGBA8888, stride =
 // width*4 — independent of the panel's pitch/layout). Two jobs:
 //  1. Diff present: `blit` memcmp's each incoming row against the shadow and
@@ -123,6 +129,7 @@ pub fn last_pixel() -> u32 { LAST_PIXEL.load(Ordering::Relaxed) }
 /// Blit a guest RGBA8888 rectangle (`buf`, row-major, `w*h*4` bytes) to the
 /// framebuffer at (x,y), converting to the panel layout. Clips to the screen.
 pub fn blit(buf: &[u8], x: u32, y: u32, w: u32, h: u32) {
+    if PANIC_FREEZE.load(Ordering::Acquire) { return; }
     let base = GFX_VIRT.load(Ordering::Acquire);
     if base.is_null() { return; }
     let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
@@ -372,6 +379,7 @@ static CUR_LOCK: crate::sync::IrqMutex<()> = crate::sync::IrqMutex::new(());
 /// Erase the cursor: restore the true background under the sprite from the RAM
 /// shadow (the sprite is never written there). Caller holds CUR_LOCK.
 fn cursor_erase() {
+    if PANIC_FREEZE.load(Ordering::Acquire) { return; }
     if !CUR_VALID.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -418,6 +426,7 @@ fn cursor_erase() {
 /// keeps the background). No-op without the shadow (erase would be impossible
 /// and the sprite would smear). Caller holds CUR_LOCK.
 fn cursor_paint(x: i32, y: i32) {
+    if PANIC_FREEZE.load(Ordering::Acquire) { return; }
     let base = GFX_VIRT.load(Ordering::Acquire);
     if base.is_null() || SHADOW.load(Ordering::Acquire).is_null() {
         return;
@@ -459,9 +468,112 @@ pub fn cursor_move(x: i32, y: i32) {
 /// rows it skipped still show it — repainting is idempotent either way, and
 /// the background never needs saving because the shadow is canonical.
 fn cursor_repaint() {
-    if !gui_mode() { return; }
+    if !gui_mode() || PANIC_FREEZE.load(Ordering::Acquire) { return; }
     let _g = CUR_LOCK.lock();
     cursor_paint(CUR_X.load(Ordering::Relaxed), CUR_Y.load(Ordering::Relaxed));
+}
+
+/// PANIC SCREEN — disegno DIRETTO sul framebuffer lineare dal panic handler.
+/// Niente lock (i parametri fb sono atomics), niente alloc, IRQ già off: si può
+/// chiamare da qualunque contesto morente, sia in GUI mode sia in console mode
+/// (scrive sopra qualunque cosa). Solo 32 bpp; fb assente/bpp diverso = no-op.
+/// `msg` = messaggio panic (con location), già formattato dal chiamante;
+/// `footer` = riga finale (es. "reboot in 30 s" / "halted (panic-halt)").
+pub fn panic_screen(msg: &str, footer: &str) {
+    // Congela blit/cursore PRIMA di qualunque check: anche se poi questo fb
+    // non è disegnabile (bpp != 32), nessun altro core deve più dipingere.
+    PANIC_FREEZE.store(true, Ordering::Release);
+    let base = GFX_VIRT.load(Ordering::Acquire);
+    if base.is_null() { return; }
+    let pitch = GFX_PITCH.load(Ordering::Acquire) as usize;
+    let bpp = GFX_BPP.load(Ordering::Acquire);
+    if bpp != 32 { return; }
+    let bgr = GFX_FMT.load(Ordering::Acquire) == 1;
+    let (sw, sh) = (GFX_W.load(Ordering::Acquire) as usize, GFX_H.load(Ordering::Acquire) as usize);
+    if sw == 0 || sh == 0 { return; }
+
+    // Sfondo rosso scuro pieno (#3a0d0d).
+    let bg = if bgr { [0x0d, 0x0d, 0x3a, 0xff] } else { [0x3a, 0x0d, 0x0d, 0xff] };
+    for y in 0..sh {
+        // SAFETY: fb lineare mappato per pitch*sh byte; siamo in panic, nessun
+        // altro writer coordinato — l'ultima scrittura vince ed è quello che
+        // vogliamo (schermo interamente nostro).
+        let row = unsafe { base.add(y * pitch) };
+        for x in 0..sw {
+            unsafe { core::ptr::copy_nonoverlapping(bg.as_ptr(), row.add(x * 4), 4); }
+        }
+    }
+
+    // Riga di testo col font bitmap kernel (testo bianco, niente blending col
+    // fondo: in panic la semplicità vince sull'estetica).
+    let gw = crate::console::font::glyph_width();
+    let gh = crate::console::font::glyph_height();
+    let cols = ((sw.saturating_sub(16)) / gw.max(1)).max(1);
+    let mut cy = 16usize;
+    let mut draw_line = |text: &str, cy: &mut usize| {
+        if *cy + gh >= sh { return; }
+        let mut cx = 16usize;
+        for ch in text.chars() {
+            if cx + gw >= sw { break; }
+            let r = crate::console::font::raster_for_weight(ch, false);
+            for (ry, rrow) in r.raster().iter().enumerate() {
+                let py = *cy + ry;
+                if py >= sh { break; }
+                let row = unsafe { base.add(py * pitch) };
+                for (rx, &a) in rrow.iter().enumerate() {
+                    if a < 64 { continue; }
+                    let px = cx + rx;
+                    if px >= sw { continue; }
+                    let p = [a, a, a, 0xff];
+                    unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), row.add(px * 4), 4); }
+                }
+            }
+            cx += gw;
+        }
+        *cy += gh + 2;
+    };
+
+    draw_line("KERNEL PANIC", &mut cy);
+    cy += gh / 2;
+    // Messaggio (multi-riga/lungo: spezza a `cols`).
+    for line in msg.lines() {
+        let mut rest = line;
+        loop {
+            let take = rest.char_indices().nth(cols).map_or(rest.len(), |(i, _)| i);
+            draw_line(&rest[..take], &mut cy);
+            rest = &rest[take..];
+            if rest.is_empty() { break; }
+        }
+    }
+    cy += gh / 2;
+    {
+        use core::fmt::Write as _;
+        let mut hdr = crate::klog::Scratch::new();
+        let _ = write!(hdr, "core={} tick={}", crate::cpu::cpu_id(), crate::timer::ticks());
+        draw_line(core::str::from_utf8(hdr.as_bytes()).unwrap_or(""), &mut cy);
+    }
+    cy += gh / 2;
+    draw_line("--- klog tail ---", &mut cy);
+
+    // Tail del ring klog: buffer statico (niente stack pressure in panic, il
+    // flusso è single-core con IRQ off; best-effort sul resto). try_read:
+    // se il panic è scoppiato DENTRO il lock del klog, niente tail — ma
+    // sfondo+messaggio sono già disegnati e non ci blocchiamo mai.
+    static mut TAIL: [u8; crate::klog::LOG_CAP] = [0; crate::klog::LOG_CAP];
+    // SAFETY: panic path; unico accessor di TAIL.
+    let tail = unsafe { &mut *core::ptr::addr_of_mut!(TAIL) };
+    let n = crate::klog::try_read(tail).unwrap_or(0);
+    let text = core::str::from_utf8(&tail[..n]).unwrap_or("");
+    // Ultime ~15 righe, in ordine.
+    let mut lines: heapless::Vec<&str, 16> = heapless::Vec::new();
+    for l in text.lines().rev().take(15) {
+        let _ = lines.push(l);
+    }
+    for l in lines.iter().rev() {
+        draw_line(l, &mut cy);
+    }
+    cy += gh / 2;
+    draw_line(footer, &mut cy);
 }
 
 /// Boot-check: blit a 2×2 red square at (0,0) and read pixel (0,0) back.

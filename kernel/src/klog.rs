@@ -8,7 +8,7 @@
 
 use spin::Mutex;
 
-const LOG_CAP: usize = 32 * 1024;
+pub const LOG_CAP: usize = 32 * 1024;
 
 struct Ring {
     buf: [u8; LOG_CAP],
@@ -69,6 +69,13 @@ pub fn try_push(bytes: &[u8]) {
 
 pub fn read(out: &mut [u8]) -> usize {
     LOG.lock().read(out)
+}
+
+/// Best-effort read: copies oldest-to-newest into `out` only if the ring lock
+/// is uncontested, `None` otherwise. Safe to call from a panic handler where
+/// we must not block (mirror of `try_push`).
+pub fn try_read(out: &mut [u8]) -> Option<usize> {
+    LOG.try_lock().map(|ring| ring.read(out))
 }
 
 /// Fixed-size formatter sink: `kprintln!` / `binfo!` reformat into this so

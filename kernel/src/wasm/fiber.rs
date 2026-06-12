@@ -320,6 +320,22 @@ impl Fiber {
                 }
                 ResumableCall::OutOfFuel(_) => {
                     kprintln!("wasm: task killed (fuel exhausted)");
+                    let pid = self.pid.unwrap_or(0);
+                    // Nome dal proc-registry (evento raro: la lookup alloca, ok —
+                    // siamo in contesto fiber/executor, non IRQ).
+                    let name = self.pid.and_then(|pid| {
+                        crate::proc::list().into_iter()
+                            .find(|p| p.pid == pid)
+                            .map(|p| p.name)
+                    });
+                    match name {
+                        Some(n) => crate::kevent::publish_named(
+                            crate::kevent::KIND_APP_FUEL_EXHAUSTED,
+                            crate::kevent::SEV_WARN, [pid, 0, 0, 0], &n),
+                        None => crate::kevent::publish(
+                            crate::kevent::KIND_APP_FUEL_EXHAUSTED,
+                            crate::kevent::SEV_WARN, [pid, 0, 0, 0]),
+                    }
                     return 137;
                 }
             }

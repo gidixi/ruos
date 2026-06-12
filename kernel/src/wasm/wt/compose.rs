@@ -29,6 +29,10 @@ pub struct WinDesc {
     pub w: u32,        // footprint width  (px)
     pub h: u32,        // footprint height (px)
     pub shadow: bool,  // cast a drop shadow under this window (false for the bg)
+    /// Alpha-blend (src-over, sorgente PREMOLTIPLICATA — tiny-skia) invece di
+    /// copy opaco. Solo la finestra overlay (notifiche) lo usa; tutto intero,
+    /// così il composite a bande resta bit-identico al riferimento seriale.
+    pub blend: bool,
 }
 
 /// Drop-shadow parameters (global v1; the same soft shadow under every non-bg
@@ -139,11 +143,29 @@ pub unsafe fn composite_band(
             if src_end > win.px_len { break; }
             let src = win.px.add(src_row_off);
             let dst = back.add(sy * stride + wx * 4);
-            // RGBA src → RGBX dst: identical byte order (alpha lands in the
-            // ignored X slot). One row memcpy. (BGR conversion, if any, is done
-            // once at present time by gfx::blit — the back-buffer is canonical
-            // RGBX, matching the SP3 footprint format.)
-            core::ptr::copy_nonoverlapping(src, dst, vis_w * 4);
+            if win.blend {
+                // Overlay: src-over con sorgente premoltiplicata (tiny-skia).
+                // out = src + dst*(255-a)/255 per canale; X del back-buffer
+                // ignorato. Tutto intero (equivalenza seriale/parallela).
+                let mut i = 0usize;
+                while i < vis_w {
+                    let o = i * 4;
+                    let a = *src.add(o + 3) as u32;
+                    if a == 255 {
+                        core::ptr::copy_nonoverlapping(src.add(o), dst.add(o), 4);
+                    } else if a != 0 {
+                        let inv = 255 - a;
+                        *dst.add(o)     = (*src.add(o)     as u32 + (*dst.add(o)     as u32 * inv) / 255) as u8;
+                        *dst.add(o + 1) = (*src.add(o + 1) as u32 + (*dst.add(o + 1) as u32 * inv) / 255) as u8;
+                        *dst.add(o + 2) = (*src.add(o + 2) as u32 + (*dst.add(o + 2) as u32 * inv) / 255) as u8;
+                    }
+                    i += 1;
+                }
+            } else {
+                // RGBA src → RGBX dst: identical byte order (alpha lands in the
+                // ignored X slot). One row memcpy.
+                core::ptr::copy_nonoverlapping(src, dst, vis_w * 4);
+            }
             sy += 1;
         }
     }

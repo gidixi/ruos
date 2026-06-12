@@ -149,7 +149,16 @@ ready, `-2` author error.
 Write RTC fields to the pointers; `epoch_ptr` gets `u64` unix seconds.
 
 ### `poweroff()` / `reboot()`
-Halt / restart. Never return.
+Halt / restart. Never return. (IMMEDIATE — unlike the GUI's `wm.poweroff`/
+`wm.reboot`, which are deferred + cancellable.)
+
+### `kev_test(mode: i32) -> i32`
+DEBUG del kernel event bus (usata dal builtin `kev-test` della shell). `mode`:
+`0` pubblica un evento WARN di prova (toast nel compositor), `1` richiede il
+poweroff differito (10 s, annullabile), `2` il reboot differito, `3` annulla la
+richiesta pendente, `4` panica il kernel di proposito (debug del panic screen:
+schermata tecnica full-screen, poi reboot dopo 30 s — non ritorna). Ritorna
+`0`, o `-1` per modo sconosciuto.
 
 ## Terminal control / services / SMP
 

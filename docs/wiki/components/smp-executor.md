@@ -17,9 +17,10 @@ altri**:
   offload**: eseguono job puri CPU senza I/O, senza lock, senza accesso al VFS.
   Nessun AP tocca mai l'executor, il runtime WASM, o i device.
 
-Non c'è preemption: un task che non yielda (`.await`) monopolizza il core fino
-all'esaurimento del fuel. Il timer IRQ a 100 Hz è il **wake source** che risveglia
-l'executor dal `hlt`.
+Non c'è preemption classica per l'I/O time-sharing: un task che non yielda (`.await`) monopolizza il core
+sotto l'executor. Il timer IRQ a 100 Hz è il **wake source** che risveglia
+l'executor dal `hlt`, e avanza l'**epoch clock** (che può intrappolare o uccidere
+task CPU-bound malfunzionanti tramite fuel in wasmi o epoch watchdog in Wasmtime).
 
 ## Dove vive
 
@@ -141,8 +142,9 @@ I contatori sono esposti dalle host fn `cpustat` (wasmi) e `sys.cpustat`
 
 ## Vincoli e limiti
 
-- **Nessun preemptive scheduler**: un task che non fa `.await` (o che non esaurisce
-  il fuel) occupa il BSP per la durata del suo slice. Niente time-sharing.
+- **Nessun preemptive scheduler I/O**: un task che non fa `.await` occupa il BSP
+  finché non subentra il meccanismo di protezione per evitare stalli (esaurimento
+  del fuel per *wasmi*, o trigger dell'epoch watchdog per *Wasmtime*). Niente time-sharing tradizionale.
 - **No multi-queue executor**: c'è un solo executor, sul BSP. I task WASM non
   possono migrare su un AP.
 - **Job pool a slot fissi**: il numero di job in volo è limitato (cap nel pool).

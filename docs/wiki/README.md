@@ -25,10 +25,16 @@ tono e lingua. Pagine che non seguono lo stile vanno riallineate.
 
 ### Architettura
 - [Panoramica](architecture/overview.md) — layer cake, boot, runtime, SMP, source map
+- [Modello di Sicurezza](architecture/security.md) — single-address-space, capability paths, isolation
+- [Ecosistema Userland](architecture/userland.md) — tool CLI `wasmi`, app AOT, ABI e limitazioni
 
 ### Componenti
 - [Boot a fasi](components/boot-phases.md) — le 10 fasi di init, da GDT a executor
-- [Runtime WASM](components/wasm-runtime.md) — wasmi + Wasmtime AOT, fibers, fuel, host ABI
+- [Runtime WASM](components/wasm-runtime.md) — wasmi + Wasmtime AOT, fibers, fuel/epoch, host ABI
+- [Gestione della Memoria](components/memory.md) — heap, frame allocator, demand paging
+- [Component Model e WIT](components/component-model.md) — Wasmtime components, dynamic linking
+- [Build System e AOT](components/build-system.md) — Makefile, wt-precompile, ISO gen
+- [Hardware Abstraction & Driver](components/drivers.md) — bus PCIe, DMA, device asincroni
 - [VFS / Storage](components/vfs-storage.md) — tmpfs, FAT32, AHCI, GPT, disk authoring
 - [Input](components/input.md) — PS/2 + USB HID keyboard/mouse, coda condivisa
 - [Networking + SSH](components/networking-ssh.md) — smoltcp, NIC, DHCP, TCP, SSH, Wi-Fi

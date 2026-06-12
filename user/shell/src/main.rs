@@ -24,6 +24,7 @@ extern "C" {
     fn chdir(path_ptr: u32, path_len: u32) -> i32;
     fn poweroff() -> !;
     fn reboot() -> !;
+    fn kev_test(mode: i32) -> i32;
 }
 
 #[repr(C)]
@@ -402,6 +403,7 @@ fn run_command(line: &str) {
         "help"     => builtin_help(),
         "poweroff" => unsafe { poweroff() },
         "reboot"   => unsafe { reboot() },
+        "kev-test" => builtin_kev_test(&argv),
         "source" | "." => builtin_source(&argv),
         cmd        => { let _ = exec_external(cmd, &argv); }
     }
@@ -434,6 +436,26 @@ fn builtin_source(argv: &[&str]) {
 
 fn builtin_pwd() {
     println!("{}", CWD.lock().unwrap());
+}
+
+/// Debug del kernel event bus (host fn `ruos.kev_test`): pubblica un evento
+/// di prova (toast nel compositor) o esercita il power differito annullabile.
+fn builtin_kev_test(argv: &[&str]) {
+    let mode = match argv.get(1).copied() {
+        None | Some("toast") => 0,
+        Some("poweroff") => 1,
+        Some("reboot") => 2,
+        Some("cancel") => 3,
+        Some("panic") => 4,
+        Some(other) => {
+            println!("kev-test: modo sconosciuto '{}' (toast|poweroff|reboot|cancel|panic)", other);
+            return;
+        }
+    };
+    let r = unsafe { kev_test(mode) };
+    if r != 0 {
+        println!("kev-test: errore {}", r);
+    }
 }
 
 fn builtin_cd(argv: &[&str]) {
@@ -491,6 +513,7 @@ fn builtin_help() {
     println!("  help        this list");
     println!("  poweroff    halt the system");
     println!("  reboot      restart the system");
+    println!("  kev-test [toast|poweroff|reboot|cancel|panic]  debug kernel event bus");
     println!("  source <p>  run script (alias: . <p>)");
     println!("external: try 'ls /bin' to list available .wasm");
 }
@@ -610,7 +633,7 @@ fn serialize_pipeline(stages: &[(String, Vec<Vec<u8>>)]) -> Vec<u8> {
 /// Returns true if `name` is a shell builtin that cannot participate in a
 /// pipeline (builtins do not fork, so they cannot be piped).
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "cd" | "pwd" | "exit" | "help" | "poweroff" | "reboot" | "source" | ".")
+    matches!(name, "cd" | "pwd" | "exit" | "help" | "poweroff" | "reboot" | "kev-test" | "source" | ".")
 }
 
 /// Run a multi-stage pipeline. Each segment has already been split on `|`.

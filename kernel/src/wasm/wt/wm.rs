@@ -235,6 +235,17 @@ fn module_at_path(path: &str) -> Option<Module> {
 /// const data in the guest's data segment (no heap), so it is valid right after
 /// instantiation without running `_initialize`. The store is dropped on return.
 fn extract_manifest(linker: &Linker<AppState>, module: &Module, name: &str) -> Option<Manifest> {
+    // Moduli threaded (wasm32-wasip1-threads, import env::memory shared) sono
+    // tool CLI, non app finestra: il linker del launcher non definisce la
+    // shared memory e l'instantiate fallirebbe — skip silenzioso (il catalog
+    // scan è ~1 Hz: un bwarn qui sarebbe spam continuo).
+    let wants_shared = module.imports().any(|i| {
+        i.module() == "env" && i.name() == "memory"
+            && i.ty().memory().map_or(false, |m| m.is_shared())
+    });
+    if wants_shared {
+        return None;
+    }
     let mut store = Store::new(
         engine(),
         AppState {

@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 # MT Fase 2: wasm-threads gate test.
 #
-# Builds the boot-checks ISO and asserts the four thread-runtime markers:
+# Stage 1 — boot-checks ISO, asserts the four thread-runtime markers:
 #   THREADS-OK 1        — SharedMemory + native atomics (no_std wasmtime fork)
 #   THREADS-FIBER-OK    — fiber suspend/resume cross-core (host-only)
 #   THREADS-OK 3        — atomic.wait suspends the FIBER, notify wakes via IPI
 #   THREADS-OK 2        — thread-spawn: fresh Instance on the same SharedMemory
 # Boots -smp 4 (ComputeApp cores) AND -smp 1 (BSP fallback): the gates must
 # pass on both — the single-core boot is the deadlock regression.
+#
+# Stage 2 — threads-init ISO (real std binaries on wasm32-wasip1-threads):
+#   PARSUM_OK threads>=2   — rayon end-to-end (RAYON_NUM_THREADS injected)
+#   STRESS_MT_OK count=400000 — contended std Mutex + join, exact count
+#   THREADS_INIT_DONE      — shell survived `mtstress trap` (kill-group, 134)
+#   no UNREACHABLE / panic — the trapped group really died, kernel intact
 set -u
 cd "$(dirname "$0")/.."
 
 ISO_T=build/threadstest.iso
+ISO_R=build/threadstest-run.iso
 LOG4=build/threads-smp4.log
 LOG1=build/threads-smp1.log
+LOGR=build/threads-run.log
 
 kill_qemu() {
   ps -eo pid,comm | awk '/qemu-system/{print $1}' | while read p; do
@@ -61,11 +69,33 @@ check_log "$LOG1" "smp1" || FAIL=1
 grep -a "THREADS" "$LOG4" | sed 's/^/[threads] smp4: /'
 grep -a "THREADS" "$LOG1" | sed 's/^/[threads] smp1: /'
 
+# --- Stage 2: parsum (rayon) + mtstress + kill-group -------------------------
+echo "[threads] building threads-init iso ($ISO_R)..."
+make iso ISO="$ISO_R" INIT_SCRIPT=user-bin/threads-init.sh \
+  >> build/threadstest-iso.log 2>&1 || {
+  echo TEST_FAIL_THREADS; echo "(threads-init iso build failed)"; tail -20 build/threadstest-iso.log; exit 1;
+}
+echo "[threads] booting threads-init (-smp 6, parsum+mtstress+trap)..."
+rm -f "$LOGR"
+timeout 240 qemu-system-x86_64 -machine q35 -cpu max -smp 6 -m 2048 \
+  -cdrom "$ISO_R" -serial "file:$LOGR" -display none -no-reboot \
+  -device qemu-xhci >/dev/null 2>&1
+kill_qemu
+
+grep -aE "PARSUM_OK|STRESS_MT_OK|THREADS_INIT_DONE|thread-spawn" "$LOGR" \
+  | sed 's/^/[threads] run: /'
+grep -aqE "PARSUM_OK threads=[2-9]" "$LOGR" || { echo "(missing/serial PARSUM_OK)"; FAIL=1; }
+grep -aq "STRESS_MT_OK count=400000" "$LOGR" || { echo "(missing STRESS_MT_OK count=400000)"; FAIL=1; }
+grep -aq "THREADS_INIT_DONE" "$LOGR" || { echo "(missing THREADS_INIT_DONE — shell died after trap?)"; FAIL=1; }
+grep -aq "UNREACHABLE" "$LOGR" && { echo "(UNREACHABLE printed — kill-group failed)"; FAIL=1; }
+grep -aqi "kernel panic" "$LOGR" && { echo "(kernel panic in run log)"; FAIL=1; }
+
 if [ "$FAIL" -eq 0 ]; then
   echo "TEST_PASS_THREADS"
   exit 0
 else
   echo "TEST_FAIL_THREADS"
   echo "--- smp4 log tail ---"; tail -15 "$LOG4"
+  echo "--- run log tail ---"; tail -25 "$LOGR"
   exit 1
 fi

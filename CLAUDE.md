@@ -29,7 +29,10 @@ accesso remoto via SSH.** Tutto userspace = moduli WebAssembly; il runtime WASM
   (USB input, GUI, installer SSD).
 - **Due runtime WASM**: `wasmi` (interprete, esegue i tool `.wasm` wasm32-wasip1) +
   **Wasmtime AOT** no_std (esegue i `.cwasm` precompilati: GUI/compositor + Component
-  Model). Il router `.cwasm` della shell sceglie Wasmtime.
+  Model + **app multi-thread** `wasm32-wasip1-threads` — `std::thread`/rayon su
+  fiber M:N cooperativi, MT Fase 2, spec
+  `docs/superpowers/specs/2026-06-12-wasm-mt-fase2-threads-design.md`). Il router
+  `.cwasm` della shell sceglie Wasmtime.
 - **Legacy C (rimosso)** — il vecchio kernel C su Pure64 + gestore memoria
   (E820/bitmap/buddy/paging) viveva in `x64barebones/`. Rimosso dal working tree;
   resta come **riferimento storico in git history** fino al commit `c1d2a81`
@@ -94,8 +97,9 @@ wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <c
 ```
 
 - **Toolchain installato in WSL:** rustup nightly (`nightly-2026-05-26`) +
-  componenti `rust-src` e `llvm-tools-preview` + target `wasm32-wasip1` (tool/UI)
-  e `wasm32-unknown-unknown` (finestre compositor); `xorriso`, `qemu-system-x86_64`,
+  componenti `rust-src` e `llvm-tools-preview` + target `wasm32-wasip1` (tool/UI),
+  `wasm32-unknown-unknown` (finestre compositor) e `wasm32-wasip1-threads`
+  (tool/app threaded MT Fase 2, es. `tools/parsum`); `xorriso`, `qemu-system-x86_64`,
   `gcc`/`make` (per buildare il tool host `limine`).
 - **Submodule:** `git submodule update --init --recursive` (serve `ruos-desktop`
   per buildare `gui.cwasm`). Su `/mnt/e` può servire

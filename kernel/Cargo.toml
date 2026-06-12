@@ -100,3 +100,7 @@ debug = 1
 # deviati sugli hook extern "C" wasmtime_futex_* (implementati in wt/threads.rs).
 # Spec: docs/superpowers/specs/2026-06-12-wasm-mt-fase2-threads-design.md
 wasmtime = { path = "../third_party/wasmtime45" }
+# Fix backend no_std: anche il TOP dello stack fiber va allineato a 16 (lo
+# stack cresce dal top; l'unwinder asserisce FP%16==0 al primo trap in un
+# fiber). Una riga in align_ptr (nostd.rs) — vedi CHANGELOG/493.
+wasmtime-internal-fiber = { path = "../third_party/wasmtime-fiber45" }

@@ -1,0 +1,14 @@
+[package]
+name = "mtstress"
+version = "0.1.0"
+edition = "2021"
+
+# MT Fase 2 stress tool: Mutex std conteso tra 4 thread (futex wait/notify
+# reali) + join. Con arg `trap` un thread abortisce -> il kernel uccide
+# l'intero gruppo (exit 134) e la shell deve sopravvivere.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+
+[workspace]

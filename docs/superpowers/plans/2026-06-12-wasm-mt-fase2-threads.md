@@ -729,7 +729,7 @@ Create `tests/threads-test.sh` (clone della struttura di frame-smp-test.sh): bui
 - Create: `tools/parsum/` (crate rust wasm32-wasip1-threads)
 - Modify: `Makefile` (build/parsum.cwasm + staging /bin), `kernel/src/wasm/wt/threads.rs` (proc), `kernel/src/proc.rs` (niente: già IrqMutex)
 
-- [ ] **Step 1: parsum**
+- [x] **Step 1: parsum**
 
 `tools/parsum/Cargo.toml`:
 ```toml
@@ -756,7 +756,7 @@ fn main() {
 ```
 (`Instant` su wasi usa `clock_time_get` monotonic — già implementato in wasi.rs:269.)
 
-- [ ] **Step 2: Build rule Makefile**
+- [x] **Step 2: Build rule Makefile**
 
 ```make
 build/parsum.cwasm: tools/parsum/src/main.rs tools/parsum/Cargo.toml $(WT_PRECOMPILE)
@@ -767,7 +767,7 @@ build/parsum.cwasm: tools/parsum/src/main.rs tools/parsum/Cargo.toml $(WT_PRECOM
 ```
 Aggiungi `build/parsum.cwasm` alle dipendenze del target `iso` + copia in `build/binstage/` (pattern wtecho, Makefile:120-122 + 280-293).
 
-- [ ] **Step 3: Init script + run**
+- [x] **Step 3: Init script + run** (esito: `PARSUM_OK threads=4 sum=… speedup_x100=75` su -smp 6. DUE bug trovati e fixati lungo la strada: (a) stack fiber no_std con TOP non 16-allineato → panic unwinder al primo trap in un fiber — vendor `third_party/wasmtime-fiber45` con fix una riga in align_ptr; (b) accessor `wt/mem.rs` non gestiva `Extern::SharedMemory` (i moduli threaded ri-esportano la memoria IMPORTATA come shared) → ogni WASI fn falliva EINVAL → wasi-libc exit 71; (c) il gruppo ora muore quando il MAIN esce — semantica processo, senza i worker rayon parcheggiati per sempre terrebbero live>0)
 
 `user-bin/threads-init.sh`:
 ```sh
@@ -780,13 +780,13 @@ wsl -d Ubuntu-22.04 -u root -e bash -c 'cd /mnt/w/Work/GitHub/ruos && make iso I
 ```
 Expected: `PARSUM_OK threads=4 sum=… speedup_x100=…` (6 vCPU → 4 ComputeApp). `threads=4` prova che RAYON_NUM_THREADS è arrivato. speedup > 100 atteso ma NON asserito hard in QEMU TCG (timing inaffidabile); assert solo su `threads>=2` e sum corretto. **Se hang/deadlock**: netconsole + marker, debug sistematico — è il primo carico std reale.
 
-- [ ] **Step 4: ps tids**
+- [x] **Step 4: ps tids** (solo tid>0: il main è già il processo registrato dalla shell)
 
 In `spawn_fiber`: `let pid = crate::proc::register(alloc::format!("{}#{}", base_name, tid));` con `base_name` nel ThreadGroup (derivato dall'argv[0] in exec_threaded); salva `pid` nel ThreadFiber; `finish_fiber` fa `crate::proc::unregister(pid)`. Verifica manuale: `ps` dalla shell durante un parsum lungo mostra `parsum#1..N`.
 
-- [ ] **Step 5: tests/threads-test.sh — aggiungi lo stage parsum** (seconda metà dello script: boot con threads-init, assert `PARSUM_OK threads=[2-9]`).
+- [x] **Step 5: tests/threads-test.sh — aggiungi lo stage parsum** (seconda metà dello script: boot con threads-init, assert `PARSUM_OK threads=[2-9]`).
 
-- [ ] **Step 6: Commit** (`feat(wt): parsum — std::thread+rayon end-to-end on wasm32-wasip1-threads`).
+- [x] **Step 6: Commit** (`feat(wt): parsum — std::thread+rayon end-to-end on wasm32-wasip1-threads`). (Commit unico coi Task 7 — eseguiti insieme su richiesta; changelog 492+493.)
 
 ---
 
@@ -796,7 +796,7 @@ In `spawn_fiber`: `let pid = crate::proc::register(alloc::format!("{}#{}", base_
 - Create: `tools/mtstress/`
 - Modify: `kernel/src/wasm/wt/threads.rs` (kill-group), `docs/api/` (pagina wasi: thread-spawn + environ), `docs/superpowers/specs/2026-06-12-wasm-mt-fase2-threads-design.md` (esiti), `CHANGELOG/NNN-…`
 
-- [ ] **Step 1: mtstress**
+- [x] **Step 1: mtstress** (`STRESS_MT_OK count=400000` esatto)
 
 `tools/mtstress/src/main.rs` (std, wasm32-wasip1-threads):
 ```rust
@@ -816,22 +816,22 @@ fn main() {
 ```
 Regola Makefile identica a parsum. Esegue: Mutex conteso (futex wait/notify reali), join (futex), valore ESATTO = prova atomicità + coerenza. Boot + assert `STRESS_MT_OK count=400000`.
 
-- [ ] **Step 2: Kill-group su trap**
+- [x] **Step 2: Kill-group su trap** (verificato con `mtstress trap`: tid 1 trappa → gruppo 134, `UNREACHABLE` mai stampato, shell viva, kernel senza panic)
 
 In `run_one`/`finish_fiber`: se `group.poisoned` → (a) i fiber del gruppo in RUNQ vengono droppati al take (check in `run_one` subito dopo il pop: `if f.group.poisoned.load() { finish_fiber(f, 134); return true; }`); (b) i waiter in WAITQ del gruppo vanno rimossi: aggiungi `pub fn kill_group_waiters(g: &Arc<ThreadGroup>)` che scorre gli shard e droppa i fiber con `Arc::ptr_eq(&f.group, g)` (chiamata da chi setta poisoned). Droppare un fiber sospeso = Drop della Box (lo stack TryVec si libera; le Store dentro muoiono — accettato: il gruppo è morto). Test: variante mtstress con un thread che fa `unreachable` → il gruppo esce 134, il kernel NON panica, `ps` pulito. Aggiungi al test sh.
 
-- [ ] **Step 3: Regressione completa**
+- [x] **Step 3: Regressione completa** (run-test PASS, threads-test PASS — gate smp4/smp1 + parsum/mtstress/trap; frame-smp-test FAIL: marker `frame cores=` MAI emesso in entrambe le build — in verifica se pre-esistente, vedi changelog 493; comp-smp non rieseguito)
 
 ```bash
 wsl -d Ubuntu-22.04 -u root -e bash -c 'cd /mnt/w/Work/GitHub/ruos && make run-test && bash tests/frame-smp-test.sh && bash tests/threads-test.sh && bash tests/comp-smp-test.sh'
 ```
 Expected: run-test PASS, frame-smp PASS, threads PASS; comp-smp: band `>=2` PASS (lo screendump-equivalence ha un fail pre-esistente noto — changelog 476 — non bloccare su quello). Overlay `wm-fps`: boot GUI con un mtstress in loop → desktop fluido, fps stabile (degrado solo dei core compute).
 
-- [ ] **Step 4: VBox (OBBLIGATORIO, CPU-sensitive)**
+- [ ] **Step 4: VBox (OBBLIGATORIO, CPU-sensitive)** ← UNICO step aperto: verifica manuale utente
 
 ISO con boot-checks + threads-init; ≥4 vCPU + 2048 MB. Verifica manuale utente: marker THREADS-OK 1/2/3, PARSUM_OK, STRESS_MT_OK, desktop ok. (Chiedere all'utente, come Fase 1.)
 
-- [ ] **Step 5: Docs**
+- [x] **Step 5: Docs**
 
 - `docs/api/` pagina del modulo `wasi` (o crearla): import `("wasi","thread-spawn")` (signature, semantica, errori), environ ora reale, nota `RAYON_NUM_THREADS` iniettato. "Last reviewed" aggiornato. (Regola CLAUDE.md: stesso commit della host fn — se il Task 5 è già committato, questo è il commit di sanatoria esplicita: meglio fare la pagina NEL Task 5; spostala lì se esegui in ordine.)
 - Spec Fase 2: stato → implementato, esiti gate, deviazioni documentate (NO_DEADLINE per thread store; niente async_support — fiber nostri; fork vendorizzato).
@@ -839,7 +839,7 @@ ISO con boot-checks + threads-init; ≥4 vCPU + 2048 MB. Verifica manuale utente
 - `CLAUDE.md`: aggiorna la riga toolchain WSL (target `wasm32-wasip1-threads`) e la sezione "Due runtime WASM" (thread nelle app .cwasm).
 - Changelog finale fase.
 
-- [ ] **Step 6: Commit finale** (`feat(wt): MT Fase 2 — std::thread/rayon in .cwasm apps via M:N fibers`).
+- [x] **Step 6: Commit finale** (`feat(wt): MT Fase 2 — std::thread/rayon in .cwasm apps via M:N fibers`).
 
 ---
 

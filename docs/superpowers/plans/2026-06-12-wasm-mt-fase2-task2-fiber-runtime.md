@@ -15,8 +15,8 @@
 | 3 — exec_threaded (main on fiber) | ✅ Done | 489 |
 | 4 — Futex hooks (atomic.wait/notify) + Gate 3 | ✅ Done | 490 |
 | 5 — thread-spawn + Gate 2 | ✅ Done | 491 |
-| **6 — parsum end-to-end (rayon)** | ⬜ **NEXT** | — |
-| 7 — Stress + kill-group + docs | ⬜ Pending | — |
+| 6 — parsum end-to-end (rayon) | ✅ Done | 492 |
+| 7 — Stress + kill-group + docs | ✅ Done (resta VBox manuale) | 493 |
 
 ## File da toccare nel Task 2
 

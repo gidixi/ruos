@@ -14,7 +14,8 @@
          qemu-system-x86, python3, curl, git) — only the missing ones are
          installed;
       2. ensure the Rust toolchain: install rustup non-interactively if absent,
-         then add the wasm targets (wasm32-wasip1, wasm32-unknown-unknown). The
+         then add the wasm targets (wasm32-wasip1, wasm32-unknown-unknown,
+         wasm32-wasip1-threads). The
          pinned nightly + components come from rust-toolchain.toml automatically;
       3. ensure the ruos-desktop submodule (egui UI -> *.cwasm app windows):
          clones it on first run; an EXISTING checkout — and your local
@@ -237,7 +238,8 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 # The pinned nightly + components (rust-src, llvm-tools-preview) come from
 # rust-toolchain.toml automatically on first use; targets must be explicit.
-rustup target add wasm32-wasip1 wasm32-unknown-unknown
+# wasm32-wasip1-threads: tool threaded MT Fase 2 (parsum/mtstress).
+rustup target add wasm32-wasip1 wasm32-unknown-unknown wasm32-wasip1-threads
 
 echo "==> [3/5] git submodule (ruos-desktop -> egui app .cwasm)"
 git config --global --add safe.directory '*' >/dev/null 2>&1 || true

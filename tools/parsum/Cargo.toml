@@ -1,0 +1,14 @@
+[package]
+name = "parsum"
+version = "0.1.0"
+edition = "2021"
+
+# MT Fase 2 test tool: rayon su wasm32-wasip1-threads (thread = fiber M:N nel
+# kernel). RAYON_NUM_THREADS arriva dall'environ iniettato da exec_threaded.
+[dependencies]
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

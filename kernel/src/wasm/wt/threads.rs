@@ -40,6 +40,8 @@ struct ThreadFiber {
     /// Gruppo dell'app threaded; `None` per i fiber host-only (self-test).
     group: Option<Arc<ThreadGroup>>,
     tid: u32,
+    /// pid in `proc` (ps/kill); 0 = non registrato (main, gate, self-test).
+    pid: u32,
     /// Chiave futex su cui il fiber vuole parcheggiarsi (0 = nessuna).
     /// Scritta dal fiber in `park_current`, letta da `run_one` dopo il suspend.
     park_key: usize,
@@ -77,6 +79,8 @@ pub struct ThreadGroup {
     pub base_args: Vec<Vec<u8>>,
     /// Environ "K=V" del gruppo (RAYON_NUM_THREADS iniettato da exec_threaded).
     pub env: Vec<Vec<u8>>,
+    /// Nome base per `ps` (argv[0]): i thread compaiono come "nome#tid".
+    pub base_name: alloc::string::String,
 }
 
 /// Run-queue globale dei fiber runnable. Per-core sharding = ottimizzazione
@@ -139,6 +143,13 @@ pub fn run_one(cpu: u32) -> bool {
         Some(f) => f,
         None => return false,
     };
+    // Kill-group: i fiber runnable di un gruppo avvelenato muoiono al take
+    // (i parcheggiati li rimuove kill_group_waiters; quelli in esecuzione
+    // muoiono al prossimo park — vedi il branch Err sotto).
+    if f.group.as_ref().map_or(false, |g| g.poisoned.load(Ordering::SeqCst)) {
+        finish_fiber(f, 134);
+        return true;
+    }
     // TLS swap: dentro va il TLS del fiber (activation chain sospesa nel suo
     // stack), fuori si ripristina quello del core. Vedi doc-comment in testa.
     let prev = crate::wasm::wt::platform::tls_raw_get();
@@ -154,6 +165,12 @@ pub fn run_one(cpu: u32) -> bool {
         // Suspend: park richiesto da park_current (o spurio) — è QUI che la
         // Box si sposta in WAITQ, mai dentro il fiber (vedi doc-comment).
         Err(()) => {
+            // Kill-group: un fiber che si parcheggia in un gruppo ormai
+            // avvelenato muore qui invece di restare in WAITQ per sempre.
+            if f.group.as_ref().map_or(false, |g| g.poisoned.load(Ordering::SeqCst)) {
+                finish_fiber(f, 134);
+                return true;
+            }
             let key = f.park_key;
             if key == 0 {
                 // Suspend senza park registrato: resta runnable.
@@ -189,6 +206,9 @@ pub fn run_one(cpu: u32) -> bool {
 
 /// Chiusura di un fiber terminato (return o trap già tradotta in exit code).
 fn finish_fiber(f: Box<ThreadFiber>, code: i32) {
+    if f.pid != 0 {
+        crate::proc::unregister(f.pid);
+    }
     if let Some(g) = f.group.as_ref() {
         if f.tid == 0 {
             *g.exit.lock() = Some(code);
@@ -199,7 +219,34 @@ fn finish_fiber(f: Box<ThreadFiber>, code: i32) {
             crate::executor::wake_core(g.waiter_core.load(Ordering::SeqCst));
         }
     }
-    // (Task 6: unregister da proc/ps.)
+}
+
+/// Kill-group: rimuove e droppa i waiter parcheggiati di un gruppo avvelenato.
+/// Chiamata da chi setta `poisoned` (trap/instantiate-fail in spawn_fiber);
+/// i runnable muoiono al take in run_one, gli in-esecuzione al prossimo park.
+/// Drop di un fiber sospeso = lo stack si libera, le Store dentro muoiono
+/// senza Drop (accettato: il gruppo è morto, exit 134).
+fn kill_group_waiters(g: &Arc<ThreadGroup>) {
+    let mut killed: Vec<Box<ThreadFiber>> = Vec::new();
+    for sh in WAITQ.iter() {
+        let mut s = sh.0.lock();
+        let mut i = 0;
+        while i < s.waiters.len() {
+            let same = s.waiters[i].2.group.as_ref().map_or(false, |fg| Arc::ptr_eq(fg, g));
+            if same {
+                let (_, d, f) = s.waiters.swap_remove(i);
+                if d != u64::MAX {
+                    TIMED_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                }
+                killed.push(f);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for f in killed {
+        finish_fiber(f, 134);
+    }
 }
 
 /// Pubblica l'handle Suspend del fiber corrente (chiamata come PRIMA cosa dal
@@ -447,6 +494,10 @@ pub fn exec_threaded(
     let ncomp = total.saturating_sub(2).max(1);
     let mut env: Vec<Vec<u8>> = Vec::new();
     env.push(alloc::format!("RAYON_NUM_THREADS={}", ncomp).into_bytes());
+    // Nome base per ps: argv[0] (i thread spawnati compaiono come "nome#tid").
+    let base_name = args.first()
+        .map(|a| alloc::string::String::from_utf8_lossy(a).into_owned())
+        .unwrap_or_else(|| alloc::string::String::from("wasm-threads"));
     let cpu = crate::cpu::cpu_id();
     let group = Arc::new(ThreadGroup {
         module: module.clone(),
@@ -459,6 +510,7 @@ pub fn exec_threaded(
         waiter_core: AtomicU32::new(cpu),
         base_args: args,
         env,
+        base_name,
     });
     // main = tid 0
     spawn_fiber(group.clone(), 0, 0, pts);
@@ -467,17 +519,30 @@ pub fn exec_threaded(
     // inline su 1-2 core) — se non drenasse, su un sistema con UN solo core
     // abilitato il main fiber non girerebbe mai (deadlock). Gli altri core
     // ComputeApp rubano comunque dalla RUNQ globale dentro run_core.
+    let mut reaping = false;
     loop {
+        // Semantica processo (come wasmtime-wasi-threads upstream / Linux):
+        // quando il MAIN esce muore l'intero gruppo. Senza questo i worker
+        // rayon — parcheggiati per sempre in attesa di lavoro — terrebbero
+        // live > 0 e l'exec non ritornerebbe mai.
+        if !reaping && group.exit.lock().is_some() {
+            reaping = true;
+            group.poisoned.store(true, Ordering::SeqCst);
+            kill_group_waiters(&group);
+        }
         if group.live.load(Ordering::SeqCst) == 0 {
             let code = *group.exit.lock();
             return code.unwrap_or(if group.poisoned.load(Ordering::SeqCst) { 134 } else { 0 });
         }
+        // Heartbeat: questo loop sostituisce run_core sul core per tutta la
+        // vita dell'app — senza bump il supervisor lo crederebbe muto.
+        crate::sched::cpustat::heartbeat_bump(cpu as usize);
         if core_allowed(cpu) {
             // Anche il riscatto timeout: su 1-2 core (BSP inline) nessun
             // run_core gira mentre questo loop blocca il core.
             expire_timeouts();
             while run_one(cpu) {}
-            if group.live.load(Ordering::SeqCst) == 0 {
+            if group.live.load(Ordering::SeqCst) == 0 || group.exit.lock().is_some() {
                 continue;
             }
         }
@@ -499,8 +564,16 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
             crate::kprintln!("ruos: wt spawn_fiber stack: {:?}", e);
             group.poisoned.store(true, Ordering::SeqCst);
             group.live.fetch_sub(1, Ordering::SeqCst);
+            kill_group_waiters(&group);
             return;
         }
+    };
+    // ps: i thread spawnati compaiono come "nome#tid"; il main (tid 0) è già
+    // il processo registrato dal path exec della shell — niente doppione.
+    let pid = if tid > 0 {
+        crate::proc::register(alloc::format!("{}#{}", group.base_name, tid))
+    } else {
+        0
     };
     let g = group.clone();
     let fiber = match wasmtime_internal_fiber::Fiber::new(stack, move |_: (), sus| -> i32 {
@@ -530,6 +603,7 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
             Err(e) => {
                 crate::kprintln!("ruos: wt thread tid={} instantiate: {:?}", tid, e);
                 g.poisoned.store(true, Ordering::SeqCst);
+                kill_group_waiters(&g);
                 return 126;
             }
         };
@@ -548,8 +622,11 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
             Err(e) => match store.data().exit {
                 Some(c) => c, // proc_exit trappa per srotolare: non è un errore
                 None => {
-                    crate::bwarn!("wt", "thread tid={} trap: {:?} — group poisoned", tid, e);
+                    crate::bwarn!("wt", "thread tid={} trap: {:?} — kill group", tid, e);
                     g.poisoned.store(true, Ordering::SeqCst);
+                    // Uccidi subito i fratelli parcheggiati (i runnable muoiono
+                    // al take, gli in-esecuzione al prossimo park).
+                    kill_group_waiters(&g);
                     134
                 }
             },
@@ -573,6 +650,7 @@ fn spawn_fiber(group: Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<us
         suspend_ptr: AtomicUsize::new(0),
         group: Some(group),
         tid,
+        pid,
         park_key: 0,
         park_deadline: 0,
     }));
@@ -655,6 +733,7 @@ pub fn gate3_run(cwasm: &[u8]) -> bool {
         waiter_core: AtomicU32::new(cpu),
         base_args: Vec::new(),
         env: Vec::new(),
+        base_name: alloc::string::String::from("gate3"),
     });
     // waiter = tid 0: il suo valore di ritorno finisce in group.exit.
     spawn_fiber_export(group.clone(), 0, "waiter");
@@ -728,6 +807,7 @@ pub fn gate2_run(cwasm: &[u8]) -> bool {
         waiter_core: AtomicU32::new(cpu),
         base_args: Vec::new(),
         env: Vec::new(),
+        base_name: alloc::string::String::from("gate2"),
     });
     // main = tid 0 sull'export `run`; il thread tid 1 lo crea thread-spawn.
     spawn_fiber_export(group.clone(), 0, "run");
@@ -806,6 +886,7 @@ fn spawn_fiber_export(group: Arc<ThreadGroup>, tid: u32, export: &'static str) {
         suspend_ptr: AtomicUsize::new(0),
         group: Some(group),
         tid,
+        pid: 0,
         park_key: 0,
         park_deadline: 0,
     }));
@@ -856,6 +937,7 @@ pub fn fiber_self_test() -> (bool, u32, u32) {
         suspend_ptr: AtomicUsize::new(0),
         group: None,
         tid: 0,
+        pid: 0,
         park_key: 0,
         park_deadline: 0,
     }));

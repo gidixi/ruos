@@ -121,6 +121,19 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	@mkdir -p build
 	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
 
+# MT Fase 2: tool threaded (wasm32-wasip1-threads → thread = fiber M:N nel
+# kernel). parsum = rayon end-to-end; mtstress = Mutex conteso + kill-group.
+build/parsum.cwasm: tools/parsum/src/main.rs tools/parsum/Cargo.toml $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/parsum && \
+		cargo build --release --target wasm32-wasip1-threads
+	$(WT_PRECOMPILE) tools/parsum/target/wasm32-wasip1-threads/release/parsum.wasm build/parsum.cwasm
+build/mtstress.cwasm: tools/mtstress/src/main.rs tools/mtstress/Cargo.toml $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/mtstress && \
+		cargo build --release --target wasm32-wasip1-threads
+	$(WT_PRECOMPILE) tools/mtstress/target/wasm32-wasip1-threads/release/mtstress.wasm build/mtstress.cwasm
+
 # Boot-check AOT demos embedded in the kernel via include_bytes! (compiled ONLY
 # under the `boot-checks` feature). Regenerated into the source tree from their
 # .wat/.wasm inputs so the (large) .cwasm need not be committed.
@@ -274,7 +287,7 @@ build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml
 		-o build/rtop.component.wasm
 	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/parsum.cwasm build/mtstress.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -285,6 +298,8 @@ iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm b
 	# Stage dell'intero /bin in build/binstage, poi pack → bin.bgz (non loose).
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm build/binstage/; done
 	cp build/wtecho.cwasm build/binstage/wtecho.cwasm
+	cp build/parsum.cwasm build/binstage/parsum.cwasm
+	cp build/mtstress.cwasm build/binstage/mtstress.cwasm
 	cp build/about.cwasm build/binstage/about.cwasm
 	cp build/files.cwasm build/binstage/files.cwasm
 	cp build/terminal.cwasm build/binstage/terminal.cwasm

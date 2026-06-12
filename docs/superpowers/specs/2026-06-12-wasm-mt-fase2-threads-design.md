@@ -1,7 +1,7 @@
 # Fase 2 — wasm-threads MVP: fiber cooperativi M:N (design)
 
 **Data:** 2026-06-12
-**Stato:** approvato (brainstorming), da pianificare — NON ancora implementato
+**Stato:** ✅ IMPLEMENTATO (2026-06-12, changelog 486-493 — esiti in fondo, §13)
 **Prerequisito:** Fase 1 (compositor parallelo + audit host fn) conclusa — changelog 476.
 **Ri-specifica** l'outline §Fase 2 di
 `docs/superpowers/specs/2026-06-12-wasm-multithreading-roadmap-design.md`.
@@ -179,6 +179,36 @@ Verifica su QEMU `-smp 4 -m 2048` e su **VBox** (regola CPU-sensitive).
 - Thread nei tool wasmi (l'interprete non ha shared memory; i CLI restano
   single-thread — chi vuole parallelismo scrive un'app `.cwasm`).
 - Component model multi-thread.
+
+## 13. Esiti implementazione (2026-06-12)
+
+Implementata task-by-task (piano
+`docs/superpowers/plans/2026-06-12-wasm-mt-fase2-threads.md`, changelog
+486-493, commit su main da 9df5003 in poi). Tutti i gate verdi:
+
+- `THREADS-OK 1` (SharedMemory + atomics no_std), `THREADS-FIBER-OK`
+  (suspend/resume cross-core), `THREADS-OK 3` (wait sospende il fiber, notify
+  IPI), `THREADS-OK 2` (thread-spawn = fresh Instance su stessa memoria) — su
+  QEMU `-smp 4` E `-smp 1` (fallback BSP). Test: `make run-threads-test`.
+- End-to-end reale: `parsum` (rayon, `PARSUM_OK threads=N`) e `mtstress`
+  (Mutex std conteso, `STRESS_MT_OK count=400000` esatto) su
+  `wasm32-wasip1-threads`; `mtstress trap` → kill-group exit 134, shell viva.
+
+Deviazioni dalla spec (documentate nei changelog):
+
+1. **Niente `async_support`** (§1 punto 3): wasmtime resta sync; ogni guest
+   threaded gira in un fiber NOSTRO (`wasmtime-internal-fiber`, backend
+   no_std). L'hook futex sospende il fiber — stesso requisito comportamentale,
+   meno superficie.
+2. **Epoch deadline dei thread store = `NO_DEADLINE_TICKS`** (§7): una
+   deadline assoluta trapperebbe al resume dopo un park lungo. Il kill-group
+   su trap resta (un thread che trappa uccide il gruppo: runnable al take,
+   parcheggiati via `kill_group_waiters`, in-esecuzione al prossimo park).
+3. **Pre-filtro timeout = contatore `TIMED_WAITERS`**, non `EARLIEST_DEADLINE`
+   atomico (race insert-vs-rescan con deadline perse).
+4. **Anti-lost-wakeup = crediti per-shard** (notify che incrocia un park in
+   volo lascia un credito consumato da `run_one` prima dell'insert in WAITQ);
+   al più un wake spurio per chiave — il chiamante futex ricontrolla.
 - `MWAIT`. Scheduler preemptive (Fase 3, solo carta).
 
 ## 11. Test & verifica

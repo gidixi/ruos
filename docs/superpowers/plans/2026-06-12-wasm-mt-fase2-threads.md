@@ -827,7 +827,7 @@ wsl -d Ubuntu-22.04 -u root -e bash -c 'cd /mnt/w/Work/GitHub/ruos && make run-t
 ```
 Expected: run-test PASS, frame-smp PASS, threads PASS; comp-smp: band `>=2` PASS (lo screendump-equivalence ha un fail pre-esistente noto — changelog 476 — non bloccare su quello). Overlay `wm-fps`: boot GUI con un mtstress in loop → desktop fluido, fps stabile (degrado solo dei core compute).
 
-- [ ] **Step 4: VBox (OBBLIGATORIO, CPU-sensitive)** ← UNICO step aperto: verifica manuale utente
+- [x] **Step 4: VBox (OBBLIGATORIO, CPU-sensitive)** — superato: verifica manuale di Giuseppe direttamente su **HARDWARE REALE** (2026-06-12/13), esito "va molto bene, veramente fluido". Più forte del VBox richiesto. **FASE 2 CHIUSA.**
 
 ISO con boot-checks + threads-init; ≥4 vCPU + 2048 MB. Verifica manuale utente: marker THREADS-OK 1/2/3, PARSUM_OK, STRESS_MT_OK, desktop ok. (Chiedere all'utente, come Fase 1.)
 

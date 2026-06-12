@@ -42,6 +42,9 @@ wasi-threads di Rust, via wasi-sdk coi flag giusti.
   `PTHREAD_C_OK val=42 ret=123`, `THREADS_INIT_DONE` su QEMU -smp 6.
 - Gate boot-checks: 4/4 marker ok su -smp 4 E -smp 1.
 - `make run-test`: TEST_PASS.
+- **HARDWARE REALE** (verifica manuale Giuseppe, 2026-06-12/13): sistema
+  fluido coi wasm-thread attivi — chiude lo step CPU-sensitive del piano
+  (più forte del VBox richiesto).
 
 ## File toccati
 

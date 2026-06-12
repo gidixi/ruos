@@ -42,6 +42,7 @@ fn main() {
     // kernel's engine_config — flipping it invalidates every existing .cwasm
     // (see docs/api/README.md §".cwasm compatibility").
     config.epoch_interruption(true);
+    config.wasm_threads(true); // proposta threads: atomics nativi + shared memory (MT Fase 2)
     config.memory_reservation(256 << 20);
     config.memory_guard_size(0);
     // Runtime-only (not hashed): keep 0 here, the kernel sets its own.

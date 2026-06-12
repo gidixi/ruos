@@ -296,6 +296,7 @@ fn engine_config() -> wasmtime::Config {
     // invalida ogni .cwasm esistente, vedi docs/api/README.md §compatibilità
     // e spec 2026-06-11-wt-epoch-interruption-design).
     config.epoch_interruption(true);
+    config.wasm_threads(true); // deve combaciare con wt-precompile (regola deserialize)
     // memory_reservation > 0 forza il path MmapMemory (wasmtime memory.rs:
     // signals||guard||reservation||cow): la linear memory passa da
     // wasmtime_mmap_new → demand paging → FRAME allocator (RAM−heap), non più

@@ -126,6 +126,138 @@ pub struct Prim {
     pub idx1: u32,
 }
 
+// ---------------------------------------------------------------------------
+// WIRE CODEC — the single source of truth for the app↔kernel mesh byte layout.
+//
+// Layout (little-endian, packed, NO padding). ruos-window encodes these bytes
+// and the kernel decodes them; this module is authoritative byte-for-byte.
+//
+//   Vertex = 20 bytes:  x:f32, y:f32, u:f32, v:f32  (4×4 = 16 B) then color:u32 (4 B)
+//   Index  =  4 bytes:  u32
+//   Prim   = 32 bytes:  clip[0..4]:f32 (16 B), tex_id:u64 (8 B), idx0:u32 (4 B), idx1:u32 (4 B)
+//
+// NOTE: the design spec text mistakenly said Prim is "28 B"; the correct packed
+// size is 32 B (16 + 8 + 4 + 4). Use 32.
+//
+// We read/write fields EXPLICITLY via to_le_bytes/from_le_bytes — NEVER transmute
+// or repr(C) slice casts (alignment/padding hazards, and host endianness must not
+// leak into the wire format).
+// ---------------------------------------------------------------------------
+
+/// Wire size of one encoded `Vertex`, in bytes.
+pub const VERTEX_WIRE_SIZE: usize = 20;
+/// Wire size of one encoded index, in bytes.
+pub const INDEX_WIRE_SIZE: usize = 4;
+/// Wire size of one encoded `Prim`, in bytes (16 clip + 8 tex_id + 4 idx0 + 4 idx1).
+/// NOTE: 32, not the "28" erroneously stated in the design spec.
+pub const PRIM_WIRE_SIZE: usize = 32;
+
+/// Encode vertices to the canonical wire format: `VERTEX_WIRE_SIZE` (20) bytes each,
+/// fields little-endian in order `x, y, u, v, color`.
+pub fn encode_verts(verts: &[Vertex]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(verts.len() * VERTEX_WIRE_SIZE);
+    for vtx in verts {
+        out.extend_from_slice(&vtx.x.to_le_bytes());
+        out.extend_from_slice(&vtx.y.to_le_bytes());
+        out.extend_from_slice(&vtx.u.to_le_bytes());
+        out.extend_from_slice(&vtx.v.to_le_bytes());
+        out.extend_from_slice(&vtx.color.to_le_bytes());
+    }
+    out
+}
+
+/// Encode indices to the canonical wire format: `INDEX_WIRE_SIZE` (4) bytes each,
+/// little-endian `u32`.
+pub fn encode_indices(idx: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(idx.len() * INDEX_WIRE_SIZE);
+    for &i in idx {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out
+}
+
+/// Encode primitives to the canonical wire format: `PRIM_WIRE_SIZE` (32) bytes each,
+/// fields little-endian in order `clip[0..4], tex_id, idx0, idx1`.
+pub fn encode_prims(prims: &[Prim]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prims.len() * PRIM_WIRE_SIZE);
+    for p in prims {
+        out.extend_from_slice(&p.clip[0].to_le_bytes());
+        out.extend_from_slice(&p.clip[1].to_le_bytes());
+        out.extend_from_slice(&p.clip[2].to_le_bytes());
+        out.extend_from_slice(&p.clip[3].to_le_bytes());
+        out.extend_from_slice(&p.tex_id.to_le_bytes());
+        out.extend_from_slice(&p.idx0.to_le_bytes());
+        out.extend_from_slice(&p.idx1.to_le_bytes());
+    }
+    out
+}
+
+// --- decoders (kernel side; trust boundary: guest-controlled bytes → NEVER panic).
+// All use `chunks_exact(N)`, which yields only whole records — a trailing partial
+// record is silently dropped and we never index out of range.
+
+#[inline]
+fn le_f32(b: &[u8]) -> f32 {
+    // b is a slice of exactly 4 bytes from chunks_exact → try_into can't fail.
+    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Decode `floor(b.len() / VERTEX_WIRE_SIZE)` vertices from the wire format. A
+/// trailing partial record is dropped. Panic-free on any input.
+pub fn decode_verts(b: &[u8]) -> Vec<Vertex> {
+    let mut out = Vec::with_capacity(b.len() / VERTEX_WIRE_SIZE);
+    for c in b.chunks_exact(VERTEX_WIRE_SIZE) {
+        out.push(Vertex {
+            x: le_f32(&c[0..4]),
+            y: le_f32(&c[4..8]),
+            u: le_f32(&c[8..12]),
+            v: le_f32(&c[12..16]),
+            color: le_u32(&c[16..20]),
+        });
+    }
+    out
+}
+
+/// Decode `floor(b.len() / INDEX_WIRE_SIZE)` indices. Trailing partial dropped.
+/// Panic-free on any input.
+pub fn decode_indices(b: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(b.len() / INDEX_WIRE_SIZE);
+    for c in b.chunks_exact(INDEX_WIRE_SIZE) {
+        out.push(le_u32(c));
+    }
+    out
+}
+
+/// Decode `floor(b.len() / PRIM_WIRE_SIZE)` primitives. Trailing partial dropped.
+/// Panic-free on any input.
+pub fn decode_prims(b: &[u8]) -> Vec<Prim> {
+    let mut out = Vec::with_capacity(b.len() / PRIM_WIRE_SIZE);
+    for c in b.chunks_exact(PRIM_WIRE_SIZE) {
+        out.push(Prim {
+            clip: [
+                le_f32(&c[0..4]),
+                le_f32(&c[4..8]),
+                le_f32(&c[8..12]),
+                le_f32(&c[12..16]),
+            ],
+            tex_id: le_u64(&c[16..24]),
+            idx0: le_u32(&c[24..28]),
+            idx1: le_u32(&c[28..32]),
+        });
+    }
+    out
+}
+
 /// Texture atlas: RGBA8888 premultiplied, row-major.
 pub struct Atlas {
     pub w: u32,
@@ -359,6 +491,30 @@ impl Raster {
         )
     }
 
+    /// Decode the wire buffers then rasterize, returning `(canvas, dirty)`. This is
+    /// the kernel's SINGLE entry point: it takes raw guest-controlled bytes, decodes
+    /// them via the canonical codec, and renders.
+    ///
+    /// Panic-free on malformed input: truncated wire records are dropped by the
+    /// decoders (`chunks_exact`), and the raster path reached via `render` guards
+    /// out-of-range `idx0/idx1` ranges and index values (see `raster_band`), so a
+    /// `Prim` referencing vertices/indices past the decoded arrays is skipped rather
+    /// than panicking. These guards are no-ops for valid input (egui never emits an
+    /// out-of-range index), so the gui-core cross-check stays bit-identical.
+    pub fn render_wire(
+        &mut self,
+        verts: &[u8],
+        idx: &[u8],
+        prims: &[u8],
+        w: u32,
+        h: u32,
+    ) -> (&[u8], DirtyRect) {
+        let v = decode_verts(verts);
+        let i = decode_indices(idx);
+        let p = decode_prims(prims);
+        self.render(&v, &i, &p, w, h)
+    }
+
     pub fn canvas(&self) -> &[u8] {
         &self.canvas
     }
@@ -434,9 +590,20 @@ fn prim_meta(p: &Prim, verts: &[Vertex], idx: &[u32], iw: i32, ih: i32) -> PrimM
     mix(&mut hsh, id as u32);
     mix(&mut hsh, (id >> 32) as u32);
 
-    let tri_idx = &idx[p.idx0 as usize..p.idx1 as usize];
+    // Trust boundary: clamp the index range so the slice can never be out of bounds.
+    // No-op for valid input (egui always emits idx0 <= idx1 <= idx.len()), so the hash
+    // is unchanged for valid scenes and the cross-check stays bit-identical.
+    let lo = (p.idx0 as usize).min(idx.len());
+    let hi = (p.idx1 as usize).min(idx.len());
+    let tri_idx = if lo < hi { &idx[lo..hi] } else { &[][..] };
     for &i in tri_idx {
-        let v = &verts[i as usize];
+        // Skip an index value that exceeds verts.len() (malformed input) instead of
+        // panicking. No-op for valid input — egui indices are always in range.
+        let vi = i as usize;
+        if vi >= verts.len() {
+            continue;
+        }
+        let v = &verts[vi];
         mix(&mut hsh, v.x.to_bits());
         mix(&mut hsh, v.y.to_bits());
         mix(&mut hsh, v.u.to_bits());
@@ -540,11 +707,26 @@ pub fn raster_band(
             continue;
         }
         let tex = textures.get(&p.tex_id);
-        let tri_idx = &idx[p.idx0 as usize..p.idx1 as usize];
+        // Trust boundary (render_wire forwards guest-controlled idx0/idx1): clamp the
+        // half-open index range to `idx.len()` so the slice can NEVER be out of range.
+        // No-op for valid input — egui always emits idx0 <= idx1 <= idx.len().
+        let lo = (p.idx0 as usize).min(idx.len());
+        let hi = (p.idx1 as usize).min(idx.len());
+        if lo >= hi {
+            continue;
+        }
+        let tri_idx = &idx[lo..hi];
         for tri in tri_idx.chunks_exact(3) {
-            let v0 = &verts[tri[0] as usize];
-            let v1 = &verts[tri[1] as usize];
-            let v2 = &verts[tri[2] as usize];
+            // Trust boundary: an index value may exceed verts.len() with malformed
+            // wire input → skip the triangle instead of panicking. No-op for valid
+            // input — egui indices are always < verts.len().
+            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            if a >= verts.len() || b >= verts.len() || c >= verts.len() {
+                continue;
+            }
+            let v0 = &verts[a];
+            let v1 = &verts[b];
+            let v2 = &verts[c];
             raster_tri(band, (cx0, cy0, cx1, cy1), tex, v0, v1, v2);
         }
     }

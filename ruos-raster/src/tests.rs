@@ -212,6 +212,119 @@ fn texture_patch_forces_full_damage() {
     assert_eq!((d3.w, d3.h), (64, 64), "un patch texture deve forzare full damage");
 }
 
+/// A richer multi-primitive scene (wallpaper + several colored rects + a
+/// semi-transparent rect), built on the wire structs. Mirrors the spirit of
+/// gui-core's `rich_scene` so the wire roundtrip exercises many prims.
+fn rich_scene(w: f32, h: f32) -> (Vec<Vertex>, Vec<u32>, Vec<Prim>) {
+    let clip = [0.0, 0.0, w, h];
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let mut prims = Vec::new();
+    let (b0, b1) = rect_mesh(&mut verts, &mut idx, 0.0, 0.0, w, h, rgba(10, 20, 30, 255));
+    prims.push(Prim { clip, tex_id: 0, idx0: b0, idx1: b1 });
+    for i in 0..6u32 {
+        let x = 4.0 + i as f32 * 9.0;
+        let (r0, r1) = rect_mesh(
+            &mut verts,
+            &mut idx,
+            x,
+            x,
+            x + 7.0,
+            x + 30.0,
+            rgba(200, (30 + i * 20) as u8, 80, 255),
+        );
+        prims.push(Prim { clip, tex_id: 0, idx0: r0, idx1: r1 });
+    }
+    let (s0, s1) = rect_mesh(&mut verts, &mut idx, 8.0, 10.0, w - 8.0, 50.0, rgba(60, 30, 90, 128));
+    prims.push(Prim { clip, tex_id: 0, idx0: s0, idx1: s1 });
+    (verts, idx, prims)
+}
+
+/// encode∘decode == identity for the raster: encode the typed mesh to the wire
+/// format, `render_wire` it, and assert the canvas is byte-identical to
+/// `render`ing the typed mesh directly. Proves the codec is lossless end-to-end.
+#[test]
+fn wire_roundtrip_matches_typed_render() {
+    for (verts, idx, prims) in [
+        scene(20.0, 20.0, rgba(255, 0, 0, 255)),
+        rich_scene(64.0, 64.0),
+    ] {
+        // Reference: typed render.
+        let mut typed = Raster::new(CLEAR);
+        white_texel(&mut typed);
+        let (typed_canvas, typed_dirty) = typed.render(&verts, &idx, &prims, 64, 64);
+        let typed_data = typed_canvas.to_vec();
+
+        // Port: encode to wire bytes, then render_wire.
+        let vb = encode_verts(&verts);
+        let ib = encode_indices(&idx);
+        let pb = encode_prims(&prims);
+        assert_eq!(vb.len(), verts.len() * VERTEX_WIRE_SIZE);
+        assert_eq!(ib.len(), idx.len() * INDEX_WIRE_SIZE);
+        assert_eq!(pb.len(), prims.len() * PRIM_WIRE_SIZE);
+
+        let mut wire = Raster::new(CLEAR);
+        white_texel(&mut wire);
+        let (wire_canvas, wire_dirty) = wire.render_wire(&vb, &ib, &pb, 64, 64);
+
+        assert_eq!(wire_dirty, typed_dirty, "wire dirty != typed dirty");
+        assert_eq!(
+            wire_canvas, typed_data.as_slice(),
+            "render_wire canvas != render(typed) canvas — codec is lossy"
+        );
+    }
+}
+
+/// Decoders are panic-free on a roundtrip of well-formed data too.
+#[test]
+fn codec_roundtrip_is_identity() {
+    let (verts, idx, prims) = rich_scene(64.0, 64.0);
+    let dv = decode_verts(&encode_verts(&verts));
+    let di = decode_indices(&encode_indices(&idx));
+    let dp = decode_prims(&encode_prims(&prims));
+    assert_eq!(dv.len(), verts.len());
+    assert_eq!(di.len(), idx.len());
+    assert_eq!(dp.len(), prims.len());
+    for (a, b) in verts.iter().zip(dv.iter()) {
+        assert_eq!((a.x, a.y, a.u, a.v, a.color), (b.x, b.y, b.u, b.v, b.color));
+    }
+    assert_eq!(idx, di);
+    for (a, b) in prims.iter().zip(dp.iter()) {
+        assert_eq!((a.clip, a.tex_id, a.idx0, a.idx1), (b.clip, b.tex_id, b.idx0, b.idx1));
+    }
+}
+
+/// Trust boundary: decoding + rendering guest-controlled GARBAGE bytes must NEVER
+/// panic. Truncated wire records are dropped; out-of-range idx0/idx1 and index
+/// values referencing past the vertex array are guarded in the raster path.
+#[test]
+fn decode_is_panic_free_on_garbage() {
+    // Truncated / nonsense buffers (not multiples of the record sizes).
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    let (canvas, _dirty) = r.render_wire(&[1, 2, 3], &[9, 9, 9, 9, 9], &[0xff; 10], 16, 16);
+    assert_eq!(canvas.len(), 16 * 16 * 4, "should still produce a canvas");
+
+    // Well-formed records, but a prim with idx0/idx1 out of range AND indices that
+    // point past the (empty) vertex array → must be skipped, not panic.
+    let verts: Vec<Vertex> = Vec::new(); // no vertices at all
+    let idx: Vec<u32> = vec![0, 1, 2, 99, 100, 101];
+    let prims = vec![
+        // idx range entirely past idx.len()
+        Prim { clip: [0.0, 0.0, 16.0, 16.0], tex_id: 0, idx0: 100, idx1: 200 },
+        // idx range valid but indices reference missing vertices
+        Prim { clip: [0.0, 0.0, 16.0, 16.0], tex_id: 0, idx0: 0, idx1: 6 },
+        // inverted range (idx0 > idx1)
+        Prim { clip: [0.0, 0.0, 16.0, 16.0], tex_id: 0, idx0: 5, idx1: 2 },
+    ];
+    let mut r2 = Raster::new(CLEAR);
+    white_texel(&mut r2);
+    let (vb, ib, pb) = (encode_verts(&verts), encode_indices(&idx), encode_prims(&prims));
+    let (canvas2, _) = r2.render_wire(&vb, &ib, &pb, 16, 16);
+    // Nothing was drawable → everything stays clear (no panic, no stale read).
+    assert_eq!(pixel(canvas2, 16, 8, 8), CLEAR);
+}
+
 /// Trust boundary: malformed texture input (guest-controlled dims) must NEVER
 /// panic — it is dropped. Mirrors what the kernel host fn would forward.
 #[test]

@@ -35,7 +35,7 @@ cp "$KEY" /tmp/ruos_id && chmod 600 /tmp/ruos_id
 
 rm -f "$SERIAL" "$CLIENT"
 timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+  -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22 \
   -device virtio-net-pci,netdev=net0 \
   -drive file="$DISK",format=raw,if=none,id=disk0 \

@@ -140,7 +140,24 @@ pub fn commit_fault(cr2: u64, irqs_were_on: bool) -> bool {
 
     let frame = match allocate_frame() {
         Some(f) => f,
-        None => return false, // genuine frame exhaustion → fall through to panic
+        None => {
+            // Esaurimento dei frame fisici DURANTE un demand-commit. Prima
+            // questo ritornava false → l'handler #PF faceva halt() del SOLO
+            // core faulting: morte silenziosa, il desktop zoppicava su meno
+            // core e ogni tool lanciato su quel core si piantava (diagnosi
+            // pessima). Ora panica forte e diagnosticabile: l'OOM è una
+            // condizione globale, non un problema di un core. Causa tipica:
+            // RAM insufficiente per l'heap fisso (HEAP_SIZE) + il working set
+            // wasm demand-paged — vedi heap.rs (richiede ≥ ~2 GiB).
+            let fc = crate::memory::frame_counts();
+            panic!(
+                "wasm linear-memory OOM: out of physical frames committing a \
+                 demand page at cr2={:#x} (frames total={} used={} free={}). \
+                 The machine has too little RAM for the heap + wasm working set \
+                 (need ~2 GiB; see kernel/src/memory/heap.rs).",
+                cr2, fc.total, fc.used, fc.free
+            );
+        }
     };
     let phys = frame.start_address();
     // Zero via the frame's HHDM alias (always kernel-writable) so we can map the

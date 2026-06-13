@@ -24,7 +24,7 @@ killq; sleep 1
 dd if=/dev/zero of="$IMG" bs=1M count=512 status=none
 make iso INIT_SCRIPT=user-bin/m2b2-init.sh > build/m2b2-iso.log 2>&1 || { echo TEST_FAIL_ISO; tail -20 build/m2b2-iso.log; exit 1; }
 # --- Phase 1: install (ISO boot + blank SATA disk) ---
-timeout 220 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom build/os.iso -serial stdio -display none -no-reboot -m 1024 -device qemu-xhci \
+timeout 220 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom build/os.iso -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
   -drive file="$IMG",format=raw,if=none,id=d0 -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0 > "$S" 2>&1 & QP=$!
 for _ in $(seq 1 100); do grep -qF "install: ok" "$S" && break; kill -0 $QP 2>/dev/null||break; sleep 2; done
 killq; cp "$S" build/serial.m2b2p1.log
@@ -36,7 +36,7 @@ timeout 150 qemu-system-x86_64 -machine q35 -cpu max \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
   -drive if=pflash,format=raw,file=build/ovmf_vars.fd \
   -drive file="$IMG",format=raw,if=none,id=d0 -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0 \
-  -serial stdio -display none -no-reboot -m 1024 -device qemu-xhci > "$S" 2>&1 & QP=$!
+  -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci > "$S" 2>&1 & QP=$!
 # Wait for the init script's LAST marker (`m2b2-installed`), not the kernel-level
 # `mnt mounted FAT`: the kernel mounts /mnt (~T+1.0s) well before the executor
 # spawns the shell that runs init (~T+1.5s), so keying on `mnt mounted FAT` would

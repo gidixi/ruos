@@ -26,7 +26,7 @@ rm -f "$SERIAL" "$QMP"
 # Nested USB topology: xHCI (id=xhci -> bus xhci.0), a hub on controller port 1,
 # and a keyboard behind that hub on hub port 1 (port "1.1").
 timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 \
+  -serial stdio -display none -no-reboot -m 2048 \
   -device qemu-xhci,id=xhci \
   -device usb-hub,id=h1,bus=xhci.0,port=1 \
   -device usb-kbd,id=k1,bus=xhci.0,port=1.1 \

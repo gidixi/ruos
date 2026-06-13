@@ -37,7 +37,7 @@ rm -f "$SERIAL" "$CLIENT"
 
 # Boot with -smp 4 so a GuiCompositor AP (cpu 1) exists, and forward SSH port.
 timeout 120 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+  -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22 \
   -device virtio-net-pci,netdev=net0 \
   -drive file="$DISK",format=raw,if=none,id=disk0 \

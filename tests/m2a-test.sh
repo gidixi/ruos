@@ -10,7 +10,7 @@ IMG=build/m2a-disk.img; S=build/serial.log
 killq(){ ps -eo pid,comm | awk '/qemu-system/{print $1}' | while read p; do kill -9 "$p" 2>/dev/null||true; done; }
 boot(){ # $1=timeout secs ; boots build/os.iso with $IMG as the only AHCI disk
   timeout "$1" qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom build/os.iso \
-    -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+    -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
     -drive file="$IMG",format=raw,if=none,id=d0 -device ahci,id=ahci \
     -device ide-hd,drive=d0,bus=ahci.0 > "$S" 2>&1 & QP=$!; }
 waitfor(){ # $1=token $2=tries(2s each)

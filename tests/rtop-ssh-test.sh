@@ -38,7 +38,7 @@ rm -f "$SERIAL" "$CLIENT"
 # file-redirected stdout is fully buffered — the log vanished on kill -9.
 # The file chardev writes through, so the serial log survives the teardown.
 timeout 70 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -boot d -cdrom "$ISO" \
-  -serial file:"$SERIAL" -display none -no-reboot -m 1024 -device qemu-xhci \
+  -serial file:"$SERIAL" -display none -no-reboot -m 2048 -device qemu-xhci \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22 \
   -device virtio-net-pci,netdev=net0 \
   -drive file="$DISK",format=raw,if=none,id=disk0 \

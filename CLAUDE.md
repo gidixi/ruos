@@ -111,6 +111,13 @@ wsl -d Ubuntu -u root -e bash -c 'cd /mnt/e/MinimalOS/BasicOperatingSystem && <c
   `git config --global --add safe.directory '*'` (dubious-ownership).
 - **Build:** `make iso` dalla root del repo (clona Limine v11.4.1-binary la prima
   volta, builda kernel + tool WASM + desktop egui + `.cwasm` AOT, assembla ISO).
+- **RAM minima `-m 2048` (OBBLIGATORIO col desktop).** L'heap kernel è FISSO a
+  768 MiB (`memory/heap.rs`); col compositor su (init.sh lancia `compositor`) il
+  working set wasm demand-paged delle finestre egui supera i frame liberi sotto
+  ~1.5 GiB → la `commit_fault` non trova un frame fisico e **panica** (`wasm
+  linear-memory OOM`, prima era un halt SILENZIOSO del core faulting). Tutti i
+  target Makefile e i test in `tests/` usano `-m 2048`. Booti con meno RAM solo
+  per testare l'OOM.
 - **Test:** `make run-test` → boot headless con seriale a stdio, asserisce la
   stringa di successo (vedi `Makefile` variabile `HELLO`). Self-test in-boot con
   `make iso CARGO_FEATURES=boot-checks`.

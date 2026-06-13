@@ -51,7 +51,7 @@ dd if="$FAT" of="$IMG" bs=512 seek="$DLBA" conv=notrunc status=none
 make iso INIT_SCRIPT=user-bin/dm-init.sh > build/dm-iso.log 2>&1 \
   || { echo TEST_FAIL_ISO; tail -20 build/dm-iso.log; exit 1; }
 timeout 180 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom build/os.iso \
-  -serial stdio -display none -no-reboot -m 1024 -device qemu-xhci \
+  -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
   -drive file="$IMG",format=raw,if=none,id=d0 -device ahci,id=ahci \
   -device ide-hd,drive=d0,bus=ahci.0 > "$S" 2>&1 & QP=$!
 for _ in $(seq 1 80); do

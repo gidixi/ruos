@@ -20,7 +20,7 @@ sleep 1
 rm -f "$SERIAL" "$QMP"
 
 timeout 60 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 \
+  -serial stdio -display none -no-reboot -m 2048 \
   -device qemu-xhci -device usb-kbd \
   -qmp unix:$QMP,server,nowait > "$SERIAL" 2>&1 &
 QP=$!

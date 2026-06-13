@@ -19,7 +19,7 @@ printf 'gpt-persist-ok\n' > build/marker.txt
 mcopy -o -i build/data.fat build/marker.txt ::/GPTHELLO.TXT
 dd if=build/data.fat of="$IMG" bs=512 seek="$DLBA" conv=notrunc status=none
 timeout 120 qemu-system-x86_64 -machine q35 -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 -device qemu-xhci \
+  -serial stdio -display none -no-reboot -m 2048 -device qemu-xhci \
   -drive file="$IMG",format=raw,if=none,id=disk0 \
   -device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 > "$SERIAL" 2>&1 &
 QP=$!

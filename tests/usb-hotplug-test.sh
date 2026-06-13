@@ -29,7 +29,7 @@ rm -f "$SERIAL" "$QMP"
 # even though the USB keyboard is gone — masking USB teardown. Disabling PS/2
 # isolates the USB HID path so this test actually gates USB add/remove.
 timeout 60 qemu-system-x86_64 -machine q35,i8042=off -cpu max -boot d -cdrom "$ISO" \
-  -serial stdio -display none -no-reboot -m 512 \
+  -serial stdio -display none -no-reboot -m 2048 \
   -device qemu-xhci,id=xhci \
   -qmp unix:$QMP,server,nowait > "$SERIAL" 2>&1 &
 QP=$!

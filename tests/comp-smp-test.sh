@@ -33,7 +33,7 @@ boot_and_shot() {
   local iso="$1" out="$2" slog="${3:-/dev/null}"
   rm -f "$out" "$QMP"
   # -m 2048: HEAP_SIZE bumped to 768 MiB (memory/heap.rs) needs a contiguous
-  # USABLE region ≥ 768 MiB; -m 512 fails HeapInit("no usable region"). Match the
+  # USABLE region ≥ 768 MiB; -m 2048 fails HeapInit("no usable region"). Match the
   # GUI run target (the JS-viewer heap bump that left this script stale).
   timeout 180 qemu-system-x86_64 -machine q35,accel=kvm:tcg -cpu max -smp 4 \
     -cdrom "$iso" -serial "file:$slog" -display none -no-reboot -m 2048 \

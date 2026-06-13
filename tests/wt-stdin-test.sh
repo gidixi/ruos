@@ -27,7 +27,7 @@ make iso ISO="$ISO" INIT_SCRIPT=user-bin/wtstdin-init.sh > build/wtstdin-iso.log
 
 echo "[wt-stdin] booting -smp 4 (wtreadline blocks on stdin)..."
 rm -f "$LOG"
-timeout 40 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -m 1024 -cdrom "$ISO" \
+timeout 40 qemu-system-x86_64 -machine q35 -cpu max -smp 4 -m 2048 -cdrom "$ISO" \
   -serial file:"$LOG" -display none -no-reboot -device qemu-xhci >/dev/null 2>&1
 for pid in $(pgrep -f 'qemu-system-x86_64'); do kill -9 "$pid" 2>/dev/null || true; done
 

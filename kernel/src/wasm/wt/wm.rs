@@ -995,7 +995,7 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
     // wm.commit_mesh(vp, vl, ip, il, pp, pl, w, h) -> 0/err: copy this frame's
     // tessellated mesh into the window's kernel buffers. vp/vl = vertices ptr/len,
     // ip/il = indices ptr/len, pp/pl = prims ptr/len — raw wire bytes (§5 of the
-    // kernel-side-raster spec: Vertex 20 B, Index u32, Prim 28 B). The kernel parses
+    // kernel-side-raster spec: Vertex 20 B, Index u32, Prim 32 B). The kernel parses
     // + rasterizes them in a LATER phase; here it only COPIES the three buffers,
     // marks the window mesh-new (mesh_dirty) and mesh-mode. The AP raster cores read
     // these kernel-owned buffers, never the guest linear memory (multi-core /

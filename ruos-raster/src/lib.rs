@@ -518,6 +518,17 @@ impl Raster {
     pub fn canvas(&self) -> &[u8] {
         &self.canvas
     }
+
+    /// Disjoint-borrow accessor for EXTERNAL band-parallel raster: the kernel splits
+    /// the returned canvas into disjoint row bands and calls `raster_band` per band
+    /// across its SMP pool. Returns `(canvas RGBA premultiplied, width px, textures,
+    /// clear)`. Call AFTER `plan_damage` (which (re)allocates/sizes the canvas to
+    /// `w*h*4`). The decoded `verts`/`idx`/`prims` for `raster_band` come from
+    /// `decode_*` on the caller side; `textures` here is the live atlas map.
+    pub fn raster_parts_mut(&mut self) -> (&mut [u8], i32, &BTreeMap<u64, Atlas>, [u8; 4]) {
+        let Raster { canvas, textures, cw, clear, .. } = self;
+        (canvas.as_mut_slice(), *cw as i32, textures, *clear)
+    }
 }
 
 /// Mutable view of canvas rows `[y0, y1)` (RGBA premultiplied), row-major, `width`

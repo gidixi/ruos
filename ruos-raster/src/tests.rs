@@ -345,3 +345,46 @@ fn malformed_texture_does_not_panic() {
     r.set_texture(4, Some((1, 1)), 4, 4, &[7u8; 64]); // doesn't fit 2×2
     assert_eq!(r.textures.get(&4).unwrap().px, before, "out-of-fit patch must be dropped");
 }
+
+/// EXTERNAL band-parallel raster — exactly the kernel's pattern: `plan_damage`, then
+/// split the canvas into disjoint row bands and call `raster_band` per band (the
+/// kernel runs these on its SMP pool). The result MUST equal the serial `render_wire`
+/// byte-for-byte. This guards the kernel's band-dispatch contract from the host side.
+#[test]
+fn external_band_split_matches_render_wire() {
+    let (v, i, p) = scene(20.0, 20.0, rgba(200, 120, 40, 255));
+
+    // Serial reference (encode → render_wire → decode+render, one band).
+    let mut ser = Raster::new(CLEAR);
+    white_texel(&mut ser);
+    let (sc, _) = ser.render_wire(
+        &encode_verts(&v), &encode_indices(&i), &encode_prims(&p), 64, 64);
+    let ser_canvas = sc.to_vec();
+
+    // External band split over 3 disjoint bands of the damage rows.
+    let mut bnd = Raster::new(CLEAR);
+    white_texel(&mut bnd);
+    let dmg = bnd.plan_damage(&v, &i, &p, 64, 64).expect("full damage on first frame");
+    let (canvas, width, textures, clear) = bnd.raster_parts_mut();
+    let (dy0, dy1) = (dmg.1, dmg.3);
+    let rows = (dy1 - dy0) as usize;
+    let nb = 3usize;
+    let band_rows = rows.div_ceil(nb);
+    let mut rest: &mut [u8] = canvas;
+    let mut consumed = 0i32; // canvas rows already split off (from row 0)
+    let mut yy = dy0;
+    while yy < dy1 {
+        let ye = (yy + band_rows as i32).min(dy1);
+        let skip = (yy - consumed) as usize * width as usize * 4;
+        let (_, tail) = rest.split_at_mut(skip);
+        let take = (ye - yy) as usize * width as usize * 4;
+        let (head, tail2) = tail.split_at_mut(take);
+        let mut band = Band { px: head, width, y0: yy, y1: ye };
+        raster_band(&mut band, dmg, clear, &v, &i, &p, textures);
+        rest = tail2;
+        consumed = ye;
+        yy = ye;
+    }
+
+    assert_eq!(ser_canvas.as_slice(), bnd.canvas(), "external band split != render_wire");
+}

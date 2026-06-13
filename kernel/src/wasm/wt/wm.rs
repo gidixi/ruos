@@ -705,8 +705,33 @@ fn dispatch_raster(
     let cbase = canvas.as_mut_ptr() as usize; // canvas row 0
     let stride = (width as usize) * 4;
 
-    let n_bands = core::cmp::min(core::cmp::max(crate::cpu::cpus_online() as usize, 1), MAX_BANDS);
     let total_rows = (dy1 - dy0) as usize;
+    // Scale the band count to the WORK, and run small damage INLINE on the GUI core.
+    // A hover-highlight or small telemetry delta is a few dozen rows: fanning it across
+    // all cores (one pool::submit per band, each a broadcast wake IPI) + a busy-spin
+    // work-steal join costs FAR more in fixed overhead than the few-µs raster, and it
+    // yanks the cores that service mouse/USB out of hlt → the "cores peg + mouse lags on
+    // hover" regression. Parallelize only when there are enough rows to amortize the
+    // fan-out (each parallel band gets >= MIN_ROWS_PER_BAND rows). Bit-identical either
+    // way: the inline path is the same `raster_band` call the SMP/leftover path makes.
+    const MIN_ROWS_PER_BAND: usize = 64;
+    let n_bands = core::cmp::min(
+        core::cmp::min(core::cmp::max(crate::cpu::cpus_online() as usize, 1), MAX_BANDS),
+        core::cmp::max(1, total_rows / MIN_ROWS_PER_BAND),
+    );
+    if n_bands <= 1 {
+        // Inline on the GUI core: no pool::submit, no wake IPI, no busy-spin join.
+        let off = (dy0 as usize) * stride;
+        let len = total_rows * stride;
+        let mut band = ruos_raster::Band {
+            px: unsafe { core::slice::from_raw_parts_mut((cbase + off) as *mut u8, len) },
+            width, y0: dy0, y1: dy1,
+        };
+        ruos_raster::raster_band(&mut band, dmg, clear, verts, idx, prims, textures);
+        let cpu = crate::cpu::cpu_id();
+        if cpu < 32 { RASTER_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+        return;
+    }
     let band_rows = (total_rows + n_bands - 1) / n_bands; // ceil
 
     let mut ids: [usize; MAX_BANDS] = [usize::MAX; MAX_BANDS];

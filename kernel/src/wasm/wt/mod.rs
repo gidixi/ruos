@@ -134,6 +134,17 @@ pub fn run_threads_gate2() -> bool {
     threads::gate2_run(THREADS_GATE2_CWASM)
 }
 
+/// Gate Fase 2.5 (`tools/mtwin` precompilato): finestra threaded — worker
+/// std::thread in background + frame() leggera + kill-group al reap.
+#[cfg(feature = "boot-checks")]
+static MTWIN_CWASM: &[u8] = include_bytes!("mtwin.cwasm");
+
+/// Gate Fase 2.5 — vedi `wm::threaded_window_self_test`.
+#[cfg(feature = "boot-checks")]
+pub fn run_threads_win_gate() -> (bool, bool) {
+    wm::threaded_window_self_test(MTWIN_CWASM)
+}
+
 /// Embedded real `cat` tool (user-bin/cat.wasm precompiled). Exercises the WASI
 /// file path: path_open + fd_read + fd_seek + fd_filestat_get + fd_close.
 #[cfg(feature = "boot-checks")]

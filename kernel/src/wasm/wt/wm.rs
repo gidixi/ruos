@@ -235,17 +235,37 @@ fn module_at_path(path: &str) -> Option<Module> {
 /// const data in the guest's data segment (no heap), so it is valid right after
 /// instantiation without running `_initialize`. The store is dropped on return.
 fn extract_manifest(linker: &Linker<AppState>, module: &Module, name: &str) -> Option<Manifest> {
-    // Moduli threaded (wasm32-wasip1-threads, import env::memory shared) sono
-    // tool CLI, non app finestra: il linker del launcher non definisce la
-    // shared memory e l'instantiate fallirebbe — skip silenzioso (il catalog
-    // scan è ~1 Hz: un bwarn qui sarebbe spam continuo).
+    // Fase 2.5: i moduli threaded (import env::memory shared) sono app
+    // finestra legittime — ma il linker condiviso non ha env::memory, quindi
+    // il probe usa un linker throwaway con una SharedMemory usa-e-getta.
+    // thread-spawn qui non ha gruppo (→ -1), ma manifest() è const data e
+    // non spawna. I tool CLI threaded senza export `manifest` cadono nel
+    // normale "non è una launcher app" (None silenzioso, cache del catalogo).
     let wants_shared = module.imports().any(|i| {
         i.module() == "env" && i.name() == "memory"
             && i.ty().memory().map_or(false, |m| m.is_shared())
     });
-    if wants_shared {
-        return None;
-    }
+    let owned: Option<Linker<AppState>> = if wants_shared {
+        let mem_ty = module.imports().find_map(|i| {
+            if i.module() == "env" && i.name() == "memory" { i.ty().memory().cloned() } else { None }
+        })?;
+        let shared = wasmtime::SharedMemory::new(engine(), mem_ty).ok()?;
+        let mut lk: Linker<AppState> = Linker::new(engine());
+        crate::wasm::wt::wasi::add_to_linker(&mut lk).ok()?;
+        add_to_linker(&mut lk).ok()?; // wm (this module)
+        crate::wasm::wt::term::add_to_linker(&mut lk).ok()?;
+        crate::wasm::wt::sys::add_to_linker(&mut lk).ok()?;
+        crate::wasm::wt::net::add_to_linker(&mut lk).ok()?;
+        crate::wasm::wt::threads::add_thread_spawn_to_linker(&mut lk).ok()?;
+        {
+            let throwaway = Store::new(engine(), worker_app_state(0));
+            lk.define(&throwaway, "env", "memory", shared.clone()).ok()?;
+        }
+        Some(lk)
+    } else {
+        None
+    };
+    let linker = owned.as_ref().unwrap_or(linker);
     let mut store = Store::new(
         engine(),
         AppState {
@@ -270,6 +290,13 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module, name: &str) -> O
     // under TCG — which would burn the epoch budget if the watchdog were armed
     // here, so the trivial `manifest()` call below would false-trap. Arm the
     // deadline AFTER instantiate (it guards guest execution, not host setup).
+    // Threaded modules have a start function (`__wasm_init_memory`) that runs
+    // INSIDE instantiate — guest code, so the epoch deadline must be armed
+    // BEFORE (default 0 traps immediately). Classic modules keep the
+    // arm-after-instantiate behavior (see the comment above).
+    if wants_shared {
+        store.set_epoch_deadline(crate::wasm::wt::PROBE_DEADLINE_TICKS);
+    }
     let inst = match linker.instantiate(&mut store, module) {
         Ok(i) => i,
         Err(e) => {
@@ -875,6 +902,25 @@ impl HasWasi for AppState {
     fn wasi(&mut self) -> &mut WtState { &mut self.wasi }
     fn wasi_ref(&self) -> &WtState { &self.wasi }
 }
+
+/// AppState "spettatore": shape di default senza limiter — usato dai probe
+/// throwaway (`extract_manifest`, id 0) e dai worker-thread delle finestre
+/// threaded (Fase 2.5, `threads::run_thread_body`, id della finestra; la loro
+/// linear memory è la SharedMemory del gruppo, già cappata dal suo max).
+pub fn worker_app_state(win_id: u32) -> AppState {
+    AppState {
+        wasi: WtState::new(alloc::vec![b"win".to_vec()]),
+        win: WmState { id: win_id, win_w: 0, win_h: 0, pixels: Vec::new(), tick: 0,
+                       events: VecDeque::new(), close_requested: false,
+                       move_requested: false, spawn_request: VecDeque::new(),
+                       bg_request: false, overlay_request: false,
+                       kev_cursor: crate::kevent::current_seq(), committed: false,
+                       minimize_request: false, maximize_request: false,
+                       activate_request: VecDeque::new(), target_w: 0, target_h: 0,
+                       stay_awake_request: false, wake_pty: -1 },
+        limits: wasmtime::StoreLimits::default(),
+    }
+}
 impl HasWindow for AppState {
     fn win(&mut self) -> &mut WmState { &mut self.win }
     fn win_ref(&self) -> &WmState { &self.win }
@@ -1181,6 +1227,19 @@ static WINDOW_SNAPSHOT: crate::sync::IrqMutex<Vec<(u32, u32, String)>> =
 /// guest's std runtime is in an arbitrary half-initialized state, so the
 /// caller must NOT keep the window (a zombie that faults on its first alloc).
 fn run_initialize(store: &mut Store<AppState>, inst: &Instance) -> bool {
+    // Fase 2.5: nei reactor wasm32-wasip1-threads NESSUNO inizializza la
+    // struct pthread del main (nei command lo fa `_start`): senza, la prima
+    // thread_local/pthread_key cammina una thread-list a zero e loopa per
+    // sempre (gap upstream del reactor wasi-threads). Le app threaded
+    // esportano `__wasi_init_tp` (link flag, vedi regola mtwin nel Makefile)
+    // e il kernel lo chiama UNA volta qui, prima di ogni altro codice guest.
+    if let Ok(init_tp) = inst.get_typed_func::<(), ()>(&mut *store, "__wasi_init_tp") {
+        store.set_epoch_deadline(crate::wasm::wt::INIT_DEADLINE_TICKS);
+        if let Err(e) = init_tp.call(&mut *store, ()) {
+            crate::bwarn!("wm", "__wasi_init_tp trapped: {:?}", e);
+            return false;
+        }
+    }
     if let Ok(init) = inst.get_typed_func::<(), ()>(&mut *store, "_initialize") {
         store.set_epoch_deadline(crate::wasm::wt::INIT_DEADLINE_TICKS);
         if let Err(e) = init.call(&mut *store, ()) {
@@ -1251,6 +1310,9 @@ pub struct Window {
     /// Ha già eseguito `_initialize` + almeno una `frame()`. Falso → primo giro
     /// sempre sveglio.
     pub framed_once: bool,
+    /// Fase 2.5: gruppo wasm-threads della finestra (Some solo per le app
+    /// `wasm32-wasip1-threads`). Al reap il gruppo viene ucciso (kill-group).
+    pub group: Option<alloc::sync::Arc<crate::wasm::wt::threads::ThreadGroup>>,
 }
 
 /// Window order in `wins` IS the z-order: index 0 = bottom, last = top.
@@ -1587,6 +1649,12 @@ impl Compositor {
         if i >= self.wins.len() { return; }
         self.dirty = true; // a window left the set → recomposite
         let w = self.wins.remove(i); // Drop tears down Store+Instance (frees guest mem)
+        // Fase 2.5: la finestra muore → muoiono i suoi worker thread
+        // (kill-group: runnable al take, parcheggiati droppati qui,
+        // in-esecuzione al prossimo park).
+        if let Some(g) = w.group.as_ref() {
+            crate::wasm::wt::threads::kill_window_group(g);
+        }
         crate::proc::unregister(w.pid);
         self.free_ids.push(w.id);
         crate::binfo!("wm", "reaped win_id={} pid={} (Store/Instance dropped)", w.id, w.pid);
@@ -1638,6 +1706,26 @@ impl Compositor {
             return None;
         }
         let id = self.alloc_id();
+        // Fase 2.5: app finestra threaded (wasm32-wasip1-threads → import
+        // env::memory shared) → linker DEDICATO (il linker condiviso del
+        // compositor non può ospitare N SharedMemory diverse sotto lo stesso
+        // nome) con thread-spawn, e un ThreadGroup ucciso al reap. Le finestre
+        // classiche restano sul linker condiviso (group/linker_owned = None).
+        let wants_shared = module.imports().any(|i| {
+            i.module() == "env" && i.name() == "memory"
+                && i.ty().memory().map_or(false, |m| m.is_shared())
+        });
+        let (group, linker_owned) = if wants_shared {
+            match self.build_threaded_window_group(name, &module, id) {
+                Some((g, lk)) => (Some(g), Some(lk)),
+                None => {
+                    self.free_ids.push(id);
+                    return None;
+                }
+            }
+        } else {
+            (None, None)
+        };
         let mut store = Store::new(
             engine(),
             AppState {
@@ -1659,10 +1747,22 @@ impl Compositor {
         // fails inside the GUEST (its allocator sees OOM and the app aborts);
         // the kernel heap and the other windows are untouched.
         store.limiter(|s| &mut s.limits);
+        // Fase 2.5: il gruppo deve essere visibile a thread-spawn dal frame().
+        store.data_mut().wasi.threads = group.clone();
+        if let Some(g) = group.as_ref() {
+            store.data_mut().wasi.env = g.env.clone();
+        }
+        // I moduli THREADED hanno una start function (`__wasm_init_memory`,
+        // one-shot atomico dei data segment): gira DENTRO instantiate, quindi
+        // la deadline epoch va armata PRIMA — con il default (0) tutto il
+        // codice wasm trappa subito ("wasm trap: interrupt", changelog 470).
+        // Innocuo per le finestre classiche (nessuno start section).
+        store.set_epoch_deadline(crate::wasm::wt::INIT_DEADLINE_TICKS);
         // SysV ABI requires DF=0 before any cranelift/Rust `rep movs`.
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("cld", options(nostack)); }
-        let inst = match self.linker.instantiate(&mut store, &module) {
+        let inst_linker: &Linker<AppState> = linker_owned.as_deref().unwrap_or(&self.linker);
+        let inst = match inst_linker.instantiate(&mut store, &module) {
             Ok(i) => i,
             Err(e) => {
                 self.free_ids.push(id);
@@ -1709,6 +1809,7 @@ impl Compositor {
             awake: true,
             last_active_frame: 0,
             framed_once: false,
+            group,
         });
         let last = self.wins.len() - 1;
         self.raise(last);                 // move to top of z-order
@@ -1716,6 +1817,68 @@ impl Compositor {
         crate::binfo!("wm", "spawn app='{}' win_id={} pid={} live={}",
                       name, id, pid, live + 1);
         Some(id)
+    }
+
+    /// Fase 2.5: costruisce gruppo + linker dedicato per una finestra
+    /// threaded — SharedMemory dal tipo dell'import del modulo, stessa
+    /// superficie host del compositor (wasi+wm+term+sys+net) più thread-spawn,
+    /// `env::memory` definita una volta (engine-scoped), RAYON_NUM_THREADS
+    /// iniettato. Il gruppo viene ucciso da `remove_at` al reap della finestra.
+    fn build_threaded_window_group(
+        &self,
+        name: &str,
+        module: &Module,
+        win_id: u32,
+    ) -> Option<(alloc::sync::Arc<crate::wasm::wt::threads::ThreadGroup>, alloc::sync::Arc<Linker<AppState>>)> {
+        use crate::wasm::wt::threads::{GroupKind, ThreadGroup};
+        use core::sync::atomic::{AtomicBool, AtomicU32};
+        let eng = engine();
+        let mem_ty = module.imports().find_map(|i| {
+            if i.module() == "env" && i.name() == "memory" { i.ty().memory().cloned() } else { None }
+        })?;
+        let shared = match wasmtime::SharedMemory::new(eng, mem_ty) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::bwarn!("wm", "spawn '{}': SharedMemory: {:?}", name, e);
+                return None;
+            }
+        };
+        let mut lk: Linker<AppState> = Linker::new(eng);
+        if crate::wasm::wt::wasi::add_to_linker(&mut lk).is_err() { return None; }
+        if add_to_linker(&mut lk).is_err() { return None; } // wm (this module)
+        if crate::wasm::wt::term::add_to_linker(&mut lk).is_err() { return None; }
+        if crate::wasm::wt::sys::add_to_linker(&mut lk).is_err() { return None; }
+        if crate::wasm::wt::net::add_to_linker(&mut lk).is_err() { return None; }
+        if crate::wasm::wt::threads::add_thread_spawn_to_linker(&mut lk).is_err() { return None; }
+        {
+            let throwaway = Store::new(eng, worker_app_state(0));
+            if let Err(e) = lk.define(&throwaway, "env", "memory", shared.clone()) {
+                crate::bwarn!("wm", "spawn '{}': define memory: {:?}", name, e);
+                return None;
+            }
+        }
+        let total = 1 + crate::cpu::cpus_online();
+        let ncomp = total.saturating_sub(2).max(1);
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        env.push(alloc::format!("RAYON_NUM_THREADS={}", ncomp).into_bytes());
+        let lk = alloc::sync::Arc::new(lk);
+        let group = alloc::sync::Arc::new(ThreadGroup {
+            kind: GroupKind::Window {
+                module: module.clone(),
+                linker: lk.clone(),
+                win_id,
+            },
+            shared,
+            next_tid: AtomicU32::new(1),
+            live: AtomicU32::new(0),
+            poisoned: AtomicBool::new(false),
+            exit: crate::sync::IrqMutex::new(None),
+            waiter_core: AtomicU32::new(0),
+            env,
+            base_name: alloc::format!("win:{}", name),
+        });
+        crate::binfo!("wm", "spawn '{}': threaded window (shared memory + thread-spawn)", name);
+        Some((group, lk))
     }
 
     /// Spawn embedded registry app `idx` as a new window (boot-checks + the
@@ -1830,8 +1993,8 @@ impl Compositor {
                 let causa = if matches!(e.downcast_ref::<wasmtime::Trap>(),
                                         Some(wasmtime::Trap::Interrupt)) {
                     crate::bwarn!("wm",
-                        "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed",
-                        w.id, w.title);
+                        "frame() WATCHDOG (epoch deadline) win_id={} '{}': killed — {:?}",
+                        w.id, w.title, e);
                     crate::kevent::CRASH_WATCHDOG
                 } else {
                     crate::bwarn!("wm", "frame() err win_id={}: {:?}", w.id, e);
@@ -3095,6 +3258,88 @@ pub fn egui_demo_self_test() -> usize {
 /// TRAPPED (`Trap::Interrupt` → `WATCHDOG` log → reap) while the healthy
 /// reactor keeps ticking — i.e. "runaway frame()" no longer freezes the loop.
 /// Returns (spinner_reaped, healthy_tick).
+/// Fase 2.5 gate (boot-checks): finestra THREADED end-to-end. Spawn headless
+/// dell'app embedded mtwin (worker `std::thread` che conta fino a 1001 con
+/// una sleep in mezzo), drive di `frame()` finché il contatore — riletto dai
+/// pixel committati — raggiunge il target: prova spawn dal frame(), worker su
+/// fiber, visibilità della memoria condivisa worker→frame e poll_oneoff su
+/// fiber finestra. Poi close → kill-group: prova che i worker muoiono col
+/// reap. Ritorna (counter_ok, teardown_ok).
+#[cfg(feature = "boot-checks")]
+pub fn threaded_window_self_test(cwasm: &'static [u8]) -> (bool, bool) {
+    let mut c = Compositor::new_empty();
+    let module = match module_for(cwasm) {
+        Some(m) => m,
+        None => return (false, false),
+    };
+    let id = match c.spawn_named("mtwin", module) {
+        Some(i) => i,
+        None => return (false, false),
+    };
+    let cpu = crate::cpu::cpu_id();
+    let deadline = crate::timer::ticks() + 500; // 5 s
+    let mut val = 0u32;
+    while crate::timer::ticks() < deadline {
+        c.reap();
+        c.frame_all();
+        c.frame_no = c.frame_no.wrapping_add(1);
+        // Senza core ComputeApp (smp 1-2) è il BSP a dover drenare i fiber.
+        if crate::wasm::wt::threads::core_allowed(cpu) {
+            crate::wasm::wt::threads::expire_timeouts();
+            while crate::wasm::wt::threads::run_one(cpu) {}
+        }
+        val = c.wins.iter().find(|w| w.id == id)
+            .map(|w| {
+                let p = &w.store.data().win.pixels;
+                if p.len() >= 4 { u32::from_le_bytes([p[0], p[1], p[2], p[3]]) } else { 0 }
+            })
+            .unwrap_or(0);
+        if val >= 1001 {
+            break;
+        }
+    }
+    let counter_ok = val >= 1001;
+    if !counter_ok {
+        let stages = c.wins.iter().find(|w| w.id == id)
+            .map(|w| {
+                let p = &w.store.data().win.pixels;
+                if p.len() >= 8 { (p[4], p[5], p[6]) } else { (255, 255, 255) }
+            })
+            .unwrap_or((254, 254, 254));
+        crate::kprintln!(
+            "ruos: mtwin gate: counter={} (want >=1001) stages entry/malloc/spawn={:?}",
+            val, stages);
+    }
+    // Teardown: la chiusura della finestra uccide il gruppo (kill-group).
+    let g = c.wins.iter().find(|w| w.id == id).and_then(|w| w.group.clone());
+    c.close(id);
+    let teardown_ok = match g {
+        Some(g) => {
+            let tdl = crate::timer::ticks() + 300; // 3 s
+            loop {
+                if g.live.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                    break true;
+                }
+                if crate::wasm::wt::threads::core_allowed(cpu) {
+                    crate::wasm::wt::threads::expire_timeouts();
+                    while crate::wasm::wt::threads::run_one(cpu) {}
+                }
+                if crate::timer::ticks() > tdl {
+                    crate::kprintln!("ruos: mtwin gate: teardown timeout (live={})",
+                        g.live.load(core::sync::atomic::Ordering::SeqCst));
+                    break false;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        None => {
+            crate::kprintln!("ruos: mtwin gate: window had NO thread group");
+            false
+        }
+    };
+    (counter_ok, teardown_ok)
+}
+
 #[cfg(feature = "boot-checks")]
 pub fn watchdog_self_test() -> (bool, u32) {
     let mut c = Compositor::new_empty();

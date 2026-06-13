@@ -30,8 +30,10 @@ accesso remoto via SSH.** Tutto userspace = moduli WebAssembly; il runtime WASM
 - **Due runtime WASM**: `wasmi` (interprete, esegue i tool `.wasm` wasm32-wasip1) +
   **Wasmtime AOT** no_std (esegue i `.cwasm` precompilati: GUI/compositor + Component
   Model + **app multi-thread** `wasm32-wasip1-threads` — `std::thread`/rayon su
-  fiber M:N cooperativi, MT Fase 2, spec
-  `docs/superpowers/specs/2026-06-12-wasm-mt-fase2-threads-design.md`). Il router
+  fiber M:N cooperativi, sia tool CLI (MT Fase 2, spec
+  `docs/superpowers/specs/2026-06-12-wasm-mt-fase2-threads-design.md`) sia
+  **app finestra del compositor** (Fase 2.5, spec
+  `2026-06-13-wm-threaded-windows-design.md`, template `tools/mtwin/`)). Il router
   `.cwasm` della shell sceglie Wasmtime.
 - **Legacy C (rimosso)** — il vecchio kernel C su Pure64 + gestore memoria
   (E820/bitmap/buddy/paging) viveva in `x64barebones/`. Rimosso dal working tree;

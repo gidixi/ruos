@@ -146,7 +146,8 @@ WT_KDIR    := kernel/src/wasm/wt
 WT_KCWASMS := $(WT_KDIR)/hello.cwasm \
               $(WT_KDIR)/echo.cwasm $(WT_KDIR)/cat.cwasm $(WT_KDIR)/spin.cwasm \
               $(WT_KDIR)/spin_reactor.cwasm $(WT_KDIR)/threads_gate1.cwasm \
-              $(WT_KDIR)/threads_gate2.cwasm $(WT_KDIR)/threads_gate3.cwasm
+              $(WT_KDIR)/threads_gate2.cwasm $(WT_KDIR)/threads_gate3.cwasm \
+              $(WT_KDIR)/mtwin.cwasm
 
 $(WT_KDIR)/hello.cwasm: tools/wt-hello/hello.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
@@ -158,6 +159,16 @@ $(WT_KDIR)/threads_gate2.cwasm: tools/wt-threads-gate/gate2.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/threads_gate3.cwasm: tools/wt-threads-gate/gate3.wat $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
+# Fase 2.5: finestra threaded (reactor frame() + std::thread worker).
+# --export=__wasi_init_tp: nel modello REACTOR nessuno inizializza la struct
+# pthread del main (nei command lo fa _start) — il kernel chiama l'export una
+# volta dopo l'instantiate (run_initialize), altrimenti la prima thread_local/
+# pthread_key cammina una thread-list a zero e loopa per sempre.
+$(WT_KDIR)/mtwin.cwasm: tools/mtwin/src/lib.rs tools/mtwin/Cargo.toml $(WT_PRECOMPILE)
+	source $$HOME/.cargo/env && cd tools/mtwin && \
+		RUSTFLAGS="-C link-arg=--export=__wasi_init_tp" \
+		cargo build --release --target wasm32-wasip1-threads
+	$(WT_PRECOMPILE) tools/mtwin/target/wasm32-wasip1-threads/release/mtwin.wasm $@
 $(WT_KDIR)/echo.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	$(WT_PRECOMPILE) $< $@
 $(WT_KDIR)/cat.cwasm: user-bin/cat.wasm $(WT_PRECOMPILE)

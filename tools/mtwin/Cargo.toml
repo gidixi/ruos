@@ -1,0 +1,17 @@
+[package]
+name = "mtwin"
+version = "0.1.0"
+edition = "2021"
+
+# Fase 2.5 gate: app FINESTRA threaded (reactor frame() + std::thread worker).
+# cdylib wasm32-wasip1-threads: il target esporta wasi_thread_start e importa
+# env::memory shared — il wm la riconosce e le monta il ThreadGroup.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+
+[workspace]

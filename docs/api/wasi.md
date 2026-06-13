@@ -52,6 +52,20 @@ otherwise the module *defines* its own shared memory and every thread's fresh
 Instance would get a private one — see `tools/hello-pthread/build-wasm.sh`
 for the working recipe.
 
+**Threaded WINDOW apps (Fase 2.5):** a compositor window (reactor model,
+exports `frame()`) built for `wasm32-wasip1-threads` can use
+`std::thread`/rayon internally — the wm detects the shared-memory import at
+spawn, mounts a per-window shared memory + `thread-spawn`, and kills the whole
+thread group when the window is closed. TWO build requirements beyond the CLI
+recipe: (1) link with `--export=__wasi_init_tp` — in the REACTOR model nothing
+initializes the main thread's pthread struct (commands do it in `_start`); the
+kernel calls that export once before `_initialize`, otherwise the first
+thread_local spins forever on a zeroed thread list. (2) Don't BLOCK in
+`frame()` (no `join`/blocking `recv`/contended long locks): the frame job is
+not a fiber — a blocking futex wait there degrades to an hlt-wait the epoch
+watchdog cannot interrupt. Blocking work belongs in the worker threads.
+Template: `tools/mtwin/`.
+
 | Function | Meaning |
 |----------|---------|
 | `("wasi", "thread-spawn")(start_arg: i32) -> i32` | Spawn a new thread: the host creates a fresh Instance of the module against the **same shared memory** and calls its exported `wasi_thread_start(tid, start_arg)` on a new cooperative fiber (first free ComputeApp core picks it up — not executed inline). Stack pointer + TLS of the new thread are guest-side, prepared by `pthread_create` in the `start_arg` block. Returns the new `tid` (range `[1, 2^29)`), or `-1` on error (group poisoned / tid range exhausted / non-threaded module) — surfaces as `EAGAIN` from `pthread_create`. |

@@ -43,7 +43,8 @@ check_log() {
   # $1 = log, $2 = label. Echoes failures; returns count.
   local log="$1" label="$2" fail=0
   for m in "THREADS-OK 1 = ok" "THREADS-FIBER-OK = ok" \
-           "THREADS-OK 3 = ok" "THREADS-OK 2 = ok"; do
+           "THREADS-OK 3 = ok" "THREADS-OK 2 = ok" \
+           "THREADS-WIN-OK = ok teardown=ok"; do
     grep -aq "$m" "$log" || { echo "($label: missing '$m')"; fail=1; }
   done
   return $fail

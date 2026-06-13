@@ -226,6 +226,11 @@ pub fn init() -> Result<(), BootError> {
         // (fresh Instance, stessa SharedMemory) e ne vede la scrittura.
         let g2 = crate::wasm::wt::run_threads_gate2();
         crate::binfo!("wt", "THREADS-OK 2 = {}", if g2 { "ok" } else { "FAIL" });
+        // Fase 2.5: finestra threaded — worker std::thread in background
+        // (contatore via memoria condivisa nei pixel) + kill-group al reap.
+        let (wok, wtd) = crate::wasm::wt::run_threads_win_gate();
+        crate::binfo!("wt", "THREADS-WIN-OK = {} teardown={}",
+            if wok { "ok" } else { "FAIL" }, if wtd { "ok" } else { "FAIL" });
         // SP3 window-manager pure-logic selftest: decoration geometry + hit-test
         // + z-order raise + drag math, NO wasm instances (fast + deterministic).
         let wmf = crate::wasm::wt::run_wm_logic_selftest();

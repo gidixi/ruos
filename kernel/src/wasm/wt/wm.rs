@@ -2946,8 +2946,8 @@ impl Compositor {
         // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
         // VBox/HW screen (the binfo log only reaches serial/netconsole).
         #[cfg(feature = "wm-fps")]
-        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr) =
-            (0u64, 0u64, 0u64, 0u64);
+        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         #[cfg(feature = "wm-fps")]
         let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
                               crate::console::font::glyph_height() as u32);
@@ -3382,7 +3382,7 @@ impl Compositor {
                         present_s, iter_s, fa_avg_us, fa_max_us, ra_avg_us, pr_avg_us,
                         FRAME_JOBS_LAST.load(Ordering::SeqCst));
                     disp_p = present_s; disp_it = iter_s;
-                    disp_fa = fa_avg_us; disp_pr = pr_avg_us;
+                    disp_fa = fa_avg_us; disp_pr = pr_avg_us; disp_ra = ra_avg_us;
                     let _ = fa_max_us; // logged above; not shown on the overlay (noisy under VM)
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
@@ -3403,8 +3403,12 @@ impl Compositor {
                     // Row 1: present rate (fps) + loop rate (Hz) — reliable counters.
                     // Row 2: per-frame timing in ms (wall-clock; approx under a VM).
                     let l1 = alloc::format!("display: {} fps  ({} Hz)", disp_p, disp_it);
-                    let l2 = alloc::format!("rendering: {} ms   blit: {} ms",
-                        disp_fa / 1000, disp_pr / 1000);
+                    // mesh-mode: "tess" = egui frontend+encode (frame_all), "rast" =
+                    // kernel-side raster stage (the real per-frame cost), "blit" =
+                    // composite+present. ms is coarse on fast HW — use netconsole's
+                    // `wmfps` line for µs precision.
+                    let l2 = alloc::format!("tess:{} rast:{} blit:{} ms",
+                        disp_fa / 1000, disp_ra / 1000, disp_pr / 1000);
                     let white = [0x80, 0xFF, 0x80, 0xFF];
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad,
                                         ov_w - ov_pad, &l1, white);

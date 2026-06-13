@@ -651,6 +651,22 @@ static RASTER_CORE_MASK: AtomicU32 = AtomicU32::new(0);
 /// Read + clear the raster core mask (boot-check marker support).
 pub fn take_raster_core_mask() -> u32 { RASTER_CORE_MASK.swap(0, Ordering::SeqCst) }
 
+/// raster_meshes sub-stage cycle accumulators (feature wm-fps): summed across all
+/// dirty windows over a report window, to localize WHERE the per-frame raster time
+/// goes on real HW. dec=wire decode, pln=plan_damage, dsp=dispatch_raster (raster +
+/// SMP join), cln=canvas.to_vec into pixels. RP_LAST packs the last raster's
+/// (damage_rows << 16 | n_bands) so the overlay can show whether it parallelized.
+#[cfg(feature = "wm-fps")]
+static RP_DEC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_PLN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_DSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_CLN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Pool job: rasterize ONE band. `input` is a byte view of one `RasterBandArg` in
 /// the static arena. Returns 0 (unused).
 ///
@@ -719,6 +735,8 @@ fn dispatch_raster(
         core::cmp::min(core::cmp::max(crate::cpu::cpus_online() as usize, 1), MAX_BANDS),
         core::cmp::max(1, total_rows / MIN_ROWS_PER_BAND),
     );
+    #[cfg(feature = "wm-fps")]
+    RP_LAST.store(((total_rows as u64) << 16) | (n_bands as u64), Ordering::Relaxed);
     if n_bands <= 1 {
         // Inline on the GUI core: no pool::submit, no wake IPI, no busy-spin join.
         let off = (dy0 as usize) * stride;
@@ -2482,17 +2500,33 @@ impl Compositor {
             // borrow of `s.win.mesh_*` before we take a `&mut` on `s.win.raster`, and
             // the Vecs outlive `dispatch_raster` (which JOINS before returning, so no
             // band job dangles on freed buffers).
+            #[cfg(feature = "wm-fps")] let t0 = crate::boot::clock::read_tsc();
             let verts = ruos_raster::decode_verts(&s.win.mesh_verts);
             let idx = ruos_raster::decode_indices(&s.win.mesh_idx);
             let prims = ruos_raster::decode_prims(&s.win.mesh_prims);
+            #[cfg(feature = "wm-fps")] let t1 = crate::boot::clock::read_tsc();
             let dmg = match s.win.raster.plan_damage(&verts, &idx, &prims, mw, mh) {
                 Some(d) => d,
-                None => { s.win.mesh_dirty = false; continue; }
+                None => {
+                    #[cfg(feature = "wm-fps")] {
+                        RP_DEC.fetch_add(t1.wrapping_sub(t0), Ordering::Relaxed);
+                        RP_PLN.fetch_add(crate::boot::clock::read_tsc().wrapping_sub(t1), Ordering::Relaxed);
+                    }
+                    s.win.mesh_dirty = false; continue;
+                }
             };
+            #[cfg(feature = "wm-fps")] let t2 = crate::boot::clock::read_tsc();
             dispatch_raster(&mut s.win.raster, &verts, &idx, &prims, dmg);
+            #[cfg(feature = "wm-fps")] let t3 = crate::boot::clock::read_tsc();
             // The band jobs wrote into the persistent canvas; read it AFTER the join.
             s.win.pixels = s.win.raster.canvas().to_vec();
-            crate::binfo!("wm", "mesh render win={} {}x{}", w.id, mw, mh);
+            #[cfg(feature = "wm-fps")] {
+                let t4 = crate::boot::clock::read_tsc();
+                RP_DEC.fetch_add(t1.wrapping_sub(t0), Ordering::Relaxed);
+                RP_PLN.fetch_add(t2.wrapping_sub(t1), Ordering::Relaxed);
+                RP_DSP.fetch_add(t3.wrapping_sub(t2), Ordering::Relaxed);
+                RP_CLN.fetch_add(t4.wrapping_sub(t3), Ordering::Relaxed);
+            }
             s.win.win_w = mw;
             s.win.win_h = mh;
             s.win.committed = true; // damage: this window updated → present runs
@@ -2978,8 +3012,9 @@ impl Compositor {
         // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
         // VBox/HW screen (the binfo log only reaches serial/netconsole).
         #[cfg(feature = "wm-fps")]
-        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra, mut disp_iter, mut disp_hlt) =
-            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra, mut disp_iter, mut disp_hlt,
+             mut disp_dec, mut disp_pln, mut disp_dsp, mut disp_cln, mut disp_nb) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         #[cfg(feature = "wm-fps")]
         let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
                               crate::console::font::glyph_height() as u32);
@@ -3416,14 +3451,25 @@ impl Compositor {
                     let ra_avg_us = if n_raster > 0 { (ra_sum / n_raster as u64) * 1000 / tpm } else { 0 };
                     let iter_avg_us = if n_iter > 0 { (iter_sum / n_iter as u64) * 1000 / tpm } else { 0 };
                     let hlt_avg_us = if n_iter > 0 { (hlt_sum / n_iter as u64) * 1000 / tpm } else { 0 };
+                    let nrz = (n_raster.max(1)) as u64;
+                    let dec_us = (RP_DEC.swap(0, Ordering::Relaxed) / nrz) * 1000 / tpm;
+                    let pln_us = (RP_PLN.swap(0, Ordering::Relaxed) / nrz) * 1000 / tpm;
+                    let dsp_us = (RP_DSP.swap(0, Ordering::Relaxed) / nrz) * 1000 / tpm;
+                    let cln_us = (RP_CLN.swap(0, Ordering::Relaxed) / nrz) * 1000 / tpm;
+                    let rp_last = RP_LAST.load(Ordering::Relaxed);
+                    let (rp_rows, rp_nb) = ((rp_last >> 16) as u64, rp_last & 0xFFFF);
                     crate::binfo!("wmfps",
                         "iters={}/s ITER={}us HLT={}us | frame_all={}us raster={}us present={}us (fps={} jobs={})",
                         iter_s, iter_avg_us, hlt_avg_us, fa_avg_us, ra_avg_us, pr_avg_us,
                         present_s, FRAME_JOBS_LAST.load(Ordering::SeqCst));
+                    crate::binfo!("wmfps2",
+                        "raster: decode={}us plan={}us dispatch={}us clone={}us (last dmg_rows={} bands={})",
+                        dec_us, pln_us, dsp_us, cln_us, rp_rows, rp_nb);
                     let _ = fa_max_us;
                     disp_p = present_s; disp_it = iter_s;
                     disp_fa = fa_avg_us; disp_pr = pr_avg_us; disp_ra = ra_avg_us;
                     disp_iter = iter_avg_us; disp_hlt = hlt_avg_us;
+                    disp_dec = dec_us; disp_pln = pln_us; disp_dsp = dsp_us; disp_cln = cln_us; disp_nb = rp_nb;
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
                     ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0;
@@ -3444,12 +3490,13 @@ impl Compositor {
                     // Row 2: per-frame timing in ms (wall-clock; approx under a VM).
                     let l1 = alloc::format!("{}fps {}Hz iter:{}ms hlt:{}ms",
                         disp_p, disp_it, disp_iter / 1000, disp_hlt / 1000);
-                    // mesh-mode: "tess" = egui frontend+encode (frame_all), "rast" =
-                    // kernel-side raster stage (the real per-frame cost), "blit" =
-                    // composite+present. ms is coarse on fast HW — use netconsole's
-                    // `wmfps` line for µs precision.
-                    let l2 = alloc::format!("tess:{} rast:{} blit:{} ms",
-                        disp_fa / 1000, disp_ra / 1000, disp_pr / 1000);
+                    // Row 2: raster_meshes BREAKDOWN (ms) — d=wire decode, p=plan_damage,
+                    // r=dispatch_raster (raster+SMP join), c=canvas.to_vec; b=bands the
+                    // last raster used (1 = ran inline/serial on the GUI core). Localizes
+                    // the per-frame raster cost: r dominates => raster (parallel? check b);
+                    // d/c dominate => serial per-frame overhead (decode/clone).
+                    let l2 = alloc::format!("d:{} p:{} r:{} c:{}ms b:{}",
+                        disp_dec / 1000, disp_pln / 1000, disp_dsp / 1000, disp_cln / 1000, disp_nb);
                     let white = [0x80, 0xFF, 0x80, 0xFF];
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad,
                                         ov_w - ov_pad, &l1, white);

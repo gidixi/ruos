@@ -2238,6 +2238,38 @@ impl Compositor {
         }
     }
 
+    /// Phase C: for every awake mesh-mode window that committed a new mesh this
+    /// frame, rasterize it kernel-side into the window's `pixels` surface (which the
+    /// compositor already composites). Serial for now (one window at a time); the
+    /// SMP band split is a later phase. `compose_window` is unchanged — we reuse
+    /// `pixels`/`win_w`/`win_h` so a mesh-mode window looks identical to a legacy
+    /// `wm.commit` (pixel) window to the rest of the pipeline.
+    fn raster_meshes(&mut self) {
+        for w in self.wins.iter_mut() {
+            if !w.awake { continue; }
+            let s = w.store.data_mut();
+            if !s.win.mesh_mode || !s.win.mesh_dirty { continue; }
+            let (mw, mh) = (s.win.mesh_w, s.win.mesh_h);
+            if mw == 0 || mh == 0 { s.win.mesh_dirty = false; continue; }
+            // render_wire borrows `raster` mut + the mesh_* fields shared — disjoint
+            // fields of WmState. Destructure so the borrow checker sees them split,
+            // then copy the canvas out (to_vec) so the borrow ends before we write
+            // back into `pixels`.
+            let pixels = {
+                let WmState { raster, mesh_verts, mesh_idx, mesh_prims, .. } = &mut s.win;
+                let (canvas, _dirty) = raster.render_wire(
+                    mesh_verts, mesh_idx, mesh_prims, mw, mh);
+                canvas.to_vec()
+            };
+            crate::binfo!("wm", "mesh render win={} {}x{}", w.id, mw, mh);
+            s.win.pixels = pixels;
+            s.win.win_w = mw;
+            s.win.win_h = mh;
+            s.win.committed = true; // damage: this window updated → present runs
+            s.win.mesh_dirty = false;
+        }
+    }
+
     /// Composite ALL windows bottom→top into the kernel back-buffer, then ONE
     /// blit. SP4: the per-band composite of each window's surface runs in parallel
     /// across the SMP compute-pool (the APs); the present is one serial blit on the
@@ -2910,6 +2942,12 @@ impl Compositor {
                 fa_sum = fa_sum.wrapping_add(d);
                 if d > fa_max { fa_max = d; }
             }
+
+            // Phase C raster: now that every awake window's `frame()` ran (and any
+            // mesh-mode window called `wm.commit_mesh`, filling its `mesh_*`),
+            // rasterize the stored mesh into the window's `pixels` surface so the
+            // compositor (below) composites it like any other committed surface.
+            self.raster_meshes();
 
             // SP-C: process deferred window→kernel requests raised during
             // `frame_all` (`wm.set_background`, `wm.spawn`). Deferred to HERE —

@@ -32,13 +32,19 @@ use alloc::vec::Vec;
 // transparently use std's versions — which are themselves IEEE-exact for these
 // three functions, hence identical. In the no_std kernel build the trait
 // methods are used.
+//
+// NOTE: floor/ceil/round are EXACT, so hand-rolling them is safe (no dependency
+// needed). If a future need arises for NON-exact ops (sin/sqrt/...), reach for the
+// `libm` crate — do NOT extend this trait with approximations.
 trait F32Ext {
     fn floor(self) -> f32;
     fn ceil(self) -> f32;
     fn round(self) -> f32;
 }
 
-#[allow(dead_code)]
+// Under cfg(test) std's inherent floor/ceil/round shadow these → they look unused.
+// Allow only there, so a genuinely-unused method in the real no_std build still warns.
+#[cfg_attr(test, allow(dead_code))]
 impl F32Ext for f32 {
     #[inline]
     fn floor(self) -> f32 {

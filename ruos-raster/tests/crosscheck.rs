@@ -9,7 +9,7 @@ use egui::epaint::{
 use egui::{pos2, ClippedPrimitive, ColorImage, Rect, TextureId, TextureOptions};
 use std::sync::Arc;
 
-use ruos_raster::{Atlas, Prim, Raster, Vertex as WVertex};
+use ruos_raster::{Prim, Raster, Vertex as WVertex};
 
 const CLEAR: [u8; 4] = [0x1e, 0x1e, 0x1e, 0xff];
 
@@ -182,8 +182,3 @@ fn ruos_raster_matches_gui_core_bit_identical() {
     }
     assert_eq!(bytes_a.as_slice(), bytes_b, "ruos-raster diverges from gui-core");
 }
-
-/// Silence the unused-import warning for Atlas (part of the public wire API we
-/// exercise indirectly via set_texture).
-#[allow(dead_code)]
-fn _atlas_is_public(_: Atlas) {}

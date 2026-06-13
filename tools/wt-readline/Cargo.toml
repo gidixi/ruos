@@ -1,0 +1,17 @@
+[package]
+name = "wt-readline"
+version = "0.1.0"
+edition = "2021"
+
+# Tool .cwasm (Wasmtime) per provare lo stdin interattivo sul runtime wt:
+# legge righe da stdin (cooked PTY) e le rifà eco. I tool .wasm (wasmi) hanno
+# già stdin via fiber/suspend; questo esercita il path wt nuovo (fd_read fd 0
+# → pty::slave_read_blocking su un core ComputeApp).
+[[bin]]
+name = "wt-readline"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

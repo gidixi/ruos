@@ -666,6 +666,7 @@ fn run_thread_body(g: &Arc<ThreadGroup>, tid: u32, start_arg: i32, pts: Option<u
                         crate::vfs::open(&path, crate::vfs::OpenFlags::WRITE)) {
                         state.stdout_pty = Some(fd);
                     }
+                    state.stdin_pts = Some(n);
                 }
             }
             let mut store = wasmtime::Store::new(engine, state);

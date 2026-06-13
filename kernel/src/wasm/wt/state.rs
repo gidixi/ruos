@@ -23,6 +23,9 @@ pub struct WtState {
     /// If set, stdout/stderr (fd 1/2) are written to this PTY slave VFS fd
     /// (so output reaches the bound terminal/SSH channel). None → CONSOLE.
     pub stdout_pty: Option<crate::vfs::Fd>,
+    /// If set, fd 0 (stdin) reads from this PTY pair's slave ring (cooked line
+    /// discipline). None → stdin is EOF. Set by `run_cwasm` when a PTY is bound.
+    pub stdin_pts: Option<usize>,
     /// Thread group of the owning threaded app (MT Fase 2); None for classic
     /// single-threaded modules. Read by the "wasi" `thread-spawn` host fn.
     pub threads: Option<alloc::sync::Arc<crate::wasm::wt::threads::ThreadGroup>>,
@@ -36,6 +39,7 @@ impl WtState {
             exit: None,
             fds: alloc::vec![WtFd::Console, WtFd::Console, WtFd::Console, WtFd::Closed],
             stdout_pty: None,
+            stdin_pts: None,
             threads: None,
         }
     }

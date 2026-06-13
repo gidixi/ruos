@@ -310,6 +310,49 @@ pub fn last_activity(idx: usize) -> u64 {
     LAST_ACTIVITY[idx].load(Ordering::Relaxed)
 }
 
+/// Blocking stdin read for a SYNC consumer (a Wasmtime `.cwasm` running on an
+/// AP, no fiber/executor to suspend on). Drains pair `idx`'s slave ring
+/// (cooked line discipline) into `out`, blocking until ≥1 byte is available
+/// (read(2) semantics), then returns how many it copied. `0` = EOF (pair shut
+/// down or foreground app `^C`'d/killed).
+///
+/// Like `component::poll_key`, it parks the core with `sti; hlt` between checks
+/// (the AP's own 100 Hz LAPIC tick re-wakes it), so it idles at ~0% while
+/// waiting and picks up a line within ≤10 ms. MUST run off the BSP: core 0
+/// PUMPS the line discipline, so blocking there would deadlock the input — it
+/// returns EOF immediately on the BSP (interactive stdin needs SMP, same rule
+/// as the tui path).
+pub fn slave_read_blocking(idx: usize, out: &mut [u8]) -> usize {
+    if idx >= NUM_PAIRS || out.is_empty() { return 0; }
+    if crate::cpu::cpu_id() == 0 { return 0; } // BSP pumps the ldisc — no block
+    loop {
+        if is_shutdown(idx) { return 0; }
+        if foreground_pid(idx).map(|p| crate::proc::is_kill_pending(p)).unwrap_or(false) {
+            return 0; // ^C / kill on the foreground app → EOF, unwind the reader
+        }
+        // Drain whatever the ring holds, up to `out.len()`. The first byte may
+        // need a wait; once data flows we copy it all without re-sleeping.
+        let mut n = 0;
+        while n < out.len() {
+            match slave_rx_ring(idx).pop() {
+                Some(b) => { out[n] = b; n += 1; }
+                None => break,
+            }
+        }
+        if n > 0 {
+            touch_activity(idx);
+            return n;
+        }
+        // Heartbeat: this core is parked in a host call, not polling its
+        // executor — without a bump the supervisor would flag it mute.
+        crate::sched::cpustat::heartbeat_bump(crate::cpu::cpu_id() as usize);
+        // Ring empty — park until the next interrupt (AP timer tick or input
+        // IPI). The sti shadow prevents a missed wake between sti and hlt; no
+        // locks are held here.
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
 /// Read one byte from pair `idx`'s slave (stdin), waiting up to `timeout_ticks`
 /// (100 Hz). Returns the byte (`0..=255`), `-1` on timeout, or `-2` on EOF
 /// (the pair was shut down). Unlike `vfs::read`, this operates directly on the

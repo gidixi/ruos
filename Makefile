@@ -121,6 +121,13 @@ build/wtecho.cwasm: user-bin/echo.wasm $(WT_PRECOMPILE)
 	@mkdir -p build
 	$(WT_PRECOMPILE) user-bin/echo.wasm build/wtecho.cwasm
 
+# Tool .cwasm per provare lo stdin interattivo del runtime Wasmtime.
+build/wtreadline.cwasm: tools/wt-readline/src/main.rs tools/wt-readline/Cargo.toml $(WT_PRECOMPILE)
+	@mkdir -p build
+	source $$HOME/.cargo/env && cd tools/wt-readline && \
+		cargo build --release --target wasm32-wasip1
+	$(WT_PRECOMPILE) tools/wt-readline/target/wasm32-wasip1/release/wt-readline.wasm build/wtreadline.cwasm
+
 # MT Fase 2: tool threaded (wasm32-wasip1-threads → thread = fiber M:N nel
 # kernel). parsum = rayon end-to-end; mtstress = Mutex conteso + kill-group.
 build/parsum.cwasm: tools/parsum/src/main.rs tools/parsum/Cargo.toml $(WT_PRECOMPILE)
@@ -303,7 +310,7 @@ build/rtop.cwasm: user/rtop/src/lib.rs user/rtop/src/sys.rs user/rtop/Cargo.toml
 		-o build/rtop.component.wasm
 	$(WT_PRECOMPILE) --component build/rtop.component.wasm build/rtop.cwasm
 
-iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/parsum.cwasm build/mtstress.cwasm build/hello-pthread.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
+iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm build/wtreadline.cwasm build/parsum.cwasm build/mtstress.cwasm build/hello-pthread.cwasm build/about.cwasm build/files.cwasm build/terminal.cwasm build/system.cwasm build/notepad.cwasm build/notify.cwasm kernel/src/wasm/wt/reactor.cwasm kernel/src/wasm/wt/reactor_close.cwasm kernel/src/wasm/wt/egui_demo.cwasm kernel/src/wasm/wt/shell.cwasm build/tui.cwasm build/rtop.cwasm
 	rm -rf $(ISO_ROOT) build/binstage
 	mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT \
 	         $(ISO_ROOT)/rescue $(ISO_ROOT)/etc $(ISO_ROOT)/root build/binstage
@@ -314,6 +321,7 @@ iso: build limine $(MKBINPACK) $(USER_WASMS) $(INIT_SCRIPT) build/wtecho.cwasm b
 	# Stage dell'intero /bin in build/binstage, poi pack → bin.bgz (non loose).
 	for n in $(BIN_TOOLS); do cp user-bin/$$n.wasm build/binstage/; done
 	cp build/wtecho.cwasm build/binstage/wtecho.cwasm
+	cp build/wtreadline.cwasm build/binstage/wtreadline.cwasm
 	cp build/parsum.cwasm build/binstage/parsum.cwasm
 	cp build/mtstress.cwasm build/binstage/mtstress.cwasm
 	cp build/hello-pthread.cwasm build/binstage/hello-pthread.cwasm
@@ -533,6 +541,12 @@ run-threads-test:
 .PHONY: run-rtop-test
 run-rtop-test: iso ssh-key-on-disk
 	bash tests/rtop-ssh-test.sh
+
+# Stdin sul runtime Wasmtime (.cwasm): boot-marker check (wtreadline blocca su
+# stdin invece di EOF). Lo script builda la sua ISO con init=wtreadline.
+.PHONY: run-wt-stdin-test
+run-wt-stdin-test:
+	bash tests/wt-stdin-test.sh
 
 # Ctrl-C test: runs a long app over SSH, sends ^C, asserts the foreground app
 # is killed and the shell prompt returns (line-discipline VINTR + cooked exec).

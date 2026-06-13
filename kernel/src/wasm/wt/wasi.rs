@@ -2,7 +2,8 @@
 //! `wasm32-wasip1` command tools that use argv/env, stdout, and read files.
 //! VFS operations run synchronously via `crate::vfs::block_on` (tmpfs futures
 //! complete in a single poll); stdout/stderr fan out to `crate::console::CONSOLE`
-//! (serial + framebuffer). PTY/socket/blocking-stdin coverage is added later.
+//! (serial + framebuffer). stdin reads from the bound PTY (cooked) when one is
+//! set (`WtState.stdin_pts`); socket coverage stays on the wasmi runtime.
 
 use wasmtime::{Caller, Linker};
 use crate::wasm::wt::state::{WtState, WtFd, HasWasi};
@@ -66,8 +67,33 @@ pub fn add_to_linker<T: HasWasi + 'static>(linker: &mut Linker<T>) -> wasmtime::
         |mut caller: Caller<'_, T>, fd: i32, iovs: i32, iovs_len: i32, nread: i32| -> i32 {
             let vfd = match caller.data().wasi_ref().get(fd) {
                 Some(WtFd::Vfs(f)) => *f,
-                Some(WtFd::Console) => { // stdin → EOF
-                    return if mem::write_u32(&mut caller, nread as u32, 0) { OK } else { EINVAL };
+                Some(WtFd::Console) => {
+                    // fd 0 with a bound PTY → blocking line read (cooked) from
+                    // the slave ring; other console fds (or no PTY) → EOF.
+                    let pts = if fd == 0 { caller.data().wasi_ref().stdin_pts } else { None };
+                    let total = match pts {
+                        Some(idx) => {
+                            // Read into the FIRST non-empty iovec only (read(2):
+                            // a short read is legal; libc loops if it wants more).
+                            let table = match mem::read(&mut caller, iovs as u32, (iovs_len as u32) * 8) {
+                                Some(t) => t, None => return EINVAL };
+                            let mut got = 0u32;
+                            for i in 0..iovs_len as usize {
+                                let b = i * 8;
+                                let ptr = u32::from_le_bytes(table[b..b+4].try_into().unwrap());
+                                let len = u32::from_le_bytes(table[b+4..b+8].try_into().unwrap());
+                                if len == 0 { continue; }
+                                let mut buf = alloc::vec![0u8; len as usize];
+                                let n = crate::pty::slave_read_blocking(idx, &mut buf);
+                                if n > 0 && !mem::write(&mut caller, ptr, &buf[..n]) { return EINVAL; }
+                                got = n as u32;
+                                break; // one iovec per call (n==0 ⇒ EOF)
+                            }
+                            got
+                        }
+                        None => 0, // EOF
+                    };
+                    return if mem::write_u32(&mut caller, nread as u32, total) { OK } else { EINVAL };
                 }
                 _ => return EBADF,
             };

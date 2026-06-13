@@ -320,12 +320,14 @@ pub fn run_cwasm(cwasm: &[u8], args: Vec<Vec<u8>>, pts: Option<usize>) -> i32 {
         return threads::exec_threaded(&module, args, pts);
     }
     let mut state = WtState::new(args);
-    // Bind stdout/stderr to the caller's PTY slave, if any.
+    // Bind stdout/stderr to the caller's PTY slave, if any, and route fd 0
+    // (stdin) to the same pair's cooked slave ring (interactive read).
     if let Some(n) = pts {
         let path = alloc::format!("/dev/pts/{}", n);
         if let Ok(fd) = crate::vfs::block_on(crate::vfs::open(&path, crate::vfs::OpenFlags::WRITE)) {
             state.stdout_pty = Some(fd);
         }
+        state.stdin_pts = Some(n);
     }
     let mut store = Store::new(engine, state);
     // CLI tools may run as long as they like — the watchdog is for the

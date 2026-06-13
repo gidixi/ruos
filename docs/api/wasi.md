@@ -77,6 +77,13 @@ Template: `tools/mtwin/`.
 | `clock_time_get(clock_id, precision, time_ptr) -> i32` | `u64` ns since boot (10 ms resolution @ 100 Hz). |
 | `clock_res_get(clock_id, res_ptr) -> i32` | Resolution (`10_000_000` ns). |
 
+> **stdin on Wasmtime `.cwasm`** (`fd_read` fd 0): when a PTY is bound (a tool
+> launched from the shell/SSH), fd 0 reads lines from that pair's cooked slave
+> ring — a blocking read on the ComputeApp core (parks with `hlt`, ~0% CPU).
+> Without a bound PTY, or on a 1-2 core boot (the BSP pumps the line
+> discipline), stdin is EOF. Interactive tools therefore need ≥3 cores, like
+> the tui/rtop path. Template: `tools/wt-readline/`.
+>
 > **Window apps (Wasmtime, `kernel/src/wasm/wt/wasi.rs` shim):** same surface,
 > but `clock_id 0` (REALTIME) returns **unix-epoch ns** (anchored to the RTC at
 > first use) so `SystemTime::now()` is wall-clock — required by in-app TLS

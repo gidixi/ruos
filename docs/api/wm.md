@@ -57,13 +57,14 @@ COPIES the pixels into this window's atlas store and returns `0`; returns `28` o
 guest-memory read fault. `id` is passed as a single 64-bit value (the linker accepts
 `i64` params directly).
 
-### `set_clear(rgba: i32) -> i32`
+### `set_clear(rgba: i32)`
 Set the **mesh-mode** kernel raster's clear colour for THIS window. `rgba` is a `u32`
 packed little-endian `[r, g, b, a]` (premultiplied); `0` = fully transparent. Forces a
 full redraw on the next frame. Used by the **notifications overlay** (`new_overlay`),
 whose full-screen surface must be transparent so it alpha-blends over the desktop
 (only the toasts/modal are painted). No-op for the legacy pixel path (which carries its
-own clear in the app-local renderer). Returns `0`.
+own clear in the app-local renderer). Returns nothing (the wasm import is
+`fn set_clear(rgba: i32)` — a `-> i32` host fn would mismatch and break instantiation).
 
 ### `surface_size() -> i64`
 Full screen framebuffer size, packed `(w << 32) | h`.

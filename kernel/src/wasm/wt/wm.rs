@@ -607,6 +607,181 @@ fn composite_band_job(input: &[u8]) -> u64 {
     0
 }
 
+// --- SMP band-parallel kernel RASTER (Phase C, mirror of the composite path) ---
+//
+// One mesh-mode window's raster is split into disjoint canvas row BANDS that run
+// on the SMP compute pool, exactly like `dispatch_bands` parallelizes the
+// compositing of one screen. The host test `external_band_split_matches_render_wire`
+// proves plan_damage + N-band split + raster_band-per-band is BIT-IDENTICAL to the
+// serial `render_wire`, so the kernel dispatch below reproduces that split.
+
+/// One raster band job descriptor. Raw pointers as usize (POD, `Copy`). The GUI core
+/// fills `[0,n)`, submits, and BLOCKS on the join before the decoded Vecs / canvas /
+/// textures are dropped or reused — so no in-flight job dangles. Bands have DISJOINT
+/// canvas row ranges → no two jobs touch the same byte.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RasterBandArg {
+    px: usize,        // *mut u8 — base of THIS band's canvas rows (row y0)
+    px_len: usize,    // (y1-y0)*width*4
+    width: i32,
+    y0: i32,
+    y1: i32,
+    d0: i32, d1: i32, d2: i32, d3: i32,   // damage rect
+    clear: u32,       // [u8;4] packed LE
+    verts: usize, verts_len: usize,        // *const ruos_raster::Vertex
+    idx: usize, idx_len: usize,            // *const u32
+    prims: usize, prims_len: usize,        // *const ruos_raster::Prim
+    tex: usize,                            // *const BTreeMap<u64, ruos_raster::Atlas>
+}
+
+/// SAFETY of the arena: same contract as BAND_ARENA. Only the GUI core writes it
+/// (between frames, never concurrently with in-flight jobs); each slot carries a
+/// distinct DISJOINT canvas row range + pointers into buffers the GUI core keeps
+/// alive across the join.
+static mut RASTER_BAND_ARENA: [RasterBandArg; MAX_BANDS] = [RasterBandArg {
+    px: 0, px_len: 0, width: 0, y0: 0, y1: 0, d0: 0, d1: 0, d2: 0, d3: 0, clear: 0,
+    verts: 0, verts_len: 0, idx: 0, idx_len: 0, prims: 0, prims_len: 0, tex: 0,
+}; MAX_BANDS];
+
+/// Distinct cores that ran a raster band job in the most recent dispatch (bitset by
+/// cpu_id). Read by the boot-check marker to prove multi-core raster.
+static RASTER_CORE_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Read + clear the raster core mask (boot-check marker support).
+pub fn take_raster_core_mask() -> u32 { RASTER_CORE_MASK.swap(0, Ordering::SeqCst) }
+
+/// Pool job: rasterize ONE band. `input` is a byte view of one `RasterBandArg` in
+/// the static arena. Returns 0 (unused).
+///
+/// SAFETY: the dispatcher guarantees (a) `input` is exactly size_of::<RasterBandArg>()
+/// bytes of a valid RasterBandArg, (b) `px`/`verts`/`idx`/`prims`/`tex` point at live
+/// buffers for the job's lifetime (GUI core blocks on join before reusing them),
+/// (c) this job's `[y0,y1)` canvas rows are disjoint from every other in-flight job.
+fn raster_band_job(input: &[u8]) -> u64 {
+    if input.len() < core::mem::size_of::<RasterBandArg>() { return 0; }
+    let a: RasterBandArg = unsafe { core::ptr::read_unaligned(input.as_ptr() as *const RasterBandArg) };
+    // SAFETY: dispatcher guarantees live buffers + disjoint rows for the flight.
+    let mut band = ruos_raster::Band {
+        px: unsafe { core::slice::from_raw_parts_mut(a.px as *mut u8, a.px_len) },
+        width: a.width, y0: a.y0, y1: a.y1,
+    };
+    let verts = unsafe { core::slice::from_raw_parts(a.verts as *const ruos_raster::Vertex, a.verts_len) };
+    let idx = unsafe { core::slice::from_raw_parts(a.idx as *const u32, a.idx_len) };
+    let prims = unsafe { core::slice::from_raw_parts(a.prims as *const ruos_raster::Prim, a.prims_len) };
+    let textures = unsafe { &*(a.tex as *const BTreeMap<u64, ruos_raster::Atlas>) };
+    ruos_raster::raster_band(&mut band, (a.d0, a.d1, a.d2, a.d3), a.clear.to_le_bytes(), verts, idx, prims, textures);
+    let cpu = crate::cpu::cpu_id();
+    if cpu < 32 { RASTER_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+    0
+}
+
+/// Dispatch the banded raster of ONE mesh-mode window. The DAMAGE rows
+/// `[dmg.1, dmg.3)` are split into `n_bands` disjoint horizontal bands across the
+/// SMP pool; each band rasterizes the SAME `prims` clipped to its rows into the
+/// window's persistent canvas. 1-CPU / pool-full → run inline. JOINS before
+/// returning (the GUI core then reads the canvas in `raster_meshes`).
+///
+/// `raster`'s canvas + textures live for the whole fn (the `&mut raster` borrow),
+/// and `verts`/`idx`/`prims` are caller-owned locals kept alive across the join.
+///
+/// Correctness: bands have DISJOINT row ranges, every job writes only its own
+/// rows ⇒ no two jobs touch the same canvas byte (same invariant as dispatch_bands).
+fn dispatch_raster(
+    raster: &mut ruos_raster::Raster,
+    verts: &[ruos_raster::Vertex],
+    idx: &[u32],
+    prims: &[ruos_raster::Prim],
+    dmg: (i32, i32, i32, i32),
+) {
+    let (dy0, dy1) = (dmg.1, dmg.3);
+    if dy0 >= dy1 { return; }
+    let (canvas, width, textures, clear) = raster.raster_parts_mut();
+    let clear_u32 = u32::from_le_bytes(clear);
+    let tex_ptr = textures as *const BTreeMap<u64, ruos_raster::Atlas> as usize;
+    let vptr = verts.as_ptr() as usize; let vlen = verts.len();
+    let iptr = idx.as_ptr() as usize; let ilen = idx.len();
+    let pptr = prims.as_ptr() as usize; let plen = prims.len();
+    let cbase = canvas.as_mut_ptr() as usize; // canvas row 0
+    let stride = (width as usize) * 4;
+
+    let n_bands = core::cmp::min(core::cmp::max(crate::cpu::cpus_online() as usize, 1), MAX_BANDS);
+    let total_rows = (dy1 - dy0) as usize;
+    let band_rows = (total_rows + n_bands - 1) / n_bands; // ceil
+
+    let mut ids: [usize; MAX_BANDS] = [usize::MAX; MAX_BANDS];
+    let mut ranges: [(i32, i32); MAX_BANDS] = [(0, 0); MAX_BANDS];
+    let mut n = 0usize; let mut n_submitted = 0usize;
+    let mut yy = dy0;
+    while yy < dy1 && n < MAX_BANDS {
+        let ye = core::cmp::min(yy + band_rows as i32, dy1);
+        ranges[n] = (yy, ye);
+        // band canvas slice = rows [yy, ye) → byte offset yy*stride, len (ye-yy)*stride
+        let arg = RasterBandArg {
+            px: cbase + (yy as usize) * stride,
+            px_len: (ye - yy) as usize * stride,
+            width, y0: yy, y1: ye,
+            d0: dmg.0, d1: dmg.1, d2: dmg.2, d3: dmg.3,
+            clear: clear_u32,
+            verts: vptr, verts_len: vlen, idx: iptr, idx_len: ilen, prims: pptr, prims_len: plen,
+            tex: tex_ptr,
+        };
+        // SAFETY: GUI-core-only write of slot n; previous dispatch fully joined.
+        unsafe { RASTER_BAND_ARENA[n] = arg; }
+        let bytes: &'static [u8] = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(RASTER_BAND_ARENA[n]) as *const u8,
+                core::mem::size_of::<RasterBandArg>(),
+            )
+        };
+        match crate::smp::pool::submit(raster_band_job, bytes) {
+            Some(id) => { ids[n] = id; n_submitted += 1; }
+            None => { break; } // pool full: remaining ranges run inline below
+        }
+        yy = ye; n += 1;
+    }
+
+    // 1-CPU (or pool-full) fallback: drain queued jobs inline on the GUI core so we
+    // never deadlock waiting on cores that aren't there.
+    if crate::cpu::cpus_online() <= 1 {
+        while let Some(slot) = crate::smp::pool::take() {
+            crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+        }
+    }
+
+    // Leftover (pool full at submit): rasterize the un-submitted bands inline by
+    // building a Band directly over their rows. Disjoint from submitted bands.
+    for k in n_submitted..n {
+        let (y0, y1) = ranges[k];
+        let off = (y0 as usize) * stride;
+        let len = (y1 - y0) as usize * stride;
+        // SAFETY: leftover bands are disjoint from submitted ones; submitted jobs
+        // only touch THEIR rows, so running these inline cannot race them.
+        let mut band = ruos_raster::Band {
+            px: unsafe { core::slice::from_raw_parts_mut((cbase + off) as *mut u8, len) },
+            width, y0, y1,
+        };
+        ruos_raster::raster_band(&mut band, dmg, clear, verts, idx, prims, textures);
+        let cpu = crate::cpu::cpu_id();
+        if cpu < 32 { RASTER_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+    }
+
+    // Join: block until every submitted band is DONE, work-stealing while we wait
+    // (same rationale as dispatch_bands — pure fn jobs, single submitter).
+    for k in 0..n {
+        if ids[k] == usize::MAX { continue; }
+        loop {
+            if crate::smp::pool::poll_done(ids[k]).is_some() { break; }
+            if let Some(slot) = crate::smp::pool::take() {
+                crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    // After this point all jobs are DONE → the GUI core may read/own the canvas.
+}
+
 /// Dispatch the banded composite into the screen-sized RGBX back-buffer pointed
 /// at by `back_ptr` (len = `stride*screen_h`). The WIN arena MUST already be
 /// filled (by `Compositor::present`) with the `n_wins` decorated footprint
@@ -2240,8 +2415,9 @@ impl Compositor {
 
     /// Phase C: for every awake mesh-mode window that committed a new mesh this
     /// frame, rasterize it kernel-side into the window's `pixels` surface (which the
-    /// compositor already composites). Serial for now (one window at a time); the
-    /// SMP band split is a later phase. `compose_window` is unchanged — we reuse
+    /// compositor already composites). The per-window raster of ONE window's damage
+    /// rows runs band-parallel across the SMP compute pool (`dispatch_raster`,
+    /// mirror of `dispatch_bands`). `compose_window` is unchanged — we reuse
     /// `pixels`/`win_w`/`win_h` so a mesh-mode window looks identical to a legacy
     /// `wm.commit` (pixel) window to the rest of the pipeline.
     fn raster_meshes(&mut self) {
@@ -2251,18 +2427,21 @@ impl Compositor {
             if !s.win.mesh_mode || !s.win.mesh_dirty { continue; }
             let (mw, mh) = (s.win.mesh_w, s.win.mesh_h);
             if mw == 0 || mh == 0 { s.win.mesh_dirty = false; continue; }
-            // render_wire borrows `raster` mut + the mesh_* fields shared — disjoint
-            // fields of WmState. Destructure so the borrow checker sees them split,
-            // then copy the canvas out (to_vec) so the borrow ends before we write
-            // back into `pixels`.
-            let pixels = {
-                let WmState { raster, mesh_verts, mesh_idx, mesh_prims, .. } = &mut s.win;
-                let (canvas, _dirty) = raster.render_wire(
-                    mesh_verts, mesh_idx, mesh_prims, mw, mh);
-                canvas.to_vec()
+            // Decode the wire buffers into GUI-core-stack locals FIRST: this ends the
+            // borrow of `s.win.mesh_*` before we take a `&mut` on `s.win.raster`, and
+            // the Vecs outlive `dispatch_raster` (which JOINS before returning, so no
+            // band job dangles on freed buffers).
+            let verts = ruos_raster::decode_verts(&s.win.mesh_verts);
+            let idx = ruos_raster::decode_indices(&s.win.mesh_idx);
+            let prims = ruos_raster::decode_prims(&s.win.mesh_prims);
+            let dmg = match s.win.raster.plan_damage(&verts, &idx, &prims, mw, mh) {
+                Some(d) => d,
+                None => { s.win.mesh_dirty = false; continue; }
             };
+            dispatch_raster(&mut s.win.raster, &verts, &idx, &prims, dmg);
+            // The band jobs wrote into the persistent canvas; read it AFTER the join.
+            s.win.pixels = s.win.raster.canvas().to_vec();
             crate::binfo!("wm", "mesh render win={} {}x{}", w.id, mw, mh);
-            s.win.pixels = pixels;
             s.win.win_w = mw;
             s.win.win_h = mh;
             s.win.committed = true; // damage: this window updated → present runs
@@ -2729,10 +2908,14 @@ impl Compositor {
         let mut overlay_btn = false;
         let mut marker_done = false;
         let mut frame_marker_done = false;
+        let mut raster_marker_done = false;
         // FPS/timing telemetry (feature wm-fps): accumulators over a ~1 s window.
         #[cfg(feature = "wm-fps")]
         let (mut fps_t0, mut n_present, mut n_iter, mut fa_sum, mut fa_max, mut pr_sum) =
             (crate::timer::ticks(), 0u32, 0u32, 0u64, 0u64, 0u64);
+        // Raster (mesh band-parallel) timing accumulators (mirror of fa_sum/pr_sum).
+        #[cfg(feature = "wm-fps")]
+        let (mut ra_sum, mut n_raster) = (0u64, 0u32);
         // Last-computed display values (held between the 1 s reports) + the small
         // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
         // VBox/HW screen (the binfo log only reaches serial/netconsole).
@@ -2947,7 +3130,12 @@ impl Compositor {
             // mesh-mode window called `wm.commit_mesh`, filling its `mesh_*`),
             // rasterize the stored mesh into the window's `pixels` surface so the
             // compositor (below) composites it like any other committed surface.
+            #[cfg(feature = "wm-fps")] let ra0 = crate::boot::clock::read_tsc();
             self.raster_meshes();
+            #[cfg(feature = "wm-fps")] {
+                ra_sum = ra_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(ra0));
+                n_raster += 1;
+            }
 
             // SP-C: process deferred window→kernel requests raised during
             // `frame_all` (`wm.set_background`, `wm.spawn`). Deferred to HERE —
@@ -3109,6 +3297,21 @@ impl Compositor {
                 marker_done = true;
             }
 
+            // Companion marker for the band-parallel RASTER dispatch (Phase C):
+            // after the warm-up window, report the distinct cores that ran a raster
+            // band job across the dispatches so far. Like the composite mask it
+            // ACCUMULATES across frames, so it proves SMP raster ran (the full-screen
+            // shell band-parallelizes its mesh raster). Greppable as "raster cores=N".
+            if !raster_marker_done && self.frame_no >= 30 {
+                let mask = take_raster_core_mask();
+                let mut cores: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                for c in 0..32u32 {
+                    if mask & (1u32 << c) != 0 { cores.push(c); }
+                }
+                crate::binfo!("wm", "raster cores={} {:?}", cores.len(), cores);
+                raster_marker_done = true;
+            }
+
             // Companion marker for the PARALLEL frame() dispatch (MT Fase 1): on
             // the first frame ≥30 that dispatched ≥2 jobs, report the distinct
             // cores that ran frame() this frame (FRAME_CORE_MASK is reset per
@@ -3139,6 +3342,7 @@ impl Compositor {
                     // misleading startup spike. Keep the window anchored to now.
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
+                    ra_sum = 0; n_raster = 0;
                 } else if elapsed >= 100 {
                     let tpm = crate::boot::clock::tsc_per_ms().max(1);
                     let present_s = (n_present as u64) * 100 / elapsed;
@@ -3146,15 +3350,17 @@ impl Compositor {
                     let fa_avg_us = if n_iter > 0 { (fa_sum / n_iter as u64) * 1000 / tpm } else { 0 };
                     let fa_max_us = fa_max * 1000 / tpm;
                     let pr_avg_us = if n_present > 0 { (pr_sum / n_present as u64) * 1000 / tpm } else { 0 };
+                    let ra_avg_us = if n_raster > 0 { (ra_sum / n_raster as u64) * 1000 / tpm } else { 0 };
                     crate::binfo!("wmfps",
-                        "present={}/s iters={}/s frame_all avg={}us max={}us present avg={}us jobs={}",
-                        present_s, iter_s, fa_avg_us, fa_max_us, pr_avg_us,
+                        "present={}/s iters={}/s frame_all avg={}us max={}us raster avg={}us present avg={}us jobs={}",
+                        present_s, iter_s, fa_avg_us, fa_max_us, ra_avg_us, pr_avg_us,
                         FRAME_JOBS_LAST.load(Ordering::SeqCst));
                     disp_p = present_s; disp_it = iter_s;
                     disp_fa = fa_avg_us; disp_pr = pr_avg_us;
                     let _ = fa_max_us; // logged above; not shown on the overlay (noisy under VM)
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
+                    ra_sum = 0; n_raster = 0;
                 }
             }
 

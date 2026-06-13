@@ -388,3 +388,26 @@ fn external_band_split_matches_render_wire() {
 
     assert_eq!(ser_canvas.as_slice(), bnd.canvas(), "external band split != render_wire");
 }
+
+/// `set_clear` changes the clear colour AND forces a full redraw — the overlay uses
+/// it to make its background transparent for the kernel-side raster.
+#[test]
+fn set_clear_transparent_forces_full_and_bg() {
+    // A single small rect (NOT full-screen) so the clear shows at the corners.
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let (i0, i1) = rect_mesh(&mut verts, &mut idx, 2.0, 2.0, 8.0, 8.0, rgba(200, 0, 0, 255));
+    let prims = vec![Prim { clip: [0.0, 0.0, 16.0, 16.0], tex_id: 0, idx0: i0, idx1: i1 }];
+
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    let (_, d1) = r.render(&verts, &idx, &prims, 16, 16);
+    assert_eq!((d1.w, d1.h), (16, 16));
+    assert_eq!(pixel(r.canvas(), 16, 0, 0), [0x1e, 0x1e, 0x1e, 0xff], "opaque clear");
+
+    r.set_clear([0, 0, 0, 0]); // transparent
+    let (_, d2) = r.render(&verts, &idx, &prims, 16, 16);
+    assert_eq!((d2.w, d2.h), (16, 16), "set_clear must force full redraw");
+    assert_eq!(pixel(r.canvas(), 16, 0, 0), [0, 0, 0, 0], "corner now transparent");
+    assert_eq!(pixel(r.canvas(), 16, 5, 5), [200, 0, 0, 255], "rect still drawn");
+}

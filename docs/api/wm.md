@@ -8,9 +8,10 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-13 (26 functions; added `tex_update()` + `commit_mesh()`
-— the kernel-side-raster mesh ABI: apps send tessellated meshes + texture deltas, the
-kernel copies them into per-window state and rasterizes them kernel-side).
+**Last reviewed:** 2026-06-13 (27 functions; added `tex_update()` + `commit_mesh()` +
+`set_clear()` — the kernel-side-raster mesh ABI: apps send tessellated meshes + texture
+deltas, the kernel copies them into per-window state and rasterizes them kernel-side;
+`set_clear` makes the overlay's mesh raster transparent).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -55,6 +56,14 @@ only on egui `TexturesDelta` (rare: font atlas at startup, atlas growth). The ke
 COPIES the pixels into this window's atlas store and returns `0`; returns `28` on a
 guest-memory read fault. `id` is passed as a single 64-bit value (the linker accepts
 `i64` params directly).
+
+### `set_clear(rgba: i32) -> i32`
+Set the **mesh-mode** kernel raster's clear colour for THIS window. `rgba` is a `u32`
+packed little-endian `[r, g, b, a]` (premultiplied); `0` = fully transparent. Forces a
+full redraw on the next frame. Used by the **notifications overlay** (`new_overlay`),
+whose full-screen surface must be transparent so it alpha-blends over the desktop
+(only the toasts/modal are painted). No-op for the legacy pixel path (which carries its
+own clear in the app-local renderer). Returns `0`.
 
 ### `surface_size() -> i64`
 Full screen framebuffer size, packed `(w << 32) | h`.

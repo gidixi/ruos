@@ -529,6 +529,18 @@ impl Raster {
         let Raster { canvas, textures, cw, clear, .. } = self;
         (canvas.as_mut_slice(), *cw as i32, textures, *clear)
     }
+
+    /// Set the clear colour (sRGBA premultiplied). `[0,0,0,0]` = transparent — used by
+    /// the notifications overlay, whose full-screen surface is alpha-blended over the
+    /// desktop (only the toasts are opaque). Invalidates the canvas + per-prim diff so
+    /// the next frame is a full redraw with the new clear. Mirrors gui-core's set_clear.
+    pub fn set_clear(&mut self, c: [u8; 4]) {
+        self.clear = c;
+        self.cw = 0;
+        self.ch = 0;
+        self.canvas.clear();
+        self.prev.clear();
+    }
 }
 
 /// Mutable view of canvas rows `[y0, y1)` (RGBA premultiplied), row-major, `width`

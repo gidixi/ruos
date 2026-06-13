@@ -1214,6 +1214,16 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             s.mesh_mode = true;
             0
         })?;
+    // wm.set_clear(rgba) -> 0: set the mesh-mode kernel raster's clear colour for
+    // THIS window. `rgba` = u32 packed little-endian [r,g,b,a] premultiplied; 0 =
+    // transparent (the notifications overlay, whose full-screen surface is alpha-
+    // blended over the desktop). Forces a full redraw next frame. No-op for the
+    // legacy pixel path (which carries its own clear in the app's local renderer).
+    linker.func_wrap("wm", "set_clear",
+        |mut caller: Caller<'_, T>, rgba: i32| -> i32 {
+            caller.data_mut().win().raster.set_clear((rgba as u32).to_le_bytes());
+            0
+        })?;
     // wm.app_id() -> u32: this instance's window id. (Import name is `app_id`
     // with an underscore — Rust `#[link]` preserves the symbol verbatim; verified
     // via `wasm-tools print`.)

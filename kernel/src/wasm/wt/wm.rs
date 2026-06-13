@@ -2967,12 +2967,19 @@ impl Compositor {
         // Raster (mesh band-parallel) timing accumulators (mirror of fa_sum/pr_sum).
         #[cfg(feature = "wm-fps")]
         let (mut ra_sum, mut n_raster) = (0u64, 0u32);
+        // Per-iter wall-clock + hlt accumulators: resolves "loop iteration time vs the
+        // sum of the timed stages". ITER avg = true wall-clock per loop iter; HLT avg =
+        // time parked in hlt per iter. If ITER >> (frame_all+raster+present) and HLT is
+        // large → the loop is IDLE-bound (waiting for IRQs); if HLT is small → the gap
+        // is unmeasured work in the loop body.
+        #[cfg(feature = "wm-fps")]
+        let (mut hlt_sum, mut iter_sum, mut prev_iter) = (0u64, 0u64, 0u64);
         // Last-computed display values (held between the 1 s reports) + the small
         // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
         // VBox/HW screen (the binfo log only reaches serial/netconsole).
         #[cfg(feature = "wm-fps")]
-        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra, mut disp_iter, mut disp_hlt) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         #[cfg(feature = "wm-fps")]
         let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
                               crate::console::font::glyph_height() as u32);
@@ -3168,7 +3175,12 @@ impl Compositor {
                 s.win.stay_awake_request = false;
             }
 
-            #[cfg(feature = "wm-fps")] { n_iter += 1; }
+            #[cfg(feature = "wm-fps")] {
+                n_iter += 1;
+                let now = crate::boot::clock::read_tsc();
+                if prev_iter != 0 { iter_sum = iter_sum.wrapping_add(now.wrapping_sub(prev_iter)); }
+                prev_iter = now;
+            }
             #[cfg(feature = "wm-fps")] let fa0 = crate::boot::clock::read_tsc();
             self.frame_all();
             #[cfg(feature = "wm-fps")] {
@@ -3393,7 +3405,7 @@ impl Compositor {
                     // misleading startup spike. Keep the window anchored to now.
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
-                    ra_sum = 0; n_raster = 0;
+                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0;
                 } else if elapsed >= 100 {
                     let tpm = crate::boot::clock::tsc_per_ms().max(1);
                     let present_s = (n_present as u64) * 100 / elapsed;
@@ -3402,16 +3414,19 @@ impl Compositor {
                     let fa_max_us = fa_max * 1000 / tpm;
                     let pr_avg_us = if n_present > 0 { (pr_sum / n_present as u64) * 1000 / tpm } else { 0 };
                     let ra_avg_us = if n_raster > 0 { (ra_sum / n_raster as u64) * 1000 / tpm } else { 0 };
+                    let iter_avg_us = if n_iter > 0 { (iter_sum / n_iter as u64) * 1000 / tpm } else { 0 };
+                    let hlt_avg_us = if n_iter > 0 { (hlt_sum / n_iter as u64) * 1000 / tpm } else { 0 };
                     crate::binfo!("wmfps",
-                        "present={}/s iters={}/s frame_all avg={}us max={}us raster avg={}us present avg={}us jobs={}",
-                        present_s, iter_s, fa_avg_us, fa_max_us, ra_avg_us, pr_avg_us,
-                        FRAME_JOBS_LAST.load(Ordering::SeqCst));
+                        "iters={}/s ITER={}us HLT={}us | frame_all={}us raster={}us present={}us (fps={} jobs={})",
+                        iter_s, iter_avg_us, hlt_avg_us, fa_avg_us, ra_avg_us, pr_avg_us,
+                        present_s, FRAME_JOBS_LAST.load(Ordering::SeqCst));
+                    let _ = fa_max_us;
                     disp_p = present_s; disp_it = iter_s;
                     disp_fa = fa_avg_us; disp_pr = pr_avg_us; disp_ra = ra_avg_us;
-                    let _ = fa_max_us; // logged above; not shown on the overlay (noisy under VM)
+                    disp_iter = iter_avg_us; disp_hlt = hlt_avg_us;
                     fps_t0 = now;
                     n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
-                    ra_sum = 0; n_raster = 0;
+                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0;
                 }
             }
 
@@ -3427,7 +3442,8 @@ impl Compositor {
                                      [0x10, 0x10, 0x10, 0xFF]);
                     // Row 1: present rate (fps) + loop rate (Hz) — reliable counters.
                     // Row 2: per-frame timing in ms (wall-clock; approx under a VM).
-                    let l1 = alloc::format!("display: {} fps  ({} Hz)", disp_p, disp_it);
+                    let l1 = alloc::format!("{}fps {}Hz iter:{}ms hlt:{}ms",
+                        disp_p, disp_it, disp_iter / 1000, disp_hlt / 1000);
                     // mesh-mode: "tess" = egui frontend+encode (frame_all), "rast" =
                     // kernel-side raster stage (the real per-frame cost), "blit" =
                     // composite+present. ms is coarse on fast HW — use netconsole's
@@ -3450,7 +3466,11 @@ impl Compositor {
             // present-gating above, an idle desktop now does ~zero work per tick.
             // SAFETY: the compositor loop runs with IF=1 (entered from the executor,
             // which enables interrupts), so `hlt` is guaranteed to be woken by an IRQ.
+            #[cfg(feature = "wm-fps")] let hlt_t0 = crate::boot::clock::read_tsc();
             x86_64::instructions::hlt();
+            #[cfg(feature = "wm-fps")] {
+                hlt_sum = hlt_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(hlt_t0));
+            }
         }
 
         // Teardown su "torna alla shell": chiudi ogni finestra (le istanze guest e

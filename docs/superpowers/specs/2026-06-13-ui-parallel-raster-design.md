@@ -1,7 +1,16 @@
 # Design — Rasterizzatore UI software parallelo (stile llvmpipe), GPU-less
 
+> **⚠️ SUPERSEDED (2026-06-13)** dall'architettura **kernel-side display-server**:
+> `2026-06-13-ui-kernel-side-raster-design.md` (Opzione C). Motivo: le app finestra
+> sono `wasm32-wasip1` (single-thread); parallelizzare il raster DENTRO l'app
+> richiedeva convertirle tutte a `wasip1-threads` (overhead + rischio). C sposta il
+> raster nel kernel (pool SMP esistente), niente thread per-app. **Resta valido di
+> questa spec:** il profiling, il prior-art, e il refactor `gui-core` band-able
+> (commit `ee39f15`/`184a0d9`) — ora **riferimento bit-identico** per il port kernel
+> e raster dell'anteprima PC. Lo spike "join in frame()" (PASS) non serve più.
+
 **Data:** 2026-06-13
-**Stato:** DRAFT (in revisione utente; target perf da riempire con numeri HW reali)
+**Stato:** SUPERSEDED → vedi `2026-06-13-ui-kernel-side-raster-design.md`
 **Topic:** sotto-progetto #1 della direzione "fluidità UI come Ubuntu, in Rust"
 
 ## 0. Da dove nasce (contesto del pivot)

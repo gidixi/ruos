@@ -1,0 +1,193 @@
+//! Unit tests adapted from gui-core's `raster.rs` tests, built directly on the
+//! wire `Vertex`/`Prim`/`idx` inputs (no egui here — the cross-check test in
+//! `tests/crosscheck.rs` proves byte-identity with gui-core).
+
+use super::*;
+
+const CLEAR: [u8; 4] = [0x1e, 0x1e, 0x1e, 0xff];
+
+/// A 1x1 white opaque texture on tex_id 0 (solid texel for fills) — mirrors
+/// gui-core's `white_texel_delta`.
+fn white_texel(r: &mut Raster) {
+    r.set_texture(0, None, 1, 1, &[255, 255, 255, 255]);
+}
+
+/// Build a rect mesh (2 triangles) of `color`, uv on the white texel (0,0),
+/// appended into shared `verts`/`idx`. Returns the half-open index range.
+fn rect_mesh(
+    verts: &mut Vec<Vertex>,
+    idx: &mut Vec<u32>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: u32,
+) -> (u32, u32) {
+    let base = verts.len() as u32;
+    let (u, v) = (0.0, 0.0);
+    verts.push(Vertex { x: x0, y: y0, u, v, color });
+    verts.push(Vertex { x: x1, y: y0, u, v, color });
+    verts.push(Vertex { x: x1, y: y1, u, v, color });
+    verts.push(Vertex { x: x0, y: y1, u, v, color });
+    let i0 = idx.len() as u32;
+    idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    let i1 = idx.len() as u32;
+    (i0, i1)
+}
+
+/// Pack RGBA bytes into a wire color (premultiplied), same as
+/// `u32::from_le_bytes([r,g,b,a])`.
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    u32::from_le_bytes([r, g, b, a])
+}
+
+fn pixel(canvas: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * w + x) * 4) as usize;
+    [canvas[i], canvas[i + 1], canvas[i + 2], canvas[i + 3]]
+}
+
+#[test]
+fn renders_solid_red_rect() {
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let (i0, i1) = rect_mesh(&mut verts, &mut idx, 2.0, 2.0, 8.0, 8.0, rgba(255, 0, 0, 255));
+    let prims = vec![Prim { clip: [0.0, 0.0, 10.0, 10.0], tex_id: 0, idx0: i0, idx1: i1 }];
+
+    let (canvas, dirty) = r.render(&verts, &idx, &prims, 10, 10);
+    assert_eq!(dirty, DirtyRect { x: 0, y: 0, w: 10, h: 10 });
+
+    // Centro del rettangolo = rosso opaco.
+    let c = pixel(canvas, 10, 5, 5);
+    assert_eq!((c[0], c[1], c[2], c[3]), (255, 0, 0, 255));
+
+    // Fuori dal rettangolo = clear (0x1e), non rosso.
+    let bg = pixel(canvas, 10, 0, 0);
+    assert_eq!((bg[0], bg[1], bg[2]), (0x1e, 0x1e, 0x1e));
+}
+
+#[test]
+fn alpha_blends_over_background() {
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    // Rosso al 50% (premoltiplicato: rgb scalati con a).
+    let half = rgba(128, 0, 0, 128);
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let (i0, i1) = rect_mesh(&mut verts, &mut idx, 0.0, 0.0, 4.0, 4.0, half);
+    let prims = vec![Prim { clip: [0.0, 0.0, 4.0, 4.0], tex_id: 0, idx0: i0, idx1: i1 }];
+
+    let (canvas, _) = r.render(&verts, &idx, &prims, 4, 4);
+    let c = pixel(canvas, 4, 1, 1);
+    // out.r = 128 + 0x1e*(1-128/255) ≈ 143
+    assert!(c[0] > 135 && c[0] < 150, "red was {}", c[0]);
+    assert!(c[1] < 20 && c[2] < 20);
+}
+
+/// Scena: rettangolo di sfondo statico + un piccolo rettangolo mobile.
+fn scene(sx: f32, sy: f32, col: u32) -> (Vec<Vertex>, Vec<u32>, Vec<Prim>) {
+    let clip = [0.0, 0.0, 64.0, 64.0];
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    let (b0, b1) = rect_mesh(&mut verts, &mut idx, 0.0, 0.0, 64.0, 64.0, rgba(10, 20, 30, 255));
+    let (r0, r1) = rect_mesh(&mut verts, &mut idx, sx, sy, sx + 8.0, sy + 8.0, col);
+    let prims = vec![
+        Prim { clip, tex_id: 0, idx0: b0, idx1: b1 },
+        Prim { clip, tex_id: 0, idx0: r0, idx1: r1 },
+    ];
+    (verts, idx, prims)
+}
+
+/// Dirty-rect: spostare il rettangolo → l'update parziale del canvas deve
+/// coincidere PIXEL-PER-PIXEL con un render full della nuova scena.
+#[test]
+fn dirty_rect_move_matches_full_render() {
+    let (va, ia, pa) = scene(2.0, 2.0, rgba(255, 0, 0, 255));
+    let (vb, ib, pb) = scene(40.0, 40.0, rgba(255, 0, 0, 255));
+
+    let mut inc = Raster::new(CLEAR);
+    white_texel(&mut inc);
+    let _ = inc.render(&va, &ia, &pa, 64, 64); // primo frame: full
+    let (inc_canvas, dirty) = inc.render(&vb, &ib, &pb, 64, 64); // parziale
+    let inc_data = inc_canvas.to_vec();
+
+    assert!(dirty.w > 0 && dirty.h > 0, "damage vuoto");
+    assert!(dirty.w < 64 || dirty.h < 64, "atteso damage parziale, ho {dirty:?}");
+
+    let mut full = Raster::new(CLEAR);
+    white_texel(&mut full);
+    let (full_canvas, _) = full.render(&vb, &ib, &pb, 64, 64);
+    assert_eq!(
+        inc_data.as_slice(),
+        full_canvas,
+        "canvas dirty-rect != render full (scia / regione stale)"
+    );
+}
+
+/// Cambio di solo colore → update parziale corretto.
+#[test]
+fn dirty_rect_recolor_matches_full_render() {
+    let (va, ia, pa) = scene(20.0, 20.0, rgba(255, 0, 0, 255));
+    let (vb, ib, pb) = scene(20.0, 20.0, rgba(0, 255, 0, 255));
+
+    let mut inc = Raster::new(CLEAR);
+    white_texel(&mut inc);
+    let _ = inc.render(&va, &ia, &pa, 64, 64);
+    let (inc_canvas, _) = inc.render(&vb, &ib, &pb, 64, 64);
+    let inc_data = inc_canvas.to_vec();
+
+    let mut full = Raster::new(CLEAR);
+    white_texel(&mut full);
+    let (full_canvas, _) = full.render(&vb, &ib, &pb, 64, 64);
+    assert_eq!(inc_data.as_slice(), full_canvas);
+}
+
+/// The no_std float ops (used in the kernel build) must be bit-identical to
+/// std's intrinsics (used by gui-core). Under `cargo test`, std's inherent
+/// methods shadow the trait in the ported code, so call the trait impls via
+/// fully-qualified syntax and compare bit patterns against std over a wide range
+/// of values. floor/ceil/round are EXACT for these inputs → must match exactly.
+#[test]
+fn float_ops_match_std_bit_identical() {
+    use super::F32Ext;
+    let mut vals: Vec<f32> = Vec::new();
+    // Pixel-coordinate-ish values + fractions + negatives + edge cases.
+    let mut x = -2000.0f32;
+    while x <= 2000.0 {
+        vals.push(x);
+        x += 0.125;
+    }
+    for &k in &[0.0f32, -0.0, 0.5, -0.5, 0.49999997, 0.50000006, 1.5, -1.5, 2.5, -2.5] {
+        vals.push(k);
+    }
+    // Larger magnitudes where the exponent path differs.
+    for &k in &[8_388_608.0f32, 8_388_607.5, 16_777_216.0, -16_777_216.0, 123_456.78] {
+        vals.push(k);
+    }
+    for v in vals {
+        let mine_floor = F32Ext::floor(v).to_bits();
+        let std_floor = f32::floor(v).to_bits();
+        assert_eq!(mine_floor, std_floor, "floor({v}) mismatch");
+
+        let mine_ceil = F32Ext::ceil(v).to_bits();
+        let std_ceil = f32::ceil(v).to_bits();
+        assert_eq!(mine_ceil, std_ceil, "ceil({v}) mismatch");
+
+        let mine_round = F32Ext::round(v).to_bits();
+        let std_round = f32::round(v).to_bits();
+        assert_eq!(mine_round, std_round, "round({v}) mismatch");
+    }
+}
+
+/// Scena invariata → damage vuoto (niente raster, niente blit).
+#[test]
+fn unchanged_scene_yields_empty_dirty() {
+    let (v, i, p) = scene(10.0, 10.0, rgba(50, 60, 70, 255));
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    let (_, d1) = r.render(&v, &i, &p, 64, 64);
+    assert_eq!((d1.w, d1.h), (64, 64)); // primo frame = full
+    let (_, d2) = r.render(&v, &i, &p, 64, 64);
+    assert_eq!((d2.w, d2.h), (0, 0)); // invariato → niente da presentare
+}

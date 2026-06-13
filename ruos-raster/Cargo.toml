@@ -1,0 +1,12 @@
+[package]
+name = "ruos-raster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+gui-core = { path = "../ruos-desktop/crates/gui-core" }
+egui = "0.31"
+epaint = "0.31"
+tiny-skia = "0.11"

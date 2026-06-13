@@ -878,8 +878,11 @@ pub struct WmState {
     pub mesh_prims: alloc::vec::Vec<u8>,
     pub mesh_w: u32,
     pub mesh_h: u32,
-    pub mesh_dirty: bool,   // set by commit_mesh; the raster step (later) consumes it
-    pub mesh_mode: bool,    // this window committed at least one mesh
+    /// Set by commit_mesh; the raster step (later phase) consumes it.
+    pub mesh_dirty: bool,
+    /// True once this window has committed at least one mesh (one-way latch, never
+    /// resets). Until then the window uses the legacy pixel-commit path (wm.commit).
+    pub mesh_mode: bool,
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -975,6 +978,16 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
                 Some(b) => b,
                 None => return 28,
             };
+            // Validate guest-controlled dims (trust boundary — multi-tenant no-SPOF).
+            // `set_texture` is also internally panic-safe, but reject malformed input
+            // here so the guest gets a clean error and we never store a partial atlas.
+            if w <= 0 || h <= 0 || x < 0 || y < 0 {
+                return 28;
+            }
+            let need = (w as u64).checked_mul(h as u64).and_then(|n| n.checked_mul(4));
+            if need != Some(px.len() as u64) {
+                return 28;
+            }
             let pos = if full != 0 { None } else { Some((x as u32, y as u32)) };
             caller.data_mut().win().raster.set_texture(id as u64, pos, w as u32, h as u32, &px);
             0
@@ -1000,6 +1013,8 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             let prims = match crate::wasm::wt::mem::read(&mut caller, pp as u32, pl as u32) {
                 Some(b) => b, None => return 28,
             };
+            // TODO(phase3): when this goes per-frame hot, read into existing capacity
+            // (needs a mem::read_into(&mut Vec) variant) to avoid 3 allocs/frame.
             let s = caller.data_mut().win();
             s.mesh_verts = verts;
             s.mesh_idx = idx;

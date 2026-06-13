@@ -211,3 +211,24 @@ fn texture_patch_forces_full_damage() {
     let (_, d3) = r.render(&v, &i, &p, 64, 64);
     assert_eq!((d3.w, d3.h), (64, 64), "un patch texture deve forzare full damage");
 }
+
+/// Trust boundary: malformed texture input (guest-controlled dims) must NEVER
+/// panic — it is dropped. Mirrors what the kernel host fn would forward.
+#[test]
+fn malformed_texture_does_not_panic() {
+    let mut r = Raster::new(CLEAR);
+    // Full atlas but px too short for the declared 4×4 → dropped.
+    r.set_texture(1, None, 4, 4, &[0u8; 4]);
+    assert!(r.textures.get(&1).is_none(), "short full atlas must be dropped");
+    // Zero dims → dropped.
+    r.set_texture(2, None, 0, 0, &[]);
+    assert!(r.textures.get(&2).is_none());
+    // Overflowing dims → dropped (no arithmetic panic).
+    r.set_texture(3, None, u32::MAX, u32::MAX, &[1, 2, 3, 4]);
+    assert!(r.textures.get(&3).is_none());
+    // Valid 2×2, then an out-of-bounds patch → dropped, atlas unchanged.
+    r.set_texture(4, None, 2, 2, &[9u8; 16]);
+    let before = r.textures.get(&4).unwrap().px.clone();
+    r.set_texture(4, Some((1, 1)), 4, 4, &[7u8; 64]); // doesn't fit 2×2
+    assert_eq!(r.textures.get(&4).unwrap().px, before, "out-of-fit patch must be dropped");
+}

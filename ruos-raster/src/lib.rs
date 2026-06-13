@@ -226,16 +226,32 @@ impl Raster {
     /// replace); `pos = Some((ox, oy))` → patch a sub-region of the existing
     /// atlas. `px` is RGBA8888 premultiplied, row-major, `w*h*4` bytes.
     pub fn set_texture(&mut self, id: u64, pos: Option<(u32, u32)>, w: u32, h: u32, px: &[u8]) {
+        // Trust boundary: the kernel host fn forwards guest-controlled w/h/px here.
+        // NEVER panic on malformed input — bail instead. `w*h*4` is computed with
+        // checked arithmetic (it can overflow u32/usize), and we require `px` to
+        // actually hold that many bytes before reading it.
+        let need = match (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) {
+            Some(n) => n,
+            None => return,
+        };
+        if w == 0 || h == 0 || px.len() < need {
+            return;
+        }
         match pos {
-            // Update parziale di una sub-regione dell'atlante esistente.
+            // Patch a sub-region of an EXISTING atlas. Drop (no clamp) if it doesn't
+            // fit — egui never sends an out-of-bounds patch; a malformed one is ignored.
             Some((ox, oy)) => {
                 if let Some(atlas) = self.textures.get_mut(&id) {
                     let aw = atlas.w as usize;
-                    let pw = w as usize;
-                    let ph = h as usize;
+                    let ah = atlas.h as usize;
+                    let (pw, ph) = (w as usize, h as usize);
+                    let (ox, oy) = (ox as usize, oy as usize);
+                    if ox + pw > aw || oy + ph > ah {
+                        return;
+                    }
                     for row in 0..ph {
                         for col in 0..pw {
-                            let dst = ((oy as usize + row) * aw + (ox as usize + col)) * 4;
+                            let dst = ((oy + row) * aw + (ox + col)) * 4;
                             let src = (row * pw + col) * 4;
                             atlas.px[dst] = px[src];
                             atlas.px[dst + 1] = px[src + 1];
@@ -243,17 +259,15 @@ impl Raster {
                             atlas.px[dst + 3] = px[src + 3];
                         }
                     }
+                } else {
+                    return; // no atlas to patch
                 }
             }
-            // Atlante nuovo / sostituzione completa.
+            // New atlas / full replacement (exactly w×h, `need` bytes).
             None => {
-                let aw = w.max(1);
-                let ah = h.max(1);
-                let mut buf = Vec::with_capacity((aw * ah * 4) as usize);
-                buf.extend_from_slice(&px[..((w * h * 4) as usize)]);
-                // If px was empty (w or h == 0) the buf may be short; pad to aw*ah*4.
-                buf.resize((aw * ah * 4) as usize, 0);
-                self.textures.insert(id, Atlas { w: aw, h: ah, px: buf });
+                let mut buf = Vec::with_capacity(need);
+                buf.extend_from_slice(&px[..need]);
+                self.textures.insert(id, Atlas { w, h, px: buf });
             }
         }
         self.tex_dirty = true;

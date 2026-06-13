@@ -196,6 +196,11 @@ pub struct Raster {
     prev: Vec<PrimMeta>,
     /// Colore di clear (sRGBA premoltiplicato).
     clear: [u8; 4],
+    /// Set by `set_texture`; forces full damage on the next `plan_damage` (an atlas
+    /// patch — e.g. egui font-atlas growth — changes pixels WITHOUT changing
+    /// geometry, so the per-primitive hash diff can't detect it). Mirrors gui-core's
+    /// `tex_changed → full` branch.
+    tex_dirty: bool,
 }
 
 impl Raster {
@@ -207,6 +212,7 @@ impl Raster {
             ch: 0,
             prev: Vec::new(),
             clear,
+            tex_dirty: false,
         }
     }
 
@@ -244,6 +250,7 @@ impl Raster {
                 self.textures.insert(id, Atlas { w: aw, h: ah, px: buf });
             }
         }
+        self.tex_dirty = true;
     }
 
     /// (Re)alloc the canvas, compute this frame's damage rect. Returns
@@ -272,7 +279,7 @@ impl Raster {
             .collect();
         let full = IRect { x0: 0, y0: 0, x1: iw, y1: ih };
         let mut damage = IRect::empty();
-        if realloc || self.prev.len() != meta.len() {
+        if realloc || self.tex_dirty || self.prev.len() != meta.len() {
             damage = full;
         } else {
             for (a, b) in self.prev.iter().zip(meta.iter()) {
@@ -292,6 +299,7 @@ impl Raster {
             .clamp(iw, ih);
         }
         self.prev = meta;
+        self.tex_dirty = false;
         if damage.is_empty() {
             return None;
         }

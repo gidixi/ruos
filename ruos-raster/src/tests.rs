@@ -191,3 +191,23 @@ fn unchanged_scene_yields_empty_dirty() {
     let (_, d2) = r.render(&v, &i, &p, 64, 64);
     assert_eq!((d2.w, d2.h), (0, 0)); // invariato → niente da presentare
 }
+
+/// Patch di una texture tra due frame a geometria IDENTICA → deve forzare full
+/// damage: i pixel dell'atlante cambiano ma la geometria no, quindi il diff per
+/// hash non può vederlo (l'hash non include i pixel dell'atlante). È il caso della
+/// crescita incrementale dell'atlante font di egui. Senza `tex_dirty` il secondo
+/// frame avrebbe damage vuoto → testo stale.
+#[test]
+fn texture_patch_forces_full_damage() {
+    let (v, i, p) = scene(10.0, 10.0, rgba(50, 60, 70, 255));
+    let mut r = Raster::new(CLEAR);
+    white_texel(&mut r);
+    let (_, d1) = r.render(&v, &i, &p, 64, 64);
+    assert_eq!((d1.w, d1.h), (64, 64)); // primo frame = full
+    let (_, d2) = r.render(&v, &i, &p, 64, 64);
+    assert_eq!((d2.w, d2.h), (0, 0)); // baseline: invariato → vuoto
+    // Patch dell'atlante (geometria identica).
+    r.set_texture(0, Some((0, 0)), 1, 1, &[200, 200, 200, 255]);
+    let (_, d3) = r.render(&v, &i, &p, 64, 64);
+    assert_eq!((d3.w, d3.h), (64, 64), "un patch texture deve forzare full damage");
+}

@@ -711,34 +711,48 @@ fn dispatch_raster(
 
     let mut ids: [usize; MAX_BANDS] = [usize::MAX; MAX_BANDS];
     let mut ranges: [(i32, i32); MAX_BANDS] = [(0, 0); MAX_BANDS];
-    let mut n = 0usize; let mut n_submitted = 0usize;
+
+    // Enumerate ALL band ranges FIRST, independent of submission success. This is
+    // what lets the pool-full leftover loop below cover EVERY un-submitted band
+    // (the failed one and all after it) — not just the bands before the first
+    // submit failure. Mirror of `dispatch_bands` (whose leftover iterates to the
+    // full band count). With one band failing to submit, the previous shape left
+    // those rows neither submitted nor drawn → torn frame.
+    let mut n_total = 0usize;
     let mut yy = dy0;
-    while yy < dy1 && n < MAX_BANDS {
+    while yy < dy1 && n_total < MAX_BANDS {
         let ye = core::cmp::min(yy + band_rows as i32, dy1);
-        ranges[n] = (yy, ye);
-        // band canvas slice = rows [yy, ye) → byte offset yy*stride, len (ye-yy)*stride
+        ranges[n_total] = (yy, ye);
+        n_total += 1;
+        yy = ye;
+    }
+
+    // Submit one job per band until the pool is full (then stop; the rest go inline).
+    let mut n_submitted = 0usize;
+    for k in 0..n_total {
+        let (y0, y1) = ranges[k];
+        // band canvas slice = rows [y0, y1) → byte offset y0*stride, len (y1-y0)*stride
         let arg = RasterBandArg {
-            px: cbase + (yy as usize) * stride,
-            px_len: (ye - yy) as usize * stride,
-            width, y0: yy, y1: ye,
+            px: cbase + (y0 as usize) * stride,
+            px_len: (y1 - y0) as usize * stride,
+            width, y0, y1,
             d0: dmg.0, d1: dmg.1, d2: dmg.2, d3: dmg.3,
             clear: clear_u32,
             verts: vptr, verts_len: vlen, idx: iptr, idx_len: ilen, prims: pptr, prims_len: plen,
             tex: tex_ptr,
         };
-        // SAFETY: GUI-core-only write of slot n; previous dispatch fully joined.
-        unsafe { RASTER_BAND_ARENA[n] = arg; }
+        // SAFETY: GUI-core-only write of slot k; previous dispatch fully joined.
+        unsafe { RASTER_BAND_ARENA[k] = arg; }
         let bytes: &'static [u8] = unsafe {
             core::slice::from_raw_parts(
-                core::ptr::addr_of!(RASTER_BAND_ARENA[n]) as *const u8,
+                core::ptr::addr_of!(RASTER_BAND_ARENA[k]) as *const u8,
                 core::mem::size_of::<RasterBandArg>(),
             )
         };
         match crate::smp::pool::submit(raster_band_job, bytes) {
-            Some(id) => { ids[n] = id; n_submitted += 1; }
-            None => { break; } // pool full: remaining ranges run inline below
+            Some(id) => { ids[k] = id; n_submitted += 1; }
+            None => { break; } // pool full: this band + the rest run inline below
         }
-        yy = ye; n += 1;
     }
 
     // 1-CPU (or pool-full) fallback: drain queued jobs inline on the GUI core so we
@@ -749,9 +763,9 @@ fn dispatch_raster(
         }
     }
 
-    // Leftover (pool full at submit): rasterize the un-submitted bands inline by
-    // building a Band directly over their rows. Disjoint from submitted bands.
-    for k in n_submitted..n {
+    // Leftover (pool full at submit): rasterize EVERY un-submitted band inline
+    // (ranges [n_submitted, n_total)). Disjoint from submitted bands.
+    for k in n_submitted..n_total {
         let (y0, y1) = ranges[k];
         let off = (y0 as usize) * stride;
         let len = (y1 - y0) as usize * stride;
@@ -768,7 +782,7 @@ fn dispatch_raster(
 
     // Join: block until every submitted band is DONE, work-stealing while we wait
     // (same rationale as dispatch_bands — pure fn jobs, single submitter).
-    for k in 0..n {
+    for k in 0..n_total {
         if ids[k] == usize::MAX { continue; }
         loop {
             if crate::smp::pool::poll_done(ids[k]).is_some() { break; }

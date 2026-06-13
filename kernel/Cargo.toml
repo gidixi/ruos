@@ -51,6 +51,10 @@ getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 gzip-core = { path = "../user/gzip-core", default-features = false }
 log = { version = "0.4", default-features = false }
 xhci = "0.9"
+# Rasterizzatore UI kernel-side (no_std, port di gui-core/raster.rs). Le finestre
+# mesh-mode (wm.commit_mesh) copiano la mesh tessellata in WmState e il kernel la
+# rasterizza nella surface. Vedi docs/.../2026-06-13-ui-kernel-side-raster-design.md.
+ruos-raster = { path = "../ruos-raster" }
 
 [features]
 boot-checks = []

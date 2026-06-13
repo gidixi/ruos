@@ -8,8 +8,9 @@ Most apps use the `ruos-window` wrappers (`frame_once`, `WindowState`,
 `declare_manifest!`) and never call these raw — reach here for `spawn`, taskbar /
 launcher lists, drag, power.
 
-**Last reviewed:** 2026-06-11 (24 functions; added `set_overlay()`,
-`power_pending()`, `power_cancel()`; `poweroff()`/`reboot()` are now deferred + cancellable).
+**Last reviewed:** 2026-06-13 (26 functions; added `tex_update()` + `commit_mesh()`
+— the kernel-side-raster mesh ABI: apps send tessellated meshes + texture deltas, the
+kernel copies them into per-window state and rasterizes them kernel-side).
 
 ```rust
 #[link(wasm_import_module = "wm")]
@@ -23,6 +24,37 @@ extern "C" { /* signatures below */ }
 ### `commit(ptr: *const u8, len: u32, w: u32, h: u32)`
 Copy the guest's `w×h` RGBA8888 surface (`len = w*h*4` bytes at `ptr`) into this
 window's framebuffer and mark it committed. Call once per frame after rendering.
+This is the **legacy pixel-commit path**; a window that uses `commit_mesh` instead
+becomes "mesh-mode" and is rasterized kernel-side (see below).
+
+### `commit_mesh(verts_ptr, verts_len, idx_ptr, idx_len, prims_ptr, prims_len, w, h: u32) -> i32`
+Send this frame's **tessellated mesh** (egui → triangles) to the kernel, which copies
+the three raw wire buffers into per-window kernel state and rasterizes them kernel-side
+(later phase) instead of receiving a pixel surface. `verts_ptr/len`, `idx_ptr/len`,
+`prims_ptr/len` point at the vertex / index / primitive arrays in the guest's linear
+memory; `w×h` is the surface size. The kernel COPIES the buffers (the SMP raster cores
+never touch guest memory), marks the window mesh-dirty + mesh-mode, and returns `0`;
+returns `28` (read fault) on any out-of-bounds buffer, leaving the prior mesh unchanged.
+The first `commit_mesh` flips the window to mesh-mode; until then it stays on the legacy
+`commit` path. Wire format (little-endian, mirrors `egui::epaint`):
+
+| Struct | Size | Layout |
+|--------|------|--------|
+| Vertex | 20 B | `pos.x f32, pos.y f32, uv.x f32, uv.y f32, color u32` (color = premultiplied `[r,g,b,a]`) |
+| Index  | 4 B  | `u32` |
+| Prim   | 28 B | `clip_min_x, clip_min_y, clip_max_x, clip_max_y f32`, `tex_id u64`, `idx0 u32, idx1 u32` (semi-open range into indices) |
+
+`tex_id` = Managed→`id`, User→`id | 0x8000_0000_0000_0000`. `Primitive::Callback`
+(GPU custom) primitives are not representable and are dropped, same as today.
+
+### `tex_update(id: u64, full: u32, x: u32, y: u32, w: u32, h: u32, ptr: *const u8, len: u32) -> i32`
+Update or create the texture atlas `id`. `full != 0` → replace the **whole** atlas
+(`w×h`); `full == 0` → patch the `w×h` sub-region at `(x, y)` of the existing atlas.
+`ptr/len` point at RGBA8888 **premultiplied** pixels, row-major, `len = w*h*4`. Called
+only on egui `TexturesDelta` (rare: font atlas at startup, atlas growth). The kernel
+COPIES the pixels into this window's atlas store and returns `0`; returns `28` on a
+guest-memory read fault. `id` is passed as a single 64-bit value (the linker accepts
+`i64` params directly).
 
 ### `surface_size() -> i64`
 Full screen framebuffer size, packed `(w << 32) | h`.

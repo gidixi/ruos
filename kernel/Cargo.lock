@@ -808,6 +808,7 @@ dependencies = [
  "pbkdf2",
  "pci_types",
  "rand_chacha",
+ "ruos-raster",
  "sha1",
  "sha2",
  "smoltcp",
@@ -1137,6 +1138,10 @@ dependencies = [
  "rustc-hash",
  "smallvec",
 ]
+
+[[package]]
+name = "ruos-raster"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-demangle"

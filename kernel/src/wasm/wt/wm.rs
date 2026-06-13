@@ -277,7 +277,11 @@ fn extract_manifest(linker: &Linker<AppState>, module: &Module, name: &str) -> O
                            kev_cursor: crate::kevent::current_seq(), committed: false,
                            minimize_request: false, maximize_request: false,
                            activate_request: VecDeque::new(), target_w: 0, target_h: 0,
-                           stay_awake_request: false, wake_pty: -1 },
+                           stay_awake_request: false, wake_pty: -1,
+                           raster: ruos_raster::Raster::new([0x1e, 0x1e, 0x1e, 0xff]),
+                           mesh_verts: Vec::new(), mesh_idx: Vec::new(),
+                           mesh_prims: Vec::new(), mesh_w: 0, mesh_h: 0,
+                           mesh_dirty: false, mesh_mode: false },
             limits: wasmtime::StoreLimits::default(), // throwaway probe: unlimited
         },
     );
@@ -864,6 +868,18 @@ pub struct WmState {
     /// Risorsa PTY legata via `wm.wake_on_pty(idx)`: -1 = nessuna. Il compositor
     /// sveglia la finestra dormiente se quel pair ha output non drenato.
     pub wake_pty: i32,
+    /// Kernel-side raster state for this window (Phase C). `mesh_mode` flips true the
+    /// first time the app calls wm.commit_mesh; until then the window uses the legacy
+    /// pixel-commit path (wm.commit). The mesh buffers are the COPIED wire data from the
+    /// last commit_mesh; the kernel rasters them in a later phase (not here).
+    pub raster: ruos_raster::Raster,
+    pub mesh_verts: alloc::vec::Vec<u8>,
+    pub mesh_idx: alloc::vec::Vec<u8>,
+    pub mesh_prims: alloc::vec::Vec<u8>,
+    pub mesh_w: u32,
+    pub mesh_h: u32,
+    pub mesh_dirty: bool,   // set by commit_mesh; the raster step (later) consumes it
+    pub mesh_mode: bool,    // this window committed at least one mesh
 }
 
 use crate::wasm::wt::state::{WtState, HasWasi};
@@ -917,7 +933,11 @@ pub fn worker_app_state(win_id: u32) -> AppState {
                        kev_cursor: crate::kevent::current_seq(), committed: false,
                        minimize_request: false, maximize_request: false,
                        activate_request: VecDeque::new(), target_w: 0, target_h: 0,
-                       stay_awake_request: false, wake_pty: -1 },
+                       stay_awake_request: false, wake_pty: -1,
+                       raster: ruos_raster::Raster::new([0x1e, 0x1e, 0x1e, 0xff]),
+                       mesh_verts: Vec::new(), mesh_idx: Vec::new(),
+                       mesh_prims: Vec::new(), mesh_w: 0, mesh_h: 0,
+                       mesh_dirty: false, mesh_mode: false },
         limits: wasmtime::StoreLimits::default(),
     }
 }
@@ -937,6 +957,58 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
                 s.win_h = h as u32;
                 s.committed = true; // damage: this window drew a new surface this frame
             }
+        })?;
+    // wm.tex_update(id, full, x, y, w, h, ptr, len) -> 0/err: update/create the
+    // texture atlas `id`. full!=0 → whole atlas (pos=None, create/replace);
+    // full==0 → patch a `w×h` sub-region at (x,y) (pos=Some). `px` = RGBA8888
+    // premultiplied, row-major, `w*h*4` bytes at `ptr`. Rare (egui TexturesDelta:
+    // font atlas at startup / atlas growth). The kernel COPIES the pixels into this
+    // window's `raster` (no rasterization here — that's a later phase). The tex id
+    // is a u64 (Managed→id, User→id|0x8000_0000_0000_0000); the linker takes i64
+    // params directly (cf. wm.surface_size/window_size returning i64), so it is
+    // passed as a single i64 — no lo/hi split needed. Returns 0 on success, 28 on
+    // a guest-memory read failure (matches gfx_blit), leaving state unchanged.
+    linker.func_wrap("wm", "tex_update",
+        |mut caller: Caller<'_, T>, id: i64, full: i32, x: i32, y: i32,
+         w: i32, h: i32, ptr: i32, len: i32| -> i32 {
+            let px = match crate::wasm::wt::mem::read(&mut caller, ptr as u32, len as u32) {
+                Some(b) => b,
+                None => return 28,
+            };
+            let pos = if full != 0 { None } else { Some((x as u32, y as u32)) };
+            caller.data_mut().win().raster.set_texture(id as u64, pos, w as u32, h as u32, &px);
+            0
+        })?;
+    // wm.commit_mesh(vp, vl, ip, il, pp, pl, w, h) -> 0/err: copy this frame's
+    // tessellated mesh into the window's kernel buffers. vp/vl = vertices ptr/len,
+    // ip/il = indices ptr/len, pp/pl = prims ptr/len — raw wire bytes (§5 of the
+    // kernel-side-raster spec: Vertex 20 B, Index u32, Prim 28 B). The kernel parses
+    // + rasterizes them in a LATER phase; here it only COPIES the three buffers,
+    // marks the window mesh-new (mesh_dirty) and mesh-mode. The AP raster cores read
+    // these kernel-owned buffers, never the guest linear memory (multi-core /
+    // single-accessor constraint). Returns 0 on success, 28 on any read failure,
+    // leaving the previous mesh state unchanged.
+    linker.func_wrap("wm", "commit_mesh",
+        |mut caller: Caller<'_, T>, vp: i32, vl: i32, ip: i32, il: i32,
+         pp: i32, pl: i32, w: i32, h: i32| -> i32 {
+            let verts = match crate::wasm::wt::mem::read(&mut caller, vp as u32, vl as u32) {
+                Some(b) => b, None => return 28,
+            };
+            let idx = match crate::wasm::wt::mem::read(&mut caller, ip as u32, il as u32) {
+                Some(b) => b, None => return 28,
+            };
+            let prims = match crate::wasm::wt::mem::read(&mut caller, pp as u32, pl as u32) {
+                Some(b) => b, None => return 28,
+            };
+            let s = caller.data_mut().win();
+            s.mesh_verts = verts;
+            s.mesh_idx = idx;
+            s.mesh_prims = prims;
+            s.mesh_w = w as u32;
+            s.mesh_h = h as u32;
+            s.mesh_dirty = true;
+            s.mesh_mode = true;
+            0
         })?;
     // wm.app_id() -> u32: this instance's window id. (Import name is `app_id`
     // with an underscore — Rust `#[link]` preserves the symbol verbatim; verified
@@ -1737,7 +1809,11 @@ impl Compositor {
                                kev_cursor: crate::kevent::current_seq(), committed: false,
                                minimize_request: false, maximize_request: false,
                                activate_request: VecDeque::new(), target_w: 0, target_h: 0,
-                               stay_awake_request: false, wake_pty: -1 },
+                               stay_awake_request: false, wake_pty: -1,
+                               raster: ruos_raster::Raster::new([0x1e, 0x1e, 0x1e, 0xff]),
+                               mesh_verts: Vec::new(), mesh_idx: Vec::new(),
+                               mesh_prims: Vec::new(), mesh_w: 0, mesh_h: 0,
+                               mesh_dirty: false, mesh_mode: false },
                 limits: wasmtime::StoreLimitsBuilder::new()
                     .memory_size(WINDOW_MEM_CAP)
                     .build(),

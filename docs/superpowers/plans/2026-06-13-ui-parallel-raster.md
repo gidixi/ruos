@@ -772,7 +772,15 @@ git commit -m "feat(ruos-window): driver raster a bande (seriale) + euristica n_
 
 ### Task 8: Parallelizzare il driver (gated sullo spike)
 
-**ESITO SPIKE (compilare dal Task 1 Step 4):** `____________________`
+**ESITO SPIKE (Task 1):** **PASS** (2026-06-13). `std::thread::scope` fan-out+join
+DENTRO `frame()` di mtwin completa entro il deadline: `THREADS-WIN-OK = ok
+teardown=ok` resta verde (se il join avesse fatto deadlock, `frame()` non tornava →
+il counter del worker di background non avanzava → il gate falliva), nessun
+`WATCHDOG` su mtwin. I `WATCHDOG` su `'shell'`/`'spinner'` sono l'artefatto TCG
+pre-esistente (raster > FRAME_DEADLINE sotto TCG; HW reale fluido), non causati dallo
+spike (l'edit toccava solo `tools/mtwin`). → **Usare il Caso 8a (scope-join
+cooperativo)**, non il fallback double-buffer. La sonda è stata rimossa da mtwin
+(usa-e-getta); il raster parallelo del Task 8 sarà l'esercizio permanente.
 
 **Files:**
 - Modify: `ruos-desktop/crates/ruos-window/src/lib.rs` (`raster_windowed`)

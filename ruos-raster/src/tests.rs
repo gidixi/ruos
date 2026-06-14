@@ -35,6 +35,30 @@ fn rect_mesh(
     (i0, i1)
 }
 
+/// Rect mesh with EXPLICIT uv (for a "glyph" prim that samples real atlas content,
+/// uv != WHITE_UV). Returns the half-open index range.
+fn uv_rect(
+    verts: &mut Vec<Vertex>,
+    idx: &mut Vec<u32>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    u: f32,
+    v: f32,
+    color: u32,
+) -> (u32, u32) {
+    let base = verts.len() as u32;
+    verts.push(Vertex { x: x0, y: y0, u, v, color });
+    verts.push(Vertex { x: x1, y: y0, u, v, color });
+    verts.push(Vertex { x: x1, y: y1, u, v, color });
+    verts.push(Vertex { x: x0, y: y1, u, v, color });
+    let i0 = idx.len() as u32;
+    idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    let i1 = idx.len() as u32;
+    (i0, i1)
+}
+
 /// Pack RGBA bytes into a wire color (premultiplied), same as
 /// `u32::from_le_bytes([r,g,b,a])`.
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -242,24 +266,52 @@ fn unchanged_scene_yields_empty_dirty() {
     assert_eq!((d2.w, d2.h), (0, 0)); // invariato → niente da presentare
 }
 
-/// Patch di una texture tra due frame a geometria IDENTICA → deve forzare full
-/// damage: i pixel dell'atlante cambiano ma la geometria no, quindi il diff per
-/// hash non può vederlo (l'hash non include i pixel dell'atlante). È il caso della
-/// crescita incrementale dell'atlante font di egui. Senza `tex_dirty` il secondo
-/// frame avrebbe damage vuoto → testo stale.
+/// Un patch dell'atlante font NON deve forzare full damage: i prim white-only
+/// (fill/wallpaper, uv==(0,0)) campionano il texel bianco riservato (0,0), mai
+/// patchato → mai stale → risparmiati. Solo i prim atlas-dependent (uv!=(0,0),
+/// "glifi") sono danneggiati. Oracolo: canvas incrementale == full render.
 #[test]
-fn texture_patch_forces_full_damage() {
-    let (v, i, p) = scene(10.0, 10.0, rgba(50, 60, 70, 255));
+fn texture_patch_damages_only_atlas_dependent_prims() {
+    let (w, h) = (64u32, 64u32);
+    let white4 = [255u8; 4 * 4 * 4]; // 4x4 atlas, tutto bianco
+
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    // Wallpaper full-screen white-only (uv 0,0) + un "glifo" che campiona texel (2,2).
+    let (w0, w1) = rect_mesh(&mut verts, &mut idx, 0.0, 0.0, w as f32, h as f32, rgba(10, 20, 30, 255));
+    let (g0, g1) = uv_rect(&mut verts, &mut idx, 40.0, 40.0, 50.0, 50.0, 0.625, 0.625, rgba(255, 255, 255, 255));
+    let clip = [0.0, 0.0, w as f32, h as f32];
+    let prims = vec![
+        Prim { clip, tex_id: 0, idx0: w0, idx1: w1 },
+        Prim { clip, tex_id: 0, idx0: g0, idx1: g1 },
+    ];
+
     let mut r = Raster::new(CLEAR);
-    white_texel(&mut r);
-    let (_, d1) = r.render(&v, &i, &p, 64, 64);
-    assert_eq!((d1.w, d1.h), (64, 64)); // primo frame = full
-    let (_, d2) = r.render(&v, &i, &p, 64, 64);
-    assert_eq!((d2.w, d2.h), (0, 0)); // baseline: invariato → vuoto
-    // Patch dell'atlante (geometria identica).
-    r.set_texture(0, Some((0, 0)), 1, 1, &[200, 200, 200, 255]);
-    let (_, d3) = r.render(&v, &i, &p, 64, 64);
-    assert_eq!((d3.w, d3.h), (64, 64), "un patch texture deve forzare full damage");
+    r.set_texture(0, None, 4, 4, &white4);
+    let (_, d1) = r.render(&verts, &idx, &prims, w, h);
+    assert_eq!((d1.w, d1.h), (w, h), "primo frame = full");
+    let (_, d2) = r.render(&verts, &idx, &prims, w, h);
+    assert_eq!((d2.w, d2.h), (0, 0), "frame invariato → vuoto");
+
+    // Patch del texel (2,2) che il glifo campiona: bianco → rosso.
+    r.set_texture(0, Some((2, 2)), 1, 1, &[255, 0, 0, 255]);
+    let (canvas3, d3) = r.render(&verts, &idx, &prims, w, h);
+    let canvas3 = canvas3.to_vec();
+
+    // Danno = bbox del glifo (piccolo), NON full-screen.
+    assert!(d3.w < w && d3.h < h, "patch NON deve forzare full, got {}x{}", d3.w, d3.h);
+    assert!(d3.w > 0 && d3.h > 0, "il glifo deve essere danneggiato");
+    assert!(
+        d3.x <= 40 && d3.y <= 40 && d3.x + d3.w >= 50 && d3.y + d3.h >= 50,
+        "il danno deve coprire il glifo"
+    );
+
+    // Oracolo no-stale: incrementale == full render della scena patchata.
+    let mut r_full = Raster::new(CLEAR);
+    r_full.set_texture(0, None, 4, 4, &white4);
+    r_full.set_texture(0, Some((2, 2)), 1, 1, &[255, 0, 0, 255]);
+    let (full_canvas, _) = r_full.render(&verts, &idx, &prims, w, h);
+    assert_eq!(canvas3.as_slice(), full_canvas, "incrementale != full → pixel stale");
 }
 
 /// A richer multi-primitive scene (wallpaper + several colored rects + a

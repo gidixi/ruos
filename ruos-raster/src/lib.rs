@@ -319,6 +319,17 @@ impl IRect {
 struct PrimMeta {
     hash: u64,
     bbox: IRect,
+    /// Texture campionata dalla primitiva (per intersecare i dirty-rect dell'atlante).
+    tex_id: u64,
+    /// Bounding box UV (normalizzato) sui vertici referenziati. `uv_x0 > uv_x1`
+    /// ⇒ vuoto (nessun vertice). Mappa la primitiva sull'area di atlante che
+    /// campiona: un patch di texture danneggia SOLO i prim la cui uv-bbox interseca
+    /// la regione patchata. I fill solidi campionano (0,0) → fuori da ogni patch di
+    /// glifo → risparmiati senza casi speciali.
+    uv_x0: f32,
+    uv_y0: f32,
+    uv_x1: f32,
+    uv_y1: f32,
 }
 
 /// Renderer con stato: atlanti texture (set/free), un canvas persistente (il
@@ -334,11 +345,13 @@ pub struct Raster {
     prev: Vec<PrimMeta>,
     /// Colore di clear (sRGBA premoltiplicato).
     clear: [u8; 4],
-    /// Set by `set_texture`; forces full damage on the next `plan_damage` (an atlas
-    /// patch — e.g. egui font-atlas growth — changes pixels WITHOUT changing
-    /// geometry, so the per-primitive hash diff can't detect it). Mirrors gui-core's
-    /// `tex_changed → full` branch.
-    tex_dirty: bool,
+    /// Regioni dell'atlante (per `tex_id`, in pixel dell'atlante) modificate da
+    /// `set_texture` dall'ultimo `plan_damage`. Un patch cambia i pixel SENZA
+    /// cambiare la geometria → l'hash per-primitiva non lo vede; in `plan_damage`
+    /// mappiamo ogni patch ai SOLI prim che la campionano (uv-bbox ∩ rettangolo
+    /// patchato). `IRect` vuoto = texture liberata → tutti i prim che la usavano
+    /// sono stale.
+    tex_dirty: Vec<(u64, IRect)>,
 }
 
 impl Raster {
@@ -350,7 +363,7 @@ impl Raster {
             ch: 0,
             prev: Vec::new(),
             clear,
-            tex_dirty: false,
+            tex_dirty: Vec::new(),
         }
     }
 
@@ -391,6 +404,16 @@ impl Raster {
                             atlas.px[dst + 3] = px[src + 3];
                         }
                     }
+                    // Dirty = solo il sotto-rettangolo patchato dell'atlante.
+                    self.tex_dirty.push((
+                        id,
+                        IRect {
+                            x0: ox as i32,
+                            y0: oy as i32,
+                            x1: (ox + pw) as i32,
+                            y1: (oy + ph) as i32,
+                        },
+                    ));
                 } else {
                     return; // no atlas to patch
                 }
@@ -400,9 +423,10 @@ impl Raster {
                 let mut buf = Vec::with_capacity(need);
                 buf.extend_from_slice(&px[..need]);
                 self.textures.insert(id, Atlas { w, h, px: buf });
+                // Dirty = l'intero atlante (contenuto nuovo / dimensioni cambiate).
+                self.tex_dirty.push((id, IRect { x0: 0, y0: 0, x1: w as i32, y1: h as i32 }));
             }
         }
-        self.tex_dirty = true;
     }
 
     /// (Re)alloc the canvas, compute this frame's damage rect. Returns
@@ -431,7 +455,7 @@ impl Raster {
             .collect();
         let full = IRect { x0: 0, y0: 0, x1: iw, y1: ih };
         let mut damage = IRect::empty();
-        if realloc || self.tex_dirty {
+        if realloc {
             damage = full;
         } else {
             // Diff per CONTENUTO (hash), NON per posizione. Una primitiva il cui hash
@@ -458,6 +482,43 @@ impl Raster {
                     damage = damage.union(m.bbox); // aggiunta/cambiata
                 }
             }
+            // Patch dell'atlante: una sub-regione dei pixel cambia SENZA cambiare la
+            // geometria → l'hash non lo vede. Danneggia SOLO i prim che CAMPIONANO la
+            // regione patchata: mappiamo l'uv-bbox del prim ai pixel dell'atlante e lo
+            // intersechiamo col rettangolo modificato. Un fill solido campiona (0,0) →
+            // fuori da ogni patch di glifo → risparmiato (niente caso speciale). Un
+            // patch di font tocca solo lo slot del glifo nuovo → danno minuscolo, mai
+            // full-screen (era questa la causa del freeze sul menu).
+            for (tid, dr) in &self.tex_dirty {
+                match self.textures.get(tid) {
+                    // Texture liberata: ogni prim che la usava ora rende diverso → stale.
+                    None => {
+                        for m in &meta {
+                            if m.tex_id == *tid {
+                                damage = damage.union(m.bbox);
+                            }
+                        }
+                    }
+                    Some(atlas) => {
+                        let aw = atlas.w as f32;
+                        let ah = atlas.h as f32;
+                        for m in &meta {
+                            if m.tex_id != *tid || m.uv_x0 > m.uv_x1 {
+                                continue; // texture diversa, o prim senza vertici
+                            }
+                            // uv-bbox (normalizzato) → pixel dell'atlante.
+                            let ax0 = (m.uv_x0 * aw).floor() as i32;
+                            let ay0 = (m.uv_y0 * ah).floor() as i32;
+                            let ax1 = (m.uv_x1 * aw).ceil() as i32;
+                            let ay1 = (m.uv_y1 * ah).ceil() as i32;
+                            // intersezione half-open [ax0,ax1) ∩ [dr.x0,dr.x1).
+                            if ax0 < dr.x1 && dr.x0 < ax1 && ay0 < dr.y1 && dr.y0 < ay1 {
+                                damage = damage.union(m.bbox);
+                            }
+                        }
+                    }
+                }
+            }
         }
         let is_full = damage.x0 == 0 && damage.y0 == 0 && damage.x1 == iw && damage.y1 == ih;
         if !damage.is_empty() && !is_full {
@@ -470,7 +531,7 @@ impl Raster {
             .clamp(iw, ih);
         }
         self.prev = meta;
-        self.tex_dirty = false;
+        self.tex_dirty.clear();
         if damage.is_empty() {
             return None;
         }
@@ -559,6 +620,7 @@ impl Raster {
         self.ch = 0;
         self.canvas.clear();
         self.prev.clear();
+        self.tex_dirty.clear();
     }
 }
 
@@ -627,6 +689,12 @@ fn prim_meta(p: &Prim, verts: &[Vertex], idx: &[u32], iw: i32, ih: i32) -> PrimM
     let mut miny = f32::INFINITY;
     let mut maxx = f32::NEG_INFINITY;
     let mut maxy = f32::NEG_INFINITY;
+    // uv-bbox (normalizzato) sui vertici referenziati → mappa il prim sull'area di
+    // atlante che campiona (per intersecare i dirty-rect delle texture).
+    let mut uv_x0 = f32::INFINITY;
+    let mut uv_y0 = f32::INFINITY;
+    let mut uv_x1 = f32::NEG_INFINITY;
+    let mut uv_y1 = f32::NEG_INFINITY;
 
     let id = p.tex_id;
     mix(&mut hsh, id as u32);
@@ -651,6 +719,10 @@ fn prim_meta(p: &Prim, verts: &[Vertex], idx: &[u32], iw: i32, ih: i32) -> PrimM
         mix(&mut hsh, v.u.to_bits());
         mix(&mut hsh, v.v.to_bits());
         mix(&mut hsh, v.color);
+        uv_x0 = uv_x0.min(v.u);
+        uv_y0 = uv_y0.min(v.v);
+        uv_x1 = uv_x1.max(v.u);
+        uv_y1 = uv_y1.max(v.v);
         minx = minx.min(v.x);
         miny = miny.min(v.y);
         maxx = maxx.max(v.x);
@@ -670,7 +742,7 @@ fn prim_meta(p: &Prim, verts: &[Vertex], idx: &[u32], iw: i32, ih: i32) -> PrimM
     } else {
         IRect { x0: bx0, y0: by0, x1: bx1, y1: by1 }.clamp(iw, ih)
     };
-    PrimMeta { hash: hsh, bbox }
+    PrimMeta { hash: hsh, bbox, tex_id: id, uv_x0, uv_y0, uv_x1, uv_y1 }
 }
 
 /// Edge function (doppia area con segno) del triangolo (a,b,c) nel punto p.

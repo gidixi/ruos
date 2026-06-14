@@ -667,6 +667,30 @@ static RP_CLN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 #[cfg(feature = "wm-fps")]
 static RP_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Movement-PEAK instrumentation (feature wm-fps): per-report MAX of the damage
+/// rect actually rastered (rows, area = w*h pixels) and the band count — catches a
+/// one-frame full-screen-damage spike (e.g. a font-atlas patch forcing FULL damage →
+/// SMP fan-out) that the d/p/r/c AVGs hide. CM_* size the mesh the shell ships per
+/// move: calls-per-report + peak wire bytes and peak vert/idx/prim counts arriving at
+/// wm.commit_mesh. All swapped to 0 each 1 s report. OUTSIDE the bit-identical raster
+/// core (counters beside the existing RP_* accumulators; no pixel/hash/bbox change).
+#[cfg(feature = "wm-fps")]
+static RP_ROWS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_AREA_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static RP_BANDS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static CM_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static CM_BYTES_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static CM_VERTS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static CM_IDX_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "wm-fps")]
+static CM_PRIMS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Pool job: rasterize ONE band. `input` is a byte view of one `RasterBandArg` in
 /// the static arena. Returns 0 (unused).
 ///
@@ -736,7 +760,13 @@ fn dispatch_raster(
         core::cmp::max(1, total_rows / MIN_ROWS_PER_BAND),
     );
     #[cfg(feature = "wm-fps")]
-    RP_LAST.store(((total_rows as u64) << 16) | (n_bands as u64), Ordering::Relaxed);
+    {
+        RP_LAST.store(((total_rows as u64) << 16) | (n_bands as u64), Ordering::Relaxed);
+        let area = ((dmg.2 - dmg.0).max(0) as u64) * ((dmg.3 - dmg.1).max(0) as u64);
+        RP_ROWS_MAX.fetch_max(total_rows as u64, Ordering::Relaxed);
+        RP_AREA_MAX.fetch_max(area, Ordering::Relaxed);
+        RP_BANDS_MAX.fetch_max(n_bands as u64, Ordering::Relaxed);
+    }
     if n_bands <= 1 {
         // Inline on the GUI core: no pool::submit, no wake IPI, no busy-spin join.
         let off = (dy0 as usize) * stride;
@@ -1297,6 +1327,17 @@ pub fn add_to_linker<T: HasWindow + 'static>(linker: &mut Linker<T>) -> wasmtime
             let prims = match crate::wasm::wt::mem::read(&mut caller, pp as u32, pl as u32) {
                 Some(b) => b, None => return 28,
             };
+            // wm-fps: size the mesh the (full-screen) shell ships per move — the
+            // "full-screen shell vs small window" smoking gun. Wire: 20B/vert, 4B/idx,
+            // 32B/prim. Counters only; raster runs later in raster_meshes.
+            #[cfg(feature = "wm-fps")]
+            {
+                CM_CALLS.fetch_add(1, Ordering::Relaxed);
+                CM_BYTES_MAX.fetch_max((verts.len() + idx.len() + prims.len()) as u64, Ordering::Relaxed);
+                CM_VERTS_MAX.fetch_max((verts.len() / 20) as u64, Ordering::Relaxed);
+                CM_IDX_MAX.fetch_max((idx.len() / 4) as u64, Ordering::Relaxed);
+                CM_PRIMS_MAX.fetch_max((prims.len() / 32) as u64, Ordering::Relaxed);
+            }
             // TODO(phase3): when this goes per-frame hot, read into existing capacity
             // (needs a mem::read_into(&mut Vec) variant) to avoid 3 allocs/frame.
             let s = caller.data_mut().win();
@@ -2568,6 +2609,39 @@ impl Compositor {
                     s.win.mesh_dirty = false; continue;
                 }
             };
+            #[cfg(feature = "wm-fps")]
+            {
+                // DIAG (temporaneo): su un frame FULL-damage, dump dei prim
+                // (tex/white_only/bbox) per capire QUALE prim full-screen viene
+                // danneggiato. white_only=true full-screen ⇒ danneggiato via hash-diff
+                // (geometria cambiata), non da tex_dirty. Throttled a 12 dump.
+                let dmg_rows = (dmg.3 - dmg.1) as u32;
+                if mh > 100 && dmg_rows >= mh - 2 {
+                    static DUMPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                    if DUMPS.fetch_add(1, Ordering::Relaxed) < 12 {
+                        crate::binfo!("dbgfull", "FULL win={}x{} nprims={} dmg=({},{})-({},{})",
+                            mw, mh, prims.len(), dmg.0, dmg.1, dmg.2, dmg.3);
+                        for (pi, p) in prims.iter().enumerate() {
+                            let lo = (p.idx0 as usize).min(idx.len());
+                            let hi = (p.idx1 as usize).min(idx.len());
+                            let mut wo = true;
+                            let (mut x0, mut y0, mut x1, mut y1) =
+                                (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                            for &ii in &idx[lo..hi] {
+                                if let Some(v) = verts.get(ii as usize) {
+                                    if v.u != 0.0 || v.v != 0.0 { wo = false; }
+                                    if v.x < x0 { x0 = v.x; }
+                                    if v.y < y0 { y0 = v.y; }
+                                    if v.x > x1 { x1 = v.x; }
+                                    if v.y > y1 { y1 = v.y; }
+                                }
+                            }
+                            crate::binfo!("dbgfull", "  p{} tex={} white={} bbox=({},{})-({},{}) nv={}",
+                                pi, p.tex_id, wo, x0 as i32, y0 as i32, x1 as i32, y1 as i32, hi - lo);
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "wm-fps")] let t2 = crate::boot::clock::read_tsc();
             dispatch_raster(&mut s.win.raster, &verts, &idx, &prims, dmg);
             #[cfg(feature = "wm-fps")] let t3 = crate::boot::clock::read_tsc();
@@ -3049,18 +3123,18 @@ impl Compositor {
         let mut raster_marker_done = false;
         // FPS/timing telemetry (feature wm-fps): accumulators over a ~1 s window.
         #[cfg(feature = "wm-fps")]
-        let (mut fps_t0, mut n_present, mut n_iter, mut fa_sum, mut fa_max, mut pr_sum) =
-            (crate::timer::ticks(), 0u32, 0u32, 0u64, 0u64, 0u64);
+        let (mut fps_t0, mut n_present, mut n_iter, mut fa_sum, mut fa_max, mut pr_sum, mut pr_max) =
+            (crate::timer::ticks(), 0u32, 0u32, 0u64, 0u64, 0u64, 0u64);
         // Raster (mesh band-parallel) timing accumulators (mirror of fa_sum/pr_sum).
         #[cfg(feature = "wm-fps")]
-        let (mut ra_sum, mut n_raster) = (0u64, 0u32);
+        let (mut ra_sum, mut n_raster, mut ra_max) = (0u64, 0u32, 0u64);
         // Per-iter wall-clock + hlt accumulators: resolves "loop iteration time vs the
         // sum of the timed stages". ITER avg = true wall-clock per loop iter; HLT avg =
         // time parked in hlt per iter. If ITER >> (frame_all+raster+present) and HLT is
         // large → the loop is IDLE-bound (waiting for IRQs); if HLT is small → the gap
         // is unmeasured work in the loop body.
         #[cfg(feature = "wm-fps")]
-        let (mut hlt_sum, mut iter_sum, mut prev_iter) = (0u64, 0u64, 0u64);
+        let (mut hlt_sum, mut iter_sum, mut prev_iter, mut iter_max) = (0u64, 0u64, 0u64, 0u64);
         // Last-computed display values (held between the 1 s reports) + the small
         // RGBA overlay buffer drawn bottom-right every frame so it's visible on the
         // VBox/HW screen (the binfo log only reaches serial/netconsole).
@@ -3068,14 +3142,18 @@ impl Compositor {
         let (mut disp_p, mut disp_it, mut disp_fa, mut disp_pr, mut disp_ra, mut disp_iter, mut disp_hlt,
              mut disp_dec, mut disp_pln, mut disp_dsp, mut disp_cln, mut disp_nb) =
             (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // Row-4 PEAK (MAX) display values (held between reports like the rest).
+        #[cfg(feature = "wm-fps")]
+        let (mut disp_iter_max, mut disp_fa_max, mut disp_pr_max, mut disp_ra_max) =
+            (0u64, 0u64, 0u64, 0u64);
         #[cfg(feature = "wm-fps")]
         let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
                               crate::console::font::glyph_height() as u32);
-        // Three text rows; sized to the longer label line.
+        // Four text rows; sized to the longer label line.
         #[cfg(feature = "wm-fps")]
         let (ov_cols, ov_pad, ov_gap) = (32u32, 4u32, 2u32);
         #[cfg(feature = "wm-fps")]
-        let (ov_w, ov_h) = (ov_cols * ov_gw + ov_pad * 2, ov_gh * 3 + ov_gap * 2 + ov_pad * 2);
+        let (ov_w, ov_h) = (ov_cols * ov_gw + ov_pad * 2, ov_gh * 4 + ov_gap * 3 + ov_pad * 2);
         #[cfg(feature = "wm-fps")]
         let mut ov_buf = alloc::vec![0u8; (ov_w * ov_h * 4) as usize];
         loop {
@@ -3266,7 +3344,11 @@ impl Compositor {
             #[cfg(feature = "wm-fps")] {
                 n_iter += 1;
                 let now = crate::boot::clock::read_tsc();
-                if prev_iter != 0 { iter_sum = iter_sum.wrapping_add(now.wrapping_sub(prev_iter)); }
+                if prev_iter != 0 {
+                    let d = now.wrapping_sub(prev_iter);
+                    iter_sum = iter_sum.wrapping_add(d);
+                    if d > iter_max { iter_max = d; }
+                }
                 prev_iter = now;
             }
             #[cfg(feature = "wm-fps")] let fa0 = crate::boot::clock::read_tsc();
@@ -3284,7 +3366,9 @@ impl Compositor {
             #[cfg(feature = "wm-fps")] let ra0 = crate::boot::clock::read_tsc();
             self.raster_meshes();
             #[cfg(feature = "wm-fps")] {
-                ra_sum = ra_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(ra0));
+                let d = crate::boot::clock::read_tsc().wrapping_sub(ra0);
+                ra_sum = ra_sum.wrapping_add(d);
+                if d > ra_max { ra_max = d; }
                 n_raster += 1;
             }
 
@@ -3427,7 +3511,9 @@ impl Compositor {
                 // di ~10ms. Durante il warmup resta SMP (boot-check "composite cores").
                 self.present(self.frame_no >= WARMUP_FRAMES);
                 #[cfg(feature = "wm-fps")] {
-                    pr_sum = pr_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(pr0));
+                    let d = crate::boot::clock::read_tsc().wrapping_sub(pr0);
+                    pr_sum = pr_sum.wrapping_add(d);
+                    if d > pr_max { pr_max = d; }
                     n_present += 1;
                 }
                 self.dirty = false;
@@ -3494,8 +3580,8 @@ impl Compositor {
                     // font atlas) take ~1 s and would dominate the average as a
                     // misleading startup spike. Keep the window anchored to now.
                     fps_t0 = now;
-                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
-                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0;
+                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0; pr_max = 0;
+                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0; ra_max = 0; iter_max = 0;
                 } else if elapsed >= 100 {
                     let tpm = crate::boot::clock::tsc_per_ms().max(1);
                     let present_s = (n_present as u64) * 100 / elapsed;
@@ -3513,6 +3599,22 @@ impl Compositor {
                     let cln_us = (RP_CLN.swap(0, Ordering::Relaxed) / nrz) * 1000 / tpm;
                     let rp_last = RP_LAST.load(Ordering::Relaxed);
                     let (rp_rows, rp_nb) = ((rp_last >> 16) as u64, rp_last & 0xFFFF);
+                    // Movement PEAKS — the whole point of this build: the AVGs above
+                    // hide the per-iter spike that is felt as lag. Worst single iter /
+                    // frame_all / raster / present in the window, the peak damage rect
+                    // actually rastered (rows + area, catches a full-screen-damage
+                    // spike), and the peak mesh the shell shipped per move.
+                    let pr_max_us = pr_max * 1000 / tpm;
+                    let ra_max_us = ra_max * 1000 / tpm;
+                    let iter_max_us = iter_max * 1000 / tpm;
+                    let rows_max = RP_ROWS_MAX.swap(0, Ordering::Relaxed);
+                    let area_max = RP_AREA_MAX.swap(0, Ordering::Relaxed);
+                    let bands_max = RP_BANDS_MAX.swap(0, Ordering::Relaxed);
+                    let cm_calls = CM_CALLS.swap(0, Ordering::Relaxed);
+                    let cm_bytes = CM_BYTES_MAX.swap(0, Ordering::Relaxed);
+                    let cm_v = CM_VERTS_MAX.swap(0, Ordering::Relaxed);
+                    let cm_i = CM_IDX_MAX.swap(0, Ordering::Relaxed);
+                    let cm_p = CM_PRIMS_MAX.swap(0, Ordering::Relaxed);
                     crate::binfo!("wmfps",
                         "iters={}/s ITER={}us HLT={}us | frame_all={}us raster={}us present={}us (fps={} jobs={})",
                         iter_s, iter_avg_us, hlt_avg_us, fa_avg_us, ra_avg_us, pr_avg_us,
@@ -3520,14 +3622,21 @@ impl Compositor {
                     crate::binfo!("wmfps2",
                         "raster: decode={}us plan={}us dispatch={}us clone={}us (last dmg_rows={} bands={})",
                         dec_us, pln_us, dsp_us, cln_us, rp_rows, rp_nb);
-                    let _ = fa_max_us;
+                    crate::binfo!("wmfps3",
+                        "PEAK: ITERmax={}us fa_max={}us ra_max={}us pr_max={}us | dmg rows_max={} area_max={}px bands_max={}",
+                        iter_max_us, fa_max_us, ra_max_us, pr_max_us, rows_max, area_max, bands_max);
+                    crate::binfo!("wmfps4",
+                        "mesh: commit/win={} bytes_max={} verts_max={} idx_max={} prims_max={}",
+                        cm_calls, cm_bytes, cm_v, cm_i, cm_p);
                     disp_p = present_s; disp_it = iter_s;
                     disp_fa = fa_avg_us; disp_pr = pr_avg_us; disp_ra = ra_avg_us;
                     disp_iter = iter_avg_us; disp_hlt = hlt_avg_us;
+                    disp_iter_max = iter_max_us; disp_fa_max = fa_max_us;
+                    disp_pr_max = pr_max_us; disp_ra_max = ra_max_us;
                     disp_dec = dec_us; disp_pln = pln_us; disp_dsp = dsp_us; disp_cln = cln_us; disp_nb = rp_nb;
                     fps_t0 = now;
-                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0;
-                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0;
+                    n_present = 0; n_iter = 0; fa_sum = 0; fa_max = 0; pr_sum = 0; pr_max = 0;
+                    ra_sum = 0; n_raster = 0; hlt_sum = 0; iter_sum = 0; ra_max = 0; iter_max = 0;
                 }
             }
 
@@ -3558,6 +3667,12 @@ impl Compositor {
                     // iter ≈ fa + ra + pr + hlt: localizza dove va il tempo residuo.
                     let l3 = alloc::format!("fa:{}ms pr:{}ms ra:{}ms",
                         disp_fa / 1000, disp_pr / 1000, disp_ra / 1000);
+                    // Row 4: PEAK (MAX) ms over the last window — the per-iter spike the
+                    // AVGs above hide. it=worst loop iter, fa/pr/ra=worst frame_all/
+                    // present/raster. This is the number to read DURING continuous menu
+                    // movement (held stable for ~1s between reports). Mirrors wmfps3.
+                    let l4 = alloc::format!("M it:{} fa:{} pr:{} ra:{}ms",
+                        disp_iter_max / 1000, disp_fa_max / 1000, disp_pr_max / 1000, disp_ra_max / 1000);
                     let white = [0x80, 0xFF, 0x80, 0xFF];
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad,
                                         ov_w - ov_pad, &l1, white);
@@ -3565,6 +3680,8 @@ impl Compositor {
                                         ov_w - ov_pad, &l2, white);
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad + (ov_gh + ov_gap) * 2,
                                         ov_w - ov_pad, &l3, white);
+                    decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad + (ov_gh + ov_gap) * 3,
+                                        ov_w - ov_pad, &l4, white);
                     crate::gfx::blit(&ov_buf, g.width - ov_w - 2, g.height - ov_h - 2, ov_w, ov_h);
                 }
             }

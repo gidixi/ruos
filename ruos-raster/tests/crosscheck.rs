@@ -182,3 +182,74 @@ fn ruos_raster_matches_gui_core_bit_identical() {
     }
     assert_eq!(bytes_a.as_slice(), bytes_b, "ruos-raster diverges from gui-core");
 }
+
+/// 4x4 white Color atlas su Managed(0) (full delta).
+fn atlas4_white_delta() -> TexturesDelta {
+    let img = ColorImage { size: [4, 4], pixels: vec![Color32::WHITE; 16] };
+    let delta = ImageDelta::full(ImageData::Color(Arc::new(img)), TextureOptions::NEAREST);
+    TexturesDelta { set: vec![(TextureId::Managed(0), delta)], free: vec![] }
+}
+
+/// Patch 1x1 a (ox,oy) col colore dato (partial delta, pos=Some).
+fn patch_delta(ox: usize, oy: usize, c: Color32) -> TexturesDelta {
+    let img = ColorImage { size: [1, 1], pixels: vec![c] };
+    let delta = ImageDelta {
+        image: ImageData::Color(Arc::new(img)),
+        pos: Some([ox, oy]),
+        options: TextureOptions::NEAREST,
+    };
+    TexturesDelta { set: vec![(TextureId::Managed(0), delta)], free: vec![] }
+}
+
+/// Mesh "glifo": rect con uv esplicito (campiona contenuto reale dell'atlante).
+fn glyph_mesh(x0: f32, y0: f32, x1: f32, y1: f32, u: f32, v: f32, color: Color32) -> Mesh {
+    let mut m = Mesh::with_texture(TextureId::Managed(0));
+    let uv = pos2(u, v);
+    m.vertices.push(epaint_vertex(pos2(x0, y0), uv, color));
+    m.vertices.push(epaint_vertex(pos2(x1, y0), uv, color));
+    m.vertices.push(epaint_vertex(pos2(x1, y1), uv, color));
+    m.vertices.push(epaint_vertex(pos2(x0, y1), uv, color));
+    m.indices = vec![0, 1, 2, 0, 2, 3];
+    m
+}
+
+/// Dopo un patch dell'atlante, gui-core e ruos-raster devono concordare su
+/// rect di danno E byte del canvas (estende il guard oltre il single-frame).
+#[test]
+fn tex_patch_damage_matches_gui_core() {
+    let (w, h) = (64u32, 64u32);
+    let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(w as f32, h as f32));
+    let prims = vec![
+        ClippedPrimitive {
+            clip_rect: clip,
+            primitive: Primitive::Mesh(rect_mesh(0.0, 0.0, w as f32, h as f32, Color32::from_rgb(10, 20, 30))),
+        },
+        ClippedPrimitive {
+            clip_rect: clip,
+            primitive: Primitive::Mesh(glyph_mesh(40.0, 40.0, 50.0, 50.0, 0.625, 0.625, Color32::WHITE)),
+        },
+    ];
+    let d_full = atlas4_white_delta();
+    let empty = TexturesDelta::default();
+    let d_patch = patch_delta(2, 2, Color32::from_rgb(255, 0, 0));
+
+    // gui-core
+    let mut a = gui_core::raster::Renderer::new();
+    let _ = a.render(&prims, &d_full, w, h);
+    let _ = a.render(&prims, &empty, w, h);
+    let (pa, da) = a.render(&prims, &d_patch, w, h);
+    let bytes_a = pa.data().to_vec();
+
+    // ruos-raster (wire)
+    let (verts, idx, wprims) = to_wire(&prims);
+    let mut b = Raster::new(CLEAR);
+    apply_delta(&mut b, &d_full);
+    let _ = b.render(&verts, &idx, &wprims, w, h);
+    let _ = b.render(&verts, &idx, &wprims, w, h);
+    apply_delta(&mut b, &d_patch);
+    let (bytes_b, db) = b.render(&verts, &idx, &wprims, w, h);
+
+    assert_eq!((da.x, da.y, da.w, da.h), (db.x, db.y, db.w, db.h), "damage rect differs");
+    assert!(da.w < w && da.h < h, "patch must NOT be full-screen (got {}x{})", da.w, da.h);
+    assert_eq!(bytes_a.as_slice(), bytes_b, "canvas diverges after patch");
+}

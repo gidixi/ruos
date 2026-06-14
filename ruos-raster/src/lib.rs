@@ -431,12 +431,31 @@ impl Raster {
             .collect();
         let full = IRect { x0: 0, y0: 0, x1: iw, y1: ih };
         let mut damage = IRect::empty();
-        if realloc || self.tex_dirty || self.prev.len() != meta.len() {
+        if realloc || self.tex_dirty {
             damage = full;
         } else {
-            for (a, b) in self.prev.iter().zip(meta.iter()) {
-                if a.hash != b.hash {
-                    damage = damage.union(a.bbox).union(b.bbox);
+            // Diff per CONTENUTO (hash), NON per posizione. Una primitiva il cui hash
+            // è presente in ENTRAMBI i frame è invariata → niente danno, OVUNQUE sia
+            // nella lista. Danno solo le primitive: presenti in old e non in new
+            // (rimosse → l'area va ridipinta) o in new e non in old (aggiunte/cambiate).
+            // Fondamentale: un highlight hover inserito a METÀ lista (nel pannello)
+            // faceva slittare di posizione tutte le successive (incluso il WALLPAPER
+            // full-screen) → il diff posizionale le marcava cambiate → full-screen
+            // raster (50 ms sul gradiente slow-path) su un semplice hover. Per hash il
+            // wallpaper (hash invariato) non si tocca → danno = solo l'area
+            // dell'highlight. CORRETTO per egui (ordine relativo stabile, nessun prim
+            // translucido duplicato). Guardato da `damage_on_prim_count_change_matches_full`.
+            use alloc::collections::BTreeSet;
+            let old_hashes: BTreeSet<u64> = self.prev.iter().map(|m| m.hash).collect();
+            let new_hashes: BTreeSet<u64> = meta.iter().map(|m| m.hash).collect();
+            for m in &self.prev {
+                if !new_hashes.contains(&m.hash) {
+                    damage = damage.union(m.bbox); // rimossa
+                }
+            }
+            for m in &meta {
+                if !old_hashes.contains(&m.hash) {
+                    damage = damage.union(m.bbox); // aggiunta/cambiata
                 }
             }
         }
@@ -664,6 +683,21 @@ fn edge(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> f64 {
     (px - ax) * (by - ay) - (py - ay) * (bx - ax)
 }
 
+/// `1/255` come costante f32 (valutata a compile-time): la moltiplicazione
+/// sostituisce la divisione `/255.0` nel hot loop (≈20 cicli → ≈4). Differenza
+/// ≤1 LSB dal valore esatto, assorbita dal round; il cross-check vs gui-core
+/// resta byte-identico perché usa la STESSA costante.
+const INV_255: f32 = 1.0 / 255.0;
+
+/// Round half-away-from-zero per input NON-negativi (== `std::f32::round` su
+/// x≥0), via cast troncante hardware — niente floor software (core non ha
+/// `round` nativo, F32Ext lo emula con bit-twiddle + branch, caro per pixel).
+/// Tutti i valori di blend qui sono ≥0 (premoltiplicato, pesi inside ≥0).
+#[inline]
+fn round_nn(x: f32) -> f32 {
+    (x + 0.5) as i32 as f32
+}
+
 /// Un'arista è top-left (regola di copertura per evitare doppio-disegno dei
 /// pixel sul bordo condiviso tra triangoli). y-down, winding CCW (area>0).
 #[inline]
@@ -813,8 +847,53 @@ fn raster_tri(
         None
     };
 
+    // Wire color bytes [r,g,b,a], costanti per triangolo → hoist fuori dal loop.
+    let c0 = v0.color.to_le_bytes();
+    let c1 = v1.color.to_le_bytes();
+    let c2 = v2.color.to_le_bytes();
+
+    // FLAT-FILL fast path. egui emette wallpaper/pannelli/cornici/barre/sfondi
+    // grafici come triangoli a COLORE COSTANTE sui 3 vertici, con texel costante
+    // (tutto ciò che NON è testo). Allora il frammento (cr⊗texel/255) e `inv` sono
+    // COSTANTI sul triangolo — non dipendono dai pesi baricentrici (c0==c1==c2 ⇒
+    // cr=c0·Σw≈c0). Precalcoliamo una volta:
+    //  - fill OPACO (inv=0)       → l'uscita è una COSTANTE → `flat_const` (put diretto);
+    //  - fill TRASLUCIDO (inv>0)  → frag+inv costanti → `flat_blend`: nel loop resta
+    //    SOLO il blend OVER (che dipende dal dst), niente pesi/interp/sample/normalizza.
+    // Il testo (uv variabili → colore/texel per-pixel) resta lo slow path completo.
+    // Mirror di gui-core; ≤1 LSB dal per-pixel (Σw≈1) ma il cross-check resta esatto.
+    let flat = v0.color == v1.color && v0.color == v2.color;
+    let texel_rgba = if tex_w == 0 { Some((255.0f32, 255.0, 255.0, 255.0)) } else { const_texel };
+    let (flat_const, flat_blend): (Option<[u8; 4]>, Option<(f32, f32, f32, f32, f32)>) =
+        if let (true, Some((tr, tg, tb, ta))) = (flat, texel_rgba) {
+            let fr = c0[0] as f32 * tr * INV_255;
+            let fg = c0[1] as f32 * tg * INV_255;
+            let fb = c0[2] as f32 * tb * INV_255;
+            let fa = c0[3] as f32 * ta * INV_255;
+            if fa <= 0.0 {
+                return; // triangolo del tutto trasparente → niente da disegnare
+            }
+            let inv = 1.0 - fa * INV_255;
+            if inv == 0.0 {
+                // Opaco: out costante (il blend collassa, dst irrilevante).
+                let oa = round_nn(fa);
+                let oa_u = oa.clamp(0.0, 255.0) as u8;
+                let cc = |c: f32| c.clamp(0.0, oa).min(255.0) as u8;
+                (Some([cc(round_nn(fr)), cc(round_nn(fg)), cc(round_nn(fb)), oa_u]), None)
+            } else {
+                (None, Some((fr, fg, fb, fa, inv)))
+            }
+        } else {
+            (None, None)
+        };
+
     for py in miny..maxy {
         let pyf = py as f32 + 0.5;
+        // La copertura di un triangolo convesso su una scanline è un intervallo
+        // contiguo: una volta entrati e poi usciti dal triangolo, il resto della
+        // riga è fuori → `break`. Elimina il margine destro del bounding box
+        // (edge() sprecati su pixel non coperti). Pixel set INVARIATO.
+        let mut entered = false;
         for px in minx..maxx {
             let pxf = px as f32 + 0.5;
 
@@ -828,16 +907,36 @@ fn raster_tri(
             let in1 = e1 > 0.0 || (e1 == 0.0 && tl1);
             let in2 = e2 > 0.0 || (e2 == 0.0 && tl2);
             if !(in0 && in1 && in2) {
-                continue; // fuori, o bordo non-coperto da questo triangolo
+                if entered {
+                    break; // span contiguo finito: il resto della riga è fuori
+                }
+                continue; // non ancora entrati nel triangolo su questa riga
             }
+            entered = true;
+
+            // Flat fill OPACO: costante precalcolata → put diretto (no dst, no math).
+            if let Some(cc) = flat_const {
+                band.put(px, py, cc);
+                continue;
+            }
+            // Flat fill TRASLUCIDO: frag+inv costanti → resta solo il blend OVER.
+            if let Some((fr, fg, fb, fa, inv)) = flat_blend {
+                let dst = band.get(px, py);
+                let oa = round_nn(fa + dst[3] as f32 * inv);
+                let oa_u = oa.clamp(0.0, 255.0) as u8;
+                let cc = |c: f32| c.clamp(0.0, oa).min(255.0) as u8;
+                band.put(px, py, [
+                    cc(round_nn(fr + dst[0] as f32 * inv)),
+                    cc(round_nn(fg + dst[1] as f32 * inv)),
+                    cc(round_nn(fb + dst[2] as f32 * inv)),
+                    oa_u,
+                ]);
+                continue;
+            }
+
             let w0 = (e0 * inv_area) as f32;
             let w1 = (e1 * inv_area) as f32;
             let w2 = (e2 * inv_area) as f32;
-
-            // Wire color: bytes [r,g,b,a] = color.to_le_bytes().
-            let c0 = v0.color.to_le_bytes();
-            let c1 = v1.color.to_le_bytes();
-            let c2 = v2.color.to_le_bytes();
 
             // Colore per-vertice interpolato (premoltiplicato).
             let cr = w0 * c0[0] as f32 + w1 * c1[0] as f32 + w2 * c2[0] as f32;
@@ -858,21 +957,21 @@ fn raster_tri(
             };
 
             // frag = vertex ⊗ texel  (entrambi premoltiplicati, normalizza /255).
-            let fr = cr * tr / 255.0;
-            let fg = cg * tg / 255.0;
-            let fb = cb * tb / 255.0;
-            let fa = ca * ta / 255.0;
+            let fr = cr * tr * INV_255;
+            let fg = cg * tg * INV_255;
+            let fb = cb * tb * INV_255;
+            let fa = ca * ta * INV_255;
             if fa <= 0.0 {
                 continue; // trasparente: niente da comporre
             }
 
             // OVER premoltiplicato sopra il dst.
             let dst = band.get(px, py);
-            let inv = 1.0 - fa / 255.0;
-            let or = (fr + dst[0] as f32 * inv).round();
-            let og = (fg + dst[1] as f32 * inv).round();
-            let ob = (fb + dst[2] as f32 * inv).round();
-            let oa = (fa + dst[3] as f32 * inv).round();
+            let inv = 1.0 - fa * INV_255;
+            let or = round_nn(fr + dst[0] as f32 * inv);
+            let og = round_nn(fg + dst[1] as f32 * inv);
+            let ob = round_nn(fb + dst[2] as f32 * inv);
+            let oa = round_nn(fa + dst[3] as f32 * inv);
 
             let oa_u = oa.clamp(0.0, 255.0) as u8;
             // Mantiene l'invariante premoltiplicato r,g,b <= a.

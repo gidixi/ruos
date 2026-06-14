@@ -143,6 +143,56 @@ fn dirty_rect_recolor_matches_full_render() {
     assert_eq!(inc_data.as_slice(), full_canvas);
 }
 
+/// Cambio del NUMERO di primitive (un popup/menu che si apre → egui aggiunge prim in
+/// coda) → il damage deve essere PARZIALE (solo l'area del popup), NON full-window, e
+/// l'update incrementale deve coincidere pixel-per-pixel col render full. Guarda il
+/// fix di `plan_damage` (prima `prev.len() != meta.len()` forzava full → la shell
+/// full-screen si ri-rasterizzava tutta ad ogni frame del menu).
+#[test]
+fn damage_on_prim_count_change_matches_full() {
+    let clip = [0.0, 0.0, 64.0, 64.0];
+    // A: solo sfondo (1 primitiva).
+    let mut va = Vec::new();
+    let mut ia = Vec::new();
+    let (b0, b1) = rect_mesh(&mut va, &mut ia, 0.0, 0.0, 64.0, 64.0, rgba(10, 20, 30, 255));
+    let pa = vec![Prim { clip, tex_id: 0, idx0: b0, idx1: b1 }];
+    // B: sfondo + un piccolo rect "popup" AGGIUNTO in coda (2 primitive).
+    let mut vb = va.clone();
+    let mut ib = ia.clone();
+    let (r0, r1) = rect_mesh(&mut vb, &mut ib, 40.0, 4.0, 60.0, 24.0, rgba(200, 80, 80, 255));
+    let pb = vec![
+        Prim { clip, tex_id: 0, idx0: b0, idx1: b1 },
+        Prim { clip, tex_id: 0, idx0: r0, idx1: r1 },
+    ];
+
+    let mut inc = Raster::new(CLEAR);
+    white_texel(&mut inc);
+    let _ = inc.render(&va, &ia, &pa, 64, 64); // primo frame: full
+    let (inc_canvas, dirty) = inc.render(&vb, &ib, &pb, 64, 64); // +popup in coda
+    assert!(dirty.w > 0 && dirty.h > 0, "damage vuoto sull'aggiunta di una primitiva");
+    assert!(
+        dirty.w < 64 || dirty.h < 64,
+        "atteso damage PARZIALE sull'aggiunta (no full-window), ho {dirty:?}"
+    );
+    let inc_data = inc_canvas.to_vec();
+    let mut full = Raster::new(CLEAR);
+    white_texel(&mut full);
+    let (full_canvas, _) = full.render(&vb, &ib, &pb, 64, 64);
+    assert_eq!(inc_data.as_slice(), full_canvas, "incremental (prim aggiunta) != render full");
+
+    // Rimozione (popup chiuso): B → A. Damage parziale + coincide col full.
+    let (rc_canvas, dirty2) = inc.render(&va, &ia, &pa, 64, 64);
+    assert!(
+        dirty2.w > 0 && (dirty2.w < 64 || dirty2.h < 64),
+        "atteso damage PARZIALE sulla rimozione, ho {dirty2:?}"
+    );
+    let rc_data = rc_canvas.to_vec();
+    let mut full2 = Raster::new(CLEAR);
+    white_texel(&mut full2);
+    let (full2_canvas, _) = full2.render(&va, &ia, &pa, 64, 64);
+    assert_eq!(rc_data.as_slice(), full2_canvas, "incremental (prim rimossa) != render full");
+}
+
 /// The no_std float ops (used in the kernel build) must be bit-identical to
 /// std's intrinsics (used by gui-core). Under `cargo test`, std's inherent
 /// methods shadow the trait in the ported code, so call the trait impls via

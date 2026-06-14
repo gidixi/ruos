@@ -824,7 +824,9 @@ fn dispatch_raster(
     }
 
     // Join: block until every submitted band is DONE, work-stealing while we wait
-    // (same rationale as dispatch_bands — pure fn jobs, single submitter).
+    // (same rationale as dispatch_bands — pure fn jobs, single submitter). Pump the
+    // cursor while idle-spinning so the pointer tracks during the heavy raster.
+    let mut spins = 0u32;
     for k in 0..n_total {
         if ids[k] == usize::MAX { continue; }
         loop {
@@ -832,11 +834,33 @@ fn dispatch_raster(
             if let Some(slot) = crate::smp::pool::take() {
                 crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
             } else {
-                core::hint::spin_loop();
+                pump_cursor_spin(&mut spins);
             }
         }
     }
     // After this point all jobs are DONE → the GUI core may read/own the canvas.
+}
+
+/// Pump del cursore durante uno spin-wait di join. Mentre gli AP fanno il lavoro
+/// pesante (frame()/raster/composite), il core GUI gira a vuoto nello spin: qui ne
+/// approfittiamo per far avanzare il cursore software al rate del MOUSE invece che
+/// al rate del loop. È il vero motivo per cui il puntatore "scattava" a ~1 fps con
+/// System Monitor aperto: `fold_mouse` (che muove lo sprite) girava una sola volta
+/// per iterazione del loop, e l'iterazione è lenta sotto carico. Throttle 1/256
+/// spin: `fold_mouse` fa lavoro solo quando arriva un pacchetto mouse (~125 Hz),
+/// quindi il lock rado non affama l'IRQ mouse. SICURO: durante un join non c'è
+/// alcun blit né scrittura della RAM-shadow in volo (entrambi avvengono dopo il
+/// join, serialmente sul core GUI), e fold_mouse/cursor sono GUI-core-only
+/// (CUR_LOCK) → nessuna race col present.
+#[inline]
+fn pump_cursor_spin(spins: &mut u32) {
+    *spins = spins.wrapping_add(1);
+    // ~ogni 4096 spin (decine di µs): ben oltre il rate dei pacchetti mouse
+    // (~125 Hz) → cursore fluido, ma lock-traffic basso → l'IRQ mouse non è affamato.
+    if *spins % 4096 == 0 {
+        crate::gfx::fold_mouse();
+    }
+    core::hint::spin_loop();
 }
 
 /// Dispatch the banded composite into the screen-sized RGBX back-buffer pointed
@@ -857,11 +881,38 @@ fn dispatch_bands(
     screen_h: u32,
     bg: u32,
     n_wins: usize,
+    inline: bool,
 ) {
     if screen_h == 0 || screen_w == 0 { return; }
 
     // `wins` base into the shared WIN arena (already filled by present()).
     let wins_ptr = core::ptr::addr_of!(WIN_ARENA) as usize;
+
+    // INLINE compose (no SMP fan-out): per uno schermo tipico (poche finestre) il
+    // compositing è memcpy-bound (~8-16 MB ⇒ ~2-3 ms su un core), mentre il fan-out
+    // SMP paga submit + IPI broadcast + join-spin (~10 ms di OVERHEAD dominante, era
+    // il `pr` alto che faceva sentire lente le interazioni). Componiamo INLINE sul
+    // core GUI → present scende a ~2-3 ms. La fase di warmup resta SMP (il boot-check
+    // "composite cores" a frame 30 deve osservare più core). SICURO: full compose,
+    // solo seriale (niente damage tracking → niente rischio ghosting).
+    if inline {
+        // SAFETY: come il fallback 1-CPU sotto — composite_band scrive solo le righe
+        // [0, screen_h); non sottomettiamo job, quindi niente in volo da far correre.
+        unsafe {
+            composite_band(
+                back_ptr as *mut u8,
+                stride,
+                screen_w,
+                0,
+                screen_h,
+                bg,
+                core::slice::from_raw_parts(wins_ptr as *const WinDesc, n_wins),
+            );
+        }
+        let cpu = crate::cpu::cpu_id();
+        if cpu < 32 { COMPOSITE_CORE_MASK.fetch_or(1u32 << cpu, Ordering::SeqCst); }
+        return;
+    }
 
     // Band count: one band per online core (incl. BSP), capped — unless the
     // serial-composite feature forces a single band (visual-equivalence ref).
@@ -937,6 +988,7 @@ fn dispatch_bands(
     }
 
     // Join: block until every submitted band is DONE. poll_done frees slots.
+    let mut spins = 0u32;
     for b in 0..n_bands {
         if ids[b] == usize::MAX { continue; }
         loop {
@@ -950,7 +1002,7 @@ fn dispatch_bands(
             if let Some(slot) = crate::smp::pool::take() {
                 crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
             } else {
-                core::hint::spin_loop();
+                pump_cursor_spin(&mut spins); // cursore fluido durante il composite
             }
         }
     }
@@ -2404,6 +2456,7 @@ impl Compositor {
             // the GUI core makes forward progress if APs are slow (same rationale
             // as dispatch_bands; stealing a frame job just runs Wasmtime on the
             // GUI core, which is where it ran before the parallel split).
+            let mut spins = 0u32;
             for k in 0..n {
                 if ids[k] == usize::MAX { continue; }
                 loop {
@@ -2411,7 +2464,7 @@ impl Compositor {
                     if let Some(slot) = crate::smp::pool::take() {
                         crate::smp::pool::run_slot(slot, crate::cpu::cpu_id());
                     } else {
-                        core::hint::spin_loop();
+                        pump_cursor_spin(&mut spins); // cursore fluido durante i frame() app
                     }
                 }
             }
@@ -2543,7 +2596,7 @@ impl Compositor {
     /// CSD: `compose_window` now yields each window's RAW committed surface (the
     /// app draws its own title bar / [X]); the band kernel paints it at the
     /// window's rect. No kernel decorations are added.
-    fn present(&mut self) {
+    fn present(&mut self, compose_inline: bool) {
         let g = crate::gfx::geom();
         let (sw, sh) = (g.width, g.height);
         if sw == 0 || sh == 0 { return; }
@@ -2618,7 +2671,7 @@ impl Compositor {
         //    returning, so no band job outlives this call.
         let bg = u32::from_le_bytes(DESKTOP_BG);
         let back_ptr = self.backbuf.as_mut_ptr() as usize;
-        dispatch_bands(back_ptr, stride, sw, sh, bg, n);
+        dispatch_bands(back_ptr, stride, sw, sh, bg, n, compose_inline);
         // Overlay notifiche (toast + modale): sopra le finestre composite,
         // sotto il cursore software (che è ricomposto dal blit).
         self.draw_overlays(sw, sh);
@@ -3018,11 +3071,11 @@ impl Compositor {
         #[cfg(feature = "wm-fps")]
         let (ov_gw, ov_gh) = (crate::console::font::glyph_width() as u32,
                               crate::console::font::glyph_height() as u32);
-        // Two text rows; sized to the longer label line.
+        // Three text rows; sized to the longer label line.
         #[cfg(feature = "wm-fps")]
         let (ov_cols, ov_pad, ov_gap) = (32u32, 4u32, 2u32);
         #[cfg(feature = "wm-fps")]
-        let (ov_w, ov_h) = (ov_cols * ov_gw + ov_pad * 2, ov_gh * 2 + ov_gap + ov_pad * 2);
+        let (ov_w, ov_h) = (ov_cols * ov_gw + ov_pad * 2, ov_gh * 3 + ov_gap * 2 + ov_pad * 2);
         #[cfg(feature = "wm-fps")]
         let mut ov_buf = alloc::vec![0u8; (ov_w * ov_h * 4) as usize];
         loop {
@@ -3370,7 +3423,9 @@ impl Compositor {
             let any_committed = self.wins.iter().any(|w| w.store.data().win.committed);
             if self.dirty || any_committed || self.frame_no < WARMUP_FRAMES {
                 #[cfg(feature = "wm-fps")] let pr0 = crate::boot::clock::read_tsc();
-                self.present();
+                // Post-warmup: compose INLINE (no SMP overhead) → present ~2-3ms invece
+                // di ~10ms. Durante il warmup resta SMP (boot-check "composite cores").
+                self.present(self.frame_no >= WARMUP_FRAMES);
                 #[cfg(feature = "wm-fps")] {
                     pr_sum = pr_sum.wrapping_add(crate::boot::clock::read_tsc().wrapping_sub(pr0));
                     n_present += 1;
@@ -3497,11 +3552,19 @@ impl Compositor {
                     // d/c dominate => serial per-frame overhead (decode/clone).
                     let l2 = alloc::format!("d:{} p:{} r:{} c:{}ms b:{}",
                         disp_dec / 1000, disp_pln / 1000, disp_dsp / 1000, disp_cln / 1000, disp_nb);
+                    // Row 3: le DUE fasi del loop NON nel raster — fa=frame_all (le app
+                    // tessellano egui sotto Wasmtime), pr=present (compositing surface→
+                    // framebuffer, compose.rs), ra=raster_meshes totale (= d+p+r+c).
+                    // iter ≈ fa + ra + pr + hlt: localizza dove va il tempo residuo.
+                    let l3 = alloc::format!("fa:{}ms pr:{}ms ra:{}ms",
+                        disp_fa / 1000, disp_pr / 1000, disp_ra / 1000);
                     let white = [0x80, 0xFF, 0x80, 0xFF];
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad,
                                         ov_w - ov_pad, &l1, white);
                     decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad + ov_gh + ov_gap,
                                         ov_w - ov_pad, &l2, white);
+                    decor::draw_text_at(&mut ov_buf, ov_w, ov_h, ov_pad, ov_pad + (ov_gh + ov_gap) * 2,
+                                        ov_w - ov_pad, &l3, white);
                     crate::gfx::blit(&ov_buf, g.width - ov_w - 2, g.height - ov_h - 2, ov_w, ov_h);
                 }
             }
